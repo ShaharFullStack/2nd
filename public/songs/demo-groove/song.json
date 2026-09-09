@@ -2,8 +2,6 @@
   "id": "demo-groove",
   "title": "Groove Circuit",
   "artist": "Beat Rehab demo (synthesized)",
-  "artistUrl": "",
-  "sourceUrl": "scripts/gen-demo-stems.mjs",
   "license": "CC0 1.0",
   "licenseUrl": "https://creativecommons.org/publicdomain/zero/1.0/",
   "attribution": "\"Groove Circuit\" is an original demo track synthesized in-repo by scripts/gen-demo-stems.mjs (Beat Rehab). Released under CC0 1.0 — no rights reserved.",

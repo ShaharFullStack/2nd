@@ -54,15 +54,33 @@ export function fontPx(font: string): number {
   return m ? parseFloat(m[1]) : 16;
 }
 
+/**
+ * One shared 1x1 measuring context per factory-owning cache, so rasterizing a new string costs one
+ * canvas allocation (the sprite), not two.
+ */
+class ProbeContext {
+  private ctx: Ctx2D | null | undefined;
+  private readonly factory: CanvasFactory;
+  constructor(factory: CanvasFactory) {
+    this.factory = factory;
+  }
+  get(): Ctx2D | null {
+    if (this.ctx === undefined) this.ctx = this.factory(1, 1).getContext('2d');
+    return this.ctx;
+  }
+}
+
 export class TextCache {
   private map = new Map<string, TextSprite>();
   private readonly max: number;
   private readonly factory: CanvasFactory;
+  private readonly probe: ProbeContext;
   /** Device pixel ratio the sprites are rasterized at. */
   dpr = 1;
 
   constructor(factory: CanvasFactory = defaultCanvasFactory, maxEntries = 256) {
     this.factory = factory;
+    this.probe = new ProbeContext(factory);
     this.max = Math.max(8, maxEntries);
   }
 
@@ -104,8 +122,8 @@ export class TextCache {
     const sw = style.stroke ? (style.strokeWidth ?? Math.max(1, px * 0.08)) : 0;
     const padX = Math.ceil(blur + sw + px * 0.15);
     const padY = Math.ceil(blur + sw + px * 0.2);
-    // Measure with a probe context; fall back to an estimate.
-    const probe = this.factory(1, 1).getContext('2d');
+    // Measure with the shared probe context; fall back to an estimate.
+    const probe = this.probe.get();
     let textWidth = text.length * px * 0.6;
     if (probe) {
       probe.font = style.font;
@@ -199,16 +217,18 @@ export class DigitRoller {
   private stripDpr = 1;
   private stripKey = '';
   private readonly factory: CanvasFactory;
+  private readonly probe: ProbeContext;
 
   constructor(factory: CanvasFactory = defaultCanvasFactory) {
     this.factory = factory;
+    this.probe = new ProbeContext(factory);
   }
 
   private ensure(style: TextStyle, dpr: number): void {
     const key = `${style.font}|${style.color}|${style.glow ?? ''}|${dpr}`;
     if (this.strip && this.stripKey === key) return;
     const px = fontPx(style.font);
-    const probe = this.factory(1, 1).getContext('2d');
+    const probe = this.probe.get();
     let w = px * 0.62;
     if (probe) {
       probe.font = style.font;

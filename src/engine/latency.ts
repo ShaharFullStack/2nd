@@ -52,7 +52,7 @@ export interface LatencyOptions {
   minSamples?: number;
   /** Maximum MAD for confidence (default 0.05 s ≈ 1.5 frames at 30 fps). */
   maxMadSec?: number;
-  /** Maximum rejected fraction (including unpaired beats) for confidence (default 0.4). */
+  /** Maximum rejected fraction (including unpaired beats) for confidence (default 1/3). */
   maxRejectedFraction?: number;
   /** Beats that received no input; counted as rejected (default 0; `calibrateLatency` fills it in). */
   unpaired?: number;
@@ -67,7 +67,12 @@ export const LATENCY_OUTLIER_SEC = 0.25;
 export const LATENCY_MIN_SAMPLES = 6;
 /** ~1.5 camera frames: healthy tappers (SD ~25 ms) and impaired patients (SD ~45 ms) both pass. */
 export const LATENCY_MAX_MAD_SEC = 0.05;
-export const LATENCY_MAX_REJECTED_FRACTION = 0.4;
+/**
+ * More than a third of the beats rejected (outliers or never answered) means the run is not a
+ * trustworthy calibration even if the surviving samples are tight: a 16-beat run tolerates 5
+ * rejected beats, not 6.
+ */
+export const LATENCY_MAX_REJECTED_FRACTION = 1 / 3;
 /** Recommended metronome tempo for the calibration screen (beat interval 1 s ≫ pipeline latency). */
 export const CALIBRATION_BPM_RECOMMENDED = 60;
 export const CALIBRATION_BEATS_RECOMMENDED = 16;

@@ -75,3 +75,24 @@ describe('LaneTrigger', () => {
     expect(trig.peakSinceTrigger).toBe(0);
   });
 });
+
+describe('LaneTrigger rep completion', () => {
+  it('reports each completed rep with its peak once the lane re-arms (joined by ctxTime)', () => {
+    const trig = new LaneTrigger({ thresholdFraction: 0.5, minIntervalSec: 0.5 });
+    expect(trig.takeCompletedRep()).toBeNull();
+    trig.push(0, 0);
+    const e = trig.push(0.6, 0.1)!;
+    expect(e).not.toBeNull();
+    trig.push(0.9, 0.2);
+    trig.push(0.7, 0.3);
+    expect(trig.takeCompletedRep()).toBeNull(); // still above the re-arm level
+    trig.push(0.1, 0.4);
+    const rep = trig.takeCompletedRep()!;
+    expect(rep).toEqual({ ctxTime: e.ctxTime, endCtxTime: 0.4, peak: 0.9, emitted: true });
+    expect(trig.takeCompletedRep()).toBeNull(); // consumed
+    // A crossing swallowed by the min re-trigger interval still completes, flagged emitted:false.
+    expect(trig.push(0.8, 0.45)).toBeNull();
+    trig.push(0.0, 0.5);
+    expect(trig.takeCompletedRep()).toMatchObject({ emitted: false, peak: 0.8 });
+  });
+});

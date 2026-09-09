@@ -7,9 +7,17 @@
  * so notes travel horizon → strike line in `approachSec` seconds, and keep going
  * below the strike line (d < 0) until they leave the bottom of the canvas.
  *
- * Perspective scale s(d) = 1 / (1 + k·d), with k chosen so that s(1) = farScale.
+ * Perspective scale s(d) = 1 / (1 + k·d) for d >= 0, with k chosen so that s(1) = farScale.
  * Screen y(d) = vpY + (strikeY - vpY) · s(d). Lane x and gem radius scale by s(d).
  * The vanishing point sits above the visible horizon so the road tapers naturally.
+ *
+ * Below the strike line (d < 0) the true perspective curve would fling gems off the bottom of
+ * the canvas ~150 ms after the note time — long before the engine declares a miss
+ * (note.time + goodMs 110–180 ms + 100 ms grace = 210–280 ms). So the tail is linear instead:
+ * s(d) = 1 - d·k·pastLineSpeed, i.e. constant screen-space speed equal to `pastLineSpeed` × the
+ * speed at the strike line. Because x offsets and radius still scale with (y - vpY) the road
+ * edges stay perfectly straight (no kink at the line); only the vertical speed changes. With the
+ * default pastLineSpeed a gem stays on screen ≥ 400 ms past the line at 720p / 1080p / portrait.
  */
 
 export interface GeometryOptions {
@@ -18,6 +26,8 @@ export interface GeometryOptions {
   strikeY: number;
   farScale: number;
   roadWidth: number;
+  /** Screen-space speed below the strike line relative to the speed at the line (0.2..1). */
+  pastLineSpeed: number;
 }
 
 export interface HighwayGeometry {
@@ -34,6 +44,8 @@ export interface HighwayGeometry {
   strikeY: number;
   /** Perspective coefficient: s(d) = 1 / (1 + k d). */
   k: number;
+  /** Linear tail speed factor below the strike line (see module docs). */
+  pastLineSpeed: number;
   /** Road half-width at the strike line (px). */
   nearHalfWidth: number;
   /** Lane width at the strike line (px). */
@@ -54,6 +66,7 @@ export const DEFAULT_GEOMETRY_OPTIONS: GeometryOptions = {
   strikeY: 0.82,
   farScale: 0.28,
   roadWidth: 0.6,
+  pastLineSpeed: 0.55,
 };
 
 export function clamp(v: number, lo: number, hi: number): number {
@@ -98,6 +111,7 @@ export function makeGeometry(
     horizonY: horizonPx,
     strikeY,
     k,
+    pastLineSpeed: clamp(o.pastLineSpeed, 0.2, 1),
     nearHalfWidth,
     laneWidthNear,
     gemRadiusNear,
@@ -115,12 +129,13 @@ export function depthOf(g: HighwayGeometry, noteTime: number, songTime: number):
   return (noteTime - songTime) / g.approachSec;
 }
 
-/** Perspective scale at depth d (1 at strike line, farScale at horizon). */
+/**
+ * Perspective scale at depth d (1 at strike line, farScale at horizon). Below the line the
+ * scale grows linearly (constant screen speed, see module docs).
+ */
 export function scaleAt(g: HighwayGeometry, d: number): number {
-  const denom = 1 + g.k * d;
-  // Guard against the singularity below the strike line (d → -1/k): cap the scale.
-  if (denom < 0.05) return 20;
-  return 1 / denom;
+  if (d < 0) return 1 - d * g.k * g.pastLineSpeed;
+  return 1 / (1 + g.k * d);
 }
 
 /** Screen y for depth d. */
@@ -132,7 +147,13 @@ export function yAt(g: HighwayGeometry, d: number): number {
 export function depthAtY(g: HighwayGeometry, y: number): number {
   const s = (y - g.vpY) / (g.strikeY - g.vpY);
   if (s <= 0) return Number.POSITIVE_INFINITY;
+  if (s > 1) return (1 - s) / (g.k * g.pastLineSpeed);
   return (1 / s - 1) / g.k;
+}
+
+/** Seconds a gem stays on screen after crossing the strike line (before it is culled). */
+export function visibleTailSec(g: HighwayGeometry): number {
+  return -g.minDepth * g.approachSec;
 }
 
 /** Lane centre x at depth d. Lane 0 is leftmost. */
@@ -180,6 +201,9 @@ export function visibleTimeWindow(g: HighwayGeometry, songTime: number): { from:
   return { from: songTime + g.minDepth * g.approachSec, to: songTime + g.maxDepth * g.approachSec };
 }
 
+/** Upper bound on beat lines on screen at once (fillBeatLines buffers should be this long). */
+export const MAX_BEAT_LINES = 64;
+
 /**
  * Song times of beat lines currently on the road (from just below the strike line to the horizon),
  * with a flag for bar lines (every `beatsPerBar` beats).
@@ -193,7 +217,28 @@ export function beatLineTimes(
   beatIndexHint?: number,
 ): Array<{ time: number; bar: boolean }> {
   const out: Array<{ time: number; bar: boolean }> = [];
-  if (!(bpm > 0) || !Number.isFinite(bpm)) return out;
+  const times = new Float64Array(MAX_BEAT_LINES);
+  const bars = new Uint8Array(MAX_BEAT_LINES);
+  const n = fillBeatLines(g, songTime, bpm, beatPhase, times, bars, beatsPerBar, beatIndexHint);
+  for (let i = 0; i < n; i++) out.push({ time: times[i], bar: bars[i] === 1 });
+  return out;
+}
+
+/**
+ * Allocation-free variant of `beatLineTimes`: writes song times into `outTimes` and bar flags
+ * (1 = bar line) into `outBars`, returns the count. Used by the renderer's hot path.
+ */
+export function fillBeatLines(
+  g: HighwayGeometry,
+  songTime: number,
+  bpm: number,
+  beatPhase: number,
+  outTimes: Float64Array,
+  outBars: Uint8Array,
+  beatsPerBar = 4,
+  beatIndexHint?: number,
+): number {
+  if (!(bpm > 0) || !Number.isFinite(bpm)) return 0;
   const beatSec = 60 / bpm;
   const phase = clamp(beatPhase, 0, 0.999999);
   // Beat index of the most recent beat. Without a hint we assume beat 0 at song time 0.
@@ -201,14 +246,18 @@ export function beatLineTimes(
   const lastBeatTime = songTime - phase * beatSec;
   const first = Math.floor((g.minDepth * g.approachSec) / beatSec) - 1;
   const last = Math.ceil((g.maxDepth * g.approachSec) / beatSec) + 1;
-  for (let n = first; n <= last; n++) {
+  const cap = Math.min(outTimes.length, outBars.length);
+  let count = 0;
+  for (let n = first; n <= last && count < cap; n++) {
     const t = lastBeatTime + n * beatSec;
     const d = depthOf(g, t, songTime);
     if (d < g.minDepth || d > 1) continue;
     const idx = beatIndex + n;
-    out.push({ time: t, bar: ((idx % beatsPerBar) + beatsPerBar) % beatsPerBar === 0 });
+    outTimes[count] = t;
+    outBars[count] = ((idx % beatsPerBar) + beatsPerBar) % beatsPerBar === 0 ? 1 : 0;
+    count++;
   }
-  return out;
+  return count;
 }
 
 /** Quantize a gem radius into a sprite bucket so we can reuse a small set of pre-rendered sprites. */

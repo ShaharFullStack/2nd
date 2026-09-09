@@ -5,7 +5,10 @@ import {
   bucketRadius,
   depthAtY,
   depthOf,
+  fillBeatLines,
   isVisibleDepth,
+  MAX_BEAT_LINES,
+  visibleTailSec,
   laneBoundaryX,
   laneX,
   makeGeometry,
@@ -136,6 +139,52 @@ describe('lane x', () => {
   });
 });
 
+describe('tail below the strike line', () => {
+  it('is continuous at the line and linear (constant screen speed) below it', () => {
+    const g = makeGeometry(W, H, 4);
+    expect(scaleAt(g, 0)).toBe(1);
+    expect(scaleAt(g, -1e-9)).toBeCloseTo(1, 6);
+    const v1 = yAt(g, -0.05) - yAt(g, 0);
+    const v2 = yAt(g, -0.1) - yAt(g, -0.05);
+    const v3 = yAt(g, -0.2) - yAt(g, -0.15);
+    expect(v1).toBeCloseTo(v2, 6);
+    expect(v2).toBeCloseTo(v3, 6);
+    // Slower than the approach speed at the line by pastLineSpeed.
+    const above = yAt(g, 0) - yAt(g, 0.001);
+    expect(v1 / 50).toBeCloseTo(above * g.pastLineSpeed, 2);
+  });
+
+  it('road edges stay straight through the line (x offset proportional to y - vpY)', () => {
+    const g = makeGeometry(W, H, 4);
+    const slope = (d: number): number => (roadEdgeX(g, 1, d) - g.vpX) / (yAt(g, d) - g.vpY);
+    expect(slope(-0.2)).toBeCloseTo(slope(0.5), 9);
+    expect(slope(g.minDepth)).toBeCloseTo(slope(1), 9);
+  });
+
+  it('keeps a gem on screen at least 400 ms past the line at common resolutions and lane counts', () => {
+    for (const [w, h] of [
+      [1280, 720],
+      [1920, 1080],
+      [1366, 768],
+      [720, 1280],
+      [1024, 768],
+    ]) {
+      for (const lanes of [2, 3, 4]) {
+        const g = makeGeometry(w, h, lanes);
+        expect(visibleTailSec(g), `${w}x${h} lanes=${lanes}`).toBeGreaterThanOrEqual(0.4);
+      }
+    }
+  });
+
+  it('pastLineSpeed is tunable and clamped', () => {
+    const slow = makeGeometry(W, H, 4, { pastLineSpeed: 0.3 });
+    const fast = makeGeometry(W, H, 4, { pastLineSpeed: 1 });
+    expect(visibleTailSec(slow)).toBeGreaterThan(visibleTailSec(fast));
+    expect(makeGeometry(W, H, 4, { pastLineSpeed: 0 }).pastLineSpeed).toBe(0.2);
+    expect(makeGeometry(W, H, 4, { pastLineSpeed: 5 }).pastLineSpeed).toBe(1);
+  });
+});
+
 describe('culling', () => {
   const g = makeGeometry(W, H, 4);
 
@@ -192,6 +241,28 @@ describe('beat lines', () => {
     const atNow = lines.find((l) => Math.abs(l.time - 8) < 1e-9);
     expect(atNow?.bar).toBe(false);
     expect(lines.find((l) => Math.abs(l.time - 9.5) < 1e-9)?.bar).toBe(true);
+  });
+
+  it('fillBeatLines matches beatLineTimes without allocating', () => {
+    const times = new Float64Array(MAX_BEAT_LINES);
+    const bars = new Uint8Array(MAX_BEAT_LINES);
+    for (const [st, bpm, phase] of [
+      [8, 120, 0],
+      [8.1, 120, 0.2],
+      [-2.3, 95, 0.7],
+      [100.37, 174, 0.11],
+    ]) {
+      const ref = beatLineTimes(g, st, bpm, phase);
+      const n = fillBeatLines(g, st, bpm, phase, times, bars);
+      expect(n).toBe(ref.length);
+      for (let i = 0; i < n; i++) {
+        expect(times[i]).toBeCloseTo(ref[i].time, 9);
+        expect(bars[i] === 1).toBe(ref[i].bar);
+      }
+    }
+    expect(fillBeatLines(g, 1, 0, 0, times, bars)).toBe(0);
+    // Respects the buffer capacity.
+    expect(fillBeatLines(g, 1, 600, 0, new Float64Array(3), new Uint8Array(3))).toBeLessThanOrEqual(3);
   });
 
   it('is empty for invalid bpm', () => {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { StemMixer } from './StemMixer';
+import { DEFAULT_MASTER_GAIN, LIMITER_SETTINGS, StemMixer, aggregateProgress, readBodyWithProgress, type LoadProgress } from './StemMixer';
 import { parseManifest, type FetchLike } from './manifest';
 
 // ---------------------------------------------------------------- fake Web Audio
@@ -84,11 +84,18 @@ describe('StemMixer', () => {
 
   it('loads all stems in parallel with progress and sets the player stem', async () => {
     const { mixer, fetched } = setup();
-    const progress: string[] = [];
-    await mixer.loadSong(manifest, '/songs', (p) => progress.push(`${p.stemId}:${p.phase} ${p.stemsDecoded}/${p.stemsTotal}`));
+    const events: LoadProgress[] = [];
+    await mixer.loadSong(manifest, '/songs', (p) => events.push(p));
     expect(fetched).toEqual(['/songs/song/stems/drums.wav', '/songs/song/stems/bass.wav', '/songs/song/stems/keys.wav']);
-    expect(progress).toHaveLength(6);
-    expect(progress[progress.length - 1]).toMatch(/6\/6$/);
+    const phases = events.filter((p) => p.phase !== 'downloading').map((p) => `${p.stemId}:${p.phase}`);
+    expect(phases).toHaveLength(6); // fetched + decoded per stem
+    expect(phases.filter((x) => x.endsWith(':decoded'))).toEqual(expect.arrayContaining(['drums:decoded', 'bass:decoded', 'keys:decoded']));
+    expect(events[0].phase).toBe('downloading');
+    for (let i = 1; i < events.length; i++) expect(events[i].fraction).toBeGreaterThanOrEqual(events[i - 1].fraction);
+    const last = events[events.length - 1];
+    expect(last).toMatchObject({ fraction: 1, stemsDecoded: 3, stemCount: 3, bytesTotalKnown: true, phase: 'decoded' });
+    expect(last.bytesLoaded).toBe('drums'.length + 'bass'.length + 'keys'.length);
+    expect(last.bytesTotal).toBe(last.bytesLoaded);
     expect(mixer.state).toBe('ready');
     expect(mixer.stemIds).toEqual(['drums', 'bass', 'keys']);
     expect(mixer.playerStem).toBe('drums');
@@ -246,5 +253,104 @@ describe('StemMixer', () => {
     expect(mixer.isLoaded).toBe(false);
     expect(ctx.state).not.toBe('closed');
     expect(() => mixer.play()).toThrow(/no song loaded/);
+  });
+
+  it('master stage: limiter settings when on; 0.6 headroom and direct wiring when off', async () => {
+    const on = setup();
+    const c = on.mixer.compressor as unknown as FakeCompressor;
+    expect(on.mixer.getMasterGain()).toBe(DEFAULT_MASTER_GAIN.limiter);
+    expect({ threshold: c.threshold.value, knee: c.knee.value, ratio: c.ratio.value, attack: c.attack.value, release: c.release.value }).toEqual(LIMITER_SETTINGS);
+    expect(c.ratio.value).toBeGreaterThanOrEqual(10); // limiter, not a program compressor
+    expect(c.release.value).toBeLessThanOrEqual(0.05);
+    expect(on.mixer.output).toBe(on.mixer.compressor);
+
+    const off = setup({ compressor: false });
+    expect(off.mixer.getMasterGain()).toBe(DEFAULT_MASTER_GAIN.none);
+    expect(off.mixer.output).toBe(off.mixer.master);
+    await off.mixer.loadSong(manifest, '/songs');
+    off.mixer.play();
+    // every stem: source → duck → volume → master → destination (nothing else in the path)
+    expect(off.ctx.sources).toHaveLength(3);
+    for (const src of off.ctx.sources) {
+      const duck = src.connections[0] as FakeGain;
+      const volume = duck.connections[0] as FakeGain;
+      expect(src.connections).toHaveLength(1);
+      expect(duck.connections).toEqual([volume]);
+      expect(volume.connections).toEqual([off.mixer.master]);
+    }
+    expect((off.mixer.master as unknown as FakeGain).connections).toEqual([off.ctx.destination]);
+    expect(new StemMixer({ ctx: off.ctx as unknown as AudioContext, compressor: false, masterGain: 0.9 }).getMasterGain()).toBe(0.9);
+  });
+
+  it('reports byte progress from a streamed body with Content-Length', async () => {
+    const body = new Uint8Array(1000).fill(7);
+    const chunks = [body.subarray(0, 300), body.subarray(300, 650), body.subarray(650)];
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) { for (const c of chunks) controller.enqueue(c); controller.close(); },
+    });
+    const res = new Response(stream, { status: 200, headers: { 'content-length': '1000' } });
+    const seen: [number, number | null][] = [];
+    const data = await readBodyWithProgress(res, (r, t) => seen.push([r, t]));
+    expect(data.byteLength).toBe(1000);
+    expect(new Uint8Array(data)[999]).toBe(7);
+    expect(seen).toEqual([[0, 1000], [300, 1000], [650, 1000], [1000, 1000]]);
+
+    // no body reader → arrayBuffer fallback, one final report
+    const plain = { body: null, arrayBuffer: async () => new ArrayBuffer(12), headers: new Headers() } as unknown as Response;
+    const seen2: [number, number | null][] = [];
+    expect((await readBodyWithProgress(plain, (r, t) => seen2.push([r, t]))).byteLength).toBe(12);
+    expect(seen2).toEqual([[12, 12]]);
+  });
+
+  it('aggregateProgress weights download 0.85 and decode 0.15 per stem and tracks byte totals', () => {
+    const p = aggregateProgress([
+      { received: 500, total: 1000, fetched: false, decoded: false },
+      { received: 2000, total: 2000, fetched: true, decoded: true },
+      { received: 10, total: null, fetched: false, decoded: false },
+    ], 'bass', 'downloading');
+    expect(p.fraction).toBeCloseTo((0.85 * 0.5 + 1 + 0) / 3, 9);
+    expect(p).toMatchObject({ bytesLoaded: 2510, bytesTotal: 3000, bytesTotalKnown: false, stemsDecoded: 1, stemCount: 3, stemId: 'bass', phase: 'downloading' });
+    expect(aggregateProgress([], 'x', 'decoded').fraction).toBe(1);
+    // a stem whose Content-Length under-reports never pushes the fraction past 1
+    expect(aggregateProgress([{ received: 5000, total: 1000, fetched: false, decoded: false }], 'x', 'downloading').fraction).toBeCloseTo(0.85, 9);
+  });
+
+  it('play() at or past the end of every stem ends immediately instead of playing forever', async () => {
+    const { ctx, mixer } = setup();
+    await mixer.loadSong(manifest, '/songs');
+    let ended = 0;
+    mixer.onEnded(() => ended++);
+    ctx.currentTime = 1;
+    mixer.play(1.5);
+    mixer.seek(mixer.getDuration()); // seek to the very end while playing
+    expect(mixer.state).toBe('ended');
+    expect(ended).toBe(1);
+    expect(mixer.getSongTime()).toBe(10);
+    ctx.currentTime = 50;
+    expect(mixer.getSongTime()).toBe(10); // does not run past the duration
+    expect(ctx.sources.filter((s) => s.started && !s.stopped)).toHaveLength(0);
+    // explicit offset beyond the end behaves the same
+    mixer.play(undefined, 999);
+    expect(mixer.state).toBe('ended');
+    expect(ended).toBe(2);
+    // and playing again after 'ended' restarts from 0
+    mixer.play();
+    expect(mixer.state).toBe('playing');
+    expect(ctx.sources[ctx.sources.length - 1].started?.offset).toBe(0);
+  });
+
+  it('pause() before the scheduled start clamps song time to 0', async () => {
+    const { ctx, mixer } = setup();
+    await mixer.loadSong(manifest, '/songs');
+    ctx.currentTime = 1;
+    mixer.play(3);
+    ctx.currentTime = 2;
+    expect(mixer.getSongTime()).toBeCloseTo(-1, 9);
+    mixer.pause();
+    expect(mixer.state).toBe('paused');
+    expect(mixer.getSongTime()).toBe(0);
+    ctx.currentTime = 4;
+    mixer.play();
+    expect(ctx.sources[ctx.sources.length - 1].started).toEqual({ when: 4.03, offset: 0 });
   });
 });

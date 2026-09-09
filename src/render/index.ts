@@ -1,4 +1,4 @@
-export { Highway, DEFAULT_HIGHWAY_OPTIONS, makeFrame } from './Highway';
+export { Highway, DEFAULT_HIGHWAY_OPTIONS, makeFrame, RESTART_JUMP_SEC, MISS_FIZZLE_SEC, LONG_FRAME_MS } from './Highway';
 export type { RenderFrame, RenderNote, RenderLaneState, NoteVisualState, HighwayOptions, RenderStats, CanvasLike } from './types';
 export {
   makeGeometry,
@@ -13,6 +13,9 @@ export {
   isVisibleDepth,
   visibleTimeWindow,
   beatLineTimes,
+  fillBeatLines,
+  visibleTailSec,
+  MAX_BEAT_LINES,
   DEFAULT_GEOMETRY_OPTIONS,
 } from './geometry';
 export type { HighwayGeometry, GeometryOptions, Projected } from './geometry';

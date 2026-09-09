@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { Movement, Side } from '../engine/types.ts';
-import { EXTRACTORS, MOVEMENT_INFO, captureCompensationBaseline, checkCompensation, extractFeature, trunkTiltDeg } from './features.ts';
-import { handPose, seatedPose, seatedRest, handOpen, handFist, seatedKneeLifted } from './fixtures.ts';
+import { EXTRACTORS, MOVEMENT_INFO, baselineFromSamples, captureCompensationBaseline, checkCompensation, evaluateCompensation, extractFeature, measureCompensation, trunkTiltDeg } from './features.ts';
+import { handPose, seatedPose, seatedPoseWorld, seatedRest, handOpen, handFist, seatedKneeLifted, handWristExtended, handWristRaised } from './fixtures.ts';
 import { POSE, HAND_LANDMARK_COUNT, POSE_LANDMARK_COUNT } from './landmarks.ts';
 import type { Landmark } from './landmarks.ts';
 
@@ -44,6 +44,25 @@ describe('leg extractors (Pose fixtures)', () => {
     expect(extractFeature('knee_extension', seatedPose({ kneeExtension: 1 }), 'left')).toBeGreaterThan(165);
   });
 
+  it('angle features use metric world landmarks when supplied (monotonic, and preferred over image z)', () => {
+    for (const movement of ['knee_extension', 'ankle_dorsiflexion'] as Movement[]) {
+      const key = movement === 'knee_extension' ? 'kneeExtension' : 'toeLift';
+      const vals = STEPS.map((a) => extractFeature(movement, seatedPose({ [key]: a }), 'left', { worldLandmarks: seatedPoseWorld({ [key]: a }) }));
+      expectStrictlyIncreasing(vals as number[], `${movement}/world`);
+      // Same geometry => same angle whichever source is used.
+      expect(vals[4]).toBeCloseTo(extractFeature(movement, seatedPose({ [key]: 0.5 }), 'left') as number, 6);
+    }
+    // Image landmarks at rest but world landmarks extended: the world angle wins.
+    const rest = seatedRest();
+    const world = seatedPoseWorld({ kneeExtension: 1 });
+    expect(extractFeature('knee_extension', rest, 'left', { worldLandmarks: world })).toBeGreaterThan(165);
+    // Incomplete world landmarks fall back to the image landmarks (no crash, rest angle).
+    expect(extractFeature('knee_extension', rest, 'left', { worldLandmarks: world.slice(0, 10) })).toBeCloseTo(90, -1);
+    // Visibility is still gated on the image landmarks.
+    rest[POSE.LEFT_ANKLE] = { ...rest[POSE.LEFT_ANKLE], visibility: 0.1 };
+    expect(extractFeature('knee_extension', rest, 'left', { worldLandmarks: world })).toBeNull();
+  });
+
   it('returns null when required landmarks have low visibility', () => {
     const pose = seatedRest();
     pose[POSE.LEFT_KNEE] = { ...pose[POSE.LEFT_KNEE], visibility: 0.1 };
@@ -65,7 +84,7 @@ describe('leg extractors (Pose fixtures)', () => {
 describe('hand extractors (Hand fixtures)', () => {
   const handCases: Array<[Movement, (amount: number) => Landmark[]]> = [
     ['hand_open_close', (a) => handPose({ openness: a })],
-    ['wrist_extension', (a) => handPose({ wristRaise: a })],
+    ['wrist_extension', (a) => handWristExtended(a)],
     ['finger_opposition', (a) => handPose({ pinch: a })],
     ['finger_spread', (a) => handPose({ spread: a })],
   ];
@@ -78,12 +97,28 @@ describe('hand extractors (Hand fixtures)', () => {
     });
   }
 
-  it('hand features are scale invariant (distance to camera)', () => {
-    for (const movement of ['hand_open_close', 'finger_opposition', 'finger_spread'] as Movement[]) {
-      const a = extractFeature(movement, handPose({ openness: 0.5, pinch: 0.5, spread: 0.5, scale: 1 }), 'left');
-      const b = extractFeature(movement, handPose({ openness: 0.5, pinch: 0.5, spread: 0.5, scale: 0.5 }), 'left');
+  it('hand features are scale and position invariant (distance to camera, hand location)', () => {
+    for (const movement of ['hand_open_close', 'wrist_extension', 'finger_opposition', 'finger_spread'] as Movement[]) {
+      const base = { openness: 0.5, pinch: 0.5, spread: 0.5, wristExtension: 0.5 };
+      const a = extractFeature(movement, handPose({ ...base, scale: 1 }), 'left');
+      const b = extractFeature(movement, handPose({ ...base, scale: 0.5 }), 'left');
+      const c = extractFeature(movement, handPose({ ...base, scale: 0.7, centerX: 0.2, wristRaise: 0.8 }), 'left');
       expect(a).toBeCloseTo(b as number, 6);
+      expect(a).toBeCloseTo(c as number, 6);
     }
+  });
+
+  it('wrist_extension measures rotation about the wrist, not lifting the forearm (compensation)', () => {
+    const rest = extractFeature('wrist_extension', handWristExtended(0), 'left') as number;
+    for (const a of STEPS) {
+      // Translating the whole hand upward (forearm/elbow lift) must not score.
+      const hand = handPose({ wristExtension: 0, wristRaise: a });
+      expect(Math.abs((extractFeature('wrist_extension', hand, 'left') as number) - rest)).toBeLessThan(1e-9);
+    }
+    expect(extractFeature('wrist_extension', handWristRaised(1), 'left')).toBeCloseTo(extractFeature('wrist_extension', handWristRaised(0), 'left') as number, 9);
+    // Rest hangs slightly below level (negative elevation), full extension is well above.
+    expect(rest).toBeLessThan(0);
+    expect(extractFeature('wrist_extension', handWristExtended(1), 'left')).toBeGreaterThan(rest + MOVEMENT_INFO.wrist_extension.minRom);
   });
 
   it('finger_opposition can target another fingertip', () => {
@@ -126,6 +161,25 @@ describe('compensation checks', () => {
     expect(lean!.value).toBeGreaterThan(12);
   });
 
+  it('rest-phase median baseline is robust to a single jittery frame', () => {
+    const samples = [0, 0.2, 0.4, 0.6, 0.8, 1].map((h) => measureCompensation('ankle_dorsiflexion', seatedPose({ heelLift: h * 0.05 }), 'left')!);
+    const good = samples.slice(0, 5);
+    const outlier = seatedPose({ heelLift: 1 });
+    const jittery = [...good, measureCompensation('ankle_dorsiflexion', outlier, 'left')!];
+    const base = baselineFromSamples(jittery)!;
+    expect(base.kind).toBe('heel_lift');
+    expect(base.samples).toBe(6);
+    // Median of 6 = mean of the 3rd and 4th values, unaffected by the outlier frame.
+    const ys = jittery.map((s) => s.value).sort((a, b) => a - b);
+    expect(base.value).toBeCloseTo((ys[2] + ys[3]) / 2, 9);
+    const single = captureCompensationBaseline('ankle_dorsiflexion', outlier, 'left')!;
+    expect(single.samples).toBe(1);
+    // Against the single-frame (lifted) baseline a flat foot would read as a negative rise; the median baseline is sane.
+    expect(evaluateCompensation(good[0], single)!.value).toBeLessThan(0);
+    expect(Math.abs(evaluateCompensation(good[0], base)!.value)).toBeLessThan(0.05);
+    expect(baselineFromSamples([])).toBeNull();
+  });
+
   it('is not applicable for other movements', () => {
     expect(captureCompensationBaseline('knee_extension', seatedRest(), 'left')).toBeNull();
     expect(captureCompensationBaseline('hand_open_close', handOpen(), 'left')).toBeNull();
@@ -145,6 +199,8 @@ describe('MOVEMENT_INFO', () => {
       expect(info.instructions.length).toBeGreaterThan(10);
       expect(info.calibrationInstruction.length).toBeGreaterThan(10);
       expect(info.mode).toBe(m.startsWith('hand') || m.startsWith('wrist') || m.startsWith('finger') ? 'hand' : 'leg');
+      // Lane smoothing must be unit-free so every lane has the same filter delay.
+      expect(['ema', 'lowpass', 'none']).toContain(info.smoothing.kind);
     }
   });
 

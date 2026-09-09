@@ -14,6 +14,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 export const SAMPLE_RATE = 44100;
 const SR = SAMPLE_RATE;
@@ -465,8 +466,9 @@ export function renderSong(songId, { bars: barsOverride } = {}) {
     id: song.id,
     title: song.title,
     artist: 'Beat Rehab demo (synthesized)',
-    artistUrl: '',
-    sourceUrl: 'scripts/gen-demo-stems.mjs',
+    // no artistUrl / sourceUrl: the manifest loader only keeps absolute http(s) links and the UI
+    // renders them as anchors — a relative script path or '' would be a broken link. The
+    // provenance lives in `generated.script` below.
     license: 'CC0 1.0',
     licenseUrl: 'https://creativecommons.org/publicdomain/zero/1.0/',
     attribution: `"${song.title}" is an original demo track synthesized in-repo by scripts/gen-demo-stems.mjs (Beat Rehab). Released under CC0 1.0 — no rights reserved.`,
@@ -514,7 +516,9 @@ function parseArgs(argv) {
   return args;
 }
 
-const isMain = process.argv[1] && path.resolve(process.argv[1]) === new URL(import.meta.url).pathname;
+// `import.meta.url` → filesystem path via fileURLToPath so this also works on Windows
+// (URL.pathname there is '/C:/…' and never equals path.resolve()).
+const isMain = Boolean(process.argv[1]) && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isMain) {
   const args = parseArgs(process.argv.slice(2));
   const ids = args.song === 'all' ? Object.keys(SONGS) : [args.song];

@@ -192,7 +192,8 @@ describe('DuckController', () => {
     b.now = 3;
     d.miss(3);
     expect(b.lastRamp()[1]).toBe(0.05);
-    expect(b.calls[1]).toEqual(['set', 1, 3]); // fresh binding starts from the nominal level
+    expect(b.calls.slice(0, 2)).toEqual([['cancel', 2], ['set', 1, 2]]); // rebind pins the new stem at the nominal level
+    expect(b.calls[3]).toEqual(['set', 1, 3]); // the miss ramp anchors on that level
     expect(a.calls.filter((c) => c[0] === 'exp')).toHaveLength(1); // no new automation on a
   });
 });

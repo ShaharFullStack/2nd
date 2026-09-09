@@ -11,6 +11,10 @@
  *   } else { ...render React... }
  *
  * Drives a synthetic 120 BPM chart with scripted hits/misses and animated lane meters, looping forever.
+ * Judgment timing mimics the real engine: hits land at note time + deltaMs, misses are declared at
+ * note time + goodMs (180) + miss grace (100) = 280 ms, with the miss event's `time` = note time +
+ * goodMs exactly as src/engine/judge.ts emits it — so the grey fizzle path is exercised for real.
+ * Each loop calls `highway.reset()` like a song restart would.
  */
 import type { HitEvent, LaneSpec } from '../engine/types';
 import { Highway } from './Highway';
@@ -45,6 +49,10 @@ interface DemoNote extends RenderNote {
   /** Timing error in ms for the scripted outcome. */
   deltaMs: number;
 }
+
+/** Engine-equivalent miss timing (easy difficulty: goodMs 180 + DEFAULT_MISS_GRACE_MS 100). */
+const DEMO_GOOD_MS = 180;
+const DEMO_MISS_GRACE_MS = 100;
 
 const DEMO_LANES: LaneSpec[] = [
   { index: 0, movement: 'seated_march', side: 'left' },
@@ -129,18 +137,29 @@ export function runDemo(canvas: CanvasLike, options: DemoOptions = {}): DemoHand
     judged.clear();
     recent.length = 0;
     for (const n of chart) n.state = 'pending';
+    combo = 0;
+    score = 0;
+    health = 0.6;
+    highway.reset();
   };
 
   const buildFrame = (songTime: number): RenderFrame => {
     // Judge notes whose scripted time has passed.
     for (const n of chart) {
       if (judged.has(n.id)) continue;
-      const judgeAt = n.time + n.deltaMs / 1000 + (n.outcome === 'miss' ? 0.16 : 0);
+      const miss = n.outcome === 'miss';
+      const judgeAt = miss ? n.time + (DEMO_GOOD_MS + DEMO_MISS_GRACE_MS) / 1000 : n.time + n.deltaMs / 1000;
       if (songTime >= judgeAt) {
         judged.add(n.id);
-        n.state = n.outcome === 'miss' ? 'miss' : 'hit';
+        n.state = miss ? 'miss' : 'hit';
         n.judgment = n.outcome;
-        recent.push({ noteId: n.id, lane: n.lane, judgment: n.outcome, deltaMs: n.deltaMs, time: judgeAt });
+        recent.push({
+          noteId: n.id,
+          lane: n.lane,
+          judgment: n.outcome,
+          deltaMs: miss ? DEMO_GOOD_MS : n.deltaMs,
+          time: miss ? n.time + DEMO_GOOD_MS / 1000 : judgeAt,
+        });
         if (n.outcome === 'miss') {
           combo = 0;
           health = Math.max(0, health - 0.08);
@@ -157,7 +176,7 @@ export function runDemo(canvas: CanvasLike, options: DemoOptions = {}): DemoHand
     visible.length = 0;
     for (const n of chart) {
       if (n.time > songTime + windowSec) break;
-      if (n.time < songTime - 0.6) continue;
+      if (n.time < songTime - 1) continue;
       visible.push(n);
     }
 

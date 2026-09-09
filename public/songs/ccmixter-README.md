@@ -49,6 +49,7 @@ Then add the id to `public/songs/index.json`.
 ```
 npm run fetch-stems              # all songs
 npm run fetch-stems -- --song my-song --force
+npm run fetch-stems -- --retries 5 --timeout 60   # more patience on a slow link (defaults: 3 retries, 30 s watchdog)
 ```
 
 The script skips files that already exist, retries failed transfers and prints the

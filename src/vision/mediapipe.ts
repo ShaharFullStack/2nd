@@ -31,6 +31,11 @@ export interface DetectionResult {
   tMs: number;
   /** 33 pose landmarks (leg mode) or null when no person was found. */
   pose: Landmark[] | null;
+  /**
+   * Pose world landmarks (metres, hip-centred) for the same frame when the detector provides them.
+   * Used by the 3D angle features (knee_extension, ankle_dorsiflexion); image-space z is a fallback.
+   */
+  poseWorld?: Landmark[] | null;
   /** Detected hands (hand mode); empty when none. */
   hands: HandDetection[];
 }
@@ -134,7 +139,8 @@ export async function createDetector(opts: DetectorOptions): Promise<LandmarkDet
         const ts = nextTs(timestampMs);
         const res = instance.detectForVideo(frame as Parameters<typeof instance.detectForVideo>[0], ts);
         const pose = res.landmarks.length > 0 ? res.landmarks[0].map(toLandmark) : null;
-        return { tMs: ts, pose, hands: [] };
+        const poseWorld = pose && res.worldLandmarks.length > 0 ? res.worldLandmarks[0].map(toLandmark) : null;
+        return { tMs: ts, pose, poseWorld, hands: [] };
       },
       close: () => instance.close(),
     };
@@ -181,24 +187,30 @@ export function labelToPatientSide(label: string, mirrored: boolean): Side | nul
 }
 
 /**
- * Pick the detected hand belonging to the patient's `side`. Uses handedness labels (mirror-corrected)
- * when they are confident and unambiguous; otherwise falls back to image position: in a raw stream the
- * patient's right hand has the smaller wrist x (the larger x when `mirrored`).
+ * Pick the detected hand belonging to the patient's `side`.
+ *  1. Exactly one hand carries a confident, mirror-corrected label of `side`: that hand.
+ *  2. Otherwise (no confident label of `side`, or BOTH hands labelled the same side — a common
+ *     MediaPipe failure): assign by image position among the candidates, where candidates = the hands
+ *     labelled `side` when there are several, else every hand NOT confidently labelled the other side,
+ *     else (two hands both labelled the other side) all hands. In a raw stream the patient's right hand
+ *     has the smaller wrist x (the larger x when `mirrored`).
+ * With two hands the left and right lanes therefore always resolve to DIFFERENT hands, even when the
+ * labels are identical or missing.
  */
 export function pickHand(hands: readonly HandDetection[], side: Side, mirrored = false, minLabelScore = 0.6): HandDetection | null {
   if (hands.length === 0) return null;
-  const labelled = hands.filter((h) => h.score >= minLabelScore && labelToPatientSide(h.label, mirrored) === side);
-  if (labelled.length === 1) return labelled[0];
-  if (labelled.length > 1) return labelled.reduce((a, b) => (b.score > a.score ? b : a));
-  if (hands.length === 1) {
-    // Single hand with a confident label of the OTHER side: not ours.
-    const only = hands[0];
-    const s = labelToPatientSide(only.label, mirrored);
-    if (s && s !== side && only.score >= minLabelScore) return null;
-    return only;
-  }
-  // Positional fallback.
-  const byX = hands.slice().sort((a, b) => a.landmarks[0].x - b.landmarks[0].x);
+  const other: Side = side === 'left' ? 'right' : 'left';
+  const labelOf = (h: HandDetection) => (h.score >= minLabelScore ? labelToPatientSide(h.label, mirrored) : null);
+  const mine = hands.filter((h) => labelOf(h) === side);
+  if (mine.length === 1) return mine[0];
+  let candidates = mine.length > 1 ? mine : hands.filter((h) => labelOf(h) !== other);
+  // Every hand labelled the other side: with two hands the labels are unreliable (MediaPipe often
+  // gives both the same label) => assign by position; a single hand of the other side is not ours.
+  if (candidates.length === 0 && hands.length >= 2) candidates = hands.slice();
+  if (candidates.length === 0) return null;
+  if (candidates.length === 1) return candidates[0];
+  // Positional assignment.
+  const byX = candidates.slice().sort((a, b) => a.landmarks[0].x - b.landmarks[0].x);
   const rightIsSmallX = !mirrored;
   const wantSmallX = side === 'right' ? rightIsSmallX : !rightIsSmallX;
   return wantSmallX ? byX[0] : byX[byX.length - 1];
@@ -213,6 +225,8 @@ export interface CameraOptions {
   /** Reuse an existing <video>; otherwise one is created (not attached to the DOM). */
   video?: HTMLVideoElement;
   deviceId?: string;
+  /** Give up (stopping the acquired tracks) if the video never becomes ready within this time (default 8000 ms). */
+  timeoutMs?: number;
 }
 
 export interface CameraSession {
@@ -240,30 +254,60 @@ export async function openCamera(opts: CameraOptions = {}): Promise<CameraSessio
   };
   const stream = await navigator.mediaDevices.getUserMedia(constraints);
   const video = opts.video ?? document.createElement('video');
-  video.muted = true;
-  video.playsInline = true;
-  video.autoplay = true;
-  video.srcObject = stream;
-  await new Promise<void>((resolve, reject) => {
-    if (video.readyState >= 2) return resolve();
-    video.onloadedmetadata = () => resolve();
-    video.onerror = () => reject(new Error('Camera video failed to load'));
-  });
+  const release = () => {
+    for (const t of stream.getTracks()) t.stop();
+    video.srcObject = null;
+  };
   try {
-    await video.play();
-  } catch {
-    /* autoplay may be blocked until a gesture; the loop still runs once playing */
+    video.muted = true;
+    video.playsInline = true;
+    video.autoplay = true;
+    video.srcObject = stream;
+    await waitForVideoReady(video, opts.timeoutMs ?? 8000);
+    try {
+      await video.play();
+    } catch {
+      /* autoplay may be blocked until a gesture; the loop still runs once playing */
+    }
+  } catch (err) {
+    // Never leave the camera LED on after a failure: stop the acquired tracks before rethrowing.
+    release();
+    throw err;
   }
   return {
     video,
     stream,
     width: video.videoWidth || (opts.width ?? 640),
     height: video.videoHeight || (opts.height ?? 480),
-    stop() {
-      for (const t of stream.getTracks()) t.stop();
-      video.srcObject = null;
-    },
+    stop: release,
   };
+}
+
+/** Resolve once the video has metadata (readyState >= 2), reject on error or after `timeoutMs`. */
+export function waitForVideoReady(video: HTMLVideoElement, timeoutMs: number): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    if (video.readyState >= 2) return resolve();
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const cleanup = () => {
+      if (timer !== null) clearTimeout(timer);
+      video.onloadedmetadata = null;
+      video.onerror = null;
+    };
+    video.onloadedmetadata = () => {
+      cleanup();
+      resolve();
+    };
+    video.onerror = () => {
+      cleanup();
+      reject(new Error('Camera video failed to load'));
+    };
+    if (timeoutMs > 0 && Number.isFinite(timeoutMs)) {
+      timer = setTimeout(() => {
+        cleanup();
+        reject(new Error(`Camera video not ready after ${timeoutMs} ms`));
+      }, timeoutMs);
+    }
+  });
 }
 
 /* ---------------- detect loop ---------------- */
@@ -283,7 +327,9 @@ export type DetectionCallback = (result: DetectionResult, frameTimeMs: number) =
 
 /**
  * Runs detector.detect on every new video frame, using requestVideoFrameCallback when available
- * (frame-accurate, gives capture timestamps) and requestAnimationFrame otherwise.
+ * (frame-accurate, gives capture timestamps) and requestAnimationFrame otherwise (a frame is processed
+ * only when video.currentTime advanced). Errors thrown by the detector OR by `onResult` are reported
+ * through `onError` and the loop keeps running.
  * `onResult(result, frameTimeMs)`: frameTimeMs is the performance.now()-based capture/presentation time
  * of the frame (best effort), which callers convert to AudioContext time.
  */
@@ -328,18 +374,25 @@ export class DetectLoop {
     if (this.usingRvfc) {
       this.handle = this.video.requestVideoFrameCallback((now, meta) => {
         const frameTime = meta.captureTime ?? meta.presentationTime ?? now;
-        this.step(frameTime, now);
-        this.schedule();
+        try {
+          this.step(frameTime, now);
+        } finally {
+          this.schedule();
+        }
       });
     } else {
       const raf = typeof requestAnimationFrame === 'function' ? requestAnimationFrame : (cb: FrameRequestCallback) => setTimeout(() => cb(performance.now()), 16) as unknown as number;
       this.handle = raf((now) => {
-        const mt = this.video.currentTime;
-        if (mt !== this.lastMediaTime && this.video.readyState >= 2) {
-          this.lastMediaTime = mt;
-          this.step(now, now);
+        try {
+          const mt = this.video.currentTime;
+          // Only run inference when the video advanced to a new frame (rAF can outpace the camera).
+          if (mt !== this.lastMediaTime && this.video.readyState >= 2) {
+            this.lastMediaTime = mt;
+            this.step(now, now);
+          }
+        } finally {
+          this.schedule();
         }
-        this.schedule();
       });
     }
   }
@@ -367,6 +420,11 @@ export class DetectLoop {
     }
     this.lastTick = t1;
     s.lastFrameAt = t1;
-    this.onResult(result, frameTimeMs);
+    try {
+      this.onResult(result, frameTimeMs);
+    } catch (err) {
+      // A throwing listener must not kill the loop (the frame callback re-schedules in `finally`).
+      this.onError?.(err);
+    }
   }
 }

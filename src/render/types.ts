@@ -14,14 +14,17 @@ export interface RenderNote {
   judgment?: Judgment;
 }
 
-/** Per-lane live movement meter, mirrors `LaneState` from src/input/types.ts minus the lane index. */
+/**
+ * Per-lane live movement meter. Structurally compatible with `LaneState` from src/input/types.ts,
+ * so `inputSource.getLaneStates()` can be passed straight through (the extra `lane` field is ignored).
+ */
 export interface RenderLaneState {
   /** Normalized movement value 0..1 of calibrated ROM. */
   value: number;
   /** True when the lane can fire again (hysteresis re-armed). */
   armed: boolean;
-  /** False when the tracker lost the limb / hand. */
-  tracking: boolean;
+  /** False when the tracker lost the limb / hand. Defaults to true when absent. */
+  tracking?: boolean;
 }
 
 /**
@@ -71,10 +74,22 @@ export interface HighwayOptions {
   farScale: number;
   /** Road width at the strike line as a fraction of canvas width (for 4 lanes; fewer lanes shrink a bit). */
   roadWidth: number;
+  /**
+   * Screen-space scroll speed below the strike line relative to the speed at the line (0.2..1).
+   * Lower keeps gems visible longer past the line so the engine's late miss verdict
+   * (note time + goodMs + grace, up to ~280 ms) still lands on a visible gem. Default 0.55 ≈ ≥400 ms.
+   */
+  pastLineSpeed: number;
   /** Use the rehab-friendly high-contrast palette instead of Guitar Hero colors. */
   highContrast: boolean;
   /** Draw movement labels under each lane. */
   showLabels: boolean;
+  /**
+   * Show a (neutral grey) "MISS" popup on missed notes. Off by default for the rehab audience — a
+   * miss is still signalled by the gem greying out + fizzling and a soft red lane tint.
+   * Therapist-toggleable at runtime via setOptions().
+   */
+  showMissPopup: boolean;
   /** Overlay draw-time stats (for the demo / profiling). */
   showStats: boolean;
   /** Particle pool capacity. */
@@ -93,14 +108,29 @@ export interface CanvasLike {
   getContext(kind: '2d', opts?: unknown): CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D | null;
 }
 
-/** Draw-time statistics, updated after every `draw()`. */
+/**
+ * Draw-time statistics, updated after every `draw()`.
+ *
+ * `drawMs` is JS-side command-issue time only; on a GPU-accelerated canvas the raster/composite
+ * cost lands at frame flush and never shows up there. `frameMs` / `longFrames` / `fps` are derived
+ * from the wall-clock interval between consecutive `draw()` calls, which does include that cost
+ * when draw() is called once per requestAnimationFrame — use those to judge the 60 fps target.
+ */
 export interface RenderStats {
-  /** Draw time of the last frame in ms. */
+  /** Draw time (command issue) of the last frame in ms. */
   drawMs: number;
   /** Exponential moving average of draw time in ms. */
   avgDrawMs: number;
   /** Worst draw time seen (ms) since last `resetStats()`. */
   maxDrawMs: number;
+  /** Wall-clock interval between the last two draw() calls (ms); 0 for the first frame. */
+  frameMs: number;
+  /** EMA of `frameMs` (ms). */
+  avgFrameMs: number;
+  /** Frames per second implied by `avgFrameMs`. */
+  fps: number;
+  /** Number of frame intervals longer than 25 ms (a dropped frame at 60 Hz) since last `resetStats()`. */
+  longFrames: number;
   /** Frames drawn since construction. */
   frames: number;
   /** Notes actually painted last frame (after culling). */

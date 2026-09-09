@@ -79,6 +79,22 @@ export class SpriteCache {
     return s;
   }
 
+  /**
+   * Soft volumetric stage-light cone: apex at the top centre, widening downward, with a feathered
+   * edge and a vertical falloff. Drawn additively with a rotation around the apex.
+   */
+  beam(colorHex: string, width = 128, height = 256): Sprite | null {
+    const key = `beam|${colorHex}|${width}x${height}`;
+    let s = this.map.get(key);
+    if (!s) {
+      const made = this.makeBeam(colorHex, width, height);
+      if (!made) return null;
+      s = made;
+      this.map.set(key, s);
+    }
+    return s;
+  }
+
   /** Receptor ring (empty gem outline) for the strike line. */
   receptor(color: LaneColor, radius: number): Sprite | null {
     const r = Math.round(radius);
@@ -180,6 +196,39 @@ export class SpriteCache {
     return { canvas, width: w, height: w, ax: r, ay: r };
   }
 
+  private makeBeam(colorHex: string, w: number, h: number): Sprite | null {
+    const made = this.makeCanvas(w, h);
+    if (!made) return null;
+    const { canvas, ctx } = made;
+    const cx = w / 2;
+    // Horizontal feather: bright core, transparent edges (multiplied by a vertical falloff below).
+    const across = ctx.createLinearGradient(0, 0, w, 0);
+    across.addColorStop(0, withAlpha(colorHex, 0));
+    across.addColorStop(0.35, withAlpha(colorHex, 0.55));
+    across.addColorStop(0.5, withAlpha(colorHex, 0.9));
+    across.addColorStop(0.65, withAlpha(colorHex, 0.55));
+    across.addColorStop(1, withAlpha(colorHex, 0));
+    ctx.fillStyle = across;
+    ctx.beginPath();
+    ctx.moveTo(cx - w * 0.04, 0);
+    ctx.lineTo(cx + w * 0.04, 0);
+    ctx.lineTo(w, h);
+    ctx.lineTo(0, h);
+    ctx.closePath();
+    ctx.fill();
+    // Vertical falloff: erase toward the bottom so the cone dissolves instead of ending hard.
+    ctx.globalCompositeOperation = 'destination-in';
+    const down = ctx.createLinearGradient(0, 0, 0, h);
+    down.addColorStop(0, 'rgba(0,0,0,1)');
+    down.addColorStop(0.15, 'rgba(0,0,0,0.85)');
+    down.addColorStop(0.6, 'rgba(0,0,0,0.35)');
+    down.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = down;
+    ctx.fillRect(0, 0, w, h);
+    ctx.globalCompositeOperation = 'source-over';
+    return { canvas, width: w, height: h, ax: cx, ay: 0 };
+  }
+
   private makeReceptor(color: LaneColor, r: number): Sprite | null {
     const ry = r * GEM_ASPECT;
     const pad = Math.ceil(r * 0.4);
@@ -196,6 +245,15 @@ export class SpriteCache {
     socket.addColorStop(1, 'rgba(0,0,0,0)');
     ctx.fillStyle = socket;
     ctx.fillRect(0, 0, w, h);
+    // Button face: dark translucent disc with a top-lit bevel so the receptor reads as a fret button.
+    const face = ctx.createRadialGradient(cx, cy - ry * 0.3, r * 0.1, cx, cy, r);
+    face.addColorStop(0, 'rgba(60,66,90,0.55)');
+    face.addColorStop(0.7, 'rgba(18,20,30,0.7)');
+    face.addColorStop(1, withAlpha(color.dark, 0.85));
+    ctx.fillStyle = face;
+    ctx.beginPath();
+    ctx.ellipse(cx, cy, r, ry, 0, 0, Math.PI * 2);
+    ctx.fill();
     // Outer ring
     ctx.lineWidth = Math.max(2, r * 0.16);
     ctx.strokeStyle = color.base;

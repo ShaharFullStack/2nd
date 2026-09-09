@@ -59,10 +59,14 @@ export function laneColor(palette: LanePalette, lane: number): LaneColor {
   return lanes[((lane % lanes.length) + lanes.length) % lanes.length];
 }
 
-export const JUDGMENT_STYLE: Record<Judgment, { text: string; color: string; glow: string }> = {
-  perfect: { text: 'PERFECT!', color: '#ffd84a', glow: '#ff9d00' },
-  good: { text: 'GOOD', color: '#5fb6ff', glow: '#1e6fff' },
-  miss: { text: 'MISS', color: '#ff5050', glow: '#a00000' },
+/**
+ * Judgment popup styles. GOOD is a pale, high-luminance blue so it reads as well as PERFECT on the
+ * dark road (rehab audiences must see "good" feedback clearly); MISS is deliberately neutral grey.
+ */
+export const JUDGMENT_STYLE: Record<Judgment, { text: string; color: string; glow: string; stroke: string }> = {
+  perfect: { text: 'PERFECT!', color: '#ffd84a', glow: '#ff9d00', stroke: '#4a2a00' },
+  good: { text: 'GOOD', color: '#b6ecff', glow: '#2ea8ff', stroke: '#0a2a5a' },
+  miss: { text: 'MISS', color: '#c8c8d0', glow: '#606068', stroke: '#1a1a20' },
 };
 
 /** Multiplier badge tiers: index = clamp(multiplier, 1, 4). */

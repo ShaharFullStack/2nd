@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 // Beat Rehab — download Creative-Commons stems listed in each song.json "remoteStems".
 //
-// usage: node scripts/fetch-stems.mjs [--song <id>] [--force] [--root public/songs] [--retries 3]
+// usage: node scripts/fetch-stems.mjs [--song <id>] [--force] [--root public/songs] [--retries 3] [--timeout 30]
 //
 // For every song directory (from index.json plus any directory containing a song.json):
 //   * each remoteStems entry {id, url} is downloaded to the path of the matching "stems" entry
 //     (falls back to stems/<id>.<ext-from-url>) — existing files are skipped unless --force,
-//   * failed downloads are retried with exponential back-off,
+//   * every attempt has a watchdog: no response headers, or no body bytes, for --timeout seconds
+//     (default 30) aborts the transfer, and failed/aborted attempts are retried with exponential
+//     back-off (--retries, default 3),
 //   * placeholder URLs (example.com / "PLACEHOLDER") are skipped with a hint,
 //   * the song's attribution line is printed so the licence terms are visible at fetch time.
 //
@@ -15,19 +17,35 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { pipeline } from 'node:stream/promises';
-import { Readable } from 'node:stream';
+import { Readable, Transform } from 'node:stream';
+import { fileURLToPath } from 'node:url';
 
-function parseArgs(argv) {
-  const args = { root: 'public/songs', song: null, force: false, retries: 3 };
+export const DEFAULT_RETRIES = 3;
+export const DEFAULT_TIMEOUT_SEC = 30;
+
+function numberArg(name, raw, { integer = false, min = 0 } = {}) {
+  const n = Number(raw);
+  if (raw === undefined || raw === '' || !Number.isFinite(n) || n < min || (integer && !Number.isInteger(n))) {
+    throw new Error(`${name} expects a ${integer ? 'non-negative integer' : 'number'}${min > 0 ? ` >= ${min}` : ''}, got ${raw === undefined ? 'nothing' : JSON.stringify(raw)}`);
+  }
+  return n;
+}
+
+export function parseArgs(argv) {
+  const args = { root: 'public/songs', song: null, force: false, retries: DEFAULT_RETRIES, timeoutSec: DEFAULT_TIMEOUT_SEC };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--root') args.root = argv[++i];
     else if (a === '--song') args.song = argv[++i];
     else if (a === '--force') args.force = true;
-    else if (a === '--retries') args.retries = Number(argv[++i]);
-    else if (a === '--help' || a === '-h') { console.log('usage: fetch-stems.mjs [--song id] [--force] [--root dir] [--retries n]'); process.exit(0); }
-    else throw new Error(`unknown argument ${a}`);
+    else if (a === '--retries') args.retries = numberArg('--retries', argv[++i], { integer: true });
+    else if (a === '--timeout') args.timeoutSec = numberArg('--timeout', argv[++i], { min: 0.01 });
+    else if (a === '--help' || a === '-h') {
+      console.log('usage: fetch-stems.mjs [--song id] [--force] [--root dir] [--retries n] [--timeout seconds]');
+      process.exit(0);
+    } else throw new Error(`unknown argument ${a}`);
   }
+  if (!args.root) throw new Error('--root expects a directory');
   return args;
 }
 
@@ -62,31 +80,60 @@ export function targetPathFor(manifest, remote) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function download(url, dest, retries) {
-  let attempt = 0;
-  for (;;) {
-    attempt++;
-    const tmp = dest + '.part';
+/**
+ * One attempt: GET `url` into `tmp`. A watchdog aborts the attempt when no headers arrive, or no
+ * body bytes arrive, within `timeoutMs`; it is re-armed by every chunk so a slow-but-moving
+ * transfer never trips it, only a stalled one.
+ */
+async function downloadOnce(url, tmp, timeoutMs) {
+  const ac = new AbortController();
+  let timer = null;
+  let reason = '';
+  const arm = (why) => {
+    clearTimeout(timer);
+    timer = setTimeout(() => { reason = `${why} after ${timeoutMs} ms`; ac.abort(); }, timeoutMs);
+  };
+  let bytes = 0;
+  try {
+    arm('no response');
+    const res = await fetch(url, { redirect: 'follow', signal: ac.signal, headers: { 'user-agent': 'beat-rehab-fetch-stems/1.0' } });
+    if (!res.ok || !res.body) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+    const type = res.headers.get('content-type') ?? '';
+    if (/text\/html/i.test(type)) throw new Error(`got an HTML page instead of audio (${type}) — check that the URL is a direct file link`);
+    fs.mkdirSync(path.dirname(tmp), { recursive: true });
+    arm('transfer stalled');
+    const watchdog = new Transform({
+      transform(chunk, _enc, cb) { bytes += chunk.length; arm('transfer stalled'); cb(null, chunk); },
+    });
+    await pipeline(Readable.fromWeb(res.body), watchdog, fs.createWriteStream(tmp), { signal: ac.signal });
+    const expected = Number(res.headers.get('content-length'));
+    if (Number.isInteger(expected) && expected > 0 && bytes !== expected) throw new Error(`short read: ${bytes} of ${expected} bytes`);
+    return bytes;
+  } catch (err) {
+    throw new Error(reason || (err && err.message) || String(err));
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export async function download(url, dest, { retries = DEFAULT_RETRIES, timeoutMs = DEFAULT_TIMEOUT_SEC * 1000, warn = console.warn } = {}) {
+  const tmp = dest + '.part';
+  for (let attempt = 1; ; attempt++) {
     try {
-      const res = await fetch(url, { redirect: 'follow', headers: { 'user-agent': 'beat-rehab-fetch-stems/1.0' } });
-      if (!res.ok || !res.body) throw new Error(`HTTP ${res.status} ${res.statusText}`);
-      const type = res.headers.get('content-type') ?? '';
-      if (/text\/html/i.test(type)) throw new Error(`got an HTML page instead of audio (${type}) — check that the URL is a direct file link`);
-      fs.mkdirSync(path.dirname(dest), { recursive: true });
-      await pipeline(Readable.fromWeb(res.body), fs.createWriteStream(tmp));
+      const bytes = await downloadOnce(url, tmp, timeoutMs);
       fs.renameSync(tmp, dest);
-      return fs.statSync(dest).size;
+      return bytes;
     } catch (err) {
       try { fs.rmSync(tmp, { force: true }); } catch { /* ignore */ }
       if (attempt > retries) throw err;
       const wait = 500 * 2 ** (attempt - 1);
-      console.warn(`    attempt ${attempt} failed (${err.message}); retrying in ${wait} ms`);
+      warn(`    attempt ${attempt} failed (${err.message}); retrying in ${wait} ms`);
       await sleep(wait);
     }
   }
 }
 
-export async function fetchSong(root, id, { force = false, retries = 3, log = console.log } = {}) {
+export async function fetchSong(root, id, { force = false, retries = DEFAULT_RETRIES, timeoutSec = DEFAULT_TIMEOUT_SEC, log = console.log } = {}) {
   const dir = path.join(root, id);
   const manifestPath = path.join(dir, 'song.json');
   if (!fs.existsSync(manifestPath)) { log(`- ${id}: no song.json, skipping`); return { id, fetched: 0, skipped: 0, failed: 0 }; }
@@ -102,7 +149,7 @@ export async function fetchSong(root, id, { force = false, retries = 3, log = co
     if (isPlaceholderUrl(remote.url)) { log(`    ${remote.id}: placeholder URL (${remote.url || 'empty'}) — edit song.json first, see public/songs/ccmixter-README.md`); summary.skipped++; continue; }
     if (!force && fs.existsSync(dest) && fs.statSync(dest).size > 0) { log(`    ${remote.id}: exists (${rel}), skipping`); summary.skipped++; continue; }
     try {
-      const bytes = await download(remote.url, dest, retries);
+      const bytes = await download(remote.url, dest, { retries, timeoutMs: timeoutSec * 1000, warn: log });
       log(`    ${remote.id}: downloaded ${(bytes / 1e6).toFixed(1)} MB -> ${rel}`);
       summary.fetched++;
     } catch (err) {
@@ -113,14 +160,22 @@ export async function fetchSong(root, id, { force = false, retries = 3, log = co
   return summary;
 }
 
-const isMain = process.argv[1] && path.resolve(process.argv[1]) === new URL(import.meta.url).pathname;
+// `import.meta.url` → filesystem path via fileURLToPath so this also works on Windows
+// (URL.pathname there is '/C:/…' and never equals path.resolve()).
+const isMain = Boolean(process.argv[1]) && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isMain) {
-  const args = parseArgs(process.argv.slice(2));
+  let args;
+  try {
+    args = parseArgs(process.argv.slice(2));
+  } catch (err) {
+    console.error(`fetch-stems: ${err.message}`);
+    process.exit(2);
+  }
   const ids = args.song ? [args.song] : discoverSongIds(args.root).filter((id) => !id.startsWith('_'));
   if (ids.length === 0) { console.log(`no songs found under ${args.root}`); process.exit(0); }
   let failed = 0;
   for (const id of ids) {
-    const s = await fetchSong(args.root, id, { force: args.force, retries: args.retries });
+    const s = await fetchSong(args.root, id, { force: args.force, retries: args.retries, timeoutSec: args.timeoutSec });
     failed += s.failed;
   }
   if (failed) { console.error(`\n${failed} stem(s) failed to download.`); process.exit(1); }

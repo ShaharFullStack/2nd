@@ -19,7 +19,7 @@ export interface ReplayInputConfig {
   lanes?: number;
   /** Poll automatically with setInterval (default true). false = call tick() yourself. */
   autoTick?: boolean;
-  /** Poll interval in ms (default 4). */
+  /** Poll interval in ms (default 4; browsers clamp timers to >= 4 ms, so this is the finest practical rate). */
   tickMs?: number;
   /** How long a lane reads "value 1" after an event, seconds (default 0.12). */
   holdSec?: number;

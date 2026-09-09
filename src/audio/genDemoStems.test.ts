@@ -61,6 +61,11 @@ describe('scripts/gen-demo-stems.mjs', () => {
     expect(manifest.stems.map((s) => s.id)).toEqual(['drums', 'bass', 'keys', 'lead']);
     expect(manifest.durationSec).toBeCloseTo(expectedSec, 3);
     expect(manifest.remoteStems).toEqual([]);
+    // no '' / relative-path link fields: the UI would render them as broken anchors
+    expect(manifestJson as Record<string, unknown>).not.toHaveProperty('artistUrl');
+    expect(manifestJson as Record<string, unknown>).not.toHaveProperty('sourceUrl');
+    expect(manifest.artistUrl).toBeUndefined();
+    expect(manifest.sourceUrl).toBeUndefined();
   });
 
   it('renders every stem as a valid 16-bit 44.1 kHz mono RIFF/WAVE of the manifest length', () => {

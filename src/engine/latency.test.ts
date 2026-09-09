@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   CALIBRATION_BPM_RECOMMENDED,
   LATENCY_FRAME_SEC,
+  LATENCY_MAX_REJECTED_FRACTION,
   beatIntervalOf,
   calibrateLatency,
   defaultPairingWindow,
@@ -88,6 +89,20 @@ describe('estimateLatency', () => {
     expect(empty.confidence).toBe(0);
     expect(empty.quality).toBe('none');
     expect(estimateLatency([{ expected: 0, observed: Number.NaN }]).rejected).toBe(1);
+  });
+  it('rejected-fraction boundary on a 16-beat run: 5 rejected beats pass, 6 do not', () => {
+    const beats = Array.from({ length: 16 }, (_, i) => 2 + i);
+    const five = calibrateLatency(beats, beats.map((b, i) => b + (i < 11 ? 0.1 : 0.7)));
+    expect(five.samples).toBe(11);
+    expect(five.rejected).toBe(5);
+    expect(five.confident).toBe(true);
+    const six = calibrateLatency(beats, beats.map((b, i) => b + (i < 10 ? 0.1 : 0.7)));
+    expect(six.samples).toBe(10);
+    expect(six.rejected).toBe(6);
+    expect(six.confident).toBe(false);
+    expect(six.confidence).toBeLessThan(0.5);
+    expect(six.quality).toBe('poor');
+    expect(LATENCY_MAX_REJECTED_FRACTION).toBeCloseTo(1 / 3, 12);
   });
   it('counts unpaired beats as rejected', () => {
     const good = [0.1, 0.1, 0.1, 0.1, 0.1, 0.1].map((d, i) => ({ expected: i, observed: i + d }));
