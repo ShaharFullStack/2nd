@@ -1,0 +1,48 @@
+{
+  "id": "demo-sunrise",
+  "title": "Sunrise Shuffle",
+  "artist": "Beat Rehab demo (synthesized)",
+  "artistUrl": "",
+  "sourceUrl": "scripts/gen-demo-stems.mjs",
+  "license": "CC0 1.0",
+  "licenseUrl": "https://creativecommons.org/publicdomain/zero/1.0/",
+  "attribution": "\"Sunrise Shuffle\" is an original demo track synthesized in-repo by scripts/gen-demo-stems.mjs (Beat Rehab). Released under CC0 1.0 — no rights reserved.",
+  "description": "Laid-back 100 BPM groove with swung hats, rimshot backbeat, warm round bass, electric-piano chords and a gentle pentatonic lead.",
+  "bpm": 100,
+  "offset": 0,
+  "durationSec": 77.8,
+  "previewStart": 19,
+  "bars": 32,
+  "key": "D major",
+  "stems": [
+    {
+      "id": "drums",
+      "file": "stems/drums.wav",
+      "label": "Drums"
+    },
+    {
+      "id": "bass",
+      "file": "stems/bass.wav",
+      "label": "Bass"
+    },
+    {
+      "id": "keys",
+      "file": "stems/keys.wav",
+      "label": "Keys"
+    },
+    {
+      "id": "lead",
+      "file": "stems/lead.wav",
+      "label": "Lead"
+    }
+  ],
+  "playerStem": "drums",
+  "remoteStems": [],
+  "generated": {
+    "script": "scripts/gen-demo-stems.mjs",
+    "seed": 7301,
+    "sampleRate": 44100,
+    "channels": 1,
+    "bitDepth": 16
+  }
+}

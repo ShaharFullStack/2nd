@@ -1,0 +1,48 @@
+{
+  "id": "demo-groove",
+  "title": "Groove Circuit",
+  "artist": "Beat Rehab demo (synthesized)",
+  "artistUrl": "",
+  "sourceUrl": "scripts/gen-demo-stems.mjs",
+  "license": "CC0 1.0",
+  "licenseUrl": "https://creativecommons.org/publicdomain/zero/1.0/",
+  "attribution": "\"Groove Circuit\" is an original demo track synthesized in-repo by scripts/gen-demo-stems.mjs (Beat Rehab). Released under CC0 1.0 — no rights reserved.",
+  "description": "Upbeat 120 BPM funk-rock: driving kick/snare with fills every four bars, syncopated square bass, detuned saw chords and a call/response lead hook.",
+  "bpm": 120,
+  "offset": 0,
+  "durationSec": 97,
+  "previewStart": 16,
+  "bars": 48,
+  "key": "A minor",
+  "stems": [
+    {
+      "id": "drums",
+      "file": "stems/drums.wav",
+      "label": "Drums"
+    },
+    {
+      "id": "bass",
+      "file": "stems/bass.wav",
+      "label": "Bass"
+    },
+    {
+      "id": "keys",
+      "file": "stems/keys.wav",
+      "label": "Keys"
+    },
+    {
+      "id": "lead",
+      "file": "stems/lead.wav",
+      "label": "Lead"
+    }
+  ],
+  "playerStem": "drums",
+  "remoteStems": [],
+  "generated": {
+    "script": "scripts/gen-demo-stems.mjs",
+    "seed": 20240601,
+    "sampleRate": 44100,
+    "channels": 1,
+    "bitDepth": 16
+  }
+}

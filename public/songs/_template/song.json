@@ -1,0 +1,27 @@
+{
+  "id": "_template",
+  "title": "Song Title",
+  "artist": "Artist Name",
+  "artistUrl": "https://ccmixter.org/people/ARTIST",
+  "sourceUrl": "https://ccmixter.org/files/ARTIST/12345",
+  "license": "CC BY 4.0",
+  "licenseUrl": "https://creativecommons.org/licenses/by/4.0/",
+  "attribution": "\"Song Title\" by Artist Name (ccmixter.org) is licensed under CC BY 4.0",
+  "bpm": 120,
+  "offset": 0.0,
+  "durationSec": 180,
+  "previewStart": 30,
+  "stems": [
+    { "id": "drums", "file": "stems/drums.wav", "label": "Drums" },
+    { "id": "bass", "file": "stems/bass.wav", "label": "Bass" },
+    { "id": "keys", "file": "stems/keys.wav", "label": "Keys" },
+    { "id": "vocals", "file": "stems/vocals.wav", "label": "Vocals" }
+  ],
+  "playerStem": "drums",
+  "remoteStems": [
+    { "id": "drums", "url": "https://PLACEHOLDER.example.com/stems/drums.wav" },
+    { "id": "bass", "url": "https://PLACEHOLDER.example.com/stems/bass.wav" },
+    { "id": "keys", "url": "https://PLACEHOLDER.example.com/stems/keys.wav" },
+    { "id": "vocals", "url": "https://PLACEHOLDER.example.com/stems/vocals.wav" }
+  ]
+}
