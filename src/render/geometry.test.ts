@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  DEFAULT_GEOMETRY_OPTIONS,
   beatLineTimes,
   bucketRadius,
   depthAtY,
@@ -62,7 +63,7 @@ describe('depth / scale / y', () => {
 
   it('scale is 1 at the strike line, farScale at the horizon and monotonic between', () => {
     expect(scaleAt(g, 0)).toBe(1);
-    expect(scaleAt(g, 1)).toBeCloseTo(0.22);
+    expect(scaleAt(g, 1)).toBeCloseTo(DEFAULT_GEOMETRY_OPTIONS.farScale);
     let prev = scaleAt(g, 0);
     for (let d = 0.05; d <= 1; d += 0.05) {
       const s = scaleAt(g, d);
@@ -114,7 +115,7 @@ describe('lane x', () => {
   it('lanes converge toward the vanishing point with depth', () => {
     const near = laneX(g, 3, 0) - laneX(g, 0, 0);
     const far = laneX(g, 3, 1) - laneX(g, 0, 1);
-    expect(far).toBeCloseTo(near * 0.22);
+    expect(far).toBeCloseTo(near * DEFAULT_GEOMETRY_OPTIONS.farScale);
     expect(Math.abs(laneX(g, 0, 1) - g.vpX)).toBeLessThan(Math.abs(laneX(g, 0, 0) - g.vpX));
   });
 
@@ -184,6 +185,13 @@ describe('beat lines', () => {
   it('respects beatPhase offset', () => {
     const lines = beatLineTimes(g, 8.1, 120, 0.2);
     expect(lines.some((l) => Math.abs(l.time - 8.0) < 1e-6)).toBe(true);
+  });
+
+  it('uses the beat index hint for bar placement when given', () => {
+    const lines = beatLineTimes(g, 8.0, 120, 0, 4, 17);
+    const atNow = lines.find((l) => Math.abs(l.time - 8) < 1e-9);
+    expect(atNow?.bar).toBe(false);
+    expect(lines.find((l) => Math.abs(l.time - 9.5) < 1e-9)?.bar).toBe(true);
   });
 
   it('is empty for invalid bpm', () => {

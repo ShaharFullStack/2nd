@@ -3,12 +3,19 @@
  * player-stem ducking (docs/ARCHITECTURE.md "Audio contract").
  *
  * Graph:  source ─ duck ─ volume ─┐
- *         source ─ duck ─ volume ─┼─ master ─ [compressor] ─ destination
+ *         source ─ duck ─ volume ─┼─ master ─ [limiter] ─ destination
  *         …                        ┘
  *
  * Time base: AudioContext.currentTime is the only clock. `getSongTime()` is
  * `offset + (ctx.currentTime - startCtxTime)` while playing; the engine adds its own
  * latency compensation when judging inputs.
+ *
+ * Master stage: the optional DynamicsCompressorNode is configured as a brick-wall style
+ * *limiter* (threshold −3 dBFS, ratio 20, 1 ms attack, 50 ms release), not a program
+ * compressor — a compressor sitting after the stem sum would release when the player stem is
+ * ducked and swell the other stems by several dB, masking the "your instrument went silent"
+ * cue. With the limiter the master defaults to 0.8; without it to 0.6 so four stems peaking
+ * at 0.93/0.65/0.52/0.50 cannot hard-clip at the destination.
  */
 
 import type { FetchLike, SongManifest, StemSpec } from './manifest';
@@ -18,24 +25,42 @@ import { DuckController, type DuckOptions } from './ducking';
 export type MixerState = 'idle' | 'loading' | 'ready' | 'playing' | 'paused' | 'ended';
 
 export interface LoadProgress {
-  /** Completed steps (each stem counts twice: fetched + decoded). */
-  loaded: number;
-  total: number;
+  /** Overall progress 0..1 (per stem: download weighted 0.85, decode 0.15). */
+  fraction: number;
+  /** Bytes received so far across all stems. */
+  bytesLoaded: number;
+  /** Sum of Content-Length over the stems that reported one (grows as responses arrive). */
+  bytesTotal: number;
+  /** True once every stem reported a Content-Length (then bytesLoaded/bytesTotal is exact). */
+  bytesTotalKnown: boolean;
+  stemsDecoded: number;
+  stemCount: number;
+  /** Stem the event is about. */
   stemId: string;
-  phase: 'fetched' | 'decoded';
+  phase: 'downloading' | 'fetched' | 'decoded';
 }
 
 export interface StemMixerOptions {
   /** Pass the app-wide AudioContext (created after a user gesture). One is created lazily if absent. */
   ctx?: AudioContext;
-  /** Insert a gentle DynamicsCompressorNode on the master bus (default true). */
+  /** Insert a limiter (DynamicsCompressorNode with limiter settings) on the master bus (default true). */
   compressor?: boolean;
+  /** Master gain (default `DEFAULT_MASTER_GAIN.limiter` = 0.8 with the limiter, `.none` = 0.6 without). */
   masterGain?: number;
   duck?: Partial<DuckOptions>;
   /** Minimum scheduling lead when `play()` is called without an explicit ctx time (default 30 ms). */
   startLeadSec?: number;
   fetch?: FetchLike;
 }
+
+/** Default master headroom (see the module comment). */
+export const DEFAULT_MASTER_GAIN = { limiter: 0.8, none: 0.6 } as const;
+
+/** Limiter settings applied to the master DynamicsCompressorNode. */
+export const LIMITER_SETTINGS = { threshold: -3, knee: 0, ratio: 20, attack: 0.001, release: 0.05 } as const;
+
+/** Weight of the download phase in per-stem progress (the rest is decoding). */
+export const PROGRESS_DOWNLOAD_WEIGHT = 0.85;
 
 interface Stem {
   spec: StemSpec;
@@ -54,9 +79,78 @@ function decodeAudio(ctx: BaseAudioContext, data: ArrayBuffer): Promise<AudioBuf
   });
 }
 
+function contentLength(res: Response): number | null {
+  const h = res.headers.get('content-length');
+  if (!h || !/^\d+$/.test(h.trim())) return null;
+  const n = Number(h);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+/**
+ * Read a response body while reporting received bytes. Uses the streaming reader when available
+ * (so an 8 MB stem reports progress every chunk); falls back to arrayBuffer() otherwise.
+ */
+export async function readBodyWithProgress(
+  res: Response,
+  onChunk: (received: number, total: number | null) => void,
+): Promise<ArrayBuffer> {
+  const total = contentLength(res);
+  const body = res.body;
+  if (!body || typeof body.getReader !== 'function') {
+    const ab = await res.arrayBuffer();
+    onChunk(ab.byteLength, total ?? ab.byteLength);
+    return ab;
+  }
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+  onChunk(0, total);
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    chunks.push(value);
+    received += value.byteLength;
+    onChunk(received, total);
+  }
+  const out = new Uint8Array(received);
+  let off = 0;
+  for (const c of chunks) { out.set(c, off); off += c.byteLength; }
+  return out.buffer;
+}
+
+interface StemLoadState { received: number; total: number | null; fetched: boolean; decoded: boolean }
+
+/** Pure aggregation of per-stem load state into a LoadProgress (exported for tests). */
+export function aggregateProgress(states: readonly StemLoadState[], stemId: string, phase: LoadProgress['phase']): LoadProgress {
+  let fraction = 0;
+  let bytesLoaded = 0;
+  let bytesTotal = 0;
+  let known = states.length > 0;
+  let stemsDecoded = 0;
+  for (const s of states) {
+    bytesLoaded += s.received;
+    if (s.total !== null) bytesTotal += s.total; else known = false;
+    const dl = s.fetched ? 1 : s.total !== null ? Math.min(1, s.received / s.total) : 0;
+    fraction += PROGRESS_DOWNLOAD_WEIGHT * dl + (s.decoded ? 1 - PROGRESS_DOWNLOAD_WEIGHT : 0);
+    if (s.decoded) stemsDecoded++;
+  }
+  return {
+    fraction: states.length === 0 ? 1 : Math.min(1, fraction / states.length),
+    bytesLoaded,
+    bytesTotal,
+    bytesTotalKnown: known,
+    stemsDecoded,
+    stemCount: states.length,
+    stemId,
+    phase,
+  };
+}
+
 export class StemMixer {
   readonly ctx: AudioContext;
   readonly master: GainNode;
+  /** The master limiter (a DynamicsCompressorNode with `LIMITER_SETTINGS`), or null when disabled. */
   readonly compressor: DynamicsCompressorNode | null;
   /** Last node of the master chain (connect analysers here). */
   readonly output: AudioNode;
@@ -86,15 +180,16 @@ export class StemMixer {
     this.duckOptions = options.duck ?? {};
     this.fetchImpl = options.fetch ?? ((input, init) => globalThis.fetch(input, init));
 
+    const useLimiter = options.compressor ?? true;
     this.master = this.ctx.createGain();
-    this.master.gain.value = options.masterGain ?? 1;
-    if (options.compressor ?? true) {
+    this.master.gain.value = options.masterGain ?? (useLimiter ? DEFAULT_MASTER_GAIN.limiter : DEFAULT_MASTER_GAIN.none);
+    if (useLimiter) {
       const c = this.ctx.createDynamicsCompressor();
-      c.threshold.value = -12;
-      c.knee.value = 20;
-      c.ratio.value = 3;
-      c.attack.value = 0.005;
-      c.release.value = 0.15;
+      c.threshold.value = LIMITER_SETTINGS.threshold;
+      c.knee.value = LIMITER_SETTINGS.knee;
+      c.ratio.value = LIMITER_SETTINGS.ratio;
+      c.attack.value = LIMITER_SETTINGS.attack;
+      c.release.value = LIMITER_SETTINGS.release;
       this.master.connect(c);
       c.connect(this.ctx.destination);
       this.compressor = c;
@@ -128,28 +223,41 @@ export class StemMixer {
   /**
    * Fetch + decode every stem of `manifest` in parallel. Resolves when all are ready.
    * `baseUrl` is the songs root (stems resolve to `${baseUrl}/${manifest.id}/${stem.file}`).
+   * Progress is byte-accurate (Content-Length + streamed body) so a 30 MB download moves the bar
+   * continuously; events are throttled to ≥0.5 % steps plus every phase change.
    */
   async loadSong(manifest: SongManifest, baseUrl: string = '/songs', onProgress?: (p: LoadProgress) => void): Promise<void> {
     const gen = ++this.loadGeneration;
     this.unload();
     this.mixerState = 'loading';
     this.currentManifest = manifest;
-    const total = manifest.stems.length * 2;
-    let loaded = 0;
-    const report = (stemId: string, phase: LoadProgress['phase']) => {
-      loaded++;
-      onProgress?.({ loaded, total, stemId, phase });
+    const states: StemLoadState[] = manifest.stems.map(() => ({ received: 0, total: null, fetched: false, decoded: false }));
+    let lastFraction = -1;
+    const report = (i: number, phase: LoadProgress['phase']) => {
+      if (!onProgress || gen !== this.loadGeneration) return;
+      const p = aggregateProgress(states, manifest.stems[i].id, phase);
+      if (phase === 'downloading' && p.fraction - lastFraction < 0.005) return;
+      lastFraction = p.fraction;
+      onProgress(p);
     };
     let decoded: { spec: StemSpec; buffer: AudioBuffer }[];
     try {
-      decoded = await Promise.all(manifest.stems.map(async (spec) => {
+      decoded = await Promise.all(manifest.stems.map(async (spec, i) => {
         const url = stemUrl(baseUrl, manifest, spec);
         const res = await this.fetchImpl(url);
         if (!res.ok) throw new Error(`stem "${spec.id}" (${url}) failed to load: HTTP ${res.status}`);
-        const data = await res.arrayBuffer();
-        report(spec.id, 'fetched');
+        const data = await readBodyWithProgress(res, (received, total) => {
+          states[i].received = received;
+          states[i].total = total;
+          report(i, 'downloading');
+        });
+        states[i].fetched = true;
+        states[i].received = data.byteLength;
+        if (states[i].total === null || states[i].total !== data.byteLength) states[i].total = data.byteLength;
+        report(i, 'fetched');
         const buffer = await decodeAudio(this.ctx, data);
-        report(spec.id, 'decoded');
+        states[i].decoded = true;
+        report(i, 'decoded');
         return { spec, buffer };
       }));
     } catch (err) {
@@ -189,6 +297,7 @@ export class StemMixer {
    * Start every stem at the same ctx time (sample-accurate). `atCtxTime` defaults to
    * now + startLead; `fromSongTime` defaults to the current position (0 after load/stop,
    * the pause point after pause). Returns the ctx time at which audio starts.
+   * Starting at/after the end of every stem ends the song immediately (state 'ended', listeners fire).
    */
   play(atCtxTime?: number, fromSongTime?: number): number {
     if (this.stems.size === 0) throw new Error('StemMixer.play(): no song loaded');
@@ -209,24 +318,25 @@ export class StemMixer {
       stem.source = src;
       if (!longest || stem.buffer.duration > longest.buffer.duration) longest = stem;
     }
-    if (longest?.source) {
-      longest.source.onended = () => {
-        if (gen !== this.playGeneration || this.mixerState !== 'playing') return;
-        this.offsetSec = this.getDuration();
-        this.mixerState = 'ended';
-        this.clearSources();
-        for (const cb of this.endedListeners) cb();
-      };
-    }
     this.startCtxTime = startAt;
-    this.mixerState = 'playing';
     this.duckController?.reset(now);
+    if (!longest?.source) {
+      // nothing left to play (offset ≥ every stem's duration): end right away
+      this.finishPlayback();
+      return startAt;
+    }
+    longest.source.onended = () => {
+      if (gen !== this.playGeneration || this.mixerState !== 'playing') return;
+      this.finishPlayback();
+    };
+    this.mixerState = 'playing';
     return startAt;
   }
 
   pause(): void {
     if (this.mixerState !== 'playing') return;
-    this.offsetSec = Math.min(this.getSongTime(), this.getDuration());
+    // clamp: negative while waiting for a scheduled start, never past the end
+    this.offsetSec = Math.max(0, Math.min(this.getSongTime(), this.getDuration()));
     this.stopSources();
     this.mixerState = 'paused';
   }
@@ -312,6 +422,8 @@ export class StemMixer {
   onHit(combo: number = 0): void { this.duckController?.hit(this.ctx.currentTime, combo); }
   /** Duck the player stem to missGain (40 ms ramp); stays ducked until the next hit. */
   onMiss(): void { this.duckController?.miss(this.ctx.currentTime); }
+  /** Analytic gain of the player stem right now (for a UI meter). */
+  getPlayerStemGain(): number { return this.duckController?.valueAt(this.ctx.currentTime) ?? 1; }
 
   // ------------------------------------------------------------------ teardown
 
@@ -329,6 +441,13 @@ export class StemMixer {
     const stem = this.stems.get(id);
     if (!stem) throw new Error(`StemMixer: unknown stem "${id}"`);
     return stem;
+  }
+
+  private finishPlayback(): void {
+    this.offsetSec = this.getDuration();
+    this.mixerState = 'ended';
+    this.clearSources();
+    for (const cb of [...this.endedListeners]) cb();
   }
 
   private stopSources(): void {

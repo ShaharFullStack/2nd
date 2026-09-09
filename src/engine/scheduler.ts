@@ -9,25 +9,26 @@ export type SongClockState = 'idle' | 'running' | 'paused';
 
 /**
  * Song clock driven by AudioContext.currentTime.
- * songTime = (ctxNow - startCtxTime - totalPausedSec) + latencyOffsetSec
+ * songTime = (ctxNow - startCtxTime - totalPausedSec) + avOffsetSec
  *
- * `latencyOffsetSec` is a display/audio alignment offset added to the song time. Input pipeline
- * latency is normally handled by `Judge` instead; use `inputSongTime()` if you prefer to shift
- * input events here (then construct the Judge with latency 0 — never apply both).
+ * LATENCY — one knob only. The calibration value (`inputLatencySec`) belongs to the Judge
+ * (`JudgeOptions.latencyOffsetSec`) or, better, to `RhythmEngine`, which owns both. The SongClock
+ * deliberately has NO input-latency parameter: an input observed at ctx time t is converted with
+ * `songTime(t)` and the Judge subtracts the latency once. `avOffsetSec` is a constant audio/visual
+ * alignment offset (e.g. output latency of the audio device) — leave it at 0 unless you are aligning
+ * the highway to the speakers; it is never the calibration value.
  */
 export class SongClock {
   private readonly ctx: ClockSource;
-  private latencyOffsetSec: number;
-  private inputLatencySec: number;
+  private avOffsetSec: number;
   private startCtx = 0;
   private pausedAtCtx = 0;
   private pausedTotal = 0;
   private state: SongClockState = 'idle';
 
-  constructor(ctx: ClockSource, opts: { latencyOffsetSec?: number; inputLatencySec?: number } = {}) {
+  constructor(ctx: ClockSource, opts: { avOffsetSec?: number } = {}) {
     this.ctx = ctx;
-    this.latencyOffsetSec = opts.latencyOffsetSec ?? 0;
-    this.inputLatencySec = opts.inputLatencySec ?? 0;
+    this.avOffsetSec = opts.avOffsetSec ?? 0;
   }
 
   getState(): SongClockState {
@@ -38,20 +39,13 @@ export class SongClock {
     return this.state === 'running';
   }
 
-  setLatencyOffset(sec: number): void {
-    this.latencyOffsetSec = sec;
+  /** Audio/visual alignment offset added to song time (NOT the input latency calibration). */
+  setAvOffset(sec: number): void {
+    this.avOffsetSec = sec;
   }
 
-  getLatencyOffset(): number {
-    return this.latencyOffsetSec;
-  }
-
-  setInputLatency(sec: number): void {
-    this.inputLatencySec = sec;
-  }
-
-  getInputLatency(): number {
-    return this.inputLatencySec;
+  getAvOffset(): number {
+    return this.avOffsetSec;
   }
 
   /**
@@ -81,21 +75,16 @@ export class SongClock {
     this.state = 'idle';
   }
 
-  /** Song time (seconds) at AudioContext time `nowCtx` (default: now). Frozen while paused. */
+  /** Song time (seconds) at AudioContext time `nowCtx` (default: now). Frozen while paused; 0 while idle. */
   songTime(nowCtx: number = this.ctx.currentTime): number {
-    if (this.state === 'idle') return this.latencyOffsetSec;
+    if (this.state === 'idle') return 0;
     const t = this.state === 'paused' ? this.pausedAtCtx : nowCtx;
-    return t - this.startCtx - this.pausedTotal + this.latencyOffsetSec;
+    return t - this.startCtx - this.pausedTotal + this.avOffsetSec;
   }
 
-  /** Song time at which an input observed at `ctxTime` actually happened (minus input latency). */
-  inputSongTime(ctxTime: number): number {
-    return this.songTime(ctxTime) - this.inputLatencySec;
-  }
-
-  /** AudioContext time at which song time `songTime` will occur (valid while running). */
+  /** AudioContext time at which song time `songTime` will occur (valid while running or paused). */
   ctxTimeForSongTime(songTime: number): number {
-    return songTime - this.latencyOffsetSec + this.startCtx + this.pausedTotal;
+    return songTime - this.avOffsetSec + this.startCtx + this.pausedTotal;
   }
 }
 
@@ -138,6 +127,7 @@ export interface NoteRange {
 export class NoteCursor {
   /** Chart notes sorted by time (a copy; the chart itself is not mutated). */
   readonly notes: readonly Note[];
+  readonly chart: Chart;
   private head = 0;
   private tailSec: number;
   private readonly range: NoteRange = { start: 0, end: 0 };
@@ -147,12 +137,17 @@ export class NoteCursor {
    *                (so hit/miss animations can draw it); default 0.5 s.
    */
   constructor(chart: Chart, tailSec = 0.5) {
+    this.chart = chart;
     this.notes = chart.notes.slice().sort((a, b) => a.time - b.time || a.id - b.id);
     this.tailSec = tailSec;
   }
 
   setTail(tailSec: number): void {
     this.tailSec = tailSec;
+  }
+
+  getTail(): number {
+    return this.tailSec;
   }
 
   reset(): void {
@@ -199,10 +194,25 @@ export class NoteCursor {
   }
 }
 
+const cursorByChart = new WeakMap<Chart, NoteCursor>();
+
 /**
- * Convenience: visible notes for a frame. Pass the same `cursor` every frame (create with
- * `new NoteCursor(chart)`); supply `out` to avoid per-frame allocation.
+ * Visible notes for a frame — the spec signature `visibleNotes(chart, songTime, lookaheadSec)`.
+ * The moving cursor is kept per chart (WeakMap) so repeated calls with the same chart are amortized
+ * O(1); notes within `tailSec` (default 0.5 s) after their time are included so hit/miss animations
+ * can draw them. Pass a `NoteCursor` instead of a chart to control the tail explicitly, and `out` to
+ * avoid per-frame allocation.
  */
-export function visibleNotes(cursor: NoteCursor, songTime: number, lookaheadSec: number, out?: Note[]): Note[] {
+export function visibleNotes(source: Chart | NoteCursor, songTime: number, lookaheadSec: number, out?: Note[]): Note[] {
+  let cursor: NoteCursor;
+  if (source instanceof NoteCursor) cursor = source;
+  else {
+    let c = cursorByChart.get(source);
+    if (!c) {
+      c = new NoteCursor(source);
+      cursorByChart.set(source, c);
+    }
+    cursor = c;
+  }
   return cursor.collect(songTime, lookaheadSec, out);
 }

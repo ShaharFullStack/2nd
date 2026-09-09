@@ -87,6 +87,43 @@ export class EmaFilter implements ScalarFilter {
   }
 }
 
+/**
+ * First-order low-pass with a fixed cutoff in Hz (frame-rate independent; equals a OneEuro with beta 0).
+ * Group delay at low frequencies ~= 1 / (2*pi*cutoffHz).
+ */
+export class LowPassFilter implements ScalarFilter {
+  cutoffHz: number;
+  private x = NaN;
+  private t = NaN;
+
+  constructor(cutoffHz = 4.8) {
+    this.cutoffHz = cutoffHz;
+  }
+
+  get value(): number {
+    return this.x;
+  }
+
+  reset(): void {
+    this.x = NaN;
+    this.t = NaN;
+  }
+
+  filter(value: number, tSec: number): number {
+    if (Number.isNaN(this.x)) {
+      this.x = value;
+      this.t = tSec;
+      return value;
+    }
+    // Non-monotonic / duplicate timestamp: treat as one nominal frame (1/30 s).
+    const dt = tSec > this.t ? tSec - this.t : 1 / 30;
+    this.t += dt;
+    const a = smoothingFactor(this.cutoffHz, dt);
+    this.x = a * value + (1 - a) * this.x;
+    return this.x;
+  }
+}
+
 /** Pass-through (no smoothing). */
 export class IdentityFilter implements ScalarFilter {
   private x = NaN;
@@ -102,10 +139,24 @@ export class IdentityFilter implements ScalarFilter {
   }
 }
 
-export type FilterSpec =
-  | { kind: 'oneEuro'; minCutoff: number; beta: number; dCutoff?: number }
+/**
+ * UNIT-FREE, LINEAR filters allowed in the lane pipeline. Because they are linear and time-invariant
+ * they commute with the affine ROM normalization: filter(normalize(x)) == normalize(filter(x)) (before
+ * clamping), so filtering the raw feature is identical to filtering the 0..1 value, and the delay of
+ * every lane is the same regardless of the feature's unit (degrees vs ratio). OneEuro's `beta` term is
+ * unit-dependent (cutoff grows with |dx| in feature units) and is therefore NOT a LaneFilterSpec.
+ */
+export type LaneFilterSpec =
   | { kind: 'ema'; alpha: number }
+  | { kind: 'lowpass'; cutoffHz: number }
   | { kind: 'none' };
+
+export type FilterSpec =
+  | LaneFilterSpec
+  | { kind: 'oneEuro'; minCutoff: number; beta: number; dCutoff?: number };
+
+/** ARCHITECTURE default: EMA alpha 0.5 (~1 frame of lag at 30 fps). */
+export const DEFAULT_LANE_FILTER: LaneFilterSpec = Object.freeze({ kind: 'ema', alpha: 0.5 }) as LaneFilterSpec;
 
 export function createFilter(spec: FilterSpec): ScalarFilter {
   switch (spec.kind) {
@@ -113,7 +164,27 @@ export function createFilter(spec: FilterSpec): ScalarFilter {
       return new OneEuroFilter(spec);
     case 'ema':
       return new EmaFilter(spec.alpha);
+    case 'lowpass':
+      return new LowPassFilter(spec.cutoffHz);
     case 'none':
       return new IdentityFilter();
+  }
+}
+
+/**
+ * Low-frequency group delay (seconds) of a lane filter: the constant time a slow ramp/rep is delayed by.
+ * ema: (1-alpha)/alpha frames; lowpass: 1/(2*pi*fc); none: 0. `fps` is the sample rate the filter runs at.
+ * Exposed so the engine can fold the (identical for every lane) filter delay into its latency offset.
+ */
+export function filterGroupDelaySec(spec: LaneFilterSpec, fps: number): number {
+  switch (spec.kind) {
+    case 'ema': {
+      const a = Math.min(1, Math.max(1e-6, spec.alpha));
+      return fps > 0 ? (1 - a) / a / fps : 0;
+    }
+    case 'lowpass':
+      return spec.cutoffHz > 0 ? 1 / (2 * Math.PI * spec.cutoffHz) : 0;
+    case 'none':
+      return 0;
   }
 }

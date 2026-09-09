@@ -55,6 +55,23 @@ const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === 'obj
 const isFiniteNumber = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
 const isNonEmptyString = (v: unknown): v is string => typeof v === 'string' && v.trim().length > 0;
 
+/** Optional free-text field: blank strings become `undefined` (never hand the UI an empty value). */
+const optStr = (v: unknown): string | undefined => (isNonEmptyString(v) ? v.trim() : undefined);
+
+/** True for absolute http(s) URLs only. */
+export function isHttpUrl(v: unknown): v is string {
+  if (typeof v !== 'string') return false;
+  try {
+    const u = new URL(v);
+    return u.protocol === 'http:' || u.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+/** Optional link field: anything that is not an absolute http(s) URL (blank, relative path, other scheme) is dropped. */
+const optUrl = (v: unknown): string | undefined => (isHttpUrl(v) ? v.trim() : undefined);
+
 /** Validate a decoded song.json; throws a descriptive Error when it is not usable. */
 export function parseManifest(json: unknown): SongManifest {
   if (!isRecord(json)) throw new Error('manifest must be an object');
@@ -88,15 +105,14 @@ export function parseManifest(json: unknown): SongManifest {
   }
   if (problems.length > 0) throw new Error(`invalid song manifest${isNonEmptyString(json.id) ? ` "${json.id}"` : ''}: ${problems.join('; ')}`);
 
-  const optStr = (v: unknown): string | undefined => (typeof v === 'string' ? v : undefined);
   return {
     id: json.id as string,
     title: json.title as string,
     artist: json.artist as string,
-    artistUrl: optStr(json.artistUrl),
-    sourceUrl: optStr(json.sourceUrl),
+    artistUrl: optUrl(json.artistUrl),
+    sourceUrl: optUrl(json.sourceUrl),
     license: json.license as string,
-    licenseUrl: optStr(json.licenseUrl),
+    licenseUrl: optUrl(json.licenseUrl),
     attribution: optStr(json.attribution),
     description: optStr(json.description),
     bpm: json.bpm as number,

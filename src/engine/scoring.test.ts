@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it } from 'vitest';
 import { HEALTH_START, Scoring, multiplierForCombo, starsForAccuracy } from './scoring.ts';
 import type { HitEvent, Judgment } from './types.ts';
@@ -72,6 +73,13 @@ describe('Scoring', () => {
     expect(JSON.parse(JSON.stringify(st))).toEqual(st); // plain snapshot
     s.reset();
     expect(s.getState()).toMatchObject({ score: 0, combo: 0, hits: 0, misses: 0, health: HEALTH_START, accuracy: 0 });
+  });
+  it('rejects out-of-range lanes instead of misattributing them', () => {
+    const s = new Scoring(2);
+    expect(s.getLaneCount()).toBe(2);
+    expect(() => s.apply(ev('perfect', 2))).toThrow(/lane 2 out of range/);
+    expect(() => s.apply(ev('miss', -1))).toThrow(RangeError);
+    expect(s.getState().hits).toBe(0);
   });
   it('star rating', () => {
     expect([0, 0.2, 0.25, 0.5, 0.7, 0.85, 0.95, 1, Number.NaN].map(starsForAccuracy)).toEqual([0, 0, 1, 2, 3, 4, 5, 5, 0]);

@@ -81,6 +81,17 @@ export function seatedPose(params: SeatedPoseParams = {}): Landmark[] {
   return p;
 }
 
+/**
+ * Metric "world" landmarks for the same seated figure (MediaPipe worldLandmarks: metres, hip-centred).
+ * Same geometry as seatedPose scaled to a ~1.0 m torso-to-floor span, so tests can pass them as
+ * FeatureOptions.worldLandmarks.
+ */
+export function seatedPoseWorld(params: SeatedPoseParams = {}, metresPerUnit = 1.6): Landmark[] {
+  const p = seatedPose(params);
+  const hipMid = { x: (p[POSE.LEFT_HIP].x + p[POSE.RIGHT_HIP].x) / 2, y: (p[POSE.LEFT_HIP].y + p[POSE.RIGHT_HIP].y) / 2, z: 0 };
+  return p.map((l) => ({ x: (l.x - hipMid.x) * metresPerUnit, y: (l.y - hipMid.y) * metresPerUnit, z: l.z * metresPerUnit, visibility: l.visibility }));
+}
+
 export const seatedRest = (side: Side = 'left') => seatedPose({ side });
 export const seatedKneeLifted = (amount = 1, side: Side = 'left') => seatedPose({ kneeLift: amount, side });
 export const seatedLegExtended = (amount = 1, side: Side = 'left') => seatedPose({ kneeExtension: amount, side });
@@ -90,7 +101,13 @@ export const seatedKneeAbducted = (amount = 1, side: Side = 'left') => seatedPos
 export interface HandParams {
   /** 0 = fist, 1 = fully open (default 1). */
   openness?: number;
-  /** Raise the whole hand (wrist extension) 0..1. */
+  /**
+   * Wrist extension 0..1: rotates the hand about the wrist's lateral axis from hanging slightly down with
+   * the fingers toward the camera (0, elevation -10°) up to fingers pointing up / palm to camera (1, +80°).
+   * Default: fingers up (elevation 90°), the palm-to-camera pose used by the other hand movements.
+   */
+  wristExtension?: number;
+  /** Translate the whole hand up (forearm lift, a compensation — NOT wrist extension) 0..1. */
   wristRaise?: number;
   /** Thumb-index pinch 0..1 (1 = touching). */
   pinch?: number;
@@ -107,8 +124,10 @@ function h(x: number, y: number, z = 0): Landmark {
 }
 
 /**
- * Hand with the palm facing the camera, fingers pointing up (y decreasing). Wrist at (centerX, 0.75).
- * Palm size (wrist -> middle MCP) is 0.15 * scale.
+ * Hand rig. Built in a palm-local frame (u across the palm toward the pinky, v along the fingers,
+ * n out of the palm toward the camera), then pitched about the wrist's lateral axis by the elevation
+ * angle: 90° = fingers up / palm to camera (default), 0° = fingers pointing at the camera.
+ * Wrist at (centerX, 0.75). Palm size (wrist -> middle MCP) is 0.15 * scale; palm width 0.1 * scale.
  */
 export function handPose(params: HandParams = {}): Landmark[] {
   const o = params.openness ?? 1;
@@ -117,49 +136,57 @@ export function handPose(params: HandParams = {}): Landmark[] {
   const spread = params.spread ?? 0;
   const s = params.scale ?? 1;
   const cx = params.centerX ?? 0.5;
+  const elevDeg = params.wristExtension === undefined ? 90 : -10 + 90 * params.wristExtension;
+  const phi = (elevDeg * Math.PI) / 180;
   const wristY = 0.75 - 0.15 * w * s;
-  const out: Landmark[] = Array.from({ length: HAND_LANDMARK_COUNT }, () => h(cx, wristY));
-  const wrist = h(cx, wristY, 0);
-  out[HAND.WRIST] = wrist;
+  // Local (u, v, n) -> world: x = cx + u; y = wristY - v*sin(phi) + n*cos(phi); z = -v*cos(phi) - n*sin(phi).
+  const world = (u: number, v: number, n: number): Landmark => h(cx + u, wristY - v * Math.sin(phi) + n * Math.cos(phi), -v * Math.cos(phi) - n * Math.sin(phi));
+  const out: Landmark[] = Array.from({ length: HAND_LANDMARK_COUNT }, () => world(0, 0, 0));
+  out[HAND.WRIST] = world(0, 0, 0);
   const fingerLen = 0.16 * s;
-  // MCP row 0.15*s above the wrist, slightly fanned.
-  const mcpX = { index: -0.05, middle: -0.0167, ring: 0.0167, pinky: 0.05 };
-  const mcpY = wristY - 0.15 * s;
-  const fingers: Array<[keyof typeof mcpX, number, number, number, number, number]> = [
+  // MCP row 0.15*s along the fingers from the wrist, slightly fanned.
+  const mcpU = { index: -0.05, middle: -0.0167, ring: 0.0167, pinky: 0.05 };
+  const mcpV = 0.15 * s;
+  const fingers: Array<[keyof typeof mcpU, number, number, number, number, number]> = [
     ['index', HAND.INDEX_MCP, HAND.INDEX_PIP, HAND.INDEX_DIP, HAND.INDEX_TIP, -1],
     ['middle', HAND.MIDDLE_MCP, HAND.MIDDLE_PIP, HAND.MIDDLE_DIP, HAND.MIDDLE_TIP, -0.33],
     ['ring', HAND.RING_MCP, HAND.RING_PIP, HAND.RING_DIP, HAND.RING_TIP, 0.33],
     ['pinky', HAND.PINKY_MCP, HAND.PINKY_PIP, HAND.PINKY_DIP, HAND.PINKY_TIP, 1],
   ];
+  const local: Array<{ u: number; v: number; n: number }> = Array.from({ length: HAND_LANDMARK_COUNT }, () => ({ u: 0, v: 0, n: 0 }));
   for (const [name, mcp, pip, dip, tip, fan] of fingers) {
-    const mx = cx + mcpX[name] * s;
-    out[mcp] = h(mx, mcpY, 0);
-    // Direction: up, fanned outward by spread (up to ~25° for the outer fingers).
+    const mu = mcpU[name] * s;
+    local[mcp] = { u: mu, v: mcpV, n: 0 };
+    // Direction: along the fingers, fanned outward by spread (up to ~25° for the outer fingers).
     const ang = fan * spread * (25 * Math.PI) / 180;
-    const dx = Math.sin(ang);
-    const dy = -Math.cos(ang);
-    // Openness: extended length along the direction; curled fingers fold back toward the palm (z toward camera).
+    const du = Math.sin(ang);
+    const dv = Math.cos(ang);
+    // Openness: extended length along the direction; curled fingers fold back toward the palm (toward the camera).
     const ext = fingerLen * (0.25 + 0.75 * o);
-    const curlZ = -fingerLen * 0.5 * (1 - o);
-    out[pip] = h(mx + dx * ext * 0.4, mcpY + dy * ext * 0.4, curlZ * 0.3);
-    out[dip] = h(mx + dx * ext * 0.75, mcpY + dy * ext * 0.75, curlZ * 0.7);
-    out[tip] = h(mx + dx * ext, mcpY + dy * ext, curlZ);
+    const curl = fingerLen * 0.5 * (1 - o);
+    local[pip] = { u: mu + du * ext * 0.4, v: mcpV + dv * ext * 0.4, n: curl * 0.3 };
+    local[dip] = { u: mu + du * ext * 0.75, v: mcpV + dv * ext * 0.75, n: curl * 0.7 };
+    local[tip] = { u: mu + du * ext, v: mcpV + dv * ext, n: curl };
   }
   // Thumb: from the wrist out to the index side; pinch moves the tip to the index tip.
-  const thumbOpen = { x: cx - 0.14 * s, y: wristY - 0.12 * s, z: 0 };
-  const idxTip = out[HAND.INDEX_TIP];
-  const tipX = thumbOpen.x + (idxTip.x - thumbOpen.x) * pinch;
-  const tipY = thumbOpen.y + (idxTip.y - thumbOpen.y) * pinch;
-  const tipZ = thumbOpen.z + (idxTip.z - thumbOpen.z) * pinch;
-  out[HAND.THUMB_CMC] = h(cx - 0.04 * s, wristY - 0.03 * s, 0);
-  out[HAND.THUMB_MCP] = h(cx - 0.08 * s, wristY - 0.06 * s, 0);
-  out[HAND.THUMB_IP] = h((out[HAND.THUMB_MCP].x + tipX) / 2, (out[HAND.THUMB_MCP].y + tipY) / 2, tipZ / 2);
-  out[HAND.THUMB_TIP] = h(tipX, tipY, tipZ);
+  const thumbOpen = { u: -0.14 * s, v: 0.12 * s, n: 0 };
+  const idxTip = local[HAND.INDEX_TIP];
+  const tipU = thumbOpen.u + (idxTip.u - thumbOpen.u) * pinch;
+  const tipV = thumbOpen.v + (idxTip.v - thumbOpen.v) * pinch;
+  const tipN = thumbOpen.n + (idxTip.n - thumbOpen.n) * pinch;
+  local[HAND.THUMB_CMC] = { u: -0.04 * s, v: 0.03 * s, n: 0 };
+  local[HAND.THUMB_MCP] = { u: -0.08 * s, v: 0.06 * s, n: 0 };
+  local[HAND.THUMB_IP] = { u: (local[HAND.THUMB_MCP].u + tipU) / 2, v: (local[HAND.THUMB_MCP].v + tipV) / 2, n: tipN / 2 };
+  local[HAND.THUMB_TIP] = { u: tipU, v: tipV, n: tipN };
+  for (let k = 1; k < HAND_LANDMARK_COUNT; k++) out[k] = world(local[k].u, local[k].v, local[k].n);
   return out;
 }
 
 export const handOpen = () => handPose({ openness: 1 });
 export const handFist = () => handPose({ openness: 0 });
+/** Wrist extension rep: the hand rotates up about the wrist (forearm stays put). */
+export const handWristExtended = (amount = 1) => handPose({ wristExtension: amount });
+/** Whole-hand translation only (forearm lift compensation) — wrist_extension must NOT respond to this. */
 export const handWristRaised = (amount = 1) => handPose({ wristRaise: amount });
 export const handPinch = (amount = 1) => handPose({ pinch: amount });
 export const handSpread = (amount = 1) => handPose({ spread: amount });

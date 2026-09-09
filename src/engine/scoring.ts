@@ -135,9 +135,17 @@ export class Scoring {
     return this.health;
   }
 
-  /** Apply a judgment. Returns the points awarded and the resulting combo/multiplier/health. */
+  getLaneCount(): number {
+    return this.lanes.length;
+  }
+
+  /**
+   * Apply a judgment. Returns the points awarded and the resulting combo/multiplier/health.
+   * @throws RangeError when `e.lane` is not in [0, laneCount) — per-lane rehab metrics must never be silently misattributed.
+   */
   apply(e: HitEvent): ScoreDelta {
-    const laneAcc = this.lanes[e.lane] ?? this.lanes[this.lanes.length - 1];
+    const laneAcc = this.lanes[e.lane];
+    if (laneAcc === undefined) throw new RangeError(`Scoring: lane ${e.lane} out of range [0, ${this.lanes.length})`);
     let points = 0;
     if (e.judgment === 'miss') {
       this.combo = 0;

@@ -49,6 +49,8 @@ export interface RenderFrame {
   bpm: number;
   /** Fraction 0..1 of the way through the current beat. */
   beatPhase: number;
+  /** Index of the current beat since the chart's first beat (for bar lines every 4 beats). Defaults to floor(songTime*bpm/60). */
+  beatIndex?: number;
   songTitle?: string;
   attribution?: string;
   /** Optional audio-reactive energy 0..1 (e.g. RMS of the mix); boosts glow intensity. */

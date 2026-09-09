@@ -124,6 +124,20 @@ export function palmSize(hand: readonly Landmark[]): number {
   return distance(hand[HAND.WRIST], hand[HAND.MIDDLE_MCP]);
 }
 
+/** Palm size in the image plane only (wrist -> middle MCP, x/y). Used by the 2D hand features. */
+export function palmSize2d(hand: readonly Landmark[]): number {
+  return distance2d(hand[HAND.WRIST], hand[HAND.MIDDLE_MCP]);
+}
+
+/**
+ * Palm width in the image plane: index MCP -> pinky MCP. The MCP row is parallel to the wrist
+ * flexion/extension axis, so this length is invariant under wrist extension (unlike palm length,
+ * which foreshortens) — it is the scale normalizer for wrist_extension.
+ */
+export function palmWidth2d(hand: readonly Landmark[]): number {
+  return distance2d(hand[HAND.INDEX_MCP], hand[HAND.PINKY_MCP]);
+}
+
 /** True when the landmark exists and (for pose) its visibility is at least `minVisibility`. */
 export function isVisible(lm: Landmark | undefined, minVisibility: number = MIN_VISIBILITY): lm is Landmark {
   if (!lm) return false;

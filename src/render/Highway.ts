@@ -14,6 +14,7 @@ import type { Judgment } from '../engine/types';
 import {
   beatLineTimes,
   clamp,
+  depthAtY,
   depthOf,
   isVisibleDepth,
   laneBoundaryX,
@@ -45,7 +46,7 @@ export const DEFAULT_HIGHWAY_OPTIONS: HighwayOptions = {
   approachSec: 1.6,
   horizonY: 0.35,
   strikeY: 0.82,
-  farScale: 0.22,
+  farScale: 0.28,
   roadWidth: 0.6,
   highContrast: false,
   showLabels: true,
@@ -355,32 +356,47 @@ export class Highway {
     }
     ctx.globalCompositeOperation = 'source-over';
 
-    // Side panels: dark slabs outside the road at the near end with a beat-pulsing glow strip.
+    // Side panels: dark slabs filling the space outside the road, with a beat-pulsing glow band
+    // hugging each road edge.
     const g = this.geom;
-    const leftEdge = roadEdgeX(g, -1, g.minDepth);
-    const rightEdge = roadEdgeX(g, 1, g.minDepth);
-    const panelTop = g.horizonY + (g.strikeY - g.horizonY) * 0.35;
-    const glowA = 0.08 + beatPulse * 0.16 + energy * 0.1;
+    const panelTop = g.horizonY + (g.strikeY - g.horizonY) * 0.3;
+    const dTop = depthAtY(g, panelTop);
+    const yBottom = yAt(g, g.minDepth);
+    const glowA = 0.1 + beatPulse * 0.18 + energy * 0.12;
     const tier = multiplierTier(mult);
-    const panelW = Math.max(0, leftEdge);
-    if (panelW > 4) {
+    const bandW = 26 * this.u;
+    for (let side = -1; side <= 1; side += 2) {
+      const sd = side as -1 | 1;
+      const outerX = sd < 0 ? 0 : W;
+      const eTop = roadEdgeX(g, sd, dTop);
+      const eBot = roadEdgeX(g, sd, g.minDepth);
+      if (Math.abs(outerX - eBot) < 6) continue;
       const lp = ctx.createLinearGradient(0, panelTop, 0, H);
-      lp.addColorStop(0, 'rgba(14,17,32,0)');
-      lp.addColorStop(0.4, withAlpha(UI_COLORS.panel, 0.65));
-      lp.addColorStop(1, withAlpha(UI_COLORS.panel, 0.9));
+      lp.addColorStop(0, withAlpha(UI_COLORS.panel, 0));
+      lp.addColorStop(0.35, withAlpha(UI_COLORS.panel, 0.7));
+      lp.addColorStop(1, withAlpha(UI_COLORS.panel, 0.92));
       ctx.fillStyle = lp;
-      ctx.fillRect(0, panelTop, panelW, H - panelTop);
-      ctx.fillRect(rightEdge, panelTop, W - rightEdge, H - panelTop);
-      // Glow strips along the panel inner edges
-      const stripW = Math.max(3, 10 * this.u);
+      ctx.beginPath();
+      ctx.moveTo(outerX, panelTop);
+      ctx.lineTo(eTop, panelTop);
+      ctx.lineTo(eBot, yBottom);
+      ctx.lineTo(outerX, yBottom);
+      ctx.closePath();
+      ctx.fill();
+      // Glow band just outside the road edge.
       ctx.globalCompositeOperation = 'lighter';
       const sg = ctx.createLinearGradient(0, panelTop, 0, H);
       sg.addColorStop(0, withAlpha(tier.glow, 0));
-      sg.addColorStop(0.5, withAlpha(tier.color, glowA));
-      sg.addColorStop(1, withAlpha(tier.color, glowA * 0.6));
+      sg.addColorStop(0.55, withAlpha(tier.color, glowA));
+      sg.addColorStop(1, withAlpha(tier.color, glowA * 0.5));
       ctx.fillStyle = sg;
-      ctx.fillRect(Math.max(0, panelW - stripW * 2.5), panelTop, stripW * 2.5, H - panelTop);
-      ctx.fillRect(rightEdge, panelTop, stripW * 2.5, H - panelTop);
+      ctx.beginPath();
+      ctx.moveTo(eTop, panelTop);
+      ctx.lineTo(eTop + sd * bandW, panelTop);
+      ctx.lineTo(eBot + sd * bandW, yBottom);
+      ctx.lineTo(eBot, yBottom);
+      ctx.closePath();
+      ctx.fill();
       ctx.globalCompositeOperation = 'source-over';
     }
   }
@@ -425,7 +441,7 @@ export class Highway {
     ctx.fill();
 
     // Beat / bar lines
-    const lines = beatLineTimes(g, frame.songTime, frame.bpm, frame.beatPhase);
+    const lines = beatLineTimes(g, frame.songTime, frame.bpm, frame.beatPhase, 4, frame.beatIndex);
     ctx.lineCap = 'butt';
     for (let pass = 0; pass < 2; pass++) {
       const bar = pass === 1;
@@ -922,10 +938,11 @@ export class Highway {
     const health = clamp(frame.health, 0, 1);
     this.healthSmooth += (health - this.healthSmooth) * clamp(dt * 6, 0, 1);
     const hv = this.healthSmooth;
-    const leftPanelW = Math.max(0, roadEdgeX(g, -1, g.minDepth));
-    const gaugeR = clamp(Math.min(leftPanelW * 0.38, H * 0.11, 90 * u), 24, 140);
-    const gx = Math.max(gaugeR + pad, leftPanelW / 2);
-    const gy = g.strikeY - gaugeR * 0.2;
+    // Size the gauge from the free space left of the road at the strike line; keep it clear of the road edge.
+    const leftPanelW = Math.max(0, roadEdgeX(g, -1, 0));
+    const gaugeR = clamp(Math.min(leftPanelW * 0.3, H * 0.1, 90 * u), 18, 140);
+    const gx = Math.max(gaugeR * 1.25 + pad, leftPanelW * 0.45);
+    const gy = g.strikeY - gaugeR * 0.9;
     const a0 = Math.PI * 0.75;
     const a1 = Math.PI * 2.25;
     ctx.lineCap = 'round';

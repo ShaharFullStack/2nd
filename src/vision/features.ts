@@ -3,22 +3,30 @@
  * Every extractor: feature(landmarks, side, opts?) -> number | null (null when landmarks missing / low
  * visibility). All features are oriented so that MORE movement => LARGER value (higherIsMore = true).
  *
- * LEG extractors take the 33 Pose landmarks; angle features use x/y/z (Pose z is needed because a seated,
- * camera-facing patient's thigh is foreshortened in the image plane).
+ * LEG extractors take the 33 Pose landmarks. Ratio features (seated_march, hip_abduction) are image-plane
+ * only. Angle features (knee_extension, ankle_dorsiflexion) need depth because a seated, camera-facing
+ * patient's thigh is foreshortened in the image plane: pass MediaPipe's metric `worldLandmarks` via
+ * `opts.worldLandmarks` (preferred; image-space z is the noisiest coordinate) — they fall back to the
+ * image landmarks' z when absent. Visibility is always gated on the image landmarks.
  * HAND extractors take the 21 landmarks of the ALREADY-SELECTED hand (side is used only for symmetry);
- * hand selection by side happens in src/vision/mediapipe.ts / VisionInput.
+ * hand selection by side happens in src/vision/mediapipe.ts / VisionInput. They use x/y only (Hand z
+ * is a low-fidelity relative depth) and are position- and scale-invariant.
  */
 import type { Mode, Movement, Side } from '../engine/types.ts';
 import {
-  HAND, POSE, FINGERTIP_INDEX, allVisible, angleAtJoint, angleBetween2d, distance, midpoint, sub, palmSize,
+  HAND, POSE, FINGERTIP_INDEX, allVisible, angleAtJoint, angleBetween2d, distance, distance2d, midpoint, sub, palmSize, palmSize2d, palmWidth2d,
 } from './landmarks.ts';
 import type { Fingertip, Landmark } from './landmarks.ts';
+import type { LaneFilterSpec } from './filters.ts';
+import { median } from './stats.ts';
 
 export interface FeatureOptions {
   /** finger_opposition: which fingertip opposes the thumb (default 'index'). */
   fingertip?: Fingertip;
   /** Minimum pose visibility (default MIN_VISIBILITY). */
   minVisibility?: number;
+  /** Pose world landmarks (metres, hip-centred) for the same frame; used by the 3D angle features. */
+  worldLandmarks?: readonly Landmark[] | null;
 }
 
 export type FeatureExtractor = (landmarks: readonly Landmark[] | null | undefined, side: Side, opts?: FeatureOptions) => number | null;
@@ -31,12 +39,19 @@ function poseIdx(side: Side) {
 
 const TORSO_IDX = [POSE.LEFT_SHOULDER, POSE.RIGHT_SHOULDER, POSE.LEFT_HIP, POSE.RIGHT_HIP];
 
-/** Torso length in image units: mid-shoulder to mid-hip (2D+z). null if not visible or degenerate. */
+/** Torso length in image units: mid-shoulder to mid-hip (image plane). null if not visible or degenerate. */
 export function torsoLength(pose: readonly Landmark[] | null | undefined, minVisibility?: number): number | null {
   if (!allVisible(pose, TORSO_IDX, minVisibility)) return null;
   const p = pose as readonly Landmark[];
-  const len = distance(midpoint(p[POSE.LEFT_SHOULDER], p[POSE.RIGHT_SHOULDER]), midpoint(p[POSE.LEFT_HIP], p[POSE.RIGHT_HIP]));
+  const len = distance2d(midpoint(p[POSE.LEFT_SHOULDER], p[POSE.RIGHT_SHOULDER]), midpoint(p[POSE.LEFT_HIP], p[POSE.RIGHT_HIP]));
   return len > 1e-4 ? len : null;
+}
+
+/** The landmark set used for 3D angles: world landmarks when supplied (and complete), else image landmarks. */
+function angleSource(pose: readonly Landmark[], opts: FeatureOptions | undefined, indices: readonly number[]): readonly Landmark[] {
+  const w = opts?.worldLandmarks;
+  if (w && allVisible(w, indices, -Infinity)) return w;
+  return pose;
 }
 
 /** seated_march: knee height above hip normalized by torso length. (hip.y - knee.y)/torsoLen */
@@ -49,22 +64,24 @@ export const seatedMarch: FeatureExtractor = (pose, side, opts) => {
   return (p[i.hip].y - p[i.knee].y) / torso;
 };
 
-/** knee_extension: interior angle hip-knee-ankle in degrees (90 = bent, 180 = straight). */
+/** knee_extension: interior angle hip-knee-ankle in degrees (90 = bent, 180 = straight). 3D (world landmarks preferred). */
 export const kneeExtension: FeatureExtractor = (pose, side, opts) => {
   const i = poseIdx(side);
-  if (!allVisible(pose, [i.hip, i.knee, i.ankle], opts?.minVisibility)) return null;
-  const p = pose as readonly Landmark[];
+  const idx = [i.hip, i.knee, i.ankle];
+  if (!allVisible(pose, idx, opts?.minVisibility)) return null;
+  const p = angleSource(pose as readonly Landmark[], opts, idx);
   return angleAtJoint(p[i.hip], p[i.knee], p[i.ankle]);
 };
 
 /**
  * ankle_dorsiflexion: 180 - (interior angle at the ankle between ankle->knee and ankle->foot_index).
- * Rest ~ 90 (foot flat, shin vertical); toes lifted => angle shrinks => feature grows.
+ * Rest ~ 90 (foot flat, shin vertical); toes lifted => angle shrinks => feature grows. 3D (world landmarks preferred).
  */
 export const ankleDorsiflexion: FeatureExtractor = (pose, side, opts) => {
   const i = poseIdx(side);
-  if (!allVisible(pose, [i.knee, i.ankle, i.foot], opts?.minVisibility)) return null;
-  const p = pose as readonly Landmark[];
+  const idx = [i.knee, i.ankle, i.foot];
+  if (!allVisible(pose, idx, opts?.minVisibility)) return null;
+  const p = angleSource(pose as readonly Landmark[], opts, idx);
   return 180 - angleAtJoint(p[i.knee], p[i.ankle], p[i.foot]);
 };
 
@@ -83,33 +100,39 @@ const HAND_ALL = Array.from({ length: 21 }, (_, k) => k);
 
 function handOk(hand: readonly Landmark[] | null | undefined): hand is readonly Landmark[] {
   // Hand landmarks carry no meaningful visibility: only presence/finiteness is checked.
-  return allVisible(hand, HAND_ALL, -Infinity) && palmSize(hand as readonly Landmark[]) > 1e-4;
+  return allVisible(hand, HAND_ALL, -Infinity) && palmSize(hand as readonly Landmark[]) > 1e-4 && palmSize2d(hand as readonly Landmark[]) > 1e-4;
 }
 
-/** hand_open_close: mean (index..pinky fingertip -> wrist distance) / palm size. Open => larger. */
+/** hand_open_close: mean (index..pinky fingertip -> wrist image distance) / palm size (2D). Open => larger. */
 export const handOpenClose: FeatureExtractor = (hand) => {
   if (!handOk(hand)) return null;
-  const ps = palmSize(hand);
+  const ps = palmSize2d(hand);
   let sum = 0;
-  for (const t of FINGER_TIPS) sum += distance(hand[t], hand[HAND.WRIST]);
+  for (const t of FINGER_TIPS) sum += distance2d(hand[t], hand[HAND.WRIST]);
   return sum / FINGER_TIPS.length / ps;
 };
 
 /**
- * wrist_extension (pose-less estimate): vertical rise of the wrist landmark, normalized by palm size.
- * feature = -wrist.y / palmSize (image y grows downward, so raising the wrist => larger).
- * The rest baseline is absorbed by ROM calibration (min).
+ * wrist_extension: elevation of the hand about the wrist. Setup: forearm resting on the table, hand over
+ * the edge, fingers toward the camera (rest = hand hanging level/slightly down); extension rotates the
+ * hand up about the wrist so the knuckles rise ABOVE the wrist.
+ *   feature = (wrist.y - middle_mcp.y) / palmWidth   (image y grows downward => knuckles up => positive)
+ * palmWidth (index MCP -> pinky MCP, 2D) lies on the extension axis so it does not foreshorten during the
+ * movement; the feature is invariant to whole-arm translation and camera distance, so lifting the
+ * forearm/elbow (the compensation) does not score.
  */
 export const wristExtension: FeatureExtractor = (hand) => {
   if (!handOk(hand)) return null;
-  return -hand[HAND.WRIST].y / palmSize(hand);
+  const width = palmWidth2d(hand);
+  if (width < 1e-4) return null;
+  return (hand[HAND.WRIST].y - hand[HAND.MIDDLE_MCP].y) / width;
 };
 
-/** finger_opposition: 1 - (thumb_tip -> chosen fingertip distance / palm size). Pinch => larger. */
+/** finger_opposition: 1 - (thumb_tip -> chosen fingertip image distance / palm size 2D). Pinch => larger. */
 export const fingerOpposition: FeatureExtractor = (hand, _side, opts) => {
   if (!handOk(hand)) return null;
   const tip = FINGERTIP_INDEX[opts?.fingertip ?? 'index'];
-  return 1 - distance(hand[HAND.THUMB_TIP], hand[tip]) / palmSize(hand);
+  return 1 - distance2d(hand[HAND.THUMB_TIP], hand[tip]) / palmSize2d(hand);
 };
 
 /** finger_spread: 2D angle (degrees) between index MCP->tip and pinky MCP->tip vectors. Spread => larger. */
@@ -138,13 +161,23 @@ export function extractFeature(movement: Movement, landmarks: readonly Landmark[
 
 export type CompensationKind = 'heel_lift' | 'trunk_lean';
 
-/** Captured at rest (calibration) so compensation can be measured relative to the patient's own posture. */
+/**
+ * One frame's raw compensation quantities (before comparing with a baseline):
+ *   heel_lift : value = heel.y (image), scale = shin length knee->ankle (image)
+ *   trunk_lean: value = trunk tilt from vertical in degrees, scale = 1
+ * The calibrator accumulates these over the rest phase and takes medians (see baselineFromSamples).
+ */
+export interface CompensationSample { kind: CompensationKind; value: number; scale: number; }
+
+/** Rest baseline so compensation can be measured relative to the patient's own posture. */
 export interface CompensationBaseline {
   kind: CompensationKind;
   /** heel_lift: rest heel.y; trunk_lean: rest trunk tilt in degrees from vertical. */
   value: number;
   /** heel_lift: shin length at rest (knee->ankle) used as the scale. */
   scale: number;
+  /** Number of rest frames the baseline was taken from (1 = single frame). */
+  samples?: number;
 }
 
 export interface CompensationResult {
@@ -176,8 +209,8 @@ export function trunkTiltDeg(pose: readonly Landmark[] | null | undefined, minVi
   return angleBetween2d(up, { x: 0, y: -1, z: 0 });
 }
 
-/** Capture the rest baseline for the movement's compensation check (null: not applicable / not visible). */
-export function captureCompensationBaseline(movement: Movement, pose: readonly Landmark[] | null | undefined, side: Side, opts?: FeatureOptions): CompensationBaseline | null {
+/** Measure this frame's raw compensation quantities for the movement (null: not applicable / not visible). */
+export function measureCompensation(movement: Movement, pose: readonly Landmark[] | null | undefined, side: Side, opts?: FeatureOptions): CompensationSample | null {
   const kind = compensationKind(movement);
   if (!kind || !pose) return null;
   if (kind === 'heel_lift') {
@@ -191,27 +224,48 @@ export function captureCompensationBaseline(movement: Movement, pose: readonly L
   return tilt === null ? null : { kind, value: tilt, scale: 1 };
 }
 
+/** Median-combine rest-phase samples into a baseline (null for an empty list). */
+export function baselineFromSamples(samples: readonly CompensationSample[]): CompensationBaseline | null {
+  if (samples.length === 0) return null;
+  return {
+    kind: samples[0].kind,
+    value: median(samples.map((s) => s.value)),
+    scale: median(samples.map((s) => s.scale)),
+    samples: samples.length,
+  };
+}
+
+/**
+ * Capture a baseline from a SINGLE rest frame (null: not applicable / not visible). Prefer the
+ * calibrator's rest-phase median (RomCalibration.compensationBaseline), which is robust to jitter.
+ */
+export function captureCompensationBaseline(movement: Movement, pose: readonly Landmark[] | null | undefined, side: Side, opts?: FeatureOptions): CompensationBaseline | null {
+  const s = measureCompensation(movement, pose, side, opts);
+  return s ? { kind: s.kind, value: s.value, scale: s.scale, samples: 1 } : null;
+}
+
+/** Evaluate a measured sample against a rest baseline. */
+export function evaluateCompensation(sample: CompensationSample, baseline: CompensationBaseline): CompensationResult | null {
+  if (sample.kind !== baseline.kind) return null;
+  if (sample.kind === 'heel_lift') {
+    const scale = baseline.scale > 1e-4 ? baseline.scale : sample.scale;
+    const rise = (baseline.value - sample.value) / scale; // y grows downward: rise = baseline - now
+    return { kind: 'heel_lift', value: rise, tolerance: HEEL_LIFT_TOLERANCE, flagged: rise > HEEL_LIFT_TOLERANCE };
+  }
+  const extra = sample.value - baseline.value;
+  return { kind: 'trunk_lean', value: extra, tolerance: TRUNK_LEAN_TOLERANCE_DEG, flagged: extra > TRUNK_LEAN_TOLERANCE_DEG };
+}
+
 /** Evaluate the compensation for the current frame against a rest baseline. */
 export function checkCompensation(movement: Movement, pose: readonly Landmark[] | null | undefined, side: Side, baseline: CompensationBaseline, opts?: FeatureOptions): CompensationResult | null {
-  const kind = compensationKind(movement);
-  if (!kind || kind !== baseline.kind || !pose) return null;
-  if (kind === 'heel_lift') {
-    const i = poseIdx(side);
-    if (!allVisible(pose, [i.heel], opts?.minVisibility)) return null;
-    const rise = (baseline.value - pose[i.heel].y) / baseline.scale; // y grows downward: rise = baseline - now
-    return { kind, value: rise, tolerance: HEEL_LIFT_TOLERANCE, flagged: rise > HEEL_LIFT_TOLERANCE };
-  }
-  const tilt = trunkTiltDeg(pose, opts?.minVisibility);
-  if (tilt === null) return null;
-  const extra = tilt - baseline.value;
-  return { kind, value: extra, tolerance: TRUNK_LEAN_TOLERANCE_DEG, flagged: extra > TRUNK_LEAN_TOLERANCE_DEG };
+  const sample = measureCompensation(movement, pose, side, opts);
+  return sample ? evaluateCompensation(sample, baseline) : null;
 }
 
 /* ---------------- movement info ---------------- */
 
-export type SmoothingSpec =
-  | { kind: 'oneEuro'; minCutoff: number; beta: number; dCutoff?: number }
-  | { kind: 'ema'; alpha: number };
+/** Lane smoothing spec (unit-free linear filters only; see filters.ts LaneFilterSpec). */
+export type SmoothingSpec = LaneFilterSpec;
 
 export interface MovementInfo {
   movement: Movement;
@@ -225,7 +279,10 @@ export interface MovementInfo {
   restInstruction: string;
   /** True when a larger feature value means more movement (all built-in extractors). */
   higherIsMore: boolean;
-  /** Suggested smoothing for the raw feature stream at ~30 fps. */
+  /**
+   * Smoothing applied by the lane pipeline (identical path for calibration and play). Unit-free and
+   * linear, so every lane has the same delay whatever its feature unit; default EMA alpha 0.5 (~1 frame).
+   */
   smoothing: SmoothingSpec;
   /** Minimum acceptable (max - min) in feature units; below this calibration reports insufficient_range. */
   minRom: number;
@@ -243,7 +300,7 @@ export const MOVEMENT_INFO: Readonly<Record<Movement, MovementInfo>> = Object.fr
     instructions: 'Lift your knee up toward the ceiling, then lower it.',
     calibrationInstruction: 'Lift your knee as high as is comfortable, lower it, and repeat 3 times.',
     restInstruction: 'Sit upright with both feet flat on the floor and hold still.',
-    higherIsMore: true, smoothing: { kind: 'oneEuro', minCutoff: 1.5, beta: 0.05 },
+    higherIsMore: true, smoothing: { kind: 'ema', alpha: 0.5 },
     minRom: 0.12, unit: 'ratio', compensation: 'trunk_lean', requiredVisible: 'knees_up',
   },
   knee_extension: {
@@ -251,7 +308,7 @@ export const MOVEMENT_INFO: Readonly<Record<Movement, MovementInfo>> = Object.fr
     instructions: 'Straighten your knee, kicking your foot forward, then lower it.',
     calibrationInstruction: 'Straighten your knee as far as is comfortable, relax, and repeat 3 times.',
     restInstruction: 'Sit upright with your foot flat on the floor and hold still.',
-    higherIsMore: true, smoothing: { kind: 'oneEuro', minCutoff: 1.5, beta: 0.05 },
+    higherIsMore: true, smoothing: { kind: 'ema', alpha: 0.5 },
     minRom: 20, unit: 'deg', compensation: null, requiredVisible: 'feet',
   },
   ankle_dorsiflexion: {
@@ -259,7 +316,7 @@ export const MOVEMENT_INFO: Readonly<Record<Movement, MovementInfo>> = Object.fr
     instructions: 'Lift your toes toward your shin, keeping your heel on the floor.',
     calibrationInstruction: 'Lift your toes as high as is comfortable (heel down), relax, and repeat 3 times.',
     restInstruction: 'Keep your foot flat on the floor and hold still.',
-    higherIsMore: true, smoothing: { kind: 'oneEuro', minCutoff: 1.0, beta: 0.03 },
+    higherIsMore: true, smoothing: { kind: 'ema', alpha: 0.5 },
     minRom: 10, unit: 'deg', compensation: 'heel_lift', requiredVisible: 'feet',
   },
   hip_abduction: {
@@ -267,7 +324,7 @@ export const MOVEMENT_INFO: Readonly<Record<Movement, MovementInfo>> = Object.fr
     instructions: 'Move your knee out to the side, then bring it back.',
     calibrationInstruction: 'Move your knee out to the side as far as is comfortable, return, and repeat 3 times.',
     restInstruction: 'Sit with your knees together over your feet and hold still.',
-    higherIsMore: true, smoothing: { kind: 'oneEuro', minCutoff: 1.5, beta: 0.05 },
+    higherIsMore: true, smoothing: { kind: 'ema', alpha: 0.5 },
     minRom: 0.1, unit: 'ratio', compensation: null, requiredVisible: 'knees_up',
   },
   hand_open_close: {
@@ -275,15 +332,15 @@ export const MOVEMENT_INFO: Readonly<Record<Movement, MovementInfo>> = Object.fr
     instructions: 'Open your hand wide, then make a fist.',
     calibrationInstruction: 'Open your hand as wide as is comfortable, close it, and repeat 3 times.',
     restInstruction: 'Rest your forearm on the table, palm to the camera, hand relaxed (loosely closed).',
-    higherIsMore: true, smoothing: { kind: 'oneEuro', minCutoff: 2.0, beta: 0.1 },
+    higherIsMore: true, smoothing: { kind: 'ema', alpha: 0.5 },
     minRom: 0.35, unit: 'ratio', compensation: null, requiredVisible: 'full_hand',
   },
   wrist_extension: {
     movement: 'wrist_extension', label: 'Wrist extension', mode: 'hand',
-    instructions: 'Lift your hand up at the wrist, keeping your forearm on the table.',
-    calibrationInstruction: 'Lift your hand up at the wrist as far as is comfortable, lower it, and repeat 3 times.',
-    restInstruction: 'Rest your forearm and hand flat on the table and hold still.',
-    higherIsMore: true, smoothing: { kind: 'oneEuro', minCutoff: 1.5, beta: 0.05 },
+    instructions: 'Bend your hand up at the wrist so your knuckles rise, keeping your forearm on the table.',
+    calibrationInstruction: 'Bend your hand up at the wrist as far as is comfortable, let it drop back, and repeat 3 times.',
+    restInstruction: 'Rest your forearm on the table with your hand over the edge, fingers pointing at the camera, and hold still.',
+    higherIsMore: true, smoothing: { kind: 'ema', alpha: 0.5 },
     minRom: 0.35, unit: 'ratio', compensation: null, requiredVisible: 'full_hand',
   },
   finger_opposition: {
@@ -291,7 +348,7 @@ export const MOVEMENT_INFO: Readonly<Record<Movement, MovementInfo>> = Object.fr
     instructions: 'Touch your thumb to your fingertip, then open again.',
     calibrationInstruction: 'Touch your thumb to the fingertip, open your hand, and repeat 3 times.',
     restInstruction: 'Rest your hand open, palm to the camera, and hold still.',
-    higherIsMore: true, smoothing: { kind: 'oneEuro', minCutoff: 2.0, beta: 0.1 },
+    higherIsMore: true, smoothing: { kind: 'ema', alpha: 0.5 },
     minRom: 0.25, unit: 'ratio', compensation: null, requiredVisible: 'full_hand',
   },
   finger_spread: {
@@ -299,7 +356,7 @@ export const MOVEMENT_INFO: Readonly<Record<Movement, MovementInfo>> = Object.fr
     instructions: 'Spread your fingers wide apart, then bring them together.',
     calibrationInstruction: 'Spread your fingers as wide as is comfortable, relax, and repeat 3 times.',
     restInstruction: 'Rest your hand open with fingers together, palm to the camera.',
-    higherIsMore: true, smoothing: { kind: 'oneEuro', minCutoff: 2.0, beta: 0.1 },
+    higherIsMore: true, smoothing: { kind: 'ema', alpha: 0.5 },
     minRom: 12, unit: 'deg', compensation: null, requiredVisible: 'full_hand',
   },
 });

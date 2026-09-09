@@ -52,7 +52,7 @@ export const DEFAULT_GEOMETRY_OPTIONS: GeometryOptions = {
   approachSec: 1.6,
   horizonY: 0.35,
   strikeY: 0.82,
-  farScale: 0.22,
+  farScale: 0.28,
   roadWidth: 0.6,
 };
 
@@ -190,13 +190,14 @@ export function beatLineTimes(
   bpm: number,
   beatPhase: number,
   beatsPerBar = 4,
+  beatIndexHint?: number,
 ): Array<{ time: number; bar: boolean }> {
   const out: Array<{ time: number; bar: boolean }> = [];
   if (!(bpm > 0) || !Number.isFinite(bpm)) return out;
   const beatSec = 60 / bpm;
   const phase = clamp(beatPhase, 0, 0.999999);
-  // Beat index of the most recent beat (assumes beatPhase is consistent with songTime).
-  const beatIndex = Math.round(songTime / beatSec - phase);
+  // Beat index of the most recent beat. Without a hint we assume beat 0 at song time 0.
+  const beatIndex = beatIndexHint !== undefined && Number.isFinite(beatIndexHint) ? Math.floor(beatIndexHint) : Math.round(songTime / beatSec - phase);
   const lastBeatTime = songTime - phase * beatSec;
   const first = Math.floor((g.minDepth * g.approachSec) / beatSec) - 1;
   const last = Math.ceil((g.maxDepth * g.approachSec) / beatSec) + 1;

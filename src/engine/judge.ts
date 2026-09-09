@@ -10,20 +10,62 @@ const STATE_NAMES: readonly NoteState[] = ['pending', 'perfect', 'good', 'miss']
 
 const EMPTY: readonly HitEvent[] = Object.freeze([]) as readonly HitEvent[];
 
+export interface JudgeOptions {
+  /**
+   * Input pipeline latency (seconds, from calibration). An input observed at song time t is judged
+   * at (t - latencyOffsetSec); `update()` runs on the same shifted timeline. Apply it HERE ONLY —
+   * never also shift the SongClock (see `RhythmEngine` for the composed recipe).
+   */
+  latencyOffsetSec?: number;
+  /**
+   * Grace (ms) that `update()` lags behind the frame time before declaring a miss. Needed when
+   * inputs are timestamped at capture (camera frame) but delivered later (inference): an in-window
+   * hit delivered 30–100 ms after its timestamp must not already have been turned into a miss.
+   * Default 0 (spec-exact: miss when note time + goodMs has elapsed); `RhythmEngine` defaults to
+   * `DEFAULT_MISS_GRACE_MS`. Misses keep their nominal `time` (note time + goodMs) regardless.
+   */
+  missGraceMs?: number;
+}
+
+/** Miss grace used by `RhythmEngine`: covers 30 fps capture + inference delivery delay. */
+export const DEFAULT_MISS_GRACE_MS = 100;
+
+/** Validate chart invariants the Judge relies on: unique ids, lanes in [0, chart.lanes), finite times. Throws. */
+export function validateChartForJudge(chart: Chart): void {
+  const lanes = chart.lanes;
+  if (!Number.isInteger(lanes) || lanes < 1) throw new RangeError(`Judge: chart.lanes must be a positive integer (got ${lanes})`);
+  const seen = new Set<number>();
+  for (let i = 0; i < chart.notes.length; i++) {
+    const n = chart.notes[i];
+    if (!Number.isInteger(n.lane) || n.lane < 0 || n.lane >= lanes) throw new RangeError(`Judge: note ${n.id} lane ${n.lane} out of range [0, ${lanes})`);
+    if (!Number.isFinite(n.time)) throw new RangeError(`Judge: note ${n.id} has non-finite time`);
+    if (seen.has(n.id)) throw new RangeError(`Judge: duplicate note id ${n.id}`);
+    seen.add(n.id);
+  }
+}
+
 /**
  * Pure, deterministic hit judge.
  *
- * Time base: every time passed in is *song time in seconds* as derived from the audio clock.
- * `latencyOffsetSec` (input pipeline latency, from calibration) is subtracted internally, so an
- * input observed at song time t is judged at (t - latencyOffsetSec). `update()` uses the same
- * shifted timeline so misses are declared consistently with hits.
+ * Time base: every time passed in is *song time in seconds* as derived from the audio clock
+ * (`SongClock.songTime(ctxTime)`). `latencyOffsetSec` is subtracted internally from both inputs
+ * and update times, so hits and misses live on one consistent timeline.
+ *
+ * Ordering contract: judgment is timestamp-exact. An input at song time t is judged identically
+ * whether it arrives before or after `update(u)` as long as its note has not been declared missed,
+ * i.e. as long as t' <= note.time + goodMs and u' - missGrace < note.time + goodMs (primes = shifted
+ * times). Inputs delivered later than `missGraceMs` after their own timestamp may lose to a miss;
+ * choose the grace to cover the input pipeline's delivery delay.
  *
  * Rehab rules: an input with no candidate note is ignored (no penalty for extra movements).
+ * Allocation: `onInput` allocates only the returned event; `update` returns a shared frozen empty
+ * array when nothing was missed.
  */
 export class Judge {
   readonly chart: Chart;
   private readonly windows: TimingWindows[];
   private latencyOffsetSec: number;
+  private missGraceSec: number;
 
   /** notes sorted by time per lane */
   private readonly laneNotes: Note[][];
@@ -33,18 +75,27 @@ export class Judge {
   private readonly states: Uint8Array;
   private readonly indexById: Map<number, number>;
   private pendingCount: number;
-  private missScratch: HitEvent[] = [];
+  private readonly missScratch: HitEvent[] = [];
 
-  constructor(chart: Chart, windows: TimingWindows | TimingWindows[], latencyOffsetSec = 0) {
+  /**
+   * @param windows one TimingWindows for every lane, or an array indexed by lane (the last entry
+   *                is reused for lanes beyond the array).
+   * @param options `JudgeOptions`, or a bare number for `latencyOffsetSec` (legacy form).
+   * @throws RangeError when the chart has duplicate note ids or lanes outside [0, chart.lanes).
+   */
+  constructor(chart: Chart, windows: TimingWindows | TimingWindows[], options: number | JudgeOptions = {}) {
+    validateChartForJudge(chart);
+    const opts: JudgeOptions = typeof options === 'number' ? { latencyOffsetSec: options } : options;
     this.chart = chart;
-    const lanes = Math.max(1, chart.lanes);
+    const lanes = chart.lanes;
     this.windows = [];
     for (let l = 0; l < lanes; l++) {
       const w = Array.isArray(windows) ? (windows[l] ?? windows[windows.length - 1]) : windows;
       if (!w) throw new Error('Judge: no timing windows supplied');
       this.windows.push({ perfectMs: w.perfectMs, goodMs: w.goodMs });
     }
-    this.latencyOffsetSec = latencyOffsetSec;
+    this.latencyOffsetSec = opts.latencyOffsetSec ?? 0;
+    this.missGraceSec = Math.max(0, opts.missGraceMs ?? 0) / 1000;
     this.states = new Uint8Array(chart.notes.length);
     this.indexById = new Map();
     this.laneNotes = [];
@@ -55,7 +106,7 @@ export class Judge {
     }
     chart.notes.forEach((n, i) => {
       this.indexById.set(n.id, i);
-      if (n.lane >= 0 && n.lane < lanes) this.laneNotes[n.lane].push(n);
+      this.laneNotes[n.lane].push(n);
     });
     for (const arr of this.laneNotes) arr.sort((a, b) => a.time - b.time || a.id - b.id);
     this.pendingCount = chart.notes.length;
@@ -69,11 +120,19 @@ export class Judge {
     return this.latencyOffsetSec;
   }
 
+  setMissGrace(ms: number): void {
+    this.missGraceSec = Math.max(0, ms) / 1000;
+  }
+
+  getMissGrace(): number {
+    return this.missGraceSec * 1000;
+  }
+
   getWindows(lane: number): TimingWindows {
     return this.windows[lane] ?? this.windows[this.windows.length - 1];
   }
 
-  /** Number of notes not yet judged. */
+  /** Number of notes not yet judged (0 = every note has been hit or missed). */
   getPendingCount(): number {
     return this.pendingCount;
   }
@@ -94,7 +153,7 @@ export class Judge {
   /**
    * Judge an input on `lane` observed at `songTimeSec`.
    * Returns the HitEvent for the nearest pending note within ±goodMs, or null (input ignored).
-   * deltaMs is positive when the input is late.
+   * deltaMs is positive when the input is late. `time` is the latency-shifted input time.
    */
   onInput(lane: number, songTimeSec: number): HitEvent | null {
     const notes = this.laneNotes[lane];
@@ -127,16 +186,17 @@ export class Judge {
   }
 
   /**
-   * Advance the judge to `songTimeSec`, declaring misses for pending notes whose good window has
-   * elapsed. Returns newly missed notes ordered by note time (a shared empty array when none —
-   * do not mutate/retain the result).
+   * Advance the judge to `songTimeSec`, declaring misses for pending notes whose good window
+   * (plus miss grace) has elapsed. Returns newly missed notes ordered by note time; a shared
+   * frozen empty array when none. Miss events carry `time` = note time + goodMs (the deadline).
    */
   update(songTimeSec: number): readonly HitEvent[] {
-    const t = songTimeSec - this.latencyOffsetSec;
+    const t = songTimeSec - this.latencyOffsetSec - this.missGraceSec;
     let out: HitEvent[] | null = null;
     for (let lane = 0; lane < this.laneNotes.length; lane++) {
       const notes = this.laneNotes[lane];
-      const goodSec = this.windows[lane].goodMs / 1000;
+      const goodMs = this.windows[lane].goodMs;
+      const goodSec = goodMs / 1000;
       const deadline = t - goodSec;
       let i = this.laneCursor[lane];
       for (; i < notes.length; i++) {
@@ -150,14 +210,16 @@ export class Judge {
           out = this.missScratch;
           out.length = 0;
         }
-        out.push({ noteId: n.id, lane, judgment: 'miss', deltaMs: this.windows[lane].goodMs, time: n.time + goodSec });
+        out.push({ noteId: n.id, lane, judgment: 'miss', deltaMs: goodMs, time: n.time + goodSec });
       }
       this.laneCursor[lane] = i;
     }
     if (out === null) return EMPTY;
     if (out.length > 1) out.sort((a, b) => a.time - b.time || a.noteId - b.noteId);
     // hand back a fresh copy so callers may retain it; scratch is reused
-    return out.slice();
+    const copy = out.slice();
+    out.length = 0;
+    return copy;
   }
 
   private mark(note: Note, state: number, lane: number): void {

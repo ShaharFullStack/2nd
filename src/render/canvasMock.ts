@@ -27,7 +27,28 @@ export interface MockCanvas extends CanvasLike {
 
 export function createMockContext(canvas: CanvasLike): MockContext & CanvasRenderingContext2D {
   const calls: RecordedCall[] = [];
-  const props: Record<string, unknown> = {};
+  const props: Record<string, unknown> = {
+    globalAlpha: 1,
+    globalCompositeOperation: 'source-over',
+    fillStyle: '#000000',
+    strokeStyle: '#000000',
+    lineWidth: 1,
+    lineCap: 'butt',
+    lineJoin: 'miter',
+    miterLimit: 10,
+    lineDashOffset: 0,
+    font: '10px sans-serif',
+    textAlign: 'start',
+    textBaseline: 'alphabetic',
+    direction: 'ltr',
+    shadowBlur: 0,
+    shadowColor: 'rgba(0, 0, 0, 0)',
+    shadowOffsetX: 0,
+    shadowOffsetY: 0,
+    imageSmoothingEnabled: true,
+    imageSmoothingQuality: 'low',
+    filter: 'none',
+  };
   const gradient = { addColorStop: () => undefined };
   const api: MockContext = {
     calls,

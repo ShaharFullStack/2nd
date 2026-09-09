@@ -5,8 +5,13 @@ export interface LaneInputEvent {
   ctxTime: number;
   /** Fraction of calibrated ROM reached (0..1+). */
   strength: number;
+  /**
+   * Compensation observed on this rep up to the crossing (vision only, e.g. heel lift during ankle
+   * dorsiflexion). Absent when none was detected / not monitored.
+   */
+  compensation?: LaneCompensation;
 }
-export interface LaneState { lane: number; value: number; armed: boolean; tracking: boolean; }
+export interface LaneState { lane: number; value: number; armed: boolean; tracking?: boolean; }
 export interface InputSource {
   start(): Promise<void>;
   stop(): void;
@@ -40,5 +45,25 @@ export interface VisionStatus {
   untrackedLanes: number[];
 }
 
+export type CompensationKindName = 'heel_lift' | 'trunk_lean';
+/** Compensation summary attached to a LaneInputEvent / LaneRepEvent: `value` is the worst magnitude seen. */
+export interface LaneCompensation { kind: CompensationKindName; value: number; }
+
 /** Compensation detected on a lane (e.g. heel lift during ankle dorsiflexion). */
-export interface CompensationEvent { lane: number; ctxTime: number; kind: 'heel_lift' | 'trunk_lean'; value: number; }
+export interface CompensationEvent { lane: number; ctxTime: number; kind: CompensationKindName; value: number; }
+
+/**
+ * Rep-level rehab metrics, emitted by VisionInput.onRep() once a rep is complete (the lane re-armed).
+ * `ctxTime` equals the ctxTime of the LaneInputEvent that opened the rep, so the engine can join them.
+ */
+export interface LaneRepEvent {
+  lane: number;
+  /** ctxTime of the threshold crossing that started the rep (same as the LaneInputEvent). */
+  ctxTime: number;
+  /** ctxTime at which the lane re-armed (end of the rep). */
+  endCtxTime: number;
+  /** Peak normalized value (fraction of calibrated ROM) reached during the rep, 0..1. */
+  peak: number;
+  /** Worst compensation observed during the whole rep, if any. */
+  compensation?: LaneCompensation;
+}
