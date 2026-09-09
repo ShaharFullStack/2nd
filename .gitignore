@@ -1,0 +1,13 @@
+node_modules
+dist
+dist-ssr
+*.local
+.DS_Store
+# fetched CC stems (large) — run `npm run fetch-stems` to download
+public/songs/*/stems/*.wav
+public/songs/*/stems/*.mp3
+public/songs/*/stems/*.flac
+!public/songs/demo-*/stems/*
+test-results
+playwright-report
+critic/screenshots/*.png

@@ -1,0 +1,10 @@
+import { chromium } from '@playwright/test';
+const b = await chromium.launch({ executablePath: '/opt/pw-browsers/chromium', args: ['--use-fake-ui-for-media-stream','--use-fake-device-for-media-stream'] });
+const p = await b.newPage();
+await p.setContent('<canvas id=c width=200 height=100></canvas><script>const c=document.getElementById("c").getContext("2d");c.fillStyle="red";c.fillRect(0,0,200,100);</script>');
+await p.screenshot({ path: '/tmp/claude-0/-home-user-2nd/a10f947c-ef5b-515c-aee2-bf90f9d49567/scratchpad/pw.png' });
+const gl = await p.evaluate(() => { const c=document.createElement('canvas'); return !!(c.getContext('webgl2')||c.getContext('webgl')); });
+const ac = await p.evaluate(() => typeof AudioContext);
+const cam = await p.evaluate(async () => { try { const s = await navigator.mediaDevices.getUserMedia({video:true}); return s.getVideoTracks()[0].label; } catch(e) { return 'ERR '+e.message; } });
+console.log({gl, ac, cam});
+await b.close();

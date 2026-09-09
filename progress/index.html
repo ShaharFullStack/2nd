@@ -1,0 +1,15 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Beat Rehab — build progress</title>
+<style>body{font:14px system-ui;margin:0;background:#0f1115;color:#e6e6e6}header{padding:16px 24px;background:#171a21;border-bottom:1px solid #2a2f3a}h1{margin:0;font-size:18px}main{padding:16px 24px;max-width:1100px}
+.entry{border-left:3px solid #4c8dff;padding:8px 12px;margin:10px 0;background:#161922;border-radius:4px}.entry.pass{border-color:#3ddc84}.entry.fail{border-color:#ff5c5c}.entry.info{border-color:#8a8f9c}
+.t{color:#8a8f9c;font-size:12px}.entry img{max-width:100%;margin-top:6px;border:1px solid #2a2f3a}.piece{display:inline-block;background:#232838;padding:1px 6px;border-radius:3px;font-size:12px;margin-right:6px}
+#status{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px;margin-bottom:16px}.card{background:#161922;padding:10px;border-radius:6px;border:1px solid #2a2f3a}.card b{display:block}.card .v{color:#8a8f9c;font-size:12px}
+</style></head><body><header><h1>Beat Rehab — live build progress</h1><div class="t" id="updated"></div></header>
+<main><div id="status"></div><div id="log"></div></main>
+<script>
+fetch('log.json?'+Date.now()).then(r=>r.json()).then(d=>{
+ document.getElementById('updated').textContent='Last update: '+d.updated;
+ document.getElementById('status').innerHTML=Object.entries(d.pieces).map(([k,v])=>`<div class="card"><b>${k}</b><span class="v">round ${v.round} · ${v.status}</span><div>${v.note||''}</div></div>`).join('');
+ document.getElementById('log').innerHTML=d.entries.slice().reverse().map(e=>`<div class="entry ${e.kind||'info'}"><div class="t">${e.time}</div><span class="piece">${e.piece}</span>${e.text}${e.image?`<br><img src="${e.image}">`:''}</div>`).join('');
+});
+setTimeout(()=>location.reload(),30000);
+</script></body></html>
