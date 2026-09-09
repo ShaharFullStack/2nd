@@ -1,1 +1,63 @@
-{"updated":"2026-09-09T06:50Z","pieces":{},"entries":[{"time":"2026-09-09T06:50Z","piece":"orchestrator","kind":"info","text":"Project scaffolded (Vite+React+TS). MediaPipe models + WASM vendored locally. ccmixter.org is egress-blocked from the build sandbox: stems will be fetched by <code>npm run fetch-stems</code> on the user's machine; a generated CC0 demo multitrack ships in-repo so the game is playable now."}]}
+{
+ "updated": "2026-09-09T19:41Z",
+ "pieces": {
+  "engine": {
+   "round": 1,
+   "status": "fixing",
+   "note": "Critic round 1 (score 6.5): latency-calibration confidence unusable at 30 fps camera quantisation; pairing radius = outlier cutoff so consis"
+  },
+  "audio": {
+   "round": 1,
+   "status": "fixing",
+   "note": "Critic round 1 (score 7): latencyProbe duplicated engine latency math with different defaults; must delegate to engine estimateLatency."
+  },
+  "vision": {
+   "round": 1,
+   "status": "fixing",
+   "note": "Critic round 1 (score 6): OneEuro smoothing on raw units gives 13–95 ms lane-dependent lag; filter normalized 0..1 value and route calibrati"
+  },
+  "render": {
+   "round": 1,
+   "status": "fixing",
+   "note": "Critic round 1 (score 6.5): miss visual can never be seen — gem leaves screen 134 ms after note time but engine declares miss at 210–280 ms."
+  }
+ },
+ "entries": [
+  {
+   "time": "2026-09-09T06:50Z",
+   "piece": "orchestrator",
+   "kind": "info",
+   "text": "Project scaffolded (Vite+React+TS). MediaPipe models + WASM vendored locally. ccmixter.org is egress-blocked from the build sandbox: stems will be fetched by <code>npm run fetch-stems</code> on the user's machine; a generated CC0 demo multitrack ships in-repo so the game is playable now."
+  },
+  {
+   "time": "2026-09-09T19:41Z",
+   "piece": "engine",
+   "kind": "fail",
+   "text": "Critic round 1 (score 6.5): latency-calibration confidence unusable at 30 fps camera quantisation; pairing radius = outlier cutoff so consistently-late patients yield zero samples."
+  },
+  {
+   "time": "2026-09-09T19:41Z",
+   "piece": "audio",
+   "kind": "fail",
+   "text": "Critic round 1 (score 7): latencyProbe duplicated engine latency math with different defaults; must delegate to engine estimateLatency."
+  },
+  {
+   "time": "2026-09-09T19:41Z",
+   "piece": "vision",
+   "kind": "fail",
+   "text": "Critic round 1 (score 6): OneEuro smoothing on raw units gives 13–95 ms lane-dependent lag; filter normalized 0..1 value and route calibration through same pipeline."
+  },
+  {
+   "time": "2026-09-09T19:41Z",
+   "piece": "render",
+   "kind": "fail",
+   "text": "Critic round 1 (score 6.5): miss visual can never be seen — gem leaves screen 134 ms after note time but engine declares miss at 210–280 ms."
+  },
+  {
+   "time": "2026-09-09T19:41Z",
+   "piece": "orchestrator",
+   "kind": "info",
+   "text": "Subagent spend limit hit mid-loop; resumed workflow after reset (fix rounds + critic rounds 2+ + integration)."
+  }
+ ]
+}

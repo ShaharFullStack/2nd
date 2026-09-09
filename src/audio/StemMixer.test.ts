@@ -85,7 +85,7 @@ describe('StemMixer', () => {
   it('loads all stems in parallel with progress and sets the player stem', async () => {
     const { mixer, fetched } = setup();
     const progress: string[] = [];
-    await mixer.loadSong(manifest, '/songs', (p) => progress.push(`${p.stemId}:${p.phase} ${p.loaded}/${p.total}`));
+    await mixer.loadSong(manifest, '/songs', (p) => progress.push(`${p.stemId}:${p.phase} ${p.stemsDecoded}/${p.stemsTotal}`));
     expect(fetched).toEqual(['/songs/song/stems/drums.wav', '/songs/song/stems/bass.wav', '/songs/song/stems/keys.wav']);
     expect(progress).toHaveLength(6);
     expect(progress[progress.length - 1]).toMatch(/6\/6$/);
