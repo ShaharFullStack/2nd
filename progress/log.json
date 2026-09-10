@@ -1,25 +1,25 @@
 {
- "updated": "2026-09-10T05:02Z",
+ "updated": "2026-09-10T10:08Z",
  "pieces": {
   "engine": {
-   "round": 2,
-   "status": "fixing",
-   "note": "Round 2 (6.5): chart lattice gives unbalanced lanes (62/38 at 2 lanes) — bilateral rehab would shortchange one side."
+   "round": 5,
+   "status": "passed 9/10",
+   "note": "PASSED round 5, score 9/10. Judge/scoring/chart generation hold up against a Clone-Hero determinism bar; latency model, lane balance, unmatc"
   },
   "audio": {
-   "round": 2,
-   "status": "fixing",
-   "note": "Round 2 (7.5): StemMixer must implement the SongTimeSource contract and return resume start time; pause/resume drifts judgments."
+   "round": 4,
+   "status": "passed 8.5/10",
+   "note": "PASSED round 4, score 8.5/10. StemMixer is now the single clock (SongTimeSource), pause/resume sample-accurate, latency probe delegates to t"
   },
   "vision": {
-   "round": 2,
-   "status": "fixing",
-   "note": "Round 2 (7): VisionInput start/stop not race-safe — StrictMode double-mount leaks two cameras."
+   "round": 5,
+   "status": "round 6",
+   "note": "Round 5, score 8.5. Filter moved to normalized units, race-safe camera lifecycle, level-vs-edge trigger bug fixed. Open: pinned-lane watchdo"
   },
   "render": {
-   "round": 2,
-   "status": "fixing",
-   "note": "Round 2: miss gem culled before the engine ever declares the miss."
+   "round": 4,
+   "status": "round 5",
+   "note": "Round 4, score 8. Miss visuals now readable at real engine timing, score odometer fixed. Open: receptor ring must read full exactly when the"
   }
  },
  "entries": [
@@ -82,6 +82,30 @@
    "piece": "render",
    "kind": "fail",
    "text": "Round 2: miss gem culled before the engine ever declares the miss."
+  },
+  {
+   "time": "2026-09-10T10:08Z",
+   "piece": "engine",
+   "kind": "pass",
+   "text": "PASSED round 5, score 9/10. Judge/scoring/chart generation hold up against a Clone-Hero determinism bar; latency model, lane balance, unmatched-input telemetry and offset rebasing all fixed."
+  },
+  {
+   "time": "2026-09-10T10:08Z",
+   "piece": "audio",
+   "kind": "pass",
+   "text": "PASSED round 4, score 8.5/10. StemMixer is now the single clock (SongTimeSource), pause/resume sample-accurate, latency probe delegates to the engine, two synthesized CC0 multitracks ship in-repo."
+  },
+  {
+   "time": "2026-09-10T10:08Z",
+   "piece": "vision",
+   "kind": "info",
+   "text": "Round 5, score 8.5. Filter moved to normalized units, race-safe camera lifecycle, level-vs-edge trigger bug fixed. Open: pinned-lane watchdog false positives."
+  },
+  {
+   "time": "2026-09-10T10:08Z",
+   "piece": "render",
+   "kind": "info",
+   "text": "Round 4, score 8. Miss visuals now readable at real engine timing, score odometer fixed. Open: receptor ring must read full exactly when the lane would trigger."
   }
  ]
 }
