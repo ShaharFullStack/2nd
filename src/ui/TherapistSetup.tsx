@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { attributionText } from '../audio/manifest.ts';
 import type { SongEntry } from '../audio/manifest.ts';
 import { DIFFICULTIES, DIFFICULTY_NAMES, windowsFor } from '../engine/difficulty.ts';
@@ -6,7 +6,7 @@ import { FINGERTIPS } from '../engine/types.ts';
 import type { DifficultyName, Fingertip, LaneSpec, Side } from '../engine/types.ts';
 import { runtime } from '../session/runtime.ts';
 import { MAX_LANES, MIN_LANES, laneFingertip, movementsFor, useStore } from '../state/store.ts';
-import { MOVEMENT_INFO, laneConflicts } from '../vision/features.ts';
+import { MOVEMENT_INFO, laneConflicts, movementInstructions } from '../vision/features.ts';
 import { Screen, Toast, TopBar } from './common.tsx';
 
 const DIFFICULTY_BLURB: Record<DifficultyName, string> = {
@@ -56,6 +56,16 @@ export default function TherapistSetup() {
     };
   }, [songId, setSong]);
 
+  /**
+   * Which audition request is the current one. Loading a song's stems is async, so two quick clicks
+   * (Listen on A, then Listen on B) could resolve out of order and leave A's `playPreview` landing
+   * after B was loaded — the wrong song playing under a button that says B. Every request takes a
+   * token; a resolution whose token is stale touches neither the UI nor the transport (beyond
+   * silencing itself). The other Listen buttons are held disabled while a request is in flight, so the
+   * common case never races at all.
+   */
+  const previewSeq = useRef(0);
+
   /** Song id currently being auditioned (null = nothing playing), and the one being fetched for it. */
   const [previewing, setPreviewing] = useState<string | null>(null);
   const [previewLoading, setPreviewLoading] = useState<string | null>(null);
@@ -73,26 +83,42 @@ export default function TherapistSetup() {
     return () => clearInterval(poll);
   }, []);
 
-  // Never leave a song playing behind us — leaving Setup by any route stops the audition.
-  useEffect(() => () => runtime.stopPreview(), []);
+  // Never leave a song playing behind us — leaving Setup by any route stops the audition, and
+  // invalidates any audition still loading so it cannot start playing after we are gone.
+  useEffect(
+    () => () => {
+      previewSeq.current++;
+      runtime.stopPreview();
+    },
+    [],
+  );
 
   const stopPreview = useCallback(() => {
     runtime.stopPreview();
     setPreviewing(null);
+    setPreviewLoading(null);
   }, []);
 
   const togglePreview = useCallback(
     (entry: SongEntry) => {
       setPreviewError(null);
       if (previewing === entry.id) {
+        previewSeq.current++;
         stopPreview();
         return;
       }
+      const seq = ++previewSeq.current;
       setPreviewLoading(entry.id);
       // Called straight from the click handler: this is the gesture that creates the AudioContext.
       runtime
         .previewSong(entry.id)
         .then((manifest) => {
+          if (previewSeq.current !== seq) {
+            // Superseded by a stop or by leaving the screen — but the load may still have reached the
+            // mixer, so silence it rather than leaving a song playing on an abandoned screen.
+            if (runtime.previewingSongId() === entry.id) runtime.stopPreview();
+            return;
+          }
           setPreviewLoading(null);
           if (!manifest) {
             setPreviewError(`"${entry.manifest?.title ?? entry.id}" has no downloaded stems to play.`);
@@ -101,6 +127,7 @@ export default function TherapistSetup() {
           setPreviewing(entry.id);
         })
         .catch((err: unknown) => {
+          if (previewSeq.current !== seq) return;
           setPreviewLoading(null);
           setPreviewError(err instanceof Error ? err.message : String(err));
         });
@@ -151,7 +178,11 @@ export default function TherapistSetup() {
                   <span className="badge">Lane {i + 1}</span>
                   <b>{laneLabel(lane)}</b>
                 </div>
-                <span className="dim">{MOVEMENT_INFO[lane.movement].instructions}</span>
+                {/* The one string a patient is actually read aloud: it names the prescribed digit,
+                    not "your fingertip". */}
+                <span className="dim" data-testid={`lane-${i}-instructions`}>
+                  {movementInstructions(lane.movement, laneFingertip(lane))}
+                </span>
               </div>
 
               <select
@@ -326,7 +357,7 @@ export default function TherapistSetup() {
                   <button
                     className="btn btn-preview"
                     aria-pressed={isPreviewing}
-                    disabled={!ready || isLoading}
+                    disabled={!ready || previewLoading !== null}
                     onClick={() => togglePreview(entry)}
                     data-testid={`preview-${entry.id}`}
                     aria-label={isPreviewing ? `Stop the preview of ${m?.title ?? entry.id}` : `Hear ${m?.title ?? entry.id}`}

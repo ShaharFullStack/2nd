@@ -152,9 +152,14 @@ describe('emitHitBurst', () => {
     let sparks = 0;
     for (let i = 0; i < p.count; i++) {
       expect(p.color[i]).toBe(3);
-      expect(p.x[i]).toBe(100);
-      expect(p.y[i]).toBe(200);
-      if (p.kind[i] === PARTICLE_RING) rings++;
+      // Sparks are seeded on the gem's rim so they do not stack into one white disc over the
+      // receptor; the ring and the streaks still start at the hit point itself.
+      expect(Math.hypot(p.x[i] - 100, (p.y[i] - 200) / 0.72)).toBeLessThanOrEqual(20 * 0.72 + 1e-4);
+      if (p.kind[i] === PARTICLE_RING) {
+        rings++;
+        expect(p.x[i]).toBe(100);
+        expect(p.y[i]).toBe(200);
+      }
       if (p.kind[i] === PARTICLE_SPARK) sparks++;
     }
     expect(rings).toBe(1);

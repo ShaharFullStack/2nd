@@ -231,6 +231,11 @@ export function makeRng(seed: number): () => number {
  * `intensity` scales both the count and the speed of the debris (0 → ring only), which is what the
  * renderer's `effectIntensity` option dials for a calmer clinical presentation.
  */
+/** Sparks spawn on a ring this fraction of the gem radius out from the hit point (see below). */
+const SPARK_SPAWN_RING = 0.72;
+/** Receptors are ellipses viewed from above; the spawn ring is flattened to match (GEM_ASPECT). */
+const GEM_FLATTEN = 0.72;
+
 export function emitHitBurst(
   pool: ParticlePool,
   rng: () => number,
@@ -245,8 +250,12 @@ export function emitHitBurst(
     const ang = rng() * Math.PI * 2;
     const speed = radius * (6 + rng() * 10) * intensity;
     pool.emit({
-      x,
-      y,
+      // Spawned on a ring at the rim of the gem, not all at one point. Thirteen additive glow
+      // sprites stacked on a single pixel blew the struck receptor out to a flat white disc on the
+      // frame of the hit — the ring, its colour and its meter all gone at the exact instant they
+      // matter. Off the rim they read as a burst leaving the fret and the ring stays visible.
+      x: x + Math.cos(ang) * radius * SPARK_SPAWN_RING,
+      y: y + Math.sin(ang) * radius * SPARK_SPAWN_RING * GEM_FLATTEN,
       vx: Math.cos(ang) * speed,
       vy: Math.sin(ang) * speed * 0.6 - radius * 4,
       life: 0.35 + rng() * 0.35,

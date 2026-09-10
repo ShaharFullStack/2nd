@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { SongManifest } from '../audio/manifest.ts';
 import { DIFFICULTIES, windowsForLanes } from '../engine/difficulty.ts';
 import { AutoplayInput } from '../input/AutoplayInput.ts';
@@ -12,7 +12,8 @@ import { buildSessionResult } from '../session/results.ts';
 import { runtime } from '../session/runtime.ts';
 import { useStore } from '../state/store.ts';
 import { MOVEMENT_INFO } from '../vision/features.ts';
-import { DEFAULT_REARM_FRACTION } from '../render/receptor.ts';
+import { DEFAULT_REARM_FRACTION, receptorLookInto, type ReceptorLook } from '../render/receptor.ts';
+import CameraFallback from './CameraFallback.tsx';
 import { CameraPreview } from './CameraPreview.tsx';
 import { Meter, Toast } from './common.tsx';
 
@@ -29,10 +30,29 @@ function playCredit(m: SongManifest): string {
   return `${m.artist} · ${m.license}`;
 }
 
+/** Grey column + violet cap of a locked-out lane — the receptor's lock cues, in CSS. */
+const PIP_LOCK_FILL = 'linear-gradient(0deg, #3a3b42, #8b8d96)';
+const PIP_LOCK_CAP = '#c08cff';
+
+/**
+ * The picture-in-picture lane meters, shown next to the camera preview for the whole session.
+ *
+ * ONE VOICE: these are the only other movement meters in the patient's field of view, so they must
+ * say what the receptors say. They used to brighten on `value >= threshold` with no reference to
+ * `armed`, under the caption "gold = hit level" — so at the exact moment a receptor correctly went
+ * grey and said "lower to reset", the meter 300 px away lit up and said "hit level reached". That
+ * is the same biofeedback lie the receptor contract exists to remove, and two meters disagreeing is
+ * worse than either one being wrong.
+ *
+ * So the state comes from the same pure model the receptor uses (`receptorLookInto`), against the
+ * same threshold and the same re-arm fraction: bright only when the lane would actually fire, grey
+ * with a violet cap while it is locked out, and dropped to a hint while tracking is lost.
+ */
 function LaneMeters({ source, threshold }: { source: InputSource; threshold: number }) {
   const host = useRef<HTMLDivElement>(null);
   useEffect(() => {
     let raf = 0;
+    const look: ReceptorLook = { fill: 0, over: 0, willFire: false, locked: false, resetProgress: 0, resetLevel: DEFAULT_REARM_FRACTION, glowTarget: 0, tracking: true };
     const tick = () => {
       const el = host.current;
       if (el) {
@@ -42,10 +62,17 @@ function LaneMeters({ source, threshold }: { source: InputSource; threshold: num
           const fill = bars[i].firstElementChild as HTMLElement | null;
           if (!fill) continue;
           const s = states[i];
-          const pct = Math.max(0, Math.min(1, s.value)) * 100;
+          receptorLookInto(look, s, threshold, DEFAULT_REARM_FRACTION);
+          // No measurement ⇒ nothing derived from one: the bar empties rather than leaving a stale
+          // column standing at 80 % while the camera cannot see the patient at all.
+          const pct = look.tracking ? Math.max(0, Math.min(1, s.value)) * 100 : 0;
           fill.style.height = `${pct}%`;
-          fill.style.opacity = s.tracking === false ? '0.25' : '1';
-          fill.style.filter = s.value >= threshold ? 'brightness(1.5)' : 'none';
+          fill.style.opacity = look.tracking ? '1' : '0.25';
+          // Brightness means "this is scoring" — armed AND tracked AND at threshold, never a full
+          // meter on its own.
+          fill.style.filter = look.willFire ? 'brightness(1.5)' : 'none';
+          fill.style.background = look.locked ? PIP_LOCK_FILL : '';
+          fill.style.borderTop = look.locked ? `3px solid ${PIP_LOCK_CAP}` : '';
         }
       }
       raf = requestAnimationFrame(tick);
@@ -75,7 +102,21 @@ export default function PlayScreen() {
   const runnerRef = useRef<GameRunner | null>(null);
 
   const [hud, setHud] = useState<HudSnapshot | null>(null);
-  const [phase, setPhase] = useState<'loading' | 'running' | 'error' | 'blocked'>('loading');
+  const [phase, setPhase] = useState<'loading' | 'running' | 'error' | 'blocked' | 'camera'>('loading');
+  /**
+   * The thrown value from `ensureVision`, kept raw so CameraFallback can classify it.
+   *
+   * The camera can fail HERE and not only on the camera-check screen: unplugged between the check and
+   * the count-in, permission revoked mid-visit, or a deep link straight to `?screen=play`. That used
+   * to land on a bare "Could not start the session" with the exception text and one Back button — no
+   * cause, no remedy, no retry, and no labelled keyboard fallback. It is the same failure the fallback
+   * screen was built for, so it gets the same screen.
+   */
+  const [cameraError, setCameraError] = useState<unknown>(null);
+  /** Bumped by Retry so the boot effect re-runs and re-requests the device for real. */
+  const [attempt, setAttempt] = useState(0);
+  /** The in-flight vision attempt, so Retry can await the REAL request rather than a fixed delay. */
+  const visionAttempt = useRef<Promise<unknown> | null>(null);
   /** Lanes the camera input refuses to score — the session is not started at all while this is set. */
   const [blocked, setBlocked] = useState<InvalidCalibration[]>([]);
   const [progress, setProgress] = useState(0);
@@ -134,13 +175,23 @@ export default function PlayScreen() {
           return bot;
         };
       } else {
-        const vision = await runtime.ensureVision({
-          mode: config.mode,
-          lanes: config.lanes,
-          calibrations: st.calibrations,
-          difficulty: config.difficulty,
-          mirrored: settings.mirrored,
-        });
+        let vision;
+        try {
+          const attempting = runtime.ensureVision({
+            mode: config.mode,
+            lanes: config.lanes,
+            calibrations: st.calibrations,
+            difficulty: config.difficulty,
+            mirrored: settings.mirrored,
+          });
+          visionAttempt.current = attempting;
+          vision = await attempting;
+        } catch (err) {
+          if (!alive) return;
+          setCameraError(err);
+          setPhase('camera');
+          return;
+        }
         if (!alive) return;
         // A LANE THAT PROVABLY CANNOT SCORE IS A HARD STOP, NOT A WARNING TO READ AFTERWARDS.
         // VisionInput refuses a range that measures a different quantity (another fingertip) or the
@@ -214,6 +265,7 @@ export default function PlayScreen() {
       setPhase('running');
     };
 
+    setCameraError(null);
     boot().catch((err: unknown) => {
       console.error('[play] failed to start', err);
       if (!alive) return;
@@ -243,7 +295,26 @@ export default function PlayScreen() {
       runtime.runner = null;
       ownedInput?.stop();
     };
-  }, [inputMode]);
+  }, [inputMode, attempt]);
+
+  /**
+   * Retry = re-request. The dead VisionInput is disposed so `ensureVision` cannot hand it back, the
+   * boot effect re-runs, and this awaits the NEW attempt's own promise — so the button stays in its
+   * "asking…" state for as long as the request actually takes.
+   */
+  const retryCamera = useCallback(async () => {
+    const before = visionAttempt.current;
+    runtime.disposeVision();
+    setCameraError(null);
+    setPhase('loading');
+    setAttempt((n) => n + 1);
+    for (let i = 0; i < 60 && visionAttempt.current === before; i++) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    await visionAttempt.current?.catch(() => undefined);
+  }, []);
+
+  if (phase === 'camera') return <CameraFallback error={cameraError} onRetry={retryCamera} />;
 
   const countdown = hud?.countdown ?? 0;
 
@@ -280,7 +351,7 @@ export default function PlayScreen() {
           <div className="pip" ref={pipRef}>
             <CameraPreview className="pip-video" />
             <LaneMeters source={input} threshold={threshold} />
-            <div className="pip-note">lane meters · gold = hit level</div>
+            <div className="pip-note">lane meters · bright = scoring · grey = lower to reset</div>
           </div>
         )}
 

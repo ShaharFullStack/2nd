@@ -170,6 +170,9 @@ const POPUP_SLOTS = 4;
 /** Judgment popup lifetime (s). Short: it is redundant feedback sitting in the approach path. */
 const POPUP_SEC = 0.5;
 
+/** Opacity a judgment popup is retired at, rather than fading out into a ghost (see `drawPopups`). */
+const POPUP_MIN_ALPHA = 0.38;
+
 /** Song seconds the title / attribution block stays at full strength before it fades out. */
 const META_HOLD_SEC = 7;
 /** Seconds the title / attribution block takes to fade out once `META_HOLD_SEC` has passed. */
@@ -239,6 +242,14 @@ const LOCK_HINT_COLOR = '#c08cff';
  * something other than "not yet".
  */
 const METER_TARGET_POS = 0.76;
+/**
+ * Ceiling on a LOCKED lane's liquid column, as a fraction of the target height. A locked lane
+ * cannot score at any value, so it may never paint into the overshoot headroom (that band means
+ * "this rep cleared the target") — and it may not stop flush on the target height either, because a
+ * column whose top edge sits exactly where the trigger point is reads as being at the trigger
+ * point. The 10 % shortfall is ~7 px of empty well at 720p, which survives a 4× downscale.
+ */
+const LOCK_LEVEL_CEIL = 0.9;
 /** Ground of the meter well: flat and dark, so the liquid's top edge is a hard step, not a bevel. */
 const METER_WELL_COLOR = '#080a12';
 /** Threshold (target) line and the white-hot level cap at the trigger point. */
@@ -1049,6 +1060,11 @@ export class Highway {
       for (let i = 0; i < nLines; i++) {
         if (this.beatBars[i] !== kind) continue;
         const d = depthOf(g, this.beatTimes[i], this.stNow);
+        // The ladder is the fret board, and the fret board ends at the strike line. Below it is the
+        // apron: receptor hardware, hit bloom and the movement labels — the one band on the screen
+        // a low-vision patient has to read words in. Rungs used to keep scrolling through it (and
+        // linger there, since the tail speed is deliberately slow), striking the labels through.
+        if (d < 0) continue;
         const y = yAt(g, d);
         ctx.moveTo(roadEdgeX(g, -1, d), y);
         ctx.lineTo(roadEdgeX(g, 1, d), y);
@@ -1310,21 +1326,26 @@ export class Highway {
    *   (b) at/over threshold,
    *       armed (`willFire`)   → the liquid crosses the target line into the headroom (the only
    *                              state where anything is drawn above that line), the level line
-   *                              goes white-hot and doubles in thickness, and two additive rings
-   *                              appear that exist in no other state: an inner rim and a corona
-   *                              outside the ring. "That is scoring."
+   *                              SPLITS into two white-hot segments with a gap in the middle (a
+   *                              change in the number of marks, which survives the high-contrast
+   *                              palette where the rising cap is already near-white), and two
+   *                              additive rings appear that exist in no other state: an inner rim
+   *                              and a corona outside the ring. "That is scoring."
    *   (c) at/over threshold,
    *       NOT armed (`locked`) → the lane has already fired (or has never been seen below the
    *                              re-arm level) and CANNOT fire again until the value falls below
    *                              `thresholdFraction * rearmFraction`. Dead grey ring shrunk 12 %,
-   *                              drained grey liquid, NO level line, NO target line or ticks, NO
-   *                              halo — and instead the three return-to-rest marks that exist only
-   *                              here: a dashed re-arm line at the level to come back down to, a
-   *                              downward chevron that settles onto it, and an arc outside the ring
-   *                              that grows as they lower and completes exactly when the lane
-   *                              re-arms (how much further, not just which way). A patient holding
-   *                              at end range sees the light go out and a target to return to —
-   *                              never a lit receptor that is quietly scoring nothing.
+   *                              grey liquid capped short of the target height (`LOCK_LEVEL_CEIL` —
+   *                              it never reaches, let alone crosses, the height that means "at the
+   *                              trigger point"), NO level line, NO target line or ticks, NO halo —
+   *                              and instead the four return-to-rest marks that exist only here: a
+   *                              violet drain cap on top of the column, a dashed re-arm line at the
+   *                              level to come back down to, a downward chevron that settles onto
+   *                              it, and an arc outside the ring that grows as they lower and
+   *                              completes exactly when the lane re-arms (how much further, not
+   *                              just which way). A patient holding at end range sees the light go
+   *                              out and a target to return to — never a lit receptor that is
+   *                              quietly scoring nothing.
    *   (d) tracking lost        → there is no measurement at all, so NOTHING that encodes a value is
    *                              drawn: no well, no liquid, no level line, no halo, no lock cues,
    *                              no beat pulse (a dead signal must not dance with the music). Just
@@ -1445,7 +1466,23 @@ export class Highway {
       const yBot = y + wry;
       const span = wry * 2;
       const yTarget = yBot - METER_TARGET_POS * span;
-      const yLevel = yBot - clamp(METER_TARGET_POS * look.fill + (1 - METER_TARGET_POS) * look.over, 0, 1) * span;
+      // Where the top of the liquid goes.
+      //
+      // Live lane: the threshold sits at METER_TARGET_POS of the well and the overshoot headroom
+      // above it is a "this rep cleared the target" cue.
+      //
+      // Locked lane: nothing scores, so the headroom is not merely unearned, it would be a lie —
+      // and stopping *exactly on* the target-line height is no better, because a column whose top
+      // edge coincides with the height that means "at the trigger point" is read as being at the
+      // trigger point. So a locked column is capped at `LOCK_LEVEL_CEIL` of the target height,
+      // which leaves a permanent, visible band of empty well between it and where the (absent)
+      // target line would be. Below that ceiling the height is the patient's true value, which is
+      // the part that matters while locked: the whole job is to bring the column DOWN to the dashed
+      // re-arm line, and the entire path from the ceiling to that line is drawn to scale.
+      const levelFrac = look.locked
+        ? METER_TARGET_POS * Math.min(look.fill, LOCK_LEVEL_CEIL)
+        : METER_TARGET_POS * look.fill + (1 - METER_TARGET_POS) * look.over;
+      const yLevel = yBot - clamp(levelFrac, 0, 1) * span;
       const yRearm = yBot - METER_TARGET_POS * look.resetLevel * span;
       const hot = look.willFire;
       ctx.save();
@@ -1456,14 +1493,24 @@ export class Highway {
       ctx.globalAlpha = 0.82;
       ctx.fillRect(x - wr, y - wry, wr * 2, span);
       ctx.globalAlpha = 1;
-      // Liquid. Same geometry locked or live (the height is the patient's real value — that stays
-      // honest); the *material* is what changes.
+      // Liquid. The *material* is what changes between locked and live; the height is the patient's
+      // real value in both (a locked column is additionally capped short of the target height, see
+      // `LOCK_LEVEL_CEIL`). The locked grey is deliberately not a whisper: measured on real pixels
+      // the old 0.55/0.75-alpha column came out at ~42/255 against a ~14/255 well, which at 2 m on a
+      // clinic tablet is one uniform dark disc — the column that is supposed to be the thing the
+      // patient lowers was not visible while they lowered it.
       if (yLevel < yBot - 0.5) {
         ctx.fillStyle = look.locked
-          ? this.grad(METER_LOCK_KEY, () => {
+          ? // Desaturated toward the dead grey but still the lane's hue (`lockedColor`, the same
+            // treatment the locked ring gets), and cached per lane. A neutral grey column filling a
+            // ring whose colour had also been replaced left the struck fret with no lane identity
+            // at all for the whole lockout — which begins on the frame the note is hit, and is the
+            // frame blind reviewers kept reading as a stray sprite. Dull, not anonymous.
+            this.grad(METER_LOCK_KEY + lane, () => {
+              const dull = this.lockedColor(color, lockColor);
               const grad = ctx.createLinearGradient(0, y - ry, 0, y + ry);
-              grad.addColorStop(0, withAlpha(lockColor.base, 0.55));
-              grad.addColorStop(1, withAlpha(lockColor.dark, 0.75));
+              grad.addColorStop(0, withAlpha(dull.bright, 0.92));
+              grad.addColorStop(1, withAlpha(dull.dark, 0.92));
               return grad;
             })
           : this.grad(hot ? METER_HOT_KEYS[lane] : METER_KEYS[lane], () => {
@@ -1472,27 +1519,55 @@ export class Highway {
               grad.addColorStop(1, withAlpha(color.dark, 0.9));
               return grad;
             });
-        ctx.globalAlpha = look.locked ? 0.8 : 1;
         ctx.fillRect(x - wr, yLevel, wr * 2, yBot - yLevel);
-        ctx.globalAlpha = 1;
       }
       if (!look.locked) {
         // Level line: "here is your current level, and it counts" — the one thing a locked lane
-        // must never say. Lane-coloured while rising, white-hot and twice as thick at the trigger
-        // point, so (b) differs from (a) by a mark and not only by the height of a bar.
+        // must never say.
+        //
+        // (a) rising: ONE continuous full-width bar in the lane's bright tint.
+        // (b) firing: the bar SPLITS into two segments with a gap in the middle, white-hot and
+        //     twice as thick. The split is the point: in the high-contrast palette a lane's bright
+        //     tint is already near-white (#e6fbff on cyan), so "goes white and gets thicker" is a
+        //     ~4 px vs ~2 px difference between two near-white bars — at or below acuity at 2 m for
+        //     the very patients that palette exists for. A change in the NUMBER of marks is not.
         if (look.fill > 0.005) {
           ctx.fillStyle = hot ? TARGET_LINE_COLOR : color.bright;
           ctx.globalAlpha = hot ? 0.98 : 0.95;
           const th = hot ? Math.max(4, 6 * this.u) : Math.max(3, 3.4 * this.u);
-          ctx.fillRect(x - wr, yLevel - th * 0.5, wr * 2, th);
+          if (hot) {
+            // The two segments SIT ON the liquid rather than straddling it, so the gap between them
+            // is pure dark well. Straddling put the lower half of the gap inside the liquid, and in
+            // the high-contrast palette the hot liquid's top is itself near-white (#e6fbff) — the
+            // gap would have been filled in by the very thing it is meant to interrupt.
+            const seg = wr * 0.62;
+            ctx.fillRect(x - wr, yLevel - th, seg, th);
+            ctx.fillRect(x + wr - seg, yLevel - th, seg, th);
+          } else {
+            ctx.fillRect(x - wr, yLevel - th * 0.5, wr * 2, th);
+          }
           ctx.globalAlpha = 1;
         }
-        // Target line: the threshold, at a fixed height, always drawn on top of the liquid.
+        // Target line: the threshold, at a fixed height, always drawn on top of the liquid. The one
+        // continuous full-width white bar in states (a) and (b) — so the split cap above cannot be
+        // confused with it even when both are white.
         ctx.fillStyle = TARGET_LINE_COLOR;
         ctx.globalAlpha = 0.8;
         ctx.fillRect(x - wr, yTarget - Math.max(1, 1.1 * this.u), wr * 2, Math.max(2, 2.2 * this.u));
         ctx.globalAlpha = 1;
       } else {
+        // Drain cap: a hard bar in the lock hint colour riding the top of the grey column. It is not
+        // a level line — it says nothing about scoring, it is the thing the patient has to bring
+        // down onto the dashed line below it, and it is drawn in the same violet as that line and
+        // the chevron so the pair reads as one instruction ("this, down to there"). It also gives
+        // the dim grey column the hard top edge it needs to be resolvable at 2 m at all.
+        if (yLevel < yBot - 0.5) {
+          const th = Math.max(3, 3.4 * this.u);
+          ctx.fillStyle = LOCK_HINT_COLOR;
+          ctx.globalAlpha = 0.95;
+          ctx.fillRect(x - wr, yLevel - th * 0.5, wr * 2, th);
+          ctx.globalAlpha = 1;
+        }
         // Re-arm line: where the value has to come back down to before the next rep can register.
         // Dashed, in the hint colour, and at the same height the input layer really re-arms at
         // (thresholdFraction * rearmFraction — LaneTrigger.rearmLevel).
@@ -1522,11 +1597,15 @@ export class Highway {
       } else {
         // "Lower to reset" chevron, pointing down, settling onto the re-arm line as the value
         // drains toward it. The only chevron on the board.
-        const chev = r * 0.34;
-        const cy = y - ry * 0.28 + chev * 0.5 * look.resetProgress;
+        // Sized to be read, not to dominate: at 0.34 r / 0.13 r stroke it was the single biggest
+        // mark inside the ring, and on the frame of a hit (lockout starts there) two blind
+        // reviewers read the receptor as "a stray, wrongly-scaled sprite" because of it. The
+        // chevron is an instruction attached to the ring, so the ring has to win.
+        const chev = r * 0.26;
+        const cy = y - ry * 0.3 + chev * 0.5 * look.resetProgress;
         ctx.globalAlpha = clamp(1 - 0.45 * look.resetProgress, 0, 1);
         ctx.strokeStyle = LOCK_HINT_COLOR;
-        ctx.lineWidth = Math.max(2, r * 0.13);
+        ctx.lineWidth = Math.max(2, r * 0.1);
         ctx.lineCap = 'round';
         ctx.beginPath();
         ctx.moveTo(x - chev, cy - chev * 0.5);
@@ -1778,8 +1857,10 @@ export class Highway {
         this.particles.emit({ x, y, life: 0.32, size: g.gemRadiusNear * 0.8, endSize: g.gemRadiusNear * 2.6, color: lane, alpha: 0.9, kind: PARTICLE_RING });
       }
       if (judgment === 'perfect' && eff > 0.02) {
-        // Brief white core flash for perfects (small enough to leave the receptor readable).
-        this.particles.emit({ x, y, life: 0.11, size: g.gemRadiusNear * 0.5, endSize: g.gemRadiusNear * 0.2, color: WHITE_COLOR_INDEX, kind: PARTICLE_SPARK, alpha: 0.42 });
+        // Brief white core flash for perfects. Capped hard: the receptor ring, its lane colour and
+        // its meter have to stay readable THROUGH the flash — that is the frame the patient looks
+        // at, and a lane they cannot identify at the moment they hit it is worse than no flash.
+        this.particles.emit({ x, y, life: 0.1, size: g.gemRadiusNear * 0.34, endSize: g.gemRadiusNear * 0.14, color: WHITE_COLOR_INDEX, kind: PARTICLE_SPARK, alpha: 0.26 });
       }
     }
     this.spawnPopup(judgment, lane, x, y, st);
@@ -2017,10 +2098,15 @@ export class Highway {
       const above = Math.min(g.strikeY - p.y + rise, cap);
       // Pop: overshoot then settle.
       const pop = still ? 1 : age < 0.12 ? 0.7 + (age / 0.12) * 0.5 : age < 0.22 ? 1.2 - ((age - 0.12) / 0.1) * 0.2 : 1;
-      // Full strength for most of its life, then off quickly. A long linear tail left a ~25 %-alpha
-      // word hanging in empty lane space with no burst under it any more — which is exactly what a
-      // still frame catches, and it reads as leftover garbage rather than as feedback.
+      // Full strength for most of its life, then off. A long linear tail left a ~25 %-alpha word
+      // hanging in empty lane space with no burst under it any more — which is exactly what a still
+      // frame catches, and it reads as leftover garbage rather than as feedback. It is retired at
+      // `POPUP_MIN_ALPHA` instead of fading to nothing: a judgment word is either legible or gone.
       const alpha = t < 0.74 ? 1 : 1 - (t - 0.74) / 0.26;
+      if (alpha < POPUP_MIN_ALPHA) {
+        p.active = false;
+        continue;
+      }
       const style = this.style(p.judgment === 'perfect' ? 'popupPerfect' : p.judgment === 'good' ? 'popupGood' : 'popupMiss');
       this.text.draw(ctx, JUDGMENT_STYLE[p.judgment].text, p.x, g.strikeY - above, style, pop, alpha);
     }

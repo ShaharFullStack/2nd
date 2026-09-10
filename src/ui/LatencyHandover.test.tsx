@@ -109,4 +109,60 @@ describe('LatencyHandover', () => {
     );
     expect(screen.getByTestId('latency-handover').className).toContain('latency-panel');
   });
+
+  it('offers NOTHING to apply on a keyboard or autoplay run, and says why', () => {
+    // `latencyOffsetSec` is the CAMERA pipeline's offset. A human's +80 ms reaction bias on a keyboard
+    // run, written here, silently corrupts the next real session.
+    render(<LatencyHandover result={result({ inputMode: 'keyboard', suggestedLatencyMs: 320 })} />);
+    expect(screen.queryByTestId('apply-latency')).toBeNull();
+    expect(screen.getByTestId('latency-not-camera').textContent).toMatch(/not how long the camera takes/i);
+    expect(useStore.getState().latencyOffsetSec).toBeCloseTo(0.12, 6);
+    cleanup();
+
+    render(<LatencyHandover result={result({ inputMode: 'autoplay', suggestedLatencyMs: -2 })} />);
+    expect(screen.queryByTestId('apply-latency')).toBeNull();
+    expect(screen.getByTestId('latency-handover').textContent).toMatch(/bot's own scheduling/i);
+  });
+
+  it('never offers a value the store would silently clamp away', () => {
+    // The old panel's button read "Use -2 ms anyway" and wrote 0 ms.
+    render(<LatencyHandover result={result({ latencyOffsetMs: 400, suggestedLatencyMs: -2 })} />);
+    const button = screen.getByTestId('apply-latency');
+    expect(button.textContent).toContain('0 ms');
+    expect(button.textContent).not.toContain('-2 ms');
+    expect(screen.getByTestId('latency-clamped').textContent).toMatch(/raw figure is -2 ms/);
+    fireEvent.click(button);
+    expect(useStore.getState().latencyOffsetSec).toBe(0);
+    // The before/after pair is the STORE's value (120 ms) — what actually changes on this device.
+    expect(screen.getByTestId('latency-handover').textContent).toContain('120 ms');
+  });
+
+  it('clamps an implausibly large suggestion to the value it will store', () => {
+    render(<LatencyHandover result={result({ suggestedLatencyMs: 4000 })} />);
+    expect(screen.getByTestId('apply-latency').textContent).toContain('1000 ms');
+    fireEvent.click(screen.getByTestId('apply-latency'));
+    expect(useStore.getState().latencyOffsetSec).toBe(1);
+  });
+
+  it('can be undone — a misclick on a persisted write must not cost a re-calibration', () => {
+    render(<LatencyHandover result={result()} />);
+    fireEvent.click(screen.getByTestId('apply-latency'));
+    expect(useStore.getState().latencyOffsetSec).toBeCloseTo(0.32, 6);
+
+    const undo = screen.getByTestId('revert-latency');
+    expect(undo.textContent).toContain('120 ms');
+    fireEvent.click(undo);
+    expect(useStore.getState().latencyOffsetSec).toBeCloseTo(0.12, 6);
+    expect(useStore.getState().latencyNote).toMatch(/restored after undoing/i);
+    // ... and the offer comes back, so the therapist can change their mind again.
+    expect(screen.getByTestId('apply-latency')).toBeTruthy();
+  });
+
+  it('does not claim an update when the clamped value was already in force', () => {
+    useStore.setState({ latencyOffsetSec: 0 });
+    render(<LatencyHandover result={result({ latencyOffsetMs: 0, suggestedLatencyMs: -2 })} />);
+    const panel = screen.getByTestId('latency-handover');
+    expect(panel.textContent).not.toMatch(/Camera offset updated/);
+    expect(screen.queryByTestId('apply-latency')).toBeNull();
+  });
 });

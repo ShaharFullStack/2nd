@@ -47,7 +47,7 @@ describe('RomTrend', () => {
     expect(card.textContent).toContain('L knee extension');
     expect(card.textContent).toContain('72%'); // latest ROM
     expect(card.textContent).toContain('+20 pts'); // 0.52 → 0.72
-    expect(card.textContent).toContain('3 sessions');
+    expect(card.textContent).toContain('3 camera sessions');
   });
 
   it('gives each movement and side its own card', () => {
@@ -89,9 +89,9 @@ describe('RomTrend', () => {
   it('lets the therapist widen or narrow the window', () => {
     const many = Array.from({ length: 12 }, (_, i) => session(`s${11 - i}`, 12 - i, [lane({ romMean: (11 - i) / 20 })]));
     render(<RomTrend history={many} />);
-    expect(screen.getByTestId('trend-knee_extension:left').textContent).toContain('8 sessions');
+    expect(screen.getByTestId('trend-knee_extension:left').textContent).toContain('8 camera sessions');
     fireEvent.click(screen.getByTestId('trend-window-4'));
-    expect(screen.getByTestId('trend-knee_extension:left').textContent).toContain('4 sessions');
+    expect(screen.getByTestId('trend-knee_extension:left').textContent).toContain('4 camera sessions');
   });
 
   it('labels every chart for a screen reader', () => {
@@ -101,10 +101,89 @@ describe('RomTrend', () => {
     for (const svg of svgs) expect(svg.getAttribute('aria-label')).toMatch(/L knee extension/);
   });
 
+  it('never shows a bot or keyboard run as the patient improving', () => {
+    // The failure this guards: two autoplay runs rendered as "L knee lift — ACCURACY 100%, +14 pts,
+    // 7 movements performed". The bot's keypresses were being read as the patient's progress.
+    const history = [
+      { ...session('bot', 4, [lane({ accuracy: 1, reps: 7, romMean: null, romSamples: 0 })]), inputMode: 'autoplay' as const },
+      session('cam2', 3, [lane({ romMean: 0.72, accuracy: 0.7, reps: 10 })]),
+      session('cam1', 2, [lane({ romMean: 0.6, accuracy: 0.66, reps: 10 })]),
+    ];
+    render(<RomTrend history={history} />);
+    const card = screen.getByTestId('trend-knee_extension:left');
+    expect(card.textContent).toContain('2 camera sessions');
+    expect(card.textContent).toContain('70%'); // the patient's accuracy, not the bot's 100 %
+    expect(card.textContent).not.toContain('100%');
+    expect(card.textContent).toContain('20 movements performed'); // 10 + 10, not 27
+    // ... and the exclusion is stated, not silent.
+    expect(screen.getByTestId('trend-excluded-knee_extension:left').textContent).toMatch(/1 autoplay session/i);
+    expect(screen.getByTestId('trend-coverage').textContent).toMatch(/excluded from every figure/i);
+  });
+
+  it('offers no trend at all when every stored session was driven by keys', () => {
+    const history = [{ ...session('kb', 1, [lane()]), inputMode: 'keyboard' as const }];
+    render(<RomTrend history={history} />);
+    expect(screen.queryByTestId('rom-trend')).toBeNull();
+    expect(screen.getByTestId('rom-trend-empty').textContent).toMatch(/driven by keys, not by the\s+patient/i);
+  });
+
+  it('draws a real gain differently from noise — the chart, not just the badge', () => {
+    // A +31 pt gain and a flat-with-jitter series must not render as the same near-flat line: this was
+    // the whole complaint against a fixed 0..1 axis in 40 px of drawable height.
+    const spread = (history: SessionResult[], label: string) => {
+      cleanup();
+      render(<RomTrend history={history} />);
+      const svg = screen.getByTestId('trend-knee_extension:left').querySelector(`svg[aria-label*="${label}"]`)!;
+      const ys = (svg.querySelector('polyline')!.getAttribute('points') ?? '')
+        .split(' ')
+        .map((p) => Number(p.split(',')[1]));
+      return Math.max(...ys) - Math.min(...ys);
+    };
+    const gain = spread(
+      [
+        session('c', 3, [lane({ romMean: 0.77 })]),
+        session('b', 2, [lane({ romMean: 0.6 })]),
+        session('a', 1, [lane({ romMean: 0.46 })]),
+      ],
+      'range of motion',
+    );
+    const noise = spread(
+      [
+        session('c', 3, [lane({ romMean: 0.6 })]),
+        session('b', 2, [lane({ romMean: 0.61 })]),
+        session('a', 1, [lane({ romMean: 0.59 })]),
+      ],
+      'range of motion',
+    );
+    expect(gain).toBeGreaterThan(70); // a third of a percentage-range gain crosses most of the plot
+    expect(gain).toBeGreaterThan(noise * 6);
+  });
+
+  it('spaces sessions by their real date, so a slow gain does not look like a fast one', () => {
+    const day = 86_400_000;
+    const xs = (gapDays: number) => {
+      cleanup();
+      render(
+        <RomTrend
+          history={[
+            session('c', 100 * day, [lane({ romMean: 0.7 })]),
+            session('b', 100 * day - gapDays * day, [lane({ romMean: 0.6 })]),
+            session('a', 1 * day, [lane({ romMean: 0.5 })]),
+          ]}
+        />,
+      );
+      const svg = screen.getByTestId('trend-knee_extension:left').querySelector('svg[aria-label*="range of motion"]')!;
+      return (svg.querySelector('polyline')!.getAttribute('points') ?? '').split(' ').map((p) => Number(p.split(',')[0]));
+    };
+    const recentPair = xs(2); // last two sessions two days apart
+    const spreadOut = xs(50); // ... versus fifty
+    expect(recentPair[1] - recentPair[0]).toBeGreaterThan(spreadOut[1] - spreadOut[0]);
+  });
+
   it('reports a single session honestly instead of inventing a trend', () => {
     render(<RomTrend history={[session('a', 1, [lane()])]} />);
     const card = screen.getByTestId('trend-knee_extension:left');
-    expect(card.textContent).toContain('1 session');
+    expect(card.textContent).toContain('1 camera session');
     expect(card.textContent).toContain('no trend yet');
   });
 });

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { windowsFor } from '../engine/difficulty.ts';
-import { latencyAdvice, narrowestGoodWindowMs } from './latencyAdvice.ts';
+import { clampLatencyMs, latencyAdvice, narrowestGoodWindowMs } from './latencyAdvice.ts';
 import type { LaneResultSummary, SessionResult } from './types.ts';
 
 function lane(movement: LaneResultSummary['movement']): LaneResultSummary {
@@ -13,7 +13,7 @@ function lane(movement: LaneResultSummary['movement']): LaneResultSummary {
   };
 }
 
-type Result = Pick<SessionResult, 'suggestedLatencyMs' | 'latencyOffsetMs' | 'difficulty' | 'windowScale' | 'lanes'>;
+type Result = Pick<SessionResult, 'suggestedLatencyMs' | 'latencyOffsetMs' | 'difficulty' | 'windowScale' | 'lanes' | 'inputMode'>;
 
 function result(patch: Partial<Result> = {}): Result {
   return {
@@ -21,10 +21,38 @@ function result(patch: Partial<Result> = {}): Result {
     latencyOffsetMs: 120,
     difficulty: 'medium',
     windowScale: 1,
+    inputMode: 'camera',
     lanes: [lane('seated_march')],
     ...patch,
   };
 }
+
+describe('latencyAdvice guards the CAMERA offset', () => {
+  it('marks a keyboard or autoplay run as not applicable, and never significant', () => {
+    for (const inputMode of ['keyboard', 'autoplay'] as const) {
+      // A huge disagreement on a keyboard run is a human's reaction time, not the camera's latency.
+      const a = latencyAdvice(result({ inputMode, suggestedLatencyMs: 800 }))!;
+      expect(a.appliesToCamera).toBe(false);
+      expect(a.significant).toBe(false);
+      expect(a.inputMode).toBe(inputMode);
+    }
+  });
+
+  it('reports what the store will really keep, not the raw suggestion', () => {
+    const low = latencyAdvice(result({ suggestedLatencyMs: -2 }))!;
+    expect(low.suggestedMs).toBe(-2);
+    expect(low.applicableMs).toBe(0);
+    expect(low.clamped).toBe(true);
+
+    const high = latencyAdvice(result({ suggestedLatencyMs: 4000 }))!;
+    expect(high.applicableMs).toBe(1000);
+    expect(high.clamped).toBe(true);
+
+    const ok = latencyAdvice(result({ suggestedLatencyMs: 320 }))!;
+    expect(ok.applicableMs).toBe(320);
+    expect(ok.clamped).toBe(false);
+  });
+});
 
 describe('latencyAdvice', () => {
   it('is null when the run produced no confident suggestion', () => {
@@ -72,5 +100,16 @@ describe('latencyAdvice', () => {
   it('falls back to the difficulty window when the record carries no lanes', () => {
     expect(narrowestGoodWindowMs(result({ lanes: [] }))).toBe(140);
     expect(latencyAdvice(result({ lanes: [] }))).not.toBeNull();
+  });
+});
+
+describe('clampLatencyMs', () => {
+  it('is the single source of the 0..1000 ms bound the store applies', () => {
+    expect(clampLatencyMs(-2)).toBe(0);
+    expect(clampLatencyMs(0)).toBe(0);
+    expect(clampLatencyMs(123.4)).toBe(123);
+    expect(clampLatencyMs(1000)).toBe(1000);
+    expect(clampLatencyMs(5000)).toBe(1000);
+    expect(clampLatencyMs(Number.NaN)).toBe(0);
   });
 });

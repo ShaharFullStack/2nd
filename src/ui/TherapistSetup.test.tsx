@@ -131,6 +131,58 @@ describe('song audition', () => {
   });
 });
 
+describe('one audition at a time', () => {
+  it('holds the other Listen buttons while a song is still loading', async () => {
+    let land: (() => void) | null = null;
+    fake.previewSong.mockImplementationOnce(
+      (id: string) =>
+        new Promise((resolve) => {
+          land = () => {
+            fake.previewing = id;
+            resolve(CATALOG[0].manifest ?? null);
+          };
+        }),
+    );
+    render(<TherapistSetup />);
+    await screen.findByTestId('preview-demo-groove');
+
+    fireEvent.click(screen.getByTestId('preview-demo-groove'));
+    // Clicking Listen on a second song while the first is in flight is what let A's playPreview land
+    // after B had been loaded — auditioning B while the UI marked A as playing.
+    expect((screen.getByTestId('preview-demo-sunrise') as HTMLButtonElement).disabled).toBe(true);
+    expect(fake.previewSong).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      land?.();
+    });
+    await waitFor(() => expect(screen.getByTestId('preview-demo-groove').textContent).toMatch(/Stop/));
+    expect((screen.getByTestId('preview-demo-sunrise') as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('silences an audition that finishes loading after the therapist has left the screen', async () => {
+    let land: (() => void) | null = null;
+    fake.previewSong.mockImplementationOnce(
+      (id: string) =>
+        new Promise((resolve) => {
+          land = () => {
+            fake.previewing = id;
+            resolve(CATALOG[0].manifest ?? null);
+          };
+        }),
+    );
+    const view = render(<TherapistSetup />);
+    await screen.findByTestId('preview-demo-groove');
+    fireEvent.click(screen.getByTestId('preview-demo-groove'));
+
+    view.unmount();
+    await act(async () => {
+      land?.();
+    });
+    // The stems arrived after we were gone: the mixer must not be left playing on a dead screen.
+    expect(fake.previewing).toBeNull();
+  });
+});
+
 describe('fingertip choice', () => {
   it('is hidden for movements that have no fingertip', async () => {
     render(<TherapistSetup />);
@@ -155,7 +207,58 @@ describe('fingertip choice', () => {
     useStore.getState().setLane(0, { movement: 'finger_opposition', fingertip: 'ring' });
     render(<TherapistSetup />);
     await screen.findByTestId('preview-demo-groove');
-    expect(screen.getByText(/ring finger/i)).toBeTruthy();
+    expect(screen.getAllByText(/ring finger/i).length).toBeGreaterThan(0);
+  });
+
+  it('reads the prescribed DIGIT out in the patient instruction, not "your fingertip"', async () => {
+    useStore.getState().setLane(0, { movement: 'finger_opposition', fingertip: 'pinky' });
+    render(<TherapistSetup />);
+    await screen.findByTestId('preview-demo-groove');
+    // The one string a patient is actually read from. "Touch your thumb to your fingertip" is wrong
+    // for three of the four tips a therapist can prescribe.
+    expect(screen.getByTestId('lane-0-instructions').textContent).toBe('Touch your thumb to your little finger, then open again.');
+
+    act(() => {
+      useStore.getState().setLane(0, { fingertip: 'middle' });
+    });
+    expect(screen.getByTestId('lane-0-instructions').textContent).toContain('middle finger');
+  });
+
+  it('lets a therapist prescribe two DIFFERENT fingertips on one hand — the whole point of the choice', async () => {
+    // Thumb-to-index and thumb-to-little on the left hand: different feature, different calibration
+    // key, different trend line. The duplicate rule used to hard-block it with a message that was not
+    // true of anything downstream.
+    act(() => {
+      useStore.setState({
+        lanes: [
+          { index: 0, movement: 'finger_opposition', side: 'left', fingertip: 'index' },
+          { index: 1, movement: 'finger_opposition', side: 'left', fingertip: 'pinky' },
+        ],
+        calibrations: [null, null],
+      });
+    });
+    render(<TherapistSetup />);
+    await screen.findByTestId('preview-demo-groove');
+
+    expect(screen.getByTestId('setup-start').hasAttribute('disabled')).toBe(false);
+    // It is still worth a WARNING: a patient who cannot isolate the digits may trigger both.
+    expect(screen.getByText(/oppose the thumb to different fingers/i)).toBeTruthy();
+  });
+
+  it('still blocks the same fingertip prescribed twice on one hand', async () => {
+    act(() => {
+      useStore.setState({
+        lanes: [
+          { index: 0, movement: 'finger_opposition', side: 'left', fingertip: 'index' },
+          { index: 1, movement: 'finger_opposition', side: 'left', fingertip: 'index' },
+        ],
+        calibrations: [null, null],
+      });
+    });
+    render(<TherapistSetup />);
+    await screen.findByTestId('preview-demo-groove');
+    expect(screen.getByTestId('setup-start').hasAttribute('disabled')).toBe(true);
+    expect(screen.getByText(/one movement would hit both lanes/i)).toBeTruthy();
   });
 
   it('disappears again when the lane moves to another movement', async () => {

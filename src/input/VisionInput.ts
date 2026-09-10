@@ -799,6 +799,31 @@ export class VisionInput implements InputSource {
     /** True when this start has been superseded by a stop() or a newer start(). */
     const superseded = () => this.startSeq !== seq;
     try {
+      // THE CAMERA IS OPENED FIRST, AND THE ORDER IS THE POINT. The most common clinic failure by far is
+      // a refused (or silently blocked) permission, and it is knowable in well under a second. Building
+      // the detector first buried that behind a 6-8 MB model download and compile: measured against the
+      // dev server, a permission refusal took 45 s to reach the therapist, who spent all of it looking at
+      // a spinner that could not name the problem. getUserMedia first means permission denied / no device
+      // / device busy surface immediately, and only a session that HAS a camera pays for the model.
+      if (this.config.driveLoop !== false) {
+        const cam = this.config.camera;
+        if (!cam) {
+          camera = await openCamera({ width: 640, height: 480, facingMode: 'user', ...this.config.cameraOptions });
+          ownsCamera = true;
+        } else if (typeof cam === 'function') {
+          camera = await cam();
+          ownsCamera = true;
+        } else camera = cam;
+        if (superseded()) return abandon();
+        // A track that ends (unplugged / permission revoked / another app took the device) silently
+        // stops the frame callbacks: surface it instead of leaving the last verdict standing.
+        camera.onEnded = () => {
+          this.cameraEnded = true;
+        };
+        if (camera.ended) this.cameraEnded = true;
+        this.applyXScale(aspectScale(camera.width, camera.height));
+      }
+
       const d = this.config.detector;
       if (!d) {
         // WITHOUT A DRIVEN LOOP THERE IS NOTHING TO DETECT WITH. A default detector here would download
@@ -818,25 +843,10 @@ export class VisionInput implements InputSource {
       if (superseded()) return abandon();
 
       if (this.config.driveLoop !== false) {
-        // Unreachable: the branch above always produces a detector when the loop is driven. It is a
-        // narrowing guard, and a real one — a loop with no detector would silently process nothing.
+        // Unreachable: the branches above always produce both when the loop is driven. Narrowing guards,
+        // and real ones — a loop with neither would silently process nothing.
         if (!detector) throw new Error('VisionInput: no detector to drive the camera loop with');
-        const cam = this.config.camera;
-        if (!cam) {
-          camera = await openCamera({ width: 640, height: 480, facingMode: 'user', ...this.config.cameraOptions });
-          ownsCamera = true;
-        } else if (typeof cam === 'function') {
-          camera = await cam();
-          ownsCamera = true;
-        } else camera = cam;
-        if (superseded()) return abandon();
-        // A track that ends (unplugged / permission revoked / another app took the device) silently
-        // stops the frame callbacks: surface it instead of leaving the last verdict standing.
-        camera.onEnded = () => {
-          this.cameraEnded = true;
-        };
-        if (camera.ended) this.cameraEnded = true;
-        this.applyXScale(aspectScale(camera.width, camera.height));
+        if (!camera) throw new Error('VisionInput: no camera to drive the detect loop with');
         this.loop = new DetectLoop(
           camera.video,
           detector,

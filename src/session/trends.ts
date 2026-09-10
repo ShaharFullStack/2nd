@@ -6,8 +6,14 @@
  * into one series PER MOVEMENT, which is the unit a therapist actually reasons about — "left knee
  * extension", not "Tuesday's session".
  *
- * Three rules the History screen must not have to remember:
+ * Four rules the History screen must not have to remember:
  *
+ *  - ONLY CAMERA SESSIONS COUNT. A keyboard or autoplay run is the SYSTEM producing the input, not the
+ *    patient producing a movement: its accuracy is a property of the bot or of whoever held the
+ *    keyboard. Averaging that into a progress display would put a green "improving" badge on work the
+ *    patient never did, which is the one thing an outcome record may never do. Non-camera sessions are
+ *    excluded from every series, every count and every delta here, and counted in `excluded*` so the
+ *    screen can say out loud that they were left out.
  *  - A movement's series is keyed by movement + side (+ fingertip for finger_opposition), the same key
  *    the calibrations are stored under. Two different fingertips are two different quantities and must
  *    never share a line.
@@ -19,11 +25,13 @@
  *    and a change of span is flagged (`recalibrated`) rather than silently averaged away.
  */
 import type { Movement, Side } from '../engine/types.ts';
-import type { LaneResultSummary, SessionResult } from './types.ts';
+import type { InputMode, LaneResultSummary, SessionResult } from './types.ts';
 
 /** One session's contribution to one movement's trend. */
 export interface TrendPoint {
   sessionId: string;
+  /** Always 'camera' — a point only exists for a session the patient actually drove. */
+  inputMode: InputMode;
   /** Date.now() of the session start. */
   at: number;
   /** Mean peak ROM as a fraction of the calibrated range, or null when it was not measured. */
@@ -63,6 +71,45 @@ export interface MovementTrend {
   totalReps: number;
   /** True when any point in the window sits on a different calibrated span than its predecessor. */
   anyRecalibration: boolean;
+  /** Stored sessions containing this movement that were left out because they were not camera-driven. */
+  excludedSessions: number;
+  /** Which kinds ('keyboard' | 'autoplay' | 'unknown'), in first-seen order. */
+  excludedModes: string[];
+}
+
+/** How much of the stored history a trend can honestly draw on. */
+export interface TrendCoverage {
+  /** Sessions the patient drove through the camera — the only ones any series is built from. */
+  cameraSessions: number;
+  /** Sessions excluded because the input was a keyboard, the autoplay bot, or unrecorded. */
+  excludedSessions: number;
+  excludedModes: string[];
+}
+
+/** A session counts as the patient's performance only when the camera measured it. */
+export function isPatientDriven(s: Pick<SessionResult, 'inputMode'>): boolean {
+  return s.inputMode === 'camera';
+}
+
+function excludedMode(s: Pick<SessionResult, 'inputMode'>): string {
+  return s.inputMode === 'keyboard' || s.inputMode === 'autoplay' ? s.inputMode : 'unknown';
+}
+
+/** Camera vs non-camera split of the whole stored history, for the header of the trend view. */
+export function trendCoverage(history: readonly SessionResult[]): TrendCoverage {
+  let cameraSessions = 0;
+  let excludedSessions = 0;
+  const excludedModes: string[] = [];
+  for (const s of history) {
+    if (isPatientDriven(s)) {
+      cameraSessions++;
+      continue;
+    }
+    excludedSessions++;
+    const kind = excludedMode(s);
+    if (!excludedModes.includes(kind)) excludedModes.push(kind);
+  }
+  return { cameraSessions, excludedSessions, excludedModes };
 }
 
 /** Default number of sessions a trend looks back over — enough to see a direction on a tablet. */
@@ -95,10 +142,23 @@ export function movementTrends(history: readonly SessionResult[], window: number
   const limit = Math.max(1, Math.floor(window));
   const order: string[] = [];
   const byKey = new Map<string, { lane: LaneResultSummary; session: SessionResult }[]>();
+  const excludedByKey = new Map<string, string[]>();
 
   // history is newest-first: walking it forward keeps `order` in most-recently-worked order and gives
   // each key its newest entries first, which is what the per-movement window has to be taken from.
   for (const session of history) {
+    // A session the patient did not drive contributes NOTHING to any series — not a ROM point, not an
+    // accuracy point, not a rep. It is only tallied, so the card can name what it left out.
+    if (!isPatientDriven(session)) {
+      const kind = excludedMode(session);
+      for (const lane of session.lanes) {
+        const key = laneKey(lane);
+        const seen = excludedByKey.get(key);
+        if (seen) seen.push(kind);
+        else excludedByKey.set(key, [kind]);
+      }
+      continue;
+    }
     for (const lane of session.lanes) {
       const key = laneKey(lane);
       let rows = byKey.get(key);
@@ -113,6 +173,7 @@ export function movementTrends(history: readonly SessionResult[], window: number
 
   return order.map((key) => {
     const rows = (byKey.get(key) ?? []).slice().reverse(); // oldest first
+    const excluded = excludedByKey.get(key) ?? [];
     const points: TrendPoint[] = [];
     let previousSpan: number | null = null;
     for (const { lane, session } of rows) {
@@ -123,6 +184,7 @@ export function movementTrends(history: readonly SessionResult[], window: number
           : false;
       points.push({
         sessionId: session.id,
+        inputMode: session.inputMode,
         at: session.startedAt,
         rom: lane.romSamples > 0 ? lane.romMean : null,
         romBest: lane.romSamples > 0 ? lane.romBest : null,
@@ -157,6 +219,8 @@ export function movementTrends(history: readonly SessionResult[], window: number
       accuracyChange: change(firstAccuracy, latestAccuracy, points.length),
       totalReps: points.reduce((n, p) => n + p.reps, 0),
       anyRecalibration: points.some((p) => p.recalibrated),
+      excludedSessions: excluded.length,
+      excludedModes: excluded.filter((m, i) => excluded.indexOf(m) === i),
     };
   });
 }

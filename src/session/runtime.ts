@@ -19,6 +19,30 @@ import type { RomCalibration } from '../vision/calibration.ts';
 import { laneFingertip } from '../state/store.ts';
 import type { GameRunner } from './GameRunner.ts';
 
+/** How long to wait for the audio clock before calling it a missing-gesture failure. */
+const AUDIO_CLOCK_TIMEOUT_MS = 4000;
+
+/**
+ * Resolve the audio handles, or reject with a message `classifyCameraError` turns into the
+ * "the browser is waiting for a tap" screen. Never leaves the caller waiting forever.
+ */
+async function withAudioClockTimeout<T>(p: Promise<T>, ms = AUDIO_CLOCK_TIMEOUT_MS): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      p,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error('The audio clock could not be started: the browser is waiting for a tap on the page.')),
+          ms,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export interface AudioHandles {
   ctx: AudioContext;
   mixer: StemMixer;
@@ -183,7 +207,13 @@ class SessionRuntime {
       return this.vision;
     }
     this.disposeVision();
-    const { ctx } = await this.ensureAudio();
+    // BOUNDED, because an unbounded wait here is an unexplained spinner. Chrome leaves
+    // `AudioContext.resume()` PENDING FOREVER when the page has had no user gesture (a reload on the
+    // camera screen, or a deep link into it), and camera frames are timestamped against that clock —
+    // so the camera check used to sit on "Starting the camera…" indefinitely with nothing thrown and
+    // nothing to show. Time it out into a classified failure whose remedy is a single tap; pressing
+    // Retry on the fallback screen IS that tap, so the next attempt succeeds.
+    const { ctx } = await withAudioClockTimeout(this.ensureAudio());
     const vision = new VisionInput({
       mode: req.mode,
       lanes: req.lanes,

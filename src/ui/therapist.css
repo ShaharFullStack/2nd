@@ -92,13 +92,36 @@
 }
 .trend-card h4 { margin: 0; font-size: 1.15rem; font-weight: 800; }
 .trend-row { display: flex; gap: 14px; align-items: center; justify-content: space-between; }
-.trend-row .spark { flex: none; }
+
+/*
+ * A figure and the line it describes are ONE block: the label and number sit directly above a plot
+ * that fills the card's width. The previous layout put a fixed 200 px sparkline at the far right of a
+ * ~740 px card, leaving the therapist's eye to cross 500 px of nothing between "77 %" and its line.
+ */
+.trend-block { display: flex; flex-direction: column; gap: 6px; }
 .trend-figure { display: flex; flex-direction: column; gap: 2px; min-width: 92px; }
 .trend-figure .k { font-size: 0.72rem; letter-spacing: 0.12em; text-transform: uppercase; color: var(--dim); font-weight: 700; }
-.trend-figure .v { font-size: 1.6rem; font-weight: 900; line-height: 1; font-variant-numeric: tabular-nums; }
-.spark { display: block; }
+/* Readable at ~2 m on a tablet: this is the headline of the whole card. */
+.trend-figure .v { font-size: 2.1rem; font-weight: 900; line-height: 1; font-variant-numeric: tabular-nums; }
+.spark-wrap { width: 100%; }
+.spark { display: block; width: 100%; }
+.spark-axis { fill: #8b97b5; font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums; }
 
 .seg-sm button { min-height: 44px; padding: 0 14px; font-size: 0.85rem; }
+
+/* ---------- "this was not measured on the patient" quarantine (Results) ---------- */
+
+.quarantine {
+  display: flex;
+  gap: 18px;
+  align-items: flex-start;
+  padding: 20px 24px;
+  border-radius: var(--radius);
+  border: 1px solid #6b5a24;
+  background: linear-gradient(180deg, rgba(255, 201, 69, 0.14), rgba(255, 201, 69, 0.04));
+}
+.quarantine .glyph { font-size: 2.2rem; line-height: 1; flex: none; }
+.quarantine h3 { font-size: 1.35rem; }
 
 /* ---------- camera fallback ---------- */
 
@@ -144,5 +167,7 @@
 .lane-row:has(.tip-choice) > .btn { margin-left: auto; }
 
 .trend-card .badge { white-space: nowrap; }
+/* "autoplay · not measured" must not wrap to three lines in a narrow session-table column. */
+.table .badge { white-space: nowrap; }
 .trend-card h4 { flex: 1 1 auto; }
 .trend-figure { min-width: 116px; }

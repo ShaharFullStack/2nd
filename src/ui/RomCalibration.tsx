@@ -47,9 +47,19 @@ export default function RomCalibrationScreen() {
   const [done, setDone] = useState<(RomCalibration | null)[]>(() => lanes.map(() => null));
   const calibrator = useRef<RomCalibrator | null>(null);
   const [generation, setGeneration] = useState(0);
-  /** The reason the runtime refused THIS lane's freshly measured range (null = nothing refused). */
-  const [rejected, setRejected] = useState<string | null>(null);
+  /**
+   * The runtime's refusal of a range measured HERE, tagged with the attempt it belongs to
+   * (`laneIndex:generation`). Tagging rather than clearing in an effect means a new lane or a Redo
+   * simply stops matching, so a stale refusal can never outlive the range it describes — and no
+   * cascading render is needed to retire it.
+   */
+  const [rejected, setRejected] = useState<{ attempt: string; reason: string } | null>(null);
   const [vetting, setVetting] = useState<Vetting>(NO_VETTING);
+
+  /** Identifies one attempt at one lane: a Redo (generation++) or a lane change starts a new one. */
+  const attemptKey = `${laneIndex}:${generation}`;
+  /** The refusal that belongs to the attempt on screen right now (null once it is superseded). */
+  const rejectedReason = rejected?.attempt === attemptKey ? rejected.reason : null;
 
   const lane = lanes[laneIndex];
   const info = lane ? MOVEMENT_INFO[lane.movement] : null;
@@ -68,9 +78,6 @@ export default function RomCalibrationScreen() {
     // fallback for the (dev) case where no vision input exists.
     const cal = vision?.createCalibrator(laneIndex) ?? new RomCalibrator(lane.movement);
     calibrator.current = cal;
-    // A new attempt starts with a clean verdict: the previous refusal described a range that no longer
-    // exists, and leaving it up would block the auto-finish guard from ever running again.
-    setRejected(null);
 
     if (!vision) return;
     const off = vision.onFrame((samples) => {
@@ -117,7 +124,7 @@ export default function RomCalibrationScreen() {
           const reason =
             vision.getInvalidCalibrations().find((c) => c.lane === laneIndex)?.reason ??
             'the calibrated range is unusable';
-          setRejected(reason);
+          setRejected({ attempt: attemptKey, reason });
           setDone((d) => {
             if (d[laneIndex] === null) return d;
             const next = d.slice();
@@ -135,18 +142,18 @@ export default function RomCalibrationScreen() {
         return next;
       });
     },
-    [laneIndex, setCalibration],
+    [attemptKey, laneIndex, setCalibration],
   );
 
-  // Auto-finish as soon as the calibrator says it is done. `rejected` is part of the guard: without it
-  // a refused range is re-offered on every 80 ms poll (the calibrator stays in 'done' forever), which
-  // is an infinite refusal loop instead of one message.
+  // Auto-finish as soon as the calibrator says it is done. THIS ATTEMPT'S refusal is part of the guard:
+  // without it a refused range is re-offered on every 80 ms poll (the calibrator stays in 'done'
+  // forever), which is an infinite refusal loop instead of one message.
   useEffect(() => {
     if (!live || live.status.phase !== 'done') return;
     const cal = calibrator.current;
     const result = cal?.getResult() ?? null;
-    if (result && !done[laneIndex] && rejected === null) finishLane(result);
-  }, [live, done, laneIndex, rejected, finishLane]);
+    if (result && !done[laneIndex] && rejectedReason === null) finishLane(result);
+  }, [live, done, laneIndex, rejectedReason, finishLane]);
 
   /**
    * Re-read the runtime's verdicts (refused lanes; whether the saved range on offer applies to THIS
@@ -176,7 +183,7 @@ export default function RomCalibrationScreen() {
   }, [lane, laneIndex, previous, generation]);
 
   // "Done" means the RUNTIME holds a usable range for this lane, not that this screen measured one.
-  const laneRefused = vetting.refusals.some((r) => r.lane === laneIndex) || rejected !== null;
+  const laneRefused = vetting.refusals.some((r) => r.lane === laneIndex) || rejectedReason !== null;
   const laneDone = laneRefused ? null : (done[laneIndex] ?? null);
   const status = live?.status ?? null;
   const restPhase = status?.phase === 'rest';
@@ -305,9 +312,10 @@ export default function RomCalibrationScreen() {
 
           {/* The runtime refused the range this screen just measured. Loudest thing on the screen: the
               lane is dead until it is re-done, and this is where it gets re-done. */}
-          {rejected && (
+          {rejectedReason && (
             <Toast kind="bad">
-              <strong data-testid="rom-rejected">This range was not accepted for lane {laneIndex + 1}:</strong> {rejected}.
+              <strong data-testid="rom-rejected">This range was not accepted for lane {laneIndex + 1}:</strong>{' '}
+              {rejectedReason}.
             </Toast>
           )}
 
@@ -315,7 +323,7 @@ export default function RomCalibrationScreen() {
               it was calibrated (flip the mirror switch and every stored range belongs to the other
               limb). Without this the therapist would have to walk back through the lanes to find it. */}
           {vetting.refusals
-            .filter((r) => r.lane !== laneIndex || !rejected)
+            .filter((r) => r.lane !== laneIndex || !rejectedReason)
             .map((r) => (
               <Toast kind="bad" key={r.lane}>
                 <strong data-testid={`rom-refusal-${r.lane}`}>
@@ -370,7 +378,7 @@ export default function RomCalibrationScreen() {
             {lanes.map((l, i) => {
               // A lane the runtime is refusing is NOT done, whatever this screen measured: the ✓ and the
               // min→max readout describe a range that will not score a single note.
-              const refused = vetting.refusals.some((r) => r.lane === i) || (i === laneIndex && rejected !== null);
+              const refused = vetting.refusals.some((r) => r.lane === i) || (i === laneIndex && rejectedReason !== null);
               const cal = refused ? null : done[i];
               return (
                 <li key={i} className="row">

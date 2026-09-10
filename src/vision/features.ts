@@ -615,6 +615,32 @@ export function movementMode(movement: Movement): Mode {
   return MOVEMENT_INFO[movement].mode;
 }
 
+/** How a therapist names each fingertip to a patient. "Little finger", never "pinky", out loud. */
+export const FINGERTIP_NAME: Record<Fingertip, string> = {
+  index: 'index finger',
+  middle: 'middle finger',
+  ring: 'ring finger',
+  pinky: 'little finger',
+};
+
+/**
+ * The patient-facing instruction for a lane, naming the DIGIT that was actually prescribed.
+ *
+ * `MOVEMENT_INFO.instructions` cannot do this on its own: finger_opposition's generic "touch your
+ * thumb to your fingertip" is the one string a patient is read aloud, and it is wrong for three of
+ * the four tips a therapist can now choose. Every other movement passes straight through.
+ */
+export function movementInstructions(movement: Movement, fingertip?: Fingertip): string {
+  if (movement !== 'finger_opposition') return MOVEMENT_INFO[movement].instructions;
+  return `Touch your thumb to your ${FINGERTIP_NAME[fingertip ?? DEFAULT_FINGERTIP]}, then open again.`;
+}
+
+/** Same, for the ROM calibration screen's "do three reps" wording. */
+export function movementCalibrationInstruction(movement: Movement, fingertip?: Fingertip): string {
+  if (movement !== 'finger_opposition') return MOVEMENT_INFO[movement].calibrationInstruction;
+  return `Touch your thumb to your ${FINGERTIP_NAME[fingertip ?? DEFAULT_FINGERTIP]}, open your hand, and repeat 3 times.`;
+}
+
 /* ---------------- lane conflicts (therapist setup guard) ---------------- */
 
 export interface LaneConflict {
@@ -689,7 +715,8 @@ function postureMessage(aIdx: number, bIdx: number, aInfo: MovementInfo, bInfo: 
 
 /**
  * Physically conflicting lanes in a prescription:
- *   - the identical movement twice on one limb                     -> error   (kind 'duplicate')
+ *   - the identical movement (and fingertip) twice on one limb      -> error   (kind 'duplicate')
+ *   - finger opposition on one hand with two different fingertips   -> warning (kind 'coupled')
  *   - two movements needing incompatible postures of the same limb -> error   (kind 'posture')
  *   - the same postures on two different limbs of a hand session   -> warning (kind 'posture')
  *   - two movements driven by the same voluntary motion            -> warning (kind 'coupled')
@@ -698,6 +725,17 @@ function postureMessage(aIdx: number, bIdx: number, aInfo: MovementInfo, bInfo: 
  * start on an 'error': nothing downstream can separate the lanes, and an unearned hit is worse than a
  * miss. `hasBlockingLaneConflict` is the one-line check for that.
  */
+/**
+ * The fingertip a lane really uses: the therapist's choice, the default for finger_opposition when it
+ * carries none, and undefined for every movement that has no fingertip dimension. Mirrors
+ * `calibrationKey` in the store — the conflict rules must partition lanes exactly the way the
+ * calibration store, the runtime and the trend view do, or the app blocks a prescription it can
+ * otherwise represent end to end.
+ */
+function laneTip(l: LaneSpec): Fingertip | undefined {
+  return l.movement === 'finger_opposition' ? (l.fingertip ?? DEFAULT_FINGERTIP) : undefined;
+}
+
 export function laneConflicts(lanes: readonly LaneSpec[]): LaneConflict[] {
   const out: LaneConflict[] = [];
   for (let i = 0; i < lanes.length; i++) {
@@ -719,9 +757,24 @@ export function laneConflicts(lanes: readonly LaneSpec[]): LaneConflict[] {
         continue;
       }
       if (a.movement === b.movement) {
+        // THE FINGERTIP IS PART OF THE MOVEMENT'S IDENTITY. Thumb-to-index and thumb-to-little on one
+        // hand are two different quantities everywhere else in the app — different feature, different
+        // calibration key, different stored range, different trend line — and prescribing exactly that
+        // pair is the whole reason a therapist is offered the choice. Only the SAME tip twice is the
+        // un-runnable duplicate; different tips are a coupling warning, because opposing one tip does
+        // tend to draw its neighbours in.
+        const ta = laneTip(a);
+        const tb = laneTip(b);
+        if (ta !== undefined && tb !== undefined && ta !== tb) {
+          out.push({
+            lanes: [a.index, b.index], movements: [a.movement, b.movement], side: a.side, severity: 'warning', kind: 'coupled',
+            message: `Lanes ${a.index + 1} and ${b.index + 1} oppose the thumb to different fingers of the ${a.side} hand (${FINGERTIP_NAME[ta]} and ${FINGERTIP_NAME[tb]}). They are calibrated and scored separately, but a patient who cannot isolate the digits may trigger both — check each lane's meter alone on the camera screen.`,
+          });
+          continue;
+        }
         out.push({
           lanes: [a.index, b.index], movements: [a.movement, b.movement], side: a.side, severity: 'error', kind: 'duplicate',
-          message: `Lanes ${a.index + 1} and ${b.index + 1} are both ${ia.label} on the ${a.side} side: one movement would hit both lanes.`,
+          message: `Lanes ${a.index + 1} and ${b.index + 1} are both ${ia.label}${ta ? ` (${FINGERTIP_NAME[ta]})` : ''} on the ${a.side} side: one movement would hit both lanes.`,
         });
         continue;
       }

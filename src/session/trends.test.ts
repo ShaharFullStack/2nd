@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { DEFAULT_TREND_WINDOW, movementTrends } from './trends.ts';
+import { DEFAULT_TREND_WINDOW, movementTrends, trendCoverage } from './trends.ts';
 import type { LaneResultSummary, SessionResult } from './types.ts';
 
 function lane(patch: Partial<LaneResultSummary> = {}): LaneResultSummary {
@@ -29,6 +29,61 @@ function session(id: string, at: number, lanes: LaneResultSummary[]): SessionRes
     completed: true, lanes,
   };
 }
+
+/**
+ * THE RULE THIS FILE EXISTS FOR, first: a trend is an outcome record. Only sessions the patient drove
+ * through the camera may contribute to it — a keyboard run is whoever held the keyboard, and an
+ * autoplay run is a bot hitting every note at 100 %. Both used to be averaged into the accuracy line,
+ * the delta badge, the session count and the rep total.
+ */
+describe('movementTrends excludes sessions the patient did not drive', () => {
+  const bot = (id: string, at: number, patch: Partial<SessionResult> = {}) => ({
+    ...session(id, at, [lane({ accuracy: 1, reps: 7, romMean: null, romBest: null, romSamples: 0 })]),
+    inputMode: 'autoplay' as const,
+    ...patch,
+  });
+
+  it('plots no point, no rep and no delta for an autoplay or keyboard session', () => {
+    const history = [
+      bot('bot2', 4000),
+      bot('kb', 3000, { inputMode: 'keyboard' }),
+      session('cam2', 2000, [lane({ romMean: 0.62, accuracy: 0.62, reps: 11 })]),
+      session('cam1', 1000, [lane({ romMean: 0.5, accuracy: 0.5, reps: 9 })]),
+    ];
+    const [trend] = movementTrends(history);
+    expect(trend.points.map((p) => p.sessionId)).toEqual(['cam1', 'cam2']);
+    expect(trend.points.every((p) => p.inputMode === 'camera')).toBe(true);
+    expect(trend.totalReps).toBe(20); // 9 + 11 — not 34
+    expect(trend.latestAccuracy).toBeCloseTo(0.62, 6); // not the bot's 100 %
+    expect(trend.accuracyChange).toBeCloseTo(0.12, 6);
+    expect(trend.excludedSessions).toBe(2);
+    expect(trend.excludedModes).toEqual(['autoplay', 'keyboard']);
+  });
+
+  it('produces no card at all for a movement only ever run on the keyboard', () => {
+    expect(movementTrends([bot('kb', 1, { inputMode: 'keyboard' })])).toEqual([]);
+  });
+
+  it('never lets a bot session fill a window slot a real session should have had', () => {
+    const history = [
+      bot('bot', 100),
+      ...Array.from({ length: 4 }, (_, i) => session(`c${i}`, 90 - i, [lane({ romMean: 0.5 })])),
+    ];
+    expect(movementTrends(history, 4).map((t) => t.points.length)).toEqual([4]);
+  });
+
+  it('counts the split for the screen header', () => {
+    const history = [bot('b', 3), bot('k', 2, { inputMode: 'keyboard' }), session('c', 1, [lane()])];
+    expect(trendCoverage(history)).toEqual({ cameraSessions: 1, excludedSessions: 2, excludedModes: ['autoplay', 'keyboard'] });
+    expect(trendCoverage([])).toEqual({ cameraSessions: 0, excludedSessions: 0, excludedModes: [] });
+  });
+
+  it('treats a record with no recorded input mode as unproven, not as the patient', () => {
+    const legacy = { ...session('old', 1, [lane()]), inputMode: undefined as unknown as SessionResult['inputMode'] };
+    expect(movementTrends([legacy])).toEqual([]);
+    expect(trendCoverage([legacy]).excludedModes).toEqual(['unknown']);
+  });
+});
 
 describe('movementTrends', () => {
   it('groups by movement+side and orders points oldest first', () => {

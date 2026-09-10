@@ -26,6 +26,7 @@ const GLYPH: Record<string, string> = {
   unsupported: '🚫',
   model: '📦',
   prescription: '⚠️',
+  audio_gesture: '👆',
   unknown: '📷',
 };
 

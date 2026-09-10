@@ -44,6 +44,32 @@ export default function ResultsScreen() {
         }
       />
 
+      {/*
+        A SESSION THE PATIENT DID NOT DRIVE IS NOT A CLINICAL RESULT, and it says so before any figure
+        on the screen is read. Every number below (score, "movements performed", accuracy, timing) is a
+        property of the keyboard or of the autoplay bot; none of it was measured on the patient, and
+        none of it reaches the progress trend on the History screen.
+      */}
+      {result.inputMode !== 'camera' && (
+        <div className="quarantine" data-testid="results-not-measured">
+          <span className="glyph" aria-hidden="true">
+            {result.inputMode === 'autoplay' ? '🤖' : '⌨️'}
+          </span>
+          <div className="stack" style={{ gap: 6 }}>
+            <h3 style={{ margin: 0 }}>
+              {result.inputMode === 'autoplay' ? 'Autoplay demo — not a patient session' : 'Keyboard session — no movement was measured'}
+            </h3>
+            <p className="muted" style={{ margin: 0 }}>
+              The lanes were driven by {result.inputMode === 'autoplay' ? 'the autoplay bot' : 'keys 1–4'}, not by the
+              patient's movement. The figures below describe{' '}
+              {result.inputMode === 'autoplay' ? 'the bot' : 'whoever pressed the keys'}: no range of motion was
+              recorded, the reps are keypresses, and this session is excluded from the progress trend on the history
+              screen.
+            </p>
+          </div>
+        </div>
+      )}
+
       <div className="card-grid">
         <div className="card stack">
           <div className="eyebrow">Score</div>

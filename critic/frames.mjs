@@ -50,17 +50,64 @@ async function waitForServer(url, timeoutMs = 90_000) {
   throw new Error(`server at ${url} never came up`);
 }
 
+/**
+ * Tear the dev server down for real. Signals the child's whole process group (vite spawns
+ * workers of its own), then waits for the actual `exit` event rather than trusting
+ * `child.killed` — that flag only reports that a signal was *sent*, so the old
+ * `if (!server.killed)` escalation could never fire. Escalates to SIGKILL if it lingers.
+ */
+async function stopServer(server) {
+  if (server.exitCode !== null || server.signalCode !== null) return;
+
+  const exited = new Promise((r) => server.once('exit', r));
+  const signalGroup = (sig) => {
+    try {
+      process.kill(-server.pid, sig); // negative pid => the whole group
+    } catch {
+      try {
+        server.kill(sig);
+      } catch {
+        /* already gone */
+      }
+    }
+  };
+
+  signalGroup('SIGTERM');
+  const died = await Promise.race([
+    exited.then(() => true),
+    new Promise((r) => setTimeout(() => r(false), 3000)),
+  ]);
+  if (!died) {
+    log('vite did not stop on SIGTERM, escalating to SIGKILL');
+    signalGroup('SIGKILL');
+    await Promise.race([exited, new Promise((r) => setTimeout(r, 2000))]);
+  }
+  // Drop the stdio handles so nothing is left holding the event loop open.
+  server.stdout?.destroy();
+  server.stderr?.destroy();
+  server.unref();
+}
+
 async function main() {
   mkdirSync(OUT, { recursive: true });
 
   let server = null;
   if (!urlArg) {
     log(`starting vite on :${PORT}`);
-    server = spawn('npx', ['vite', '--port', String(PORT), '--strictPort'], {
+    // Spawn the real vite binary, not `npx vite`: npx sits in between as a wrapper, so a
+    // signal sent to the child only kills the wrapper and leaves vite running as an orphan
+    // holding our stdio pipes — which keeps this process's event loop alive forever after
+    // the last frame is captured. `detached` puts vite in its own process group so teardown
+    // can signal the whole group.
+    const VITE_BIN = resolve(ROOT, 'node_modules/.bin/vite');
+    server = spawn(VITE_BIN, ['--port', String(PORT), '--strictPort'], {
       cwd: ROOT,
       stdio: ['ignore', 'pipe', 'pipe'],
       env: process.env,
+      detached: true,
     });
+    // Drain both streams: an unread pipe fills at 64KB and blocks vite mid-run.
+    server.stdout.resume();
     server.stderr.on('data', (d) => process.stderr.write(`[vite] ${d}`));
     await waitForServer(BASE);
   }
@@ -114,8 +161,10 @@ async function main() {
 
     // combo: the autoplay bot only climbs, so a few more seconds gives a high multiplier.
     await page.waitForTimeout(6000);
-    const hud = await page.evaluate(() => window.__beatRehab.getScore());
-    log('hud at combo frame', JSON.stringify({ combo: hud.combo, mult: hud.multiplier, score: hud.score }));
+    // getScore() is null once the runner has been torn down (song over, or the shell navigated
+    // away). That is worth reporting, not worth crashing a capture over.
+    const hud = await page.evaluate(() => window.__beatRehab.getScore?.() ?? null);
+    log('hud at combo frame', hud ? JSON.stringify({ combo: hud.combo, mult: hud.multiplier, score: hud.score }) : 'no runner');
     await shoot('combo');
 
     // hit: poll at high rate until the HUD reports a hit landed on this very frame.
@@ -163,11 +212,7 @@ async function main() {
     if (errors.length) log('page errors:', errors.slice(0, 5).join(' | '));
   } finally {
     await browser.close();
-    if (server) {
-      server.kill('SIGTERM');
-      await new Promise((r) => setTimeout(r, 300));
-      if (!server.killed) server.kill('SIGKILL');
-    }
+    if (server) await stopServer(server);
   }
   log('captured', shots.join(', '), 'into', OUT);
 }

@@ -68,8 +68,14 @@ export default function HistoryScreen() {
                     <b>{r.songTitle}</b>
                     <div className="dim">
                       {r.mode === 'leg' ? 'Leg' : 'Hand'} · {r.difficulty}
-                      {r.inputMode !== 'camera' ? ` · ${r.inputMode}` : ''}
                     </div>
+                    {/* Quarantined in the record itself, not only in the trend above: these rows are
+                        the system's input, and their score/accuracy/reps are not the patient's. */}
+                    {r.inputMode !== 'camera' && (
+                      <span className="badge badge-warn" data-testid={`history-not-measured-${r.id}`}>
+                        {r.inputMode} · not measured
+                      </span>
+                    )}
                   </td>
                   <td className="mono">{r.score.toLocaleString()}</td>
                   <td>

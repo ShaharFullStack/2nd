@@ -235,13 +235,26 @@ function pageProbe(W, H) {
           const p = px(data, x, y);
           luma += lum(p);
           chroma += Math.max(p[0], p[1], p[2]) - Math.min(p[0], p[1], p[2]);
-          // The "lower to reset" hint colour (#ffcf5a) after alpha-blending onto the dark road:
-          // warm yellow — bright red channel, green well below it, blue far below that.
-          if (p[0] > 150 && p[0] - p[2] > 70 && p[0] - p[1] > 15 && p[0] - p[1] < 120) hint++;
+          // The "lower to reset" hint colour (#c08cff = 192,140,255) after alpha-blending onto the
+          // dark road: violet — blue highest, red well above green. Lane 3's own blue (#3b8cff =
+          // 59,140,255) shares the blue and green channels exactly, so the red floor is what tells
+          // the two apart, and it is why this scene uses the blue lane in the first place.
+          if (p[2] > 170 && p[0] > 110 && p[2] - p[1] > 45 && p[0] - p[1] > 18) hint++;
           n++;
         }
       }
       return { luma: luma / n, chroma: chroma / n, hint };
+    };
+    // Is the locked column resolvable AT ALL from across a room? A grey bar at ~42/255 against a
+    // ~14/255 well is one uniform dark disc at 2 m, which is what this used to be: the thing the
+    // patient is being asked to LOWER was invisible while they lowered it. What makes it readable
+    // is a hard luminance STEP at the top of the column (the violet drain cap riding it), so that
+    // is what is measured — the largest row-to-row jump down the receptor's centre line.
+    const centreStep = (data) => {
+      let worst = 0;
+      const x = Math.round(cx);
+      for (let y = box.y0; y < box.y1; y++) worst = Math.max(worst, Math.abs(lum(px(data, x, y + 1)) - lum(px(data, x, y))));
+      return worst;
     };
     const a = stats(live.data);
     const b = stats(held.data);
@@ -251,6 +264,7 @@ function pageProbe(W, H) {
     out.receptorChromaLocked = b.chroma;
     out.receptorHintArmed = a.hint;
     out.receptorHintLocked = b.hint;
+    out.receptorStepLocked = centreStep(held.data);
   }
 
   // --- 4c. the miss cue is fully inside the canvas at the latest possible verdict ---------------
@@ -612,6 +626,11 @@ try {
     'a locked-out receptor shows the "lower to reset" line/chevron, and a live one never does',
     out.receptorHintLocked > 20 && out.receptorHintArmed === 0,
     `hint pixels: locked ${out.receptorHintLocked}, armed ${out.receptorHintArmed}`,
+  );
+  check(
+    'a locked receptor\'s column has a hard top edge, so "how much further to lower" is readable at 2 m',
+    out.receptorStepLocked >= 35,
+    `largest row-to-row luma step down the centre line: ${out.receptorStepLocked.toFixed(0)}`,
   );
   check(
     'the whole missed gem is on screen at the latest miss verdict (+280 ms)',

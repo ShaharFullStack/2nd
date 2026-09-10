@@ -2,10 +2,12 @@
  * VisionInput lifecycle: start()/stop() must be race-safe, and the camera must be OFF whenever the
  * screen is gone.
  *
- * Acquiring a detector and a camera takes two awaits, the second of which contains the browser's
- * permission prompt. Real UI drives that concurrently — React StrictMode's mount/unmount/mount is
- * literally start(); stop(); start(), and a patient can back out of the camera check while the prompt
- * is up. Both races used to leave a recording camera and a running inference loop behind.
+ * Acquiring a camera and a detector takes two awaits, the FIRST of which contains the browser's
+ * permission prompt (the camera is opened before the 6-8 MB model is fetched, so a refusal reaches the
+ * therapist in under a second instead of after the download). Real UI drives that concurrently — React
+ * StrictMode's mount/unmount/mount is literally start(); stop(); start(), and a patient can back out of
+ * the camera check while the prompt is up. Both races used to leave a recording camera and a running
+ * inference loop behind.
  */
 import { describe, expect, it, vi } from 'vitest';
 import type { LaneSpec } from '../engine/types.ts';
@@ -91,46 +93,48 @@ function makeInput(over: Partial<ConstructorParameters<typeof VisionInput>[0]> =
 }
 
 describe('VisionInput start/stop is race-safe (React StrictMode, mid-open cancel)', () => {
-  it('stop() during a pending start leaves nothing running and RELEASES what the start created', async () => {
+  it('stop() while the CAMERA is opening releases it and never downloads the model', async () => {
     const det = deferredFactory(makeDetector);
     const cam = deferredFactory(makeCamera);
     const input = makeInput({ detector: det.factory, camera: cam.factory });
 
     const started = input.start();
     expect(input.isStarting()).toBe(true);
+    expect(cam.calls()).toBe(1); // the camera is the FIRST thing asked for
     // The patient backs out while the permission prompt is up.
     input.stop();
     expect(input.isRunning()).toBe(false);
-    // ... and only now does the detector arrive.
-    const detector = det.settle();
-    await started;
-
-    expect(input.isRunning()).toBe(false);
-    expect(input.getStatus().reason).toBe('stopped');
-    expect(detector.closed).toBe(true); // the superseded start closed its own detector
-    expect(cam.calls()).toBe(0); // and never went on to open the camera
-    expect(input.getVideoElement()).toBeNull();
-    expect(input.getStats().running).toBe(false);
-  });
-
-  it('stop() while the CAMERA is opening still turns the camera off', async () => {
-    const cam = deferredFactory(makeCamera);
-    const detector = makeDetector();
-    const input = makeInput({ detector: () => Promise.resolve(detector), camera: cam.factory });
-
-    const started = input.start();
-    await Promise.resolve(); // let the detector await settle so we are inside the camera open
-    expect(cam.calls()).toBe(1);
-    input.stop();
+    // ... and only now does the camera arrive.
     const camera = cam.settle();
     await started;
 
     expect(input.isRunning()).toBe(false);
+    expect(input.getStatus().reason).toBe('stopped');
     expect(camera.stopped).toBe(1); // the camera the abandoned start opened was released
     expect(camera.onEnded).toBeNull();
+    expect(det.calls()).toBe(0); // and the abandoned start never went on to build a detector
     expect(input.getVideoElement()).toBeNull();
-    // An injected-instance detector is not owned, but a factory-created one is: closed by the abandon.
-    expect(detector.closed).toBe(true);
+    expect(input.getStats().running).toBe(false);
+  });
+
+  it('stop() while the MODEL is loading closes the detector and turns the camera off', async () => {
+    const det = deferredFactory(makeDetector);
+    const camera = makeCamera();
+    const input = makeInput({ detector: det.factory, camera: () => Promise.resolve(camera) });
+
+    const started = input.start();
+    await Promise.resolve(); // let the camera await settle so we are inside the model load
+    await Promise.resolve();
+    expect(det.calls()).toBe(1);
+    input.stop();
+    const detector = det.settle();
+    await started;
+
+    expect(input.isRunning()).toBe(false);
+    expect(camera.stopped).toBe(1);
+    expect(camera.onEnded).toBeNull();
+    expect(input.getVideoElement()).toBeNull();
+    expect(detector.closed).toBe(true); // a factory-created detector is owned: closed by the abandon
   });
 
   it('two concurrent start()s create exactly ONE detector and ONE camera', async () => {
@@ -140,12 +144,12 @@ describe('VisionInput start/stop is race-safe (React StrictMode, mid-open cancel
 
     const a = input.start();
     const b = input.start();
-    expect(det.calls()).toBe(1); // the second call joined the in-flight start instead of racing it
-    det.settle();
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(cam.calls()).toBe(1);
+    expect(cam.calls()).toBe(1); // the second call joined the in-flight start instead of racing it
     cam.settle();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(det.calls()).toBe(1);
+    det.settle();
     await Promise.all([a, b]);
 
     expect(det.made).toHaveLength(1);
@@ -166,38 +170,46 @@ describe('VisionInput start/stop is race-safe (React StrictMode, mid-open cancel
     const first = input.start(); // mount
     input.stop(); // unmount
     const second = input.start(); // mount again
-    expect(det.calls()).toBe(2); // a genuinely new acquisition, not the invalidated one
+    expect(cam.calls()).toBe(2); // a genuinely new acquisition, not the invalidated one
 
-    det.settle(0); // the abandoned generation's detector arrives late
-    det.settle(1);
+    cam.settle(0); // the abandoned generation's camera arrives late
+    cam.settle(1);
     await Promise.resolve();
     await Promise.resolve();
     await first;
-    // Only the second generation reaches the camera step.
-    expect(cam.calls()).toBe(1);
-    cam.settle(0);
+    expect(cam.made[0].stopped).toBe(1); // and is turned straight back off
+    // Only the second generation reaches the model step.
+    expect(det.calls()).toBe(1);
+    det.settle(0);
     await second;
 
     expect(input.isRunning()).toBe(true);
-    expect(det.made[0].closed).toBe(true); // first generation released...
-    expect(det.made[1].closed).toBe(false); // ... second generation live
-    expect(cam.made[0].stopped).toBe(0);
-    expect(input.getVideoElement()).toBe(cam.made[0].video);
+    expect(det.made[0].closed).toBe(false); // the only detector built is the live one
+    expect(cam.made[1].stopped).toBe(0);
+    expect(input.getVideoElement()).toBe(cam.made[1].video);
 
     input.stop();
-    expect(det.made[1].closed).toBe(true);
-    expect(cam.made[0].stopped).toBe(1);
+    expect(det.made[0].closed).toBe(true);
+    expect(cam.made[1].stopped).toBe(1);
   });
 
-  it('a rejected camera (permission denied) closes the detector and leaves nothing open', async () => {
-    const detector = makeDetector();
+  it('a rejected camera (permission denied) fails FAST, before the model is fetched', async () => {
+    // The clinic's most common failure, and the reason the camera is opened first: a refused prompt
+    // must reach the therapist in the time getUserMedia takes to say no, not after a 6-8 MB download.
+    let detectorBuilds = 0;
     const denied = new Error('NotAllowedError: Permission denied');
-    const input = makeInput({ detector: () => Promise.resolve(detector), camera: () => Promise.reject(denied) });
+    const input = makeInput({
+      detector: () => {
+        detectorBuilds++;
+        return Promise.resolve(makeDetector());
+      },
+      camera: () => Promise.reject(denied),
+    });
 
     await expect(input.start()).rejects.toThrow(/Permission denied/);
+    expect(detectorBuilds).toBe(0);
     expect(input.isRunning()).toBe(false);
     expect(input.isStarting()).toBe(false);
-    expect(detector.closed).toBe(true);
     expect(input.getStatus().reason).toBe('error');
     expect(input.getLastError()).toBe(denied);
     // ... and a retry after the patient grants permission works normally.
@@ -214,7 +226,6 @@ describe('VisionInput start/stop is race-safe (React StrictMode, mid-open cancel
     const cam = deferredFactory(makeCamera);
     const input = makeInput({ detector: () => Promise.resolve(makeDetector()), camera: cam.factory });
     const p = input.start();
-    await Promise.resolve();
     cam.settle();
     await p;
     await input.start();

@@ -18,6 +18,7 @@ export default function CameraCheck() {
   const difficulty = useStore((s) => s.difficulty);
   const settings = useStore((s) => s.settings);
   const updateSettings = useStore((s) => s.updateSettings);
+  const setInputMode = useStore((s) => s.setInputMode);
 
   const holder = useRef<HTMLDivElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
@@ -30,6 +31,11 @@ export default function CameraCheck() {
   const [starting, setStarting] = useState(true);
   /** Bumped by Retry to re-run the effect, which builds a NEW VisionInput and re-requests the device. */
   const [attempt, setAttempt] = useState(0);
+  /** ctx-free wall clock of the attempt in flight, so the overlay can say how long it has been. */
+  const [startedAt, setStartedAt] = useState(() => Date.now());
+  const [elapsed, setElapsed] = useState(0);
+  /** The in-flight ensureVision promise: Retry awaits THIS, not a fixed delay. */
+  const attemptRef = useRef<Promise<unknown> | null>(null);
 
   useEffect(() => {
     let alive = true;
@@ -51,8 +57,9 @@ export default function CameraCheck() {
       raf = requestAnimationFrame(paint);
     };
 
-    runtime
-      .ensureVision({ mode, lanes, calibrations, difficulty, mirrored: settings.mirrored })
+    const attempting = runtime.ensureVision({ mode, lanes, calibrations, difficulty, mirrored: settings.mirrored });
+    attemptRef.current = attempting;
+    attempting
       .then((vision) => {
         if (!alive) return;
         setStarting(false);
@@ -104,15 +111,31 @@ export default function CameraCheck() {
    * detector) from scratch. Awaited so the button can stay in its "asking…" state until it settles.
    */
   const retry = useCallback(async () => {
+    const before = attemptRef.current;
     runtime.disposeVision();
     setError(null);
     setStatus(null);
     setRefusals([]);
     setStarting(true);
+    setStartedAt(Date.now());
     setAttempt((n) => n + 1);
-    // One frame of grace so the effect's teardown/setup pair has run before the button re-enables.
-    await new Promise((r) => setTimeout(r, 350));
+    // Wait for the effect's teardown/setup pair to publish the NEW attempt, then await THAT — the
+    // button's "asking…" state has to describe the real request. A fixed 350 ms delay re-enabled the
+    // button a third of a second into a request that can take 45 s on a cold model download.
+    for (let i = 0; i < 60 && attemptRef.current === before; i++) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    await attemptRef.current?.catch(() => undefined);
   }, []);
+
+  // A therapist with 90 seconds between patients may not be left on an unexplained spinner: the wait
+  // is named, counted, and has both a way out and a labelled downgrade once it stops looking normal.
+  useEffect(() => {
+    if (!starting) return;
+    setElapsed(Math.round((Date.now() - startedAt) / 1000));
+    const t = setInterval(() => setElapsed(Math.round((Date.now() - startedAt) / 1000)), 500);
+    return () => clearInterval(t);
+  }, [starting, startedAt]);
 
   const tracking = status?.tracking === true;
   const postures = requiredPostures(lanes);
@@ -138,7 +161,47 @@ export default function CameraCheck() {
             and flipping both together keeps the landmarks on top of the limbs they came from. */}
         <div className="camera-frame mirror grow" ref={holder} style={{ maxWidth: 760 }}>
           <canvas ref={canvas} />
-          {starting && <div className="overlay">Starting camera…</div>}
+          {starting && (
+            <div className="overlay" data-testid="camera-starting">
+              <div className="card stack" style={{ maxWidth: 420 }}>
+                <h3 style={{ margin: 0 }}>Starting the camera…</h3>
+                <p className="muted" style={{ margin: 0 }}>
+                  Asking the browser for the camera, then loading the movement model. The first run on a
+                  device downloads that model (about 8 MB) and can take a minute; after that it is cached.
+                </p>
+                <div className="row">
+                  <span className="badge mono" data-testid="camera-elapsed">
+                    {elapsed}s
+                  </span>
+                  {elapsed >= 10 && <span className="badge badge-warn">longer than usual</span>}
+                </div>
+                {elapsed >= 10 && (
+                  <>
+                    <span className="dim">
+                      If no permission prompt appeared, the browser may have blocked it silently — check the
+                      camera icon in the address bar, then start over.
+                    </span>
+                    <div className="row">
+                      <button className="btn" onClick={() => void retry()} data-testid="camera-start-over">
+                        Start over
+                      </button>
+                      <button
+                        className="btn btn-ghost"
+                        onClick={() => {
+                          runtime.disposeVision();
+                          setInputMode('keyboard');
+                          goto('play');
+                        }}
+                        data-testid="camera-starting-keyboard"
+                      >
+                        Run on the keyboard instead (no range of motion is measured)
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
+            </div>
+          )}
         </div>
 
         <div className="stack" style={{ width: 'min(380px, 100%)' }}>

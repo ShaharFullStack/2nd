@@ -64,3 +64,15 @@ describe('classifyCameraError', () => {
     expect(f.title).not.toContain('NotAllowedError');
   });
 });
+
+describe('the browser holding the audio clock', () => {
+  it('is its own failure with its own remedy — a tap, not a camera setting', () => {
+    // Reached by reloading on the camera screen: Chrome never settles AudioContext.resume() until the
+    // page has had a gesture, and camera frames are timestamped against that clock.
+    const f = classifyCameraError(new Error('The audio clock could not be started: the browser is waiting for a tap on the page.'));
+    expect(f.kind).toBe('audio_gesture');
+    expect(f.retryable).toBe(true);
+    expect(f.remedy).toMatch(/press retry/i);
+    expect(f.detail).toMatch(/nothing is wrong with the camera/i);
+  });
+});

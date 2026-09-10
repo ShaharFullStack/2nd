@@ -10,6 +10,7 @@ import { DIFFICULTIES, clampWindowScale } from '../engine/difficulty.ts';
 import type { DifficultyName, Fingertip, LaneSpec, Mode, Movement, Side } from '../engine/types.ts';
 import { FINGERTIPS, HAND_MOVEMENTS, LEG_MOVEMENTS } from '../engine/types.ts';
 import type { RomCalibration } from '../vision/calibration.ts';
+import { LATENCY_MAX_MS, LATENCY_MIN_MS, clampLatencyMs } from '../session/latencyAdvice.ts';
 import type { InputMode, SessionConfig, SessionResult } from '../session/types.ts';
 import { readJson, writeJson } from './persist.ts';
 
@@ -408,7 +409,9 @@ export const useStore = create<AppState>((set, get) => {
     clearCalibrations: () => set((s) => ({ calibrations: s.lanes.map(() => null) })),
 
     setLatency: (sec, measured, note = '') => {
-      const latencyOffsetSec = Number.isFinite(sec) ? Math.max(0, Math.min(1, sec)) : 0;
+      // Bounds (not rounding) from the same place the Results hand-over reads them, so the value the
+      // therapist is offered is the value that ends up in force.
+      const latencyOffsetSec = Number.isFinite(sec) ? Math.max(LATENCY_MIN_MS / 1000, Math.min(LATENCY_MAX_MS / 1000, sec)) : 0;
       set({ latencyOffsetSec, latencyMeasured: measured, latencyNote: note });
       writeJson(LATENCY_KEY, latencyOffsetSec);
     },
@@ -416,8 +419,9 @@ export const useStore = create<AppState>((set, get) => {
     applySuggestedLatency: (suggestedMs, source = '') => {
       if (!Number.isFinite(suggestedMs)) return null;
       const previousMs = Math.round(get().latencyOffsetSec * 1000);
-      const appliedSec = Math.max(0, Math.min(1, suggestedMs / 1000));
-      const appliedMs = Math.round(appliedSec * 1000);
+      // The same clamp the panel labels its button with, so what is offered is what is stored.
+      const appliedMs = clampLatencyMs(suggestedMs);
+      const appliedSec = appliedMs / 1000;
       // `measured` stays true: the value came from a whole run's worth of judged crossings, which is
       // strictly more evidence than the ten taps of the latency screen.
       get().setLatency(appliedSec, true, source ? `${appliedMs} ms measured from ${source}` : `${appliedMs} ms measured from the last run`);

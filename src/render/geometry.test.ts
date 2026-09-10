@@ -171,16 +171,62 @@ describe('the board is the composition, not an element in it', () => {
     expect(fadeEndY).toBeLessThan(1080 * 0.32);
   });
 
-  it('holds two bars of read-ahead: a rehab chart puts 5+ gems on the board at once', () => {
+  it('holds two bars of read-ahead: a rehab chart puts 8 gems on the board at once', () => {
     const g = makeGeometry(1920, 1080, 4);
     // 120 BPM, medium density = one note per beat (src/engine/difficulty.ts), i.e. 2 notes/second.
+    // A shipped highway carries 6-14 gems; a rehab chart cannot be made denser (every note is a rep
+    // with a return-to-rest gap after it), so the read-ahead window is the only lever there is.
     const notesPerSec = 2;
     const onBoard = g.approachSec * notesPerSec;
-    expect(g.approachSec).toBeGreaterThanOrEqual(2);
-    expect(onBoard).toBeGreaterThanOrEqual(5);
+    expect(g.approachSec).toBeGreaterThanOrEqual(3.5);
+    expect(onBoard).toBeGreaterThanOrEqual(7);
     // ...and the furthest of them is still big enough to see from a clinic chair.
     const farRadius = g.gemRadiusNear * scaleAt(g, 1);
-    expect((farRadius * 2) / 1080).toBeGreaterThanOrEqual(0.02);
+    expect((farRadius * 2) / 1080).toBeGreaterThanOrEqual(0.045);
+  });
+
+  it('spends its read-ahead on readable road: every eighth of the run is a real slice of frame', () => {
+    // The failure this pins: at farScale 0.22 the run from depth 0.5 to the horizon was 13 % of
+    // frame height and the gems in it were 30 px, so half the read-ahead time bought nothing. Each
+    // eighth of the *time* must still be worth ≥ 3 % of frame height, and a gem anywhere on the run
+    // must clear 2.5 % of frame height (a clinic screen at 2 m).
+    for (const [w, h] of SIZES) {
+      const g = makeGeometry(w, h, 4);
+      for (let i = 0; i < 8; i++) {
+        const dNear = i / 8;
+        const dFar = (i + 1) / 8;
+        const slice = (yAt(g, dNear) - yAt(g, dFar)) / h;
+        expect(slice, `${w}x${h} depth ${dNear}-${dFar}`).toBeGreaterThanOrEqual(0.03);
+        const diameter = 2 * g.gemRadiusNear * scaleAt(g, dFar);
+        expect(diameter / h, `${w}x${h} gem at depth ${dFar}`).toBeGreaterThanOrEqual(0.025);
+      }
+    }
+  });
+
+  it('never lets a gem be wider than the lane it is in, at any depth', () => {
+    // A gem drawn at the far end used to overflow the road edge and get clipped by it, which reads
+    // as a note popping in through the boundary.
+    const g = makeGeometry(1920, 1080, 4);
+    for (let i = 0; i <= 10; i++) {
+      const d = i / 10;
+      const laneW = g.laneWidthNear * scaleAt(g, d);
+      expect(2 * g.gemRadiusNear * scaleAt(g, d), `depth ${d}`).toBeLessThanOrEqual(laneW);
+    }
+  });
+
+  it('keeps the scroll speed at the strike line inside a readable band', () => {
+    // Speed at the line = (strikeY - vpY)·k / approachSec px/s. Too fast and the gem is a blur in
+    // the judgment window; too slow and it hangs on the receptor. The loose taper cut this from
+    // ~970 to ~480 px/s at 1080p, deliberately — but it is still a real approach, not a crawl.
+    const g = makeGeometry(1920, 1080, 4);
+    const speed = ((g.strikeY - g.vpY) * g.k) / g.approachSec;
+    expect(speed / 1080).toBeGreaterThanOrEqual(0.25);
+    expect(speed / 1080).toBeLessThanOrEqual(0.7);
+    // And a gem that was not hit clears the receptor ring rather than sitting inside it: the tail
+    // moves it a full gem radius below the line inside 0.6 s.
+    const clearSec = 0.6;
+    const dTail = -clearSec / g.approachSec;
+    expect(yAt(g, dTail) - g.strikeY).toBeGreaterThan(g.gemRadiusNear * GEM_ASPECT);
   });
 
   it('leaves under a third of the frame to the backdrop', () => {

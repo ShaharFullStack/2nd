@@ -1,5 +1,5 @@
 {
- "updated": "2026-09-10T20:25Z",
+ "updated": "2026-09-10T21:25Z",
  "pieces": {
   "engine": {
    "round": 5,
@@ -22,9 +22,9 @@
    "note": "Round 4, score 8. Miss visuals now readable at real engine timing, score odometer fixed. Open: receptor ring must read full exactly when the"
   },
   "highway": {
-   "round": 1,
-   "status": "blind round 2",
-   "note": "Blind round 1: ours ranked 2.56 vs shipped games 1.17 (lower is better); 1 of 3 judges put one of ours first. Unanimous deficit: the play fi"
+   "round": 3,
+   "status": "won blind A/B",
+   "note": "Blind round 3: all three judges ranked our three frames ABOVE both shipped reference games, and every judge put one of ours first. Road now "
   }
  },
  "entries": [
@@ -129,6 +129,13 @@
    "piece": "highway",
    "kind": "fail",
    "text": "Blind round 1: ours ranked 2.56 vs shipped games 1.17 (lower is better); 1 of 3 judges put one of ours first. Unanimous deficit: the play field was a postage stamp — vanishing point at 35% of frame height, strike line at 78%, only 2-4 gems on screen, ~55% dead space. Round 2 fix: road now runs near-full height with lane tints and a wider strike line."
+  },
+  {
+   "time": "2026-09-10T21:25Z",
+   "piece": "highway",
+   "kind": "pass",
+   "text": "Blind round 3: all three judges ranked our three frames ABOVE both shipped reference games, and every judge put one of ours first. Road now fills the frame, 8 gems of read-ahead, beat/bar ladder, gems land on the receptors, crowd and stage lighting. Round 1 ours 2.56 vs refs 1.17; round 3 ours ~1.0 vs refs ~3.5.",
+   "image": "shots/highway-round3.png"
   }
  ]
 }

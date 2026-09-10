@@ -44,13 +44,15 @@ export interface RenderLaneState {
    * them the same way.
    *
    * This is NOT a brightness modifier. The receptor renders it as a categorically different set of
-   * MARKS: the dead grey miss ring shrunk 12 %, drained grey liquid, and — uniquely to this state —
-   * a dashed re-arm line at the level to come back down to, a "lower to reset" chevron that settles
-   * onto that line, and an arc outside the ring that grows as the value drains and completes exactly
-   * when the lane re-arms. Just as important is what is *removed*: no level line, no target line or
-   * ticks, no hot fill, no halo, no additive rim or corona. A lane with `armed === false` must never
-   * wear any part of the "will fire" costume: the input layer will emit nothing for it however hard
-   * the patient pushes.
+   * MARKS: the dead grey miss ring shrunk 12 %, a grey liquid column capped short of the target
+   * height (it can never reach the height that means "at the trigger point", however hard the
+   * patient pushes), and — uniquely to this state — a violet drain cap riding the top of that
+   * column, a dashed re-arm line at the level to come back down to, a "lower to reset" chevron that
+   * settles onto that line, and an arc outside the ring that grows as the value drains and
+   * completes exactly when the lane re-arms. Just as important is what is *removed*: no level line,
+   * no target line or ticks, no hot fill, no halo, no additive rim or corona. A lane with
+   * `armed === false` must never wear any part of the "will fire" costume: the input layer will
+   * emit nothing for it however hard the patient pushes.
    */
   armed: boolean;
   /**
@@ -110,14 +112,23 @@ export interface RenderFrame {
    * every frame. It is drawn as a fixed TARGET LINE across the receptor's meter well (and as two
    * ticks on the ring's outline at the same height, where the liquid can never cover it), at 76 %
    * of the well's height with overshoot headroom above it. So the meter answers "how much further"
-   * during the rise, and a lane that clears the threshold is the only one that paints liquid above
-   * the target line.
+   * during the rise, and a lane that would really fire is the only one that paints liquid at or
+   * above the target-line height: a locked-out lane's column is capped ~10 % of the target height
+   * short of that line, so the band around it stays empty in every state that cannot score.
    *
    * A level at or above the target line is necessary but NOT sufficient for the "this will fire"
-   * look: that one (hot fill, white-hot cap, inner rim, corona, halo) is drawn only when the lane
-   * would really trigger — at/over threshold *and* `armed` *and* `tracking` (see `RenderLaneState`).
-   * That conjunction is the renderer's core biofeedback claim. A locked-out lane loses the target
-   * line and ticks altogether: its target is the re-arm line below, not the threshold above.
+   * look: that one (hot fill, split white-hot cap, inner rim, corona, halo) is drawn only when the
+   * lane would really trigger — at/over threshold *and* `armed` *and* `tracking` (see
+   * `RenderLaneState`). That conjunction is the renderer's core biofeedback claim. A locked-out
+   * lane loses the target line and ticks altogether: its target is the re-arm line below, not the
+   * threshold above.
+   *
+   * KNOWN LIMIT, stated because the rest of this doc is a promise: the renderer can only be as
+   * truthful as `LaneState` is. `src/vision/trigger.ts` also swallows a crossing that lands within
+   * `minIntervalSec` (0.3 s) of the previous one, and that refractory window is not exposed in
+   * `LaneState`, so a rise that re-arms and re-crosses inside 300 ms can wear the "will fire" look
+   * for the frame before it is dropped. Closing it needs the input layer to fold the min-interval
+   * into `armed` (or to publish it per lane); the renderer must not guess at it.
    *
    * The threshold is optional only so the type stays compatible with partial frames: when it is
    * absent the renderer falls back to 0.5 *and warns once on the console*, because a meter filled

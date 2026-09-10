@@ -24,6 +24,13 @@ export type CameraFailureKind =
   | 'model'
   /** The lane prescription itself is unusable, so VisionInput refused to start. Not a camera fault. */
   | 'prescription'
+  /**
+   * The browser is holding the AUDIO CLOCK until someone touches the page, and camera frames are
+   * timestamped against that clock. Reached by reloading on (or deep-linking to) the camera screen,
+   * where no gesture has happened yet: `AudioContext.resume()` simply never settles, so without this
+   * the screen waits forever with nothing to show for it.
+   */
+  | 'audio_gesture'
   | 'unknown';
 
 export interface CameraFailure {
@@ -67,6 +74,20 @@ export function classifyCameraError(err: unknown): CameraFailure {
       detail: raw,
       remedy: 'Go back to Setup and change one of the lanes — two movements of the same limb cannot be told apart.',
       retryable: false,
+      raw,
+    };
+  }
+
+  // Checked before the permission rule: this failure carries no DOMException name of its own and its
+  // remedy (touch the screen) is nothing like the camera-permission one.
+  if (/audio clock|audiocontext could not be resumed/.test(hay)) {
+    return {
+      kind: 'audio_gesture',
+      title: 'The browser is waiting for a tap',
+      detail:
+        'Camera frames are timestamped against the audio clock, and this browser will not start that clock until someone interacts with the page. Nothing is wrong with the camera.',
+      remedy: 'Press Retry — that press is the interaction the browser is waiting for.',
+      retryable: true,
       raw,
     };
   }

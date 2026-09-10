@@ -39,10 +39,11 @@
  *
  * `receptorLook` collapses a `RenderLaneState` into what the receptor should read;
  * `Highway.drawReceptors` renders each state as a different SET OF MARKS (see its doc comment):
- * (a) level line + fixed target line and ticks, (b) those plus liquid above the target line, a
- * white-hot cap and two additive rings, (c) a dead grey ring with a dashed re-arm line, a "lower to
- * reset" chevron and a return-to-rest arc — and no level line, target line or halo at all, and
- * (d) the only ring on the board with gaps in it, plus a "?", and nothing else.
+ * (a) one continuous level line + a fixed target line and ticks, (b) those plus liquid above the
+ * target line, a level cap SPLIT into two white-hot segments and two additive rings, (c) a dead grey
+ * ring whose column is capped short of the target height, with a violet drain cap on it, a dashed
+ * re-arm line, a "lower to reset" chevron and a return-to-rest arc — and no level line, target line
+ * or halo at all, and (d) the only ring on the board with gaps in it, plus a "?", and nothing else.
  */
 import { clamp } from './geometry';
 
@@ -69,13 +70,15 @@ export interface ReceptorLook {
   /**
    * Overshoot 0..1: how far *past* the threshold the value is, saturating at
    * `threshold * (1 + METER_OVER_RANGE)`. 0 whenever `fill < 1`. The renderer maps it onto the
-   * headroom above the target line, so only a lane that has really cleared the threshold ever
-   * paints anything above that line.
+   * headroom above the target line, and ignores it entirely while `locked` (a locked column is
+   * additionally capped short of the target height), so only a lane that would really fire ever
+   * paints liquid at or above that line.
    */
   over: number;
   /**
    * True exactly when the lane would score right now: re-armed, tracked, and at or past threshold.
-   * Only this state gets the hot fill, the white-hot cap, the additive rim + corona and a full halo.
+   * Only this state gets the hot fill, the split white-hot cap, the additive rim + corona and a
+   * full halo.
    */
   willFire: boolean;
   /**
