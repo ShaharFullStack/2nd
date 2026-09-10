@@ -7,10 +7,11 @@
  *   ?demo=highway     mounts the standalone renderer demo instead of the app
  *   ?song=<id> ?difficulty=easy|medium|hard ?mode=leg|hand ?seed=<n> ?scale=<n>
  *   ?lanes=seated_march:left,knee_extension:right
+ *   ?lanes=finger_opposition:left:pinky   (third segment = fingertip, finger_opposition only)
  */
 import { DIFFICULTIES } from '../engine/difficulty.ts';
-import type { DifficultyName, LaneSpec, Mode, Movement, Side } from '../engine/types.ts';
-import { HAND_MOVEMENTS, LEG_MOVEMENTS } from '../engine/types.ts';
+import type { DifficultyName, Fingertip, LaneSpec, Mode, Movement, Side } from '../engine/types.ts';
+import { FINGERTIPS, HAND_MOVEMENTS, LEG_MOVEMENTS } from '../engine/types.ts';
 import { movementMode } from '../vision/features.ts';
 import { normalizeLanes, useStore } from '../state/store.ts';
 import type { Screen } from '../state/store.ts';
@@ -20,15 +21,17 @@ import { runtime } from './runtime.ts';
 function parseLanes(value: string): LaneSpec[] {
   const specs: LaneSpec[] = [];
   for (const part of value.split(',')) {
-    const [movementRaw, sideRaw] = part.split(':');
+    const [movementRaw, sideRaw, tipRaw] = part.split(':');
     const movement = movementRaw?.trim() as Movement;
     if (!movement) continue;
     const known = [...LEG_MOVEMENTS, ...HAND_MOVEMENTS] as Movement[];
     if (!known.includes(movement)) continue;
     const side: Side = sideRaw?.trim() === 'right' ? 'right' : 'left';
-    specs.push({ index: specs.length, movement, side });
+    const tip = tipRaw?.trim() as Fingertip | undefined;
+    // `normalizeLanes` drops a fingertip the movement cannot carry and defaults the one it can.
+    specs.push({ index: specs.length, movement, side, ...(tip && FINGERTIPS.includes(tip) ? { fingertip: tip } : {}) });
   }
-  return specs.slice(0, 4);
+  return normalizeLanes(specs.slice(0, 4));
 }
 
 /** Apply URL parameters to the store. Returns the input mode actually in force. */

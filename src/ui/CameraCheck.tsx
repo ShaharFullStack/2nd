@@ -1,11 +1,12 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { runtime } from '../session/runtime.ts';
-import { useStore } from '../state/store.ts';
+import { laneFingertip, useStore } from '../state/store.ts';
 import { MOVEMENT_INFO, requiredPostures } from '../vision/features.ts';
 import { POSTURE_INFO } from '../vision/features.ts';
 import type { VisionStatus } from '../input/types.ts';
 import type { DetectionResult } from '../vision/mediapipe.ts';
 import { drawDetection } from './overlay.ts';
+import CameraFallback from './CameraFallback.tsx';
 import { Screen, Toast, TopBar } from './common.tsx';
 
 export default function CameraCheck() {
@@ -16,14 +17,16 @@ export default function CameraCheck() {
   const difficulty = useStore((s) => s.difficulty);
   const settings = useStore((s) => s.settings);
   const updateSettings = useStore((s) => s.updateSettings);
-  const setInputMode = useStore((s) => s.setInputMode);
 
   const holder = useRef<HTMLDivElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
   const latest = useRef<DetectionResult | null>(null);
   const [status, setStatus] = useState<VisionStatus | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  /** The thrown value, not a string: CameraFallback classifies a DOMException by its `name`. */
+  const [error, setError] = useState<unknown>(null);
   const [starting, setStarting] = useState(true);
+  /** Bumped by Retry to re-run the effect, which builds a NEW VisionInput and re-requests the device. */
+  const [attempt, setAttempt] = useState(0);
 
   useEffect(() => {
     let alive = true;
@@ -65,7 +68,7 @@ export default function CameraCheck() {
       .catch((err: unknown) => {
         if (!alive) return;
         setStarting(false);
-        setError(err instanceof Error ? err.message : String(err));
+        setError(err);
       });
 
     const poll = setInterval(() => {
@@ -82,10 +85,28 @@ export default function CameraCheck() {
       setStarting(true);
       setStatus(null);
     };
-  }, [mode, lanes, calibrations, difficulty, settings.mirrored]);
+  }, [mode, lanes, calibrations, difficulty, settings.mirrored, attempt]);
+
+  /**
+   * Retry means RE-REQUEST, not re-render: the failed VisionInput is disposed so `ensureVision`
+   * cannot hand back a dead one, then the effect re-runs and calls getUserMedia (and re-builds the
+   * detector) from scratch. Awaited so the button can stay in its "asking…" state until it settles.
+   */
+  const retry = useCallback(async () => {
+    runtime.disposeVision();
+    setError(null);
+    setStatus(null);
+    setStarting(true);
+    setAttempt((n) => n + 1);
+    // One frame of grace so the effect's teardown/setup pair has run before the button re-enables.
+    await new Promise((r) => setTimeout(r, 350));
+  }, []);
 
   const tracking = status?.tracking === true;
   const postures = requiredPostures(lanes);
+
+  // A camera that never started is not a corner of the camera-check screen — it is the screen.
+  if (error !== null) return <CameraFallback error={error} onRetry={retry} />;
 
   return (
     <Screen>
@@ -94,7 +115,7 @@ export default function CameraCheck() {
         title="Frame the patient"
         onBack={() => goto('setup')}
         right={
-          <button className="btn btn-primary btn-lg" onClick={() => goto('rom')} disabled={!!error} data-testid="camera-continue">
+          <button className="btn btn-primary btn-lg" onClick={() => goto('rom')} data-testid="camera-continue">
             Calibrate movement →
           </button>
         }
@@ -106,23 +127,6 @@ export default function CameraCheck() {
         <div className="camera-frame mirror grow" ref={holder} style={{ maxWidth: 760 }}>
           <canvas ref={canvas} />
           {starting && <div className="overlay">Starting camera…</div>}
-          {error && (
-            <div className="overlay">
-              <div className="card stack">
-                <h3>No camera</h3>
-                <p className="muted">{error}</p>
-                <button
-                  className="btn"
-                  onClick={() => {
-                    setInputMode('keyboard');
-                    goto('play');
-                  }}
-                >
-                  Play with the keyboard instead
-                </button>
-              </div>
-            </div>
-          )}
         </div>
 
         <div className="stack" style={{ width: 'min(380px, 100%)' }}>
@@ -160,6 +164,7 @@ export default function CameraCheck() {
               {lanes.map((l, i) => (
                 <li key={i}>
                   Lane {i + 1}: {l.side === 'left' ? 'Left' : 'Right'} {MOVEMENT_INFO[l.movement].label}
+                  {laneFingertip(l) ? ` (${laneFingertip(l)} finger)` : ''}
                 </li>
               ))}
             </ul>

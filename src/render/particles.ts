@@ -240,7 +240,7 @@ export function emitHitBurst(
   color: number,
   intensity = 1,
 ): void {
-  const sparks = Math.max(0, Math.round(20 * intensity));
+  const sparks = Math.max(0, Math.round(13 * intensity));
   for (let i = 0; i < sparks; i++) {
     const ang = rng() * Math.PI * 2;
     const speed = radius * (6 + rng() * 10) * intensity;
@@ -275,14 +275,17 @@ export function emitHitBurst(
       kind: PARTICLE_STREAK,
     });
   }
+  // Shockwave ring. Bounded to roughly one lane width across (`radius` is the gem radius, which is
+  // ~0.37 of a lane): an unbounded ring that grew to four gem radii at alpha 0.9 blew out the very
+  // receptor the hit was about, which is the one thing on the board a rehab patient is aiming at.
   pool.emit({
     x,
     y,
-    life: 0.32,
+    life: 0.28,
     size: radius * 0.8,
-    endSize: radius * (2.6 + intensity),
+    endSize: radius * (1.4 + 0.35 * intensity),
     color,
-    alpha: 0.9,
+    alpha: 0.5,
     kind: PARTICLE_RING,
   });
 }

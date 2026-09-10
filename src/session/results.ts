@@ -54,6 +54,7 @@ export function buildSessionResult(opts: BuildResultOptions): SessionResult {
       lane: i,
       movement: spec.movement,
       side: spec.side,
+      ...(spec.movement === 'finger_opposition' ? { fingertip: spec.fingertip ?? 'index' } : {}),
       label: movementLabel(spec.movement, spec.side),
       hits: stats?.hits ?? 0,
       perfects: stats?.perfects ?? 0,

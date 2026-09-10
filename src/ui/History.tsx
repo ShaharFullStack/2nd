@@ -1,6 +1,7 @@
 import { formatDate, formatDuration, formatMs, formatPercent } from '../session/results.ts';
 import { useStore } from '../state/store.ts';
 import { Screen, Stars, TopBar } from './common.tsx';
+import RomTrend from './RomTrend.tsx';
 
 export default function HistoryScreen() {
   const goto = useStore((s) => s.goto);
@@ -36,8 +37,12 @@ export default function HistoryScreen() {
           </button>
         </div>
       ) : (
-        <div className="card table-wrap">
-          <table className="table">
+        <>
+          <RomTrend history={history} />
+
+          <h3 style={{ marginBottom: 0 }}>Every session</h3>
+          <div className="card table-wrap">
+            <table className="table">
             <thead>
               <tr>
                 <th>When</th>
@@ -87,8 +92,9 @@ export default function HistoryScreen() {
                 </tr>
               ))}
             </tbody>
-          </table>
-        </div>
+            </table>
+          </div>
+        </>
       )}
     </Screen>
   );

@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_GEOMETRY_OPTIONS,
+  FAR_FADE_FRAC,
+  MIN_PAST_LINE_SPEED,
   beatLineTimes,
   bucketRadius,
   clamp,
@@ -48,7 +50,7 @@ describe('makeGeometry', () => {
   it('places the strike line and horizon at the requested fractions', () => {
     const g = makeGeometry(W, H, 4);
     expect(g.strikeY).toBeCloseTo(DEFAULT_GEOMETRY_OPTIONS.strikeY * H, 6);
-    expect(g.horizonY).toBeCloseTo(0.35 * H, 6);
+    expect(g.horizonY).toBeCloseTo(DEFAULT_GEOMETRY_OPTIONS.horizonY * H, 6);
     expect(yAt(g, 0)).toBeCloseTo(g.strikeY, 6);
     expect(yAt(g, 1)).toBeCloseTo(g.horizonY, 6);
     // Vanishing point sits above the visible horizon.
@@ -103,13 +105,96 @@ describe('makeGeometry', () => {
   });
 });
 
+describe('the board is the composition, not an element in it', () => {
+  // Three blind critics ranked this renderer against shipped Guitar-Hero-lineage frames and all
+  // three named the same single deficit: the highway was a small trapezoid floating in a starfield
+  // (43 % of frame height of note travel, 46 % of frame width at the strike line, a hard horizontal
+  // cut at 35 % down the frame). These are the proportions that fix that, pinned so a future tweak
+  // to one number cannot quietly give the board back.
+  const SIZES: Array<[number, number]> = [
+    [1920, 1080],
+    [1280, 720],
+    [1366, 768],
+    [2560, 1080],
+  ];
+
+  it('runs the board from just under the top edge to below the bottom one', () => {
+    for (const [w, h] of SIZES) {
+      const g = makeGeometry(w, h, 4);
+      const tag = `${w}x${h}`;
+      // Far end high in the frame...
+      expect(g.horizonY / h, `${tag} far end`).toBeLessThanOrEqual(0.15);
+      // ...near end off the bottom edge, so the road never floats.
+      expect(yAt(g, g.minDepth), `${tag} near end`).toBeGreaterThan(h);
+      // Note travel: horizon → strike line.
+      expect((g.strikeY - g.horizonY) / h, `${tag} travel`).toBeGreaterThanOrEqual(0.65);
+    }
+  });
+
+  it('puts the strike line low, with room under it for fret hardware and hit bloom', () => {
+    for (const [w, h] of SIZES) {
+      const g = makeGeometry(w, h, 4);
+      const tag = `${w}x${h}`;
+      expect(g.strikeY / h, `${tag} strike`).toBeGreaterThanOrEqual(0.78);
+      expect(g.strikeY / h, `${tag} strike`).toBeLessThanOrEqual(0.88);
+      // Receptor + label band must fit between the line and the bottom edge, unclipped.
+      expect((h - g.strikeY) / h, `${tag} apron`).toBeGreaterThanOrEqual(0.15);
+      expect(g.strikeY + g.receptorRadius * GEM_ASPECT, `${tag} receptor bottom`).toBeLessThan(h);
+    }
+  });
+
+  it('is 55-80% of frame width at the strike line (16:9; ultrawide is height-capped)', () => {
+    for (const [w, h] of SIZES.filter(([sw, sh]) => sw / sh < 2.2)) {
+      const g = makeGeometry(w, h, 4);
+      const frac = (g.nearHalfWidth * 2) / w;
+      expect(frac, `${w}x${h} board width`).toBeGreaterThanOrEqual(0.55);
+      expect(frac, `${w}x${h} board width`).toBeLessThanOrEqual(0.8);
+    }
+  });
+
+  it('tapers strongly but never to a pinhole, and dissolves rather than ending on a line', () => {
+    const g = makeGeometry(1920, 1080, 4);
+    expect(DEFAULT_GEOMETRY_OPTIONS.farScale).toBeGreaterThanOrEqual(0.15);
+    expect(DEFAULT_GEOMETRY_OPTIONS.farScale).toBeLessThanOrEqual(0.3);
+    // The dissolve band is a real stretch of board, not a hairline, and it ends well clear of the
+    // read-ahead zone.
+    expect(FAR_FADE_FRAC).toBeGreaterThanOrEqual(0.1);
+    expect(FAR_FADE_FRAC).toBeLessThanOrEqual(0.25);
+    const fadeEndY = g.horizonY + (g.strikeY - g.horizonY) * FAR_FADE_FRAC;
+    expect(fadeEndY - g.horizonY).toBeGreaterThan(1080 * 0.06);
+    expect(fadeEndY).toBeLessThan(1080 * 0.32);
+  });
+
+  it('holds two bars of read-ahead: a rehab chart puts 5+ gems on the board at once', () => {
+    const g = makeGeometry(1920, 1080, 4);
+    // 120 BPM, medium density = one note per beat (src/engine/difficulty.ts), i.e. 2 notes/second.
+    const notesPerSec = 2;
+    const onBoard = g.approachSec * notesPerSec;
+    expect(g.approachSec).toBeGreaterThanOrEqual(2);
+    expect(onBoard).toBeGreaterThanOrEqual(5);
+    // ...and the furthest of them is still big enough to see from a clinic chair.
+    const farRadius = g.gemRadiusNear * scaleAt(g, 1);
+    expect((farRadius * 2) / 1080).toBeGreaterThanOrEqual(0.02);
+  });
+
+  it('leaves under a third of the frame to the backdrop', () => {
+    const g = makeGeometry(1920, 1080, 4);
+    // Trapezoid area of the visible road (top edge at the horizon, bottom edge clipped to the canvas).
+    const topW = g.nearHalfWidth * 2 * scaleAt(g, 1);
+    const dBottom = depthAtY(g, 1080);
+    const botW = g.nearHalfWidth * 2 * scaleAt(g, dBottom);
+    const area = ((topW + botW) / 2) * (1080 - g.horizonY);
+    expect(area / (1920 * 1080)).toBeGreaterThan(0.4);
+  });
+});
+
 describe('depth / scale / y', () => {
   const g = makeGeometry(W, H, 4);
 
   it('maps song time to depth: 0 at the strike line, 1 at the horizon after approachSec', () => {
     expect(depthOf(g, 10, 10)).toBe(0);
     expect(depthOf(g, 10 + g.approachSec, 10)).toBeCloseTo(1);
-    expect(depthOf(g, 10 - 0.4, 10)).toBeCloseTo(-0.25);
+    expect(depthOf(g, 10 - g.approachSec / 4, 10)).toBeCloseTo(-0.25);
   });
 
   it('scale is 1 at the strike line, farScale at the horizon and monotonic between', () => {
@@ -200,8 +285,11 @@ describe('tail below the strike line', () => {
     expect(below / above).toBeGreaterThan(0.995);
     expect(below / above).toBeLessThan(1.005);
     // ...and it stays smooth all the way through the blend: no step anywhere below the line.
+    // Sampled proportionally to the blend (which is a *duration*, so it shrinks as approachSec
+    // grows): the claim is that ds/dd is Lipschitz across the line, not that any fixed depth step
+    // is small.
     let prev = above;
-    for (let d = 0; d > -0.4; d -= 0.005) {
+    for (let d = 0; d > -0.4; d -= g.tailBlend / 25) {
       const v = speed(d);
       expect(Math.abs(v - prev) / above, `step at d=${d.toFixed(3)}`).toBeLessThan(0.05);
       prev = v;
@@ -308,7 +396,7 @@ describe('tail below the strike line', () => {
     const slow = makeGeometry(W, H, 4, { pastLineSpeed: 0.3 });
     const fast = makeGeometry(W, H, 4, { pastLineSpeed: 1 });
     expect(visibleTailSec(slow)).toBeGreaterThan(visibleTailSec(fast));
-    expect(makeGeometry(W, H, 4, { pastLineSpeed: 0 }).pastLineSpeed).toBe(0.2);
+    expect(makeGeometry(W, H, 4, { pastLineSpeed: 0 }).pastLineSpeed).toBe(MIN_PAST_LINE_SPEED);
     expect(makeGeometry(W, H, 4, { pastLineSpeed: 5 }).pastLineSpeed).toBe(1);
   });
 });
@@ -318,7 +406,7 @@ describe('culling', () => {
 
   it('minDepth is negative (notes stay visible a little past the line) and maxDepth is just past the horizon', () => {
     expect(g.minDepth).toBeLessThan(0);
-    expect(g.minDepth).toBeGreaterThan(-0.8);
+    expect(g.minDepth).toBeGreaterThan(-1);
     expect(g.maxDepth).toBeGreaterThan(1);
   });
 

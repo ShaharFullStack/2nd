@@ -77,7 +77,7 @@ export const JUDGMENT_STYLE: Record<Judgment, { text: string; color: string; glo
 
 /** Multiplier badge tiers: index = clamp(multiplier, 1, 4). */
 export const MULTIPLIER_TIERS: Record<number, { color: string; glow: string; label: string }> = {
-  1: { color: '#9aa0a8', glow: '#5a6068', label: 'x1' },
+  1: { color: '#7d8ba6', glow: '#3d4a63', label: 'x1' },
   2: { color: '#4ce06a', glow: '#1c8a34', label: 'x2' },
   3: { color: '#4aa8ff', glow: '#1c5fb8', label: 'x3' },
   4: { color: '#ffcf3a', glow: '#d08a00', label: 'x4' },
@@ -101,6 +101,12 @@ export function multiplierTier(multiplier: number): { color: string; glow: strin
   return tier;
 }
 
+/**
+ * Alpha of each board line weight. A shipped highway is a ladder: an eighth-note hairline you read
+ * as texture, a quarter-note beat you can count, and a bar line you can phrase against.
+ */
+export const BOARD_LINE_ALPHA = { laneDivider: 0.1, subBeatLine: 0.1, beatLine: 0.26, barLine: 0.5 };
+
 /** Rock meter colors low → high. */
 export const ROCK_METER_COLORS = { low: '#ff3b3b', mid: '#ffd23a', high: '#41e06a' };
 
@@ -109,12 +115,20 @@ export const UI_COLORS = {
   background1: '#101528',
   asphalt0: '#171a26',
   asphalt1: '#0b0d15',
-  laneDivider: 'rgba(255,255,255,0.08)',
-  beatLine: 'rgba(255,255,255,0.13)',
-  barLine: 'rgba(255,255,255,0.32)',
+  /**
+   * Board line work. Hex + a separate alpha (see `BOARD_LINE_ALPHA`) rather than baked rgba: every
+   * one of these is painted through a vertical gradient that fades it out at the far end of the
+   * board, and `withAlpha` needs a hex to do that.
+   */
+  laneDivider: '#ffffff',
+  subBeatLine: '#ffffff',
+  beatLine: '#ffffff',
+  barLine: '#ffffff',
   strikeLine: '#ffffff',
   rail: '#8a9bff',
   panel: '#0e1120',
+  /** Backdrop tone the far end of the board dissolves into (the page gradient at that height). */
+  horizonFade: '#0a0e1a',
   text: '#f2f4ff',
   textDim: 'rgba(242,244,255,0.55)',
 };

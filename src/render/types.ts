@@ -35,13 +35,38 @@ export interface RenderLaneState {
   /** Normalized movement value 0..1 of calibrated ROM. */
   value: number;
   /**
-   * Hysteresis re-arm flag, straight from the input engine: false means the lane has already fired
-   * and **cannot fire again** until its value falls below `thresholdFraction * rearmFraction`.
-   * The receptor renders this as a categorically different state (drained grey meter, no halo, a
-   * re-arm line and a "lower to reset" chevron) — never as a dimmed version of a live receptor.
+   * Hysteresis re-arm flag, straight from the input engine (`LaneTrigger.armed`): false means the
+   * lane **cannot fire** — at any value — until it falls below `thresholdFraction * rearmFraction`
+   * (`LaneTrigger.rearmLevel`). It covers both of the trigger's non-firing states, 'triggered' (the
+   * rep fired and has not been given back) and 'unconfirmed' (never yet observed below the re-arm
+   * level: a patient who started the song at end range, a lane recovering from an occlusion, a
+   * calibration replaced mid-rep). The remedy is the same for both, which is why the receptor draws
+   * them the same way.
+   *
+   * This is NOT a brightness modifier. The receptor renders it as a categorically different set of
+   * MARKS: the dead grey miss ring shrunk 12 %, drained grey liquid, and — uniquely to this state —
+   * a dashed re-arm line at the level to come back down to, a "lower to reset" chevron that settles
+   * onto that line, and an arc outside the ring that grows as the value drains and completes exactly
+   * when the lane re-arms. Just as important is what is *removed*: no level line, no target line or
+   * ticks, no hot fill, no halo, no additive rim or corona. A lane with `armed === false` must never
+   * wear any part of the "will fire" costume: the input layer will emit nothing for it however hard
+   * the patient pushes.
    */
   armed: boolean;
-  /** False when the tracker lost the limb / hand. Defaults to true when absent. */
+  /**
+   * False when the tracker lost the limb / hand (`VisionInput.getLaneStates()` sets it, and reports
+   * `value: 0` with it when the whole stream is dead — a lane-level dropout instead leaves the last
+   * sample behind, which is why the renderer must not read `value` here either). Defaults to true
+   * when absent.
+   *
+   * There is no measurement in this state, so the receptor draws nothing that encodes `value` — no
+   * well, no fill, no level line, no target line, no halo, no lock cues, not even the beat pulse (a
+   * dead signal must not dance with the music). It shows a broken, slowly breathing light-grey ring
+   * with a large "?" instead: the only ring on the board with gaps in it, distinct from the solid
+   * grey "lower to reset" ring, because the remedy is different (get back in frame, not move
+   * differently). It outranks `armed === false`: a patient who is out of frame cannot act on
+   * "lower to reset".
+   */
   tracking?: boolean;
 }
 
@@ -82,18 +107,31 @@ export interface RenderFrame {
   energy?: number;
   /**
    * Fraction of ROM that counts as a hit — pass `Difficulty.thresholdFraction` for the session,
-   * every frame. The receptor meter fills against it and reads "full" exactly when the lane would
-   * trigger, which is the renderer's core biofeedback claim. It is optional only so the type stays
-   * compatible with partial frames: when it is absent the renderer falls back to 0.5 *and warns
-   * once on the console*, because a meter filled against the wrong threshold is a lie (a full ring
-   * with no note firing, or a note firing at a half-full ring).
+   * every frame. It is drawn as a fixed TARGET LINE across the receptor's meter well (and as two
+   * ticks on the ring's outline at the same height, where the liquid can never cover it), at 76 %
+   * of the well's height with overshoot headroom above it. So the meter answers "how much further"
+   * during the rise, and a lane that clears the threshold is the only one that paints liquid above
+   * the target line.
+   *
+   * A level at or above the target line is necessary but NOT sufficient for the "this will fire"
+   * look: that one (hot fill, white-hot cap, inner rim, corona, halo) is drawn only when the lane
+   * would really trigger — at/over threshold *and* `armed` *and* `tracking` (see `RenderLaneState`).
+   * That conjunction is the renderer's core biofeedback claim. A locked-out lane loses the target
+   * line and ticks altogether: its target is the re-arm line below, not the threshold above.
+   *
+   * The threshold is optional only so the type stays compatible with partial frames: when it is
+   * absent the renderer falls back to 0.5 *and warns once on the console*, because a meter filled
+   * against the wrong threshold is a lie (a full ring with no note firing, or a note firing at a
+   * half-full ring).
    */
   thresholdFraction?: number;
   /**
    * Hysteresis re-arm fraction: after a lane fires it cannot fire again until its value falls below
-   * `thresholdFraction * rearmFraction`. Defaults to `DEFAULT_REARM_FRACTION` (0.6), the value in
-   * the architecture contract. The receptor draws its re-arm line here, so pass the session's real
-   * value if it is ever tuned.
+   * `thresholdFraction * rearmFraction` (`LaneTrigger.rearmLevel`). Defaults to
+   * `DEFAULT_REARM_FRACTION` (0.6), the value in the architecture contract. A locked-out receptor
+   * draws its dashed re-arm line at exactly this height and closes its return-to-rest arc exactly
+   * when the value reaches it, so pass the session's real value if it is ever tuned — a re-arm line
+   * drawn at the wrong height tells the patient to stop lowering while the lane is still dead.
    */
   rearmFraction?: number;
 }

@@ -54,11 +54,19 @@
  * instead of restarting the badge pop on every frame.
  *
  * Honest biofeedback (the reason this is a rehab game and not a music game):
- *   - the receptor meter fills against `RenderFrame.thresholdFraction`, the same number the engine
- *     triggers on, and warns once if it is missing;
- *   - a lane that is locked out by hysteresis (`RenderLaneState.armed === false`) is drawn as a
- *     categorically different thing — see `drawReceptors` and receptor.ts — never as a dimmed
- *     version of a live one, so "the ring is lit" always means "this will score";
+ *   - the receptor meter is a gauge, not a glow: a dark well painted OVER the receptor's button
+ *     face (never under it), a hard-edged liquid level, and a fixed target line at
+ *     `RenderFrame.thresholdFraction` — the same number the engine triggers on, warned about once
+ *     if it is missing — with overshoot headroom above it, so "half way" reads differently from
+ *     "nearly there" from across a clinic room;
+ *   - the receptor has four categorically different looks, one per state the input layer can
+ *     actually be in — rising, at the trigger point, locked out by hysteresis
+ *     (`RenderLaneState.armed === false`) and tracking lost (`tracking === false`) — and they
+ *     differ by WHICH MARKS EXIST, not by hue or brightness, so they survive low acuity and
+ *     colour-vision deficits; see `drawReceptors` and receptor.ts. Level line + target ticks mean
+ *     "keep going", the additive rim + corona mean "this rep is scoring", a grey ring with a
+ *     chevron and a return-to-rest arc means "lower to reset", and the only ring with gaps in it
+ *     means "the camera cannot see you";
  *   - meters and labels are matched to lanes by `LaneState.lane` / `LaneSpec.index` when those are
  *     present, not by array position alone;
  *   - every judgment cue is kept inside the canvas (`missCueY`, `POPUP_MAX_RISE_FRAC`);
@@ -74,6 +82,11 @@
  */
 import type { Judgment, LaneSpec } from '../engine/types';
 import {
+  BEAT_LINE_BAR,
+  BEAT_LINE_BEAT,
+  BEAT_LINE_SUB,
+  DEFAULT_GEOMETRY_OPTIONS,
+  FAR_FADE_FRAC,
   GEM_ASPECT,
   MAX_BEAT_LINES,
   clamp,
@@ -92,6 +105,7 @@ import {
   type Projected,
 } from './geometry';
 import {
+  BOARD_LINE_ALPHA,
   JUDGMENT_STYLE,
   ROCK_METER_COLORS,
   UI_COLORS,
@@ -110,12 +124,7 @@ import { DigitRoller, TextCache, defaultCanvasFactory, fontPx, type Ctx2D, type 
 import type { CanvasLike, HighwayOptions, RenderFrame, RenderLaneState, RenderNote, RenderStats } from './types';
 
 export const DEFAULT_HIGHWAY_OPTIONS: HighwayOptions = {
-  approachSec: 1.6,
-  horizonY: 0.35,
-  strikeY: 0.78,
-  farScale: 0.28,
-  roadWidth: 0.46,
-  pastLineSpeed: 0.34,
+  ...DEFAULT_GEOMETRY_OPTIONS,
   highContrast: false,
   showLabels: true,
   showMissPopup: false,
@@ -150,20 +159,36 @@ export const MISS_CUE_MARGIN_U = 6;
 export const REARM_POP_SEC = 0.28;
 
 const MAX_LANES = 8;
-/** Judgment popup slots. More than one per lane so 8th notes on a repeated lane never cut each other off. */
-const POPUP_SLOTS = 16;
-/** Judgment popup lifetime (s). */
-const POPUP_SEC = 0.75;
-/** Popup anchor above the strike line, in receptor radii. */
-const POPUP_BASE_R = 0.95;
-/** Extra offset per stacked popup in the same lane, in receptor radii (at most two stack). */
-const POPUP_STACK_R = 0.45;
+/**
+ * Judgment popup slots. Only one is ever *active* (see `spawnPopup`) — a shipped rhythm game shows
+ * one judgment label at a time, in one place, and two overlapping "PERFECT!" instances over a
+ * receptor read as a duplication bug, which is exactly what three blind critics called ours. The
+ * ring is kept so a popup can still be replaced without allocating.
+ */
+const POPUP_SLOTS = 4;
+/** Judgment popup lifetime (s). Short: it is redundant feedback sitting in the approach path. */
+const POPUP_SEC = 0.5;
+/** Popup anchor above the strike line, in receptor radii — clear of the receptor ring's top. */
+const POPUP_BASE_R = 1.0;
 /** How far a popup (anchor + rise) may sit above the strike line, as a fraction of horizon→strike. */
 export const POPUP_MAX_RISE_FRAC = 0.34;
 /** Popup float distance over its life, in receptor radii (a third of that under reduced motion). */
 const POPUP_RISE_R = 0.35;
+/** How far up the board a lane flash reaches, as a fraction of the strike→horizon span. */
+const LANE_FLASH_REACH = 0.5;
 /** Half-height of the strike line glow band, in UI units. */
 const STRIKE_BAND_H = 16;
+/** Beat-ladder subdivision: 2 = an eighth-note hairline between every pair of beat lines. */
+const BEAT_SUBDIVISIONS = 2;
+/** Ladder stroke passes, faintest first so heavier rungs land on top. */
+const BEAT_LINE_PASSES = [BEAT_LINE_SUB, BEAT_LINE_BEAT, BEAT_LINE_BAR];
+/** Fade-gradient cache keys (built once; `grad()` clears them on geometry / palette change). */
+const LADDER_KEYS = ['ladderBeat', 'ladderBar', 'ladderSub'];
+const RAIL_KEYS = ['rail1', 'rail2', 'rail3', 'rail4', 'railBase'];
+const RAIL_GLOW_KEYS = ['railGlow1', 'railGlow2', 'railGlow3', 'railGlow4'];
+const LANE_WASH_KEYS = Array.from({ length: MAX_LANES }, (_, i) => `wash${i}`);
+/** Lane wash strength: enough for lane identity at 2 m, far too little to compete with a gem. */
+const LANE_WASH_ALPHA = 0.075;
 /** Alpha bands used to batch fading particle streaks (one path + stroke per non-empty band). */
 const STREAK_ALPHA_BANDS = 4;
 const FONT = "system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
@@ -180,8 +205,47 @@ const METER_KEYS = Array.from({ length: MAX_LANES }, (_, i) => `meter${i}`);
 const METER_HOT_KEYS = Array.from({ length: MAX_LANES }, (_, i) => `meterHot${i}`);
 /** Locked-out (hysteresis) meter fill — dead grey, never the lane colour. */
 const METER_LOCK_KEY = 'meterLocked';
-/** Re-arm line / "lower to reset" chevron colour. */
-const LOCK_HINT_COLOR = '#ffcf5a';
+/**
+ * "Lower to reset" hint colour (re-arm line, chevron, return-to-rest arc). Violet on purpose: no
+ * lane in either palette is violet (GH green/red/yellow/blue, high-contrast cyan/orange/magenta/
+ * lime), so a nearly-complete arc around a locked ring can never be mistaken for a lit lane ring —
+ * which the previous warm gold `#ffcf5a` was, at 2 m, on the yellow lane (`#f6d431`).
+ */
+const LOCK_HINT_COLOR = '#c08cff';
+/**
+ * Where the trigger threshold sits inside the receptor's meter well, as a fraction of the well's
+ * height. The remaining 24 % is overshoot headroom, so the target line is a line the level can be
+ * BELOW, ON, or ABOVE — a gauge with a fixed mark, which is what makes "half way" readable as
+ * something other than "not yet".
+ */
+const METER_TARGET_POS = 0.76;
+/** Ground of the meter well: flat and dark, so the liquid's top edge is a hard step, not a bevel. */
+const METER_WELL_COLOR = '#080a12';
+/** Threshold (target) line and the white-hot level cap at the trigger point. */
+const TARGET_LINE_COLOR = '#ffffff';
+/**
+ * "No signal" ring colour (tracking lost). Deliberately a *light* neutral grey: the locked-out ring
+ * is the palette's dead dark grey, so at 2 m the two never read as the same thing.
+ */
+const LOST_RING_COLOR = '#a9b0bb';
+/**
+ * Return-to-rest arc: starts at the upper right and sweeps clockwise through the bottom, spanning
+ * at most 1.5π so the top quarter of the ring stays permanently open. A progress cue that closes
+ * into a complete ring is a lit ring, which is the one thing a locked-out lane may not look like.
+ */
+const RESET_ARC_START = -Math.PI / 4;
+const RESET_ARC_SWEEP = Math.PI * 1.5;
+/** Arc segments of the broken "no signal" ring, and the gap between them in radians. */
+const LOST_RING_SEGMENTS = 4;
+const LOST_RING_GAP_RAD = 0.38;
+/**
+ * Rotation of the broken ring's segments. Without it the four gaps sit at 0, π/2, π and 3π/2, so
+ * the left and right ones land exactly where the white strike line crosses the receptor and are
+ * visually bridged by it — a broken ring that reads as a solid one is not a distinct state.
+ */
+const LOST_RING_PHASE = Math.PI / 4;
+/** Breathing rate (rad/s) of the "no signal" ring — slow, unrelated to the beat, off under reduced motion. */
+const LOST_BREATHE_RATE = 2.4;
 
 interface Popup {
   active: boolean;
@@ -272,7 +336,7 @@ export class Highway {
   /** Song time each lane last became able to fire again (hysteresis re-arm). */
   private laneRearmT0 = new Float64Array(MAX_LANES).fill(-10);
   /** Scratch receptor state, refilled per lane per frame (see receptor.ts). */
-  private readonly look: ReceptorLook = { fill: 0, willFire: false, locked: false, resetProgress: 0, resetLevel: DEFAULT_REARM_FRACTION, glowTarget: 0, tracking: true };
+  private readonly look: ReceptorLook = { fill: 0, over: 0, willFire: false, locked: false, resetProgress: 0, resetLevel: DEFAULT_REARM_FRACTION, glowTarget: 0, tracking: true };
   /** lane → index into frame.laneStates / frame.lanes for this frame (see `resolveLaneMaps`). */
   private stateIdx = new Int8Array(MAX_LANES);
   private specIdx = new Int8Array(MAX_LANES);
@@ -771,24 +835,46 @@ export class Highway {
     const g = this.geom;
     const H = this.height;
     // Asphalt
+    const fadeStop = clamp((this.farFadeY - g.horizonY) / Math.max(1, H - g.horizonY), 0.02, 0.6);
     ctx.fillStyle = this.grad('asphalt', () => {
       const asphalt = ctx.createLinearGradient(0, g.horizonY, 0, H);
-      asphalt.addColorStop(0, '#2a2f44');
-      asphalt.addColorStop(0.12, UI_COLORS.asphalt0);
+      // Fully transparent at the far edge: the board does not *end*, it stops being there. Every
+      // other paint on the road (ladder, dividers, rails, lane washes) runs through the same ramp,
+      // and the gems fade over the same stretch in drawNotes.
+      asphalt.addColorStop(0, 'rgba(42,47,68,0)');
+      asphalt.addColorStop(fadeStop, '#2a2f44');
+      asphalt.addColorStop(fadeStop + 0.12, UI_COLORS.asphalt0);
       asphalt.addColorStop(1, UI_COLORS.asphalt1);
       return asphalt;
     });
     this.roadPath(ctx);
     ctx.fill();
 
-    // Beat / bar lines
-    const nLines = fillBeatLines(g, this.stNow, frame.bpm, beatPhase, this.beatTimes, this.beatBars, 4, frame.beatIndex);
+    // Lane washes: a few percent of each lane's own colour down its column. Lane identity is what
+    // the movement labels spell out in words; this says the same thing without words, and it is
+    // what stops a four-lane board from reading as one undifferentiated black ramp.
+    for (let lane = 0; lane < g.laneCount; lane++) {
+      ctx.fillStyle = this.fadeStyle(ctx, LANE_WASH_KEYS[lane], laneColor(this.palette, lane).base, LANE_WASH_ALPHA);
+      ctx.beginPath();
+      ctx.moveTo(laneBoundaryX(g, lane, g.minDepth), yAt(g, g.minDepth));
+      ctx.lineTo(laneBoundaryX(g, lane + 1, g.minDepth), yAt(g, g.minDepth));
+      ctx.lineTo(laneBoundaryX(g, lane + 1, 1), g.horizonY);
+      ctx.lineTo(laneBoundaryX(g, lane, 1), g.horizonY);
+      ctx.closePath();
+      ctx.fill();
+    }
+
+    // Beat ladder. Three weights — eighth-note hairline, quarter-note beat, bar — because a board
+    // this long with only quarter lines shows 5 rungs at 120 BPM, and a rhythm game the patient
+    // cannot count against is just objects floating in a void. Bars read at 2 m; the hairlines are
+    // texture that says "the spacing is regular" without competing with the gems.
+    const nLines = fillBeatLines(g, this.stNow, frame.bpm, beatPhase, this.beatTimes, this.beatBars, 4, frame.beatIndex, BEAT_SUBDIVISIONS);
     ctx.lineCap = 'butt';
-    for (let pass = 0; pass < 2; pass++) {
+    for (const kind of BEAT_LINE_PASSES) {
       ctx.beginPath();
       let any = false;
       for (let i = 0; i < nLines; i++) {
-        if (this.beatBars[i] !== pass) continue;
+        if (this.beatBars[i] !== kind) continue;
         const d = depthOf(g, this.beatTimes[i], this.stNow);
         const y = yAt(g, d);
         ctx.moveTo(roadEdgeX(g, -1, d), y);
@@ -796,9 +882,10 @@ export class Highway {
         any = true;
       }
       if (!any) continue;
-      const bar = pass === 1;
-      ctx.strokeStyle = bar ? UI_COLORS.barLine : UI_COLORS.beatLine;
-      ctx.lineWidth = (bar ? 2.5 : 1.2) * this.u;
+      const lineColor = kind === BEAT_LINE_BAR ? UI_COLORS.barLine : kind === BEAT_LINE_BEAT ? UI_COLORS.beatLine : UI_COLORS.subBeatLine;
+      const lineAlpha = kind === BEAT_LINE_BAR ? BOARD_LINE_ALPHA.barLine : kind === BEAT_LINE_BEAT ? BOARD_LINE_ALPHA.beatLine : BOARD_LINE_ALPHA.subBeatLine;
+      ctx.strokeStyle = this.fadeStyle(ctx, LADDER_KEYS[kind], lineColor, lineAlpha);
+      ctx.lineWidth = (kind === BEAT_LINE_BAR ? 3.2 : kind === BEAT_LINE_BEAT ? 1.6 : 1) * this.u;
       ctx.stroke();
     }
 
@@ -808,40 +895,55 @@ export class Highway {
       ctx.moveTo(laneBoundaryX(g, b, g.minDepth), yAt(g, g.minDepth));
       ctx.lineTo(laneBoundaryX(g, b, 1), g.horizonY);
     }
-    ctx.strokeStyle = UI_COLORS.laneDivider;
+    ctx.strokeStyle = this.fadeStyle(ctx, 'divider', UI_COLORS.laneDivider, BOARD_LINE_ALPHA.laneDivider);
     ctx.lineWidth = 1.5 * this.u;
     ctx.stroke();
 
-    // Fog toward the horizon
-    ctx.fillStyle = this.grad('fog', () => {
-      const fog = ctx.createLinearGradient(0, g.horizonY, 0, g.horizonY + (g.strikeY - g.horizonY) * 0.35);
-      fog.addColorStop(0, 'rgba(90,110,200,0.55)');
-      fog.addColorStop(1, 'rgba(90,110,200,0)');
-      return fog;
-    });
-    this.roadPath(ctx);
-    ctx.fill();
-
     // Edge rails: wide soft glow + thin bright line, colour by multiplier tier, pulse on beat.
     const tier = multiplierTier(mult);
+    const tierIdx = clamp(Math.floor(mult) - 1, 0, 3);
     const railA = (0.35 + beatPulse * 0.4 + energy * 0.3) * this.eff;
     for (let side = -1; side <= 1; side += 2) {
       const s = side as -1 | 1;
       ctx.beginPath();
       ctx.moveTo(roadEdgeX(g, s, g.minDepth), yAt(g, g.minDepth));
       ctx.lineTo(roadEdgeX(g, s, 1), g.horizonY);
+      const railColor = mult >= 2 ? tier.color : UI_COLORS.rail;
       ctx.globalCompositeOperation = 'lighter';
       ctx.globalAlpha = clamp(railA * 0.45, 0, 1);
-      ctx.strokeStyle = tier.glow;
+      ctx.strokeStyle = this.fadeStyle(ctx, RAIL_GLOW_KEYS[tierIdx], tier.glow);
       ctx.lineWidth = 9 * this.u;
       ctx.stroke();
       ctx.globalCompositeOperation = 'source-over';
       ctx.globalAlpha = clamp(0.5 + railA * 0.5, 0, 1);
-      ctx.strokeStyle = mult >= 2 ? tier.color : UI_COLORS.rail;
+      ctx.strokeStyle = this.fadeStyle(ctx, RAIL_KEYS[mult >= 2 ? tierIdx : 4], railColor);
       ctx.lineWidth = 2.2 * this.u;
       ctx.stroke();
       ctx.globalAlpha = 1;
     }
+  }
+
+  /**
+   * Vertical gradient that ramps `color` from fully transparent at the far edge of the board up to
+   * `alpha` below the dissolve band — the single mechanism that makes the far end of the highway
+   * dissolve instead of ending on a hard horizontal cut with a bright rail lip across it. Every
+   * paint that belongs to the road surface uses it, so they all fade out together.
+   */
+  private fadeStyle(ctx: Ctx2D, key: string, color: string, alpha = 1): CanvasGradient {
+    return this.grad(key, () => {
+      const g = this.geom;
+      const lg = ctx.createLinearGradient(0, g.horizonY, 0, this.farFadeY);
+      lg.addColorStop(0, withAlpha(color, 0));
+      lg.addColorStop(0.55, withAlpha(color, alpha * 0.45));
+      lg.addColorStop(1, withAlpha(color, alpha));
+      return lg;
+    });
+  }
+
+  /** Y at which the far-end dissolve has finished (the board is fully opaque below this). */
+  private get farFadeY(): number {
+    const g = this.geom;
+    return g.horizonY + (g.strikeY - g.horizonY) * FAR_FADE_FRAC;
   }
 
   // Coloured lane flash on hit (lane colour) / miss (soft red tint), fading over ~0.3–0.45 s.
@@ -863,9 +965,12 @@ export class Highway {
       const k = (1 - clamp(age, 0, dur) / dur) * this.coreEff;
       const grad = this.grad(kind === 1 ? FLASH_KEYS[lane] : 'flashMiss', () => {
         const color = kind === 1 ? laneColor(this.palette, lane).glow : '#ff3030';
-        const lg = ctx.createLinearGradient(0, g.strikeY, 0, g.horizonY);
-        lg.addColorStop(0, withAlpha(color, kind === 1 ? 0.55 : 0.3));
-        lg.addColorStop(0.6, withAlpha(color, 0.12));
+        // Bounded: the wash dies out half way up the board rather than flooding it to the horizon.
+        // On a board this long a full-length column swamped the road and hid the very receptor the
+        // patient had just hit.
+        const lg = ctx.createLinearGradient(0, g.strikeY, 0, g.strikeY + (g.horizonY - g.strikeY) * LANE_FLASH_REACH);
+        lg.addColorStop(0, withAlpha(color, kind === 1 ? 0.4 : 0.24));
+        lg.addColorStop(0.55, withAlpha(color, 0.1));
         lg.addColorStop(1, withAlpha(color, 0));
         return lg;
       });
@@ -991,15 +1096,47 @@ export class Highway {
 
   /**
    * Receptors. The meter is the renderer's biofeedback claim, so it is drawn from the pure state
-   * model in receptor.ts and the two situations at a full meter are drawn as *different things*:
+   * model in receptor.ts, and the FOUR states a lane can be in are drawn as four different things —
+   * different MARKS (shape and topology), not different hue or brightness of one look, because a
+   * patient reads this from ~2 m mid-exercise and may have low vision or a colour-vision deficit.
    *
-   *   armed  → lane colour, liquid fill against `thresholdFraction`, meniscus, halo growing with
-   *            the meter, a beat pulse on the ring, and a white-hot fill at the trigger point.
-   *   locked → the lane has already fired and cannot fire again until the value falls below
-   *            `thresholdFraction * rearmFraction`. Dead grey drained fill, NO hot gradient, NO
-   *            halo at all, grey ring, a bright re-arm line across the ring and a downward chevron
-   *            that says "lower to reset". A patient holding at end range sees the light go out and
-   *            a target to come back down to — not a lit receptor that is quietly scoring nothing.
+   * Everything value-derived is painted ON TOP of the receptor sprite. The sprite's button face is
+   * a translucent dark disc across the whole ellipse; a meter drawn underneath it is a scrimmed
+   * warm-up glow with no resolvable level, which is exactly what a rising meter must not be.
+   *
+   * The meter is a GAUGE: a flat dark well, a liquid column with a hard-edged top, a fixed target
+   * line at `thresholdFraction` with ~24 % overshoot headroom above it (`METER_TARGET_POS`), and
+   * two ticks marking that same threshold outside the ring where no liquid can cover them.
+   *
+   *   (a) rising, armed        → lane-coloured ring with the beat pulse; liquid rising in the well;
+   *                              a lane-coloured LEVEL LINE at the patient's current value; the
+   *                              white TARGET LINE + ticks above it; halo growing with fill².
+   *                              "Keep going — this much further." The fixed target line is what
+   *                              makes half way distinguishable from nearly there.
+   *   (b) at/over threshold,
+   *       armed (`willFire`)   → the liquid crosses the target line into the headroom (the only
+   *                              state where anything is drawn above that line), the level line
+   *                              goes white-hot and doubles in thickness, and two additive rings
+   *                              appear that exist in no other state: an inner rim and a corona
+   *                              outside the ring. "That is scoring."
+   *   (c) at/over threshold,
+   *       NOT armed (`locked`) → the lane has already fired (or has never been seen below the
+   *                              re-arm level) and CANNOT fire again until the value falls below
+   *                              `thresholdFraction * rearmFraction`. Dead grey ring shrunk 12 %,
+   *                              drained grey liquid, NO level line, NO target line or ticks, NO
+   *                              halo — and instead the three return-to-rest marks that exist only
+   *                              here: a dashed re-arm line at the level to come back down to, a
+   *                              downward chevron that settles onto it, and an arc outside the ring
+   *                              that grows as they lower and completes exactly when the lane
+   *                              re-arms (how much further, not just which way). A patient holding
+   *                              at end range sees the light go out and a target to return to —
+   *                              never a lit receptor that is quietly scoring nothing.
+   *   (d) tracking lost        → there is no measurement at all, so NOTHING that encodes a value is
+   *                              drawn: no well, no liquid, no level line, no halo, no lock cues,
+   *                              no beat pulse (a dead signal must not dance with the music). Just
+   *                              a broken, slowly breathing light-grey ring — the only ring on the
+   *                              board with gaps in it — with a big "?" in it. "I cannot see you",
+   *                              which is a different instruction from "lower to reset".
    */
   private drawReceptors(ctx: Ctx2D, frame: RenderFrame, dt: number, beatPulse: number): void {
     const g = this.geom;
@@ -1030,8 +1167,6 @@ export class Highway {
       const lockColor = this.palette.miss;
       const x = laneX(g, lane, 0);
       const y = g.strikeY;
-      const fill = look.fill;
-      const alphaBase = look.tracking ? 1 : 0.4;
 
       // Re-arm edge: the instant the lane can fire again gets a visible pop, because that is the
       // instant the patient's next rep starts counting.
@@ -1047,6 +1182,16 @@ export class Highway {
       this.laneGlow[lane] = prevGlow + (look.glowTarget - prevGlow) * clamp(dt * 14, 0, 1);
       const glowLevel = this.laneGlow[lane];
 
+      // (d) No signal. Drawn on its own and nothing else: every remaining mark below encodes a
+      // measured value, and there is no measurement — including the halo, which is why this returns
+      // *before* any halo blit. The accumulator above is still stepped (its target is 0 while
+      // untracked), so the light is already back at zero when tracking returns and the recovering
+      // lane fades up from its true value rather than from a stale one.
+      if (!look.tracking) {
+        this.drawLostReceptor(ctx, x, y, r, ry, st, still);
+        continue;
+      }
+
       // Ring scale: a real (≈9 %) beat pulse while the lane is live, a hard 12 % shrink while it is
       // locked out, plus the re-arm pop. The old 3.5 % wobble was sub-pixel and was not tied to
       // arming at all.
@@ -1058,77 +1203,26 @@ export class Highway {
         const laneGlowSprite = this.sprites.glow(color.glow, 64);
         if (laneGlowSprite) {
           ctx.globalCompositeOperation = 'lighter';
-          ctx.globalAlpha = clamp(glowLevel * 0.9 * alphaBase + popK * 0.35, 0, 1);
-          blit(ctx, laneGlowSprite, x, y, (r * (2.2 + glowLevel * 1.4)) / 64);
+          // Bounded to roughly a lane width: this halo is the "this will fire" biofeedback cue, and
+          // a cue that erases the ring it is about (and the two receptors either side of it) has
+          // stopped being a cue. It stacks additively with the hit burst, so both are capped.
+          ctx.globalAlpha = clamp(glowLevel * 0.6 + popK * 0.3, 0, 1);
+          blit(ctx, laneGlowSprite, x, y, (r * (1.8 + glowLevel * 0.9)) / 64);
           ctx.globalAlpha = 1;
           ctx.globalCompositeOperation = 'source-over';
         }
       }
 
-      // Meter fill: liquid rising inside the ring. Same geometry locked or live (the height is the
-      // patient's actual value — that stays honest); the *material* is what changes.
-      if (fill > 0.01) {
-        ctx.save();
-        ctx.beginPath();
-        ctx.ellipse(x, y, r * 0.92 * pulse, ry * 0.9 * pulse, 0, 0, Math.PI * 2);
-        ctx.clip();
-        const top = y + ry - fill * ry * 2;
-        const hot = look.willFire;
-        ctx.fillStyle = look.locked
-          ? this.grad(METER_LOCK_KEY, () => {
-              const grad = ctx.createLinearGradient(0, y - ry, 0, y + ry);
-              grad.addColorStop(0, withAlpha(lockColor.base, 0.30));
-              grad.addColorStop(1, withAlpha(lockColor.dark, 0.55));
-              return grad;
-            })
-          : this.grad(hot ? METER_HOT_KEYS[lane] : METER_KEYS[lane], () => {
-              const grad = ctx.createLinearGradient(0, y - ry, 0, y + ry);
-              grad.addColorStop(0, withAlpha(hot ? color.bright : color.base, hot ? 0.95 : 0.55));
-              grad.addColorStop(1, withAlpha(color.dark, 0.85));
-              return grad;
-            });
-        ctx.globalAlpha = look.locked ? alphaBase * 0.75 : alphaBase;
-        ctx.fillRect(x - r, top, r * 2, y + ry - top + 1);
-        // Meniscus highlight — live lanes only: a bright line at the top of the fill reads as
-        // "here is your level, it counts", which is the one thing a locked lane must not say.
-        if (!look.locked) {
-          ctx.fillStyle = color.bright;
-          ctx.globalAlpha = 0.7 * alphaBase;
-          ctx.fillRect(x - r, top - 1, r * 2, Math.max(1, 2 * this.u));
-        }
-        ctx.globalAlpha = 1;
-        ctx.restore();
-      }
-
-      if (look.locked) {
-        // Re-arm line: where the value has to come back down to. Drawn as three dashes across the
-        // ring so it reads as a target line rather than as part of the fill.
-        const yReset = y + ry - look.resetLevel * ry * 2;
-        const dashW = (r * 1.7) / 5;
-        ctx.fillStyle = LOCK_HINT_COLOR;
-        ctx.globalAlpha = clamp(0.72 + 0.28 * look.resetProgress, 0, 1) * alphaBase;
-        for (let k = 0; k < 3; k++) {
-          ctx.fillRect(x - r * 0.85 + k * dashW * 2, yReset - Math.max(1, this.u), dashW, Math.max(2, 2 * this.u));
-        }
-        // "Lower to reset" chevron, pointing down, fading out as the value approaches the line.
-        const chev = r * 0.34;
-        const cy = y - ry * 0.28 + chev * 0.5 * look.resetProgress;
-        ctx.globalAlpha = clamp(1 - 0.45 * look.resetProgress, 0, 1) * alphaBase;
-        ctx.strokeStyle = LOCK_HINT_COLOR;
-        ctx.lineWidth = Math.max(2, r * 0.13);
-        ctx.lineCap = 'round';
-        ctx.beginPath();
-        ctx.moveTo(x - chev, cy - chev * 0.5);
-        ctx.lineTo(x, cy + chev * 0.5);
-        ctx.lineTo(x + chev, cy - chev * 0.5);
-        ctx.stroke();
-        ctx.globalAlpha = 1;
-      }
-
-      // Ring sprite. Locked lanes get the dead grey ring, not a 30 %-dimmed coloured one.
+      // Ring sprite FIRST — everything the patient actually has to read is painted ON TOP of it.
+      // The sprite's button face is a translucent dark disc across the whole ellipse, so a meter
+      // painted underneath it (which is what this used to do) is seen through a scrim: measured on
+      // real pixels, empty→full moved the ring's mean luminance 38→79 as a diffuse warm-up with no
+      // resolvable level line, and the meniscus was +19/255 over 2 px. At 2 m that is a binary
+      // "not yet / there" — the entire effortful phase of every rep, the one thing the ring exists
+      // to coach, was invisible. Locked lanes get the dead grey ring, not a dimmed coloured one.
       const ringColor = look.locked ? lockColor : color;
       const spr = this.sprites.receptor(ringColor, r);
-      ctx.globalAlpha = clamp(alphaBase * (look.locked ? 0.6 : 1) + popK * 0.4, 0, 1);
+      ctx.globalAlpha = clamp((look.locked ? 0.6 : 1) + popK * 0.4, 0, 1);
       if (spr) blit(ctx, spr, x, y, pulse);
       else {
         ctx.strokeStyle = ringColor.base;
@@ -1139,26 +1233,171 @@ export class Highway {
       }
       ctx.globalAlpha = 1;
 
+      // ---- the meter well ------------------------------------------------------------------
+      // A gauge, not a glow: flat dark ground, a liquid column whose top edge is a hard luminance
+      // step, and a FIXED target line at the trigger threshold with overshoot headroom above it.
+      // The fixed mark is what makes "half way" different from "nearly there" at 2 m — a level with
+      // nothing to read it against is only comparable to itself.
+      const wr = r * 0.92 * pulse;
+      const wry = ry * 0.9 * pulse;
+      const yBot = y + wry;
+      const span = wry * 2;
+      const yTarget = yBot - METER_TARGET_POS * span;
+      const yLevel = yBot - clamp(METER_TARGET_POS * look.fill + (1 - METER_TARGET_POS) * look.over, 0, 1) * span;
+      const yRearm = yBot - METER_TARGET_POS * look.resetLevel * span;
+      const hot = look.willFire;
+      ctx.save();
+      ctx.beginPath();
+      ctx.ellipse(x, y, wr, wry, 0, 0, Math.PI * 2);
+      ctx.clip();
+      ctx.fillStyle = METER_WELL_COLOR;
+      ctx.globalAlpha = 0.82;
+      ctx.fillRect(x - wr, y - wry, wr * 2, span);
+      ctx.globalAlpha = 1;
+      // Liquid. Same geometry locked or live (the height is the patient's real value — that stays
+      // honest); the *material* is what changes.
+      if (yLevel < yBot - 0.5) {
+        ctx.fillStyle = look.locked
+          ? this.grad(METER_LOCK_KEY, () => {
+              const grad = ctx.createLinearGradient(0, y - ry, 0, y + ry);
+              grad.addColorStop(0, withAlpha(lockColor.base, 0.55));
+              grad.addColorStop(1, withAlpha(lockColor.dark, 0.75));
+              return grad;
+            })
+          : this.grad(hot ? METER_HOT_KEYS[lane] : METER_KEYS[lane], () => {
+              const grad = ctx.createLinearGradient(0, y - ry, 0, y + ry);
+              grad.addColorStop(0, withAlpha(hot ? color.bright : color.base, hot ? 0.98 : 0.92));
+              grad.addColorStop(1, withAlpha(color.dark, 0.9));
+              return grad;
+            });
+        ctx.globalAlpha = look.locked ? 0.8 : 1;
+        ctx.fillRect(x - wr, yLevel, wr * 2, yBot - yLevel);
+        ctx.globalAlpha = 1;
+      }
+      if (!look.locked) {
+        // Level line: "here is your current level, and it counts" — the one thing a locked lane
+        // must never say. Lane-coloured while rising, white-hot and twice as thick at the trigger
+        // point, so (b) differs from (a) by a mark and not only by the height of a bar.
+        if (look.fill > 0.005) {
+          ctx.fillStyle = hot ? TARGET_LINE_COLOR : color.bright;
+          ctx.globalAlpha = hot ? 0.98 : 0.95;
+          const th = hot ? Math.max(4, 6 * this.u) : Math.max(3, 3.4 * this.u);
+          ctx.fillRect(x - wr, yLevel - th * 0.5, wr * 2, th);
+          ctx.globalAlpha = 1;
+        }
+        // Target line: the threshold, at a fixed height, always drawn on top of the liquid.
+        ctx.fillStyle = TARGET_LINE_COLOR;
+        ctx.globalAlpha = 0.8;
+        ctx.fillRect(x - wr, yTarget - Math.max(1, 1.1 * this.u), wr * 2, Math.max(2, 2.2 * this.u));
+        ctx.globalAlpha = 1;
+      } else {
+        // Re-arm line: where the value has to come back down to before the next rep can register.
+        // Dashed, in the hint colour, and at the same height the input layer really re-arms at
+        // (thresholdFraction * rearmFraction — LaneTrigger.rearmLevel).
+        const dashW = (wr * 1.7) / 5;
+        ctx.fillStyle = LOCK_HINT_COLOR;
+        ctx.globalAlpha = clamp(0.72 + 0.28 * look.resetProgress, 0, 1);
+        for (let k = 0; k < 3; k++) {
+          ctx.fillRect(x - wr * 0.85 + k * dashW * 2, yRearm - Math.max(1, this.u), dashW, Math.max(2, 2.4 * this.u));
+        }
+        ctx.globalAlpha = 1;
+      }
+      ctx.restore();
+
+      if (!look.locked) {
+        // ...and the same target line marked OUTSIDE the ring, where no liquid can ever cover it
+        // and no acuity loss can merge it with the level line. Two ticks flush against the ring's
+        // outline at exactly the threshold height.
+        const dy = clamp((yTarget - y) / (ry * pulse), -1, 1);
+        const edge = r * pulse * Math.sqrt(Math.max(0, 1 - dy * dy));
+        const tick = Math.max(3, r * 0.24);
+        const th = Math.max(2, 2.2 * this.u);
+        ctx.fillStyle = TARGET_LINE_COLOR;
+        ctx.globalAlpha = 0.92;
+        ctx.fillRect(x + edge, yTarget - th * 0.5, tick, th);
+        ctx.fillRect(x - edge - tick, yTarget - th * 0.5, tick, th);
+        ctx.globalAlpha = 1;
+      } else {
+        // "Lower to reset" chevron, pointing down, settling onto the re-arm line as the value
+        // drains toward it. The only chevron on the board.
+        const chev = r * 0.34;
+        const cy = y - ry * 0.28 + chev * 0.5 * look.resetProgress;
+        ctx.globalAlpha = clamp(1 - 0.45 * look.resetProgress, 0, 1);
+        ctx.strokeStyle = LOCK_HINT_COLOR;
+        ctx.lineWidth = Math.max(2, r * 0.13);
+        ctx.lineCap = 'round';
+        ctx.beginPath();
+        ctx.moveTo(x - chev, cy - chev * 0.5);
+        ctx.lineTo(x, cy + chev * 0.5);
+        ctx.lineTo(x + chev, cy - chev * 0.5);
+        ctx.stroke();
+        // Return-to-rest progress: an arc outside the ring that grows as the value drains back
+        // toward the re-arm level and is complete the instant the lane can fire again. The chevron
+        // says what to do; this says how much further, which is the part a patient holding at end
+        // range cannot otherwise know. It is deliberately never a closed ring — the top quarter
+        // stays open — and it is drawn in a hue no lane palette contains, so it cannot be read as
+        // a lit lane ring on the yellow / orange lane at 2 m.
+        if (look.resetProgress > 0.001) {
+          ctx.globalAlpha = 0.95;
+          ctx.lineWidth = Math.max(2, r * 0.12);
+          ctx.beginPath();
+          ctx.ellipse(x, y, r * 1.16, ry * 1.16, 0, RESET_ARC_START, RESET_ARC_START + RESET_ARC_SWEEP * look.resetProgress);
+          ctx.stroke();
+        }
+        ctx.globalAlpha = 1;
+      }
+
       // "This will score": an inner rim lit in the lane colour, drawn only while the lane would
-      // actually fire. The receptor's own button face darkens the meter fill behind it, so without
-      // this the difference between "nearly there" and "at the trigger point" was carried by the
-      // halo alone. It pulses with the beat, which is what "pulses when armed" has to look like.
-      if (look.willFire) {
+      // actually fire. It pulses with the beat, which is what "pulses when armed" has to look like.
+      if (hot) {
         ctx.globalCompositeOperation = 'lighter';
-        ctx.globalAlpha = clamp((0.5 + 0.35 * (still ? 0.4 : beatPulse)) * alphaBase, 0, 1);
+        ctx.globalAlpha = clamp(0.5 + 0.35 * (still ? 0.4 : beatPulse), 0, 1);
         ctx.strokeStyle = color.bright;
         ctx.lineWidth = Math.max(2, r * 0.13);
         ctx.beginPath();
         ctx.ellipse(x, y, r * 0.68 * pulse, ry * 0.68 * pulse, 0, 0, Math.PI * 2);
         ctx.stroke();
+        // ...and a corona just outside the ring. The inner rim can be swallowed by the fill it sits
+        // on at a bright lane colour; the corona sits on the dark road, so "this rep is scoring"
+        // survives being read across a clinic room.
+        ctx.globalAlpha = clamp(0.34 + 0.3 * (still ? 0.4 : beatPulse), 0, 1);
+        ctx.lineWidth = Math.max(2, r * 0.1);
+        ctx.beginPath();
+        ctx.ellipse(x, y, r * 1.16 * pulse, ry * 1.16 * pulse, 0, 0, Math.PI * 2);
+        ctx.stroke();
         ctx.globalAlpha = 1;
         ctx.globalCompositeOperation = 'source-over';
       }
-
-      if (!look.tracking) {
-        this.text.draw(ctx, '?', x, y, this.style('receptorQ'), 1, 0.85);
-      }
     }
+  }
+
+  /**
+   * (d) "I cannot see you": the tracker has no landmarks for this lane, so the receptor has no
+   * value to report and must not pretend otherwise.
+   *
+   * VisionInput reports `value: 0, tracking: false` for a dead stream (see its `getLaneStates`), and
+   * a lane-level dropout leaves the last sample behind — either way the number is not a measurement,
+   * so nothing here is derived from it: no fill, no meniscus, no halo, no re-arm cues, no beat
+   * pulse. What is drawn instead is the only BROKEN ring on the board — four light-grey arcs with
+   * gaps, breathing slowly at a rate that has nothing to do with the music — with a large "?" in the
+   * middle. Grey-but-solid means "lower to reset" (c); grey-and-broken means "the camera has lost
+   * you", and the fix is to move back into frame, not to move differently.
+   */
+  private drawLostReceptor(ctx: Ctx2D, x: number, y: number, r: number, ry: number, st: number, still: boolean): void {
+    const breathe = still ? 0.8 : 0.6 + 0.4 * (0.5 - 0.5 * Math.cos(st * LOST_BREATHE_RATE));
+    const arc = (Math.PI * 2) / LOST_RING_SEGMENTS;
+    ctx.strokeStyle = LOST_RING_COLOR;
+    ctx.lineWidth = Math.max(2, r * 0.16);
+    ctx.lineCap = 'butt';
+    ctx.globalAlpha = clamp(breathe, 0, 1);
+    for (let k = 0; k < LOST_RING_SEGMENTS; k++) {
+      const a0 = LOST_RING_PHASE + k * arc + LOST_RING_GAP_RAD * 0.5;
+      ctx.beginPath();
+      ctx.ellipse(x, y, r, ry, 0, a0, a0 + arc - LOST_RING_GAP_RAD);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+    this.text.draw(ctx, '?', x, y, this.style('receptorQ'), 1.5, clamp(0.65 + 0.35 * breathe, 0, 1));
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -1231,8 +1470,10 @@ export class Highway {
         // toward the bottom so it reads as "getting away".
         alpha = 1 - 0.3 * clamp(d / g.minDepth, 0, 1);
       }
-      // Fade in from the horizon.
-      if (d > 0.85) alpha *= clamp((1.02 - d) / 0.17, 0, 1);
+      // Fade in over exactly the stretch the board itself dissolves over (see drawRoad), so a gem
+      // materialises out of the fog instead of appearing at full alpha on the far edge.
+      const fadeSpan = this.farFadeY - g.horizonY;
+      if (fadeSpan > 0 && y < this.farFadeY) alpha *= clamp((y - g.horizonY) / fadeSpan, 0, 1);
       if (alpha <= 0.01) continue;
       // `gemSprite` + `bucketedRadius` rather than `gem()`: no result object per note per frame.
       const gem = this.sprites.gemSprite(color, radius);
@@ -1326,7 +1567,7 @@ export class Highway {
       }
       if (judgment === 'perfect' && eff > 0.02) {
         // Brief white core flash for perfects (small enough to leave the receptor readable).
-        this.particles.emit({ x, y, life: 0.14, size: g.gemRadiusNear * 0.7, endSize: g.gemRadiusNear * 0.25, color: WHITE_COLOR_INDEX, kind: PARTICLE_SPARK, alpha: 0.7 });
+        this.particles.emit({ x, y, life: 0.11, size: g.gemRadiusNear * 0.5, endSize: g.gemRadiusNear * 0.2, color: WHITE_COLOR_INDEX, kind: PARTICLE_SPARK, alpha: 0.42 });
       }
     }
     this.spawnPopup(judgment, lane, x, y, st);
@@ -1345,19 +1586,15 @@ export class Highway {
    */
   private spawnPopup(judgment: Judgment, lane: number, x: number, y: number, st: number): void {
     const g = this.geom;
-    let slot = -1;
-    let oldest = 0;
-    let stack = 0;
+    // One judgment label on screen, always: a new verdict retires the previous one instead of
+    // stacking beside it. Two labels are never worth more than one — the combo counter, the lane
+    // flash and the burst already carry the "how many" — and two overlapping ones cost the patient
+    // the receptor underneath them.
+    let slot = 0;
     for (let i = 0; i < this.popups.length; i++) {
-      const p = this.popups[i];
-      if (!p.active) {
-        if (slot < 0) slot = i;
-        continue;
-      }
-      if (p.lane === lane && st - p.t0 < POPUP_SEC * 0.55) stack++;
-      if (this.popups[oldest].active && p.t0 < this.popups[oldest].t0) oldest = i;
+      if (this.popups[i].active) this.popups[i].active = false;
+      else slot = i;
     }
-    if (slot < 0) slot = oldest;
     const p = this.popups[slot];
     p.active = true;
     p.judgment = judgment;
@@ -1366,7 +1603,7 @@ export class Highway {
     p.x = x;
     const R = g.receptorRadius;
     const cap = (g.strikeY - g.horizonY) * POPUP_MAX_RISE_FRAC;
-    p.y = y - Math.min(R * POPUP_BASE_R + Math.min(stack, 2) * R * POPUP_STACK_R, cap);
+    p.y = y - Math.min(R * POPUP_BASE_R, cap);
   }
 
   private processHits(frame: RenderFrame): void {
@@ -1656,9 +1893,14 @@ export class Highway {
       default: {
         // laneLabel:<hex>
         const color = name.startsWith('laneLabel:') ? name.slice('laneLabel:'.length) : UI_COLORS.text;
+        // Movement labels are a clinical requirement (the four lanes are prescribed exercises and
+        // the patient has to know which limb lane 3 is), so they stay — but they are a legend, not
+        // the loudest object in the bottom third. Smaller than the receptor they name, lane-coloured
+        // rather than white, and with a thinner outline, they sit under the fret hardware instead of
+        // out-shouting the gems.
         const lw = this.geom.laneWidthNear;
-        const fs = clamp(Math.round(lw * 0.14), 11, Math.round(22 * Math.max(1, u)));
-        s = { font: `700 ${fs}px ${FONT}`, color, stroke: 'rgba(0,0,0,0.75)', strokeWidth: Math.max(1, Math.round(fs * 0.12)) };
+        const fs = clamp(Math.round(lw * 0.105), 11, Math.round(20 * Math.max(1, u)));
+        s = { font: `600 ${fs}px ${FONT}`, color, stroke: 'rgba(0,0,0,0.6)', strokeWidth: Math.max(1, Math.round(fs * 0.1)) };
       }
     }
     this.styleCache.set(name, s);
@@ -1679,24 +1921,27 @@ export class Highway {
     return this.comboStr;
   }
 
-  private drawCombo(ctx: Ctx2D, frame: RenderFrame, st: number): void {
+  /**
+   * Where the combo block lives: the right side panel when it fits, else above the board. The
+   * multiplier badge is anchored off this too, so the two halves of the streak readout stay one
+   * group with a reserved slot instead of the badge sharing a corner with the song caption.
+   */
+  private comboAnchor(): { x: number; y: number; panel: boolean } {
     const g = this.geom;
+    const u = this.u;
+    const rightEdge = roadEdgeX(g, 1, 0);
+    const panelW = this.width - rightEdge;
+    if (panelW >= 110 * u) return { x: rightEdge + panelW / 2, y: g.strikeY - g.receptorRadius * 2.2, panel: true };
+    return { x: g.vpX, y: Math.max(52 * u, g.horizonY - 40 * u), panel: false };
+  }
+
+  private drawCombo(ctx: Ctx2D, frame: RenderFrame, st: number): void {
     const u = this.u;
     const combo = Number.isFinite(frame.combo) ? Math.max(0, Math.floor(frame.combo)) : 0;
     if (combo > this.lastCombo) this.comboBounceT0 = st;
     if (combo === 0 && this.lastCombo > 0) this.comboBreakT0 = st;
     this.lastCombo = combo;
-    const rightEdge = roadEdgeX(g, 1, 0);
-    const panelW = this.width - rightEdge;
-    let x: number;
-    let y: number;
-    if (panelW >= 110 * u) {
-      x = rightEdge + panelW / 2;
-      y = g.strikeY - g.receptorRadius * 2.2;
-    } else {
-      x = g.vpX;
-      y = Math.max(52 * u, g.horizonY - 40 * u);
-    }
+    const { x, y } = this.comboAnchor();
     const heat = clamp(combo / 50, 0, 1);
     const labelDy = 34 * u * (1 + heat * 0.2);
     const still = this.opts.reducedMotion;
@@ -1741,13 +1986,20 @@ export class Highway {
     const labelPx = fontPx(labelStyle.font);
     const scorePx = fontPx(scoreStyle.font);
     this.text.draw(ctx, 'SCORE', W - pad, pad + labelPx * 0.5, labelStyle, 1, 1, 'right');
-    this.digits.draw(ctx, this.displayScore, W - pad, pad + labelPx + scorePx * 0.7, scoreStyle, 6, this.dpr);
+    // Integer, never the fractional catch-up value: the odometer roll draws two glyph sets inside
+    // one digit cell, and with a score that ticks on every hit it was mid-roll in almost every
+    // frame. All three blind critics read the result as corrupted text. The value still eases
+    // toward the target — it just lands on whole numbers, in fixed-advance tabular digits.
+    this.digits.draw(ctx, Math.round(this.displayScore), W - pad, pad + labelPx + scorePx * 0.7, scoreStyle, 6, this.dpr);
 
     // Song title / attribution (top-left), fitted to the space left of the score readout so a long
     // CC-BY attribution string is ellipsized instead of running underneath the score.
     // 6 digits at ~0.62 em each, plus half an em of gutter so a fitted attribution never abuts the
     // score block.
-    const textRoom = Math.max(60 * u, W - pad * 2 - scorePx * 4.9);
+    // ...and never wider than a corner block: a full CC-BY sentence run across the top of the frame
+    // is the loudest "hobby build" tell there is. It stays legible and present (a licence
+    // obligation), ellipsized into the corner it belongs in.
+    const textRoom = Math.min(Math.max(60 * u, W - pad * 2 - scorePx * 4.9), W * 0.3);
     const titleStyle = this.style('title');
     const titlePx = fontPx(titleStyle.font);
     const titleY = pad + titlePx * 0.62;
@@ -1820,10 +2072,14 @@ export class Highway {
     const tier = multiplierTier(mult);
     const popAge = this.stNow - this.multiplierPopT0;
     const pop = !this.opts.reducedMotion && popAge >= 0 && popAge < 0.3 ? 1 + 0.4 * Math.pow(1 - popAge / 0.3, 2) : 1;
-    const bw = gaugeR * 1.5 * pop;
-    const bh = gaugeR * 0.75 * pop;
-    const bx = gx - bw / 2;
-    const by = gy + gaugeR * 1.3;
+    // Under the COMBO readout on the opposite flank, in a slot of its own. It used to sit under the
+    // rock gauge in the bottom-left corner, where the song caption landed on top of it.
+    const anchor = this.comboAnchor();
+    const badgeW = clamp(gaugeR * 1.5, 60 * u, this.width * 0.14);
+    const bw = badgeW * pop;
+    const bh = badgeW * 0.5 * pop;
+    const bx = anchor.x - bw / 2;
+    const by = anchor.y + (anchor.panel ? 58 * u : 46 * u);
     ctx.globalCompositeOperation = 'lighter';
     ctx.globalAlpha = clamp(0.25 + beatPulse * 0.25 * (mult - 1), 0, 1);
     ctx.fillStyle = tier.glow;
@@ -1832,7 +2088,7 @@ export class Highway {
     ctx.globalAlpha = 1;
     ctx.globalCompositeOperation = 'source-over';
     ctx.fillStyle = this.grad(BADGE_KEYS[clamp(mult, 1, 4) - 1], () => {
-      const bg = ctx.createLinearGradient(0, by, 0, by + gaugeR * 0.75);
+      const bg = ctx.createLinearGradient(0, by, 0, by + badgeW * 0.5);
       bg.addColorStop(0, tier.color);
       bg.addColorStop(1, mixHex(tier.color, '#000000', 0.45));
       return bg;
@@ -1842,7 +2098,7 @@ export class Highway {
     ctx.strokeStyle = 'rgba(255,255,255,0.6)';
     ctx.lineWidth = Math.max(1, 2 * u);
     ctx.stroke();
-    this.text.draw(ctx, tier.label, gx, by + bh / 2, this.style('mult'), (bh / (40 * u)) * 1.0, 1);
+    this.text.draw(ctx, tier.label, anchor.x, by + bh / 2, this.style('mult'), (bh / (40 * u)) * 1.0, 1);
   }
 
   /**
@@ -1928,7 +2184,7 @@ export class Highway {
       const tracking = ls ? ls.tracking !== false : true;
       const x = laneX(g, lane, -0.02);
       const row = this.labelStagger ? lane % 2 : 0;
-      this.text.draw(ctx, label, x, y + row * rowH, this.style(this.laneLabelKey(lane, tracking)), 1, tracking ? 1 : 0.6);
+      this.text.draw(ctx, label, x, y + row * rowH, this.style(this.laneLabelKey(lane, tracking)), 1, tracking ? 0.85 : 0.5);
     }
   }
 

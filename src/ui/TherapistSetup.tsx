@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { attributionText } from '../audio/manifest.ts';
 import type { SongEntry } from '../audio/manifest.ts';
 import { DIFFICULTIES, DIFFICULTY_NAMES, windowsFor } from '../engine/difficulty.ts';
-import type { DifficultyName, LaneSpec, Side } from '../engine/types.ts';
+import { FINGERTIPS } from '../engine/types.ts';
+import type { DifficultyName, Fingertip, LaneSpec, Side } from '../engine/types.ts';
 import { runtime } from '../session/runtime.ts';
-import { MAX_LANES, MIN_LANES, movementsFor, useStore } from '../state/store.ts';
+import { MAX_LANES, MIN_LANES, laneFingertip, movementsFor, useStore } from '../state/store.ts';
 import { MOVEMENT_INFO, laneConflicts } from '../vision/features.ts';
 import { Screen, Toast, TopBar } from './common.tsx';
 
@@ -14,8 +15,12 @@ const DIFFICULTY_BLURB: Record<DifficultyName, string> = {
   hard: 'Near-full range, one and a half notes per beat.',
 };
 
+const FINGERTIP_LABEL: Record<Fingertip, string> = { index: 'Index', middle: 'Middle', ring: 'Ring', pinky: 'Little' };
+
 function laneLabel(l: LaneSpec): string {
-  return `${l.side === 'left' ? 'Left' : 'Right'} · ${MOVEMENT_INFO[l.movement].label}`;
+  const tip = laneFingertip(l);
+  const base = `${l.side === 'left' ? 'Left' : 'Right'} · ${MOVEMENT_INFO[l.movement].label}`;
+  return tip ? `${base} · ${FINGERTIP_LABEL[tip].toLowerCase()} finger` : base;
 }
 
 export default function TherapistSetup() {
@@ -51,11 +56,66 @@ export default function TherapistSetup() {
     };
   }, [songId, setSong]);
 
+  /** Song id currently being auditioned (null = nothing playing), and the one being fetched for it. */
+  const [previewing, setPreviewing] = useState<string | null>(null);
+  const [previewLoading, setPreviewLoading] = useState<string | null>(null);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+
+  // The audition stops itself after ~12 s (and on any transport call), so the button state has to be
+  // read back from the mixer rather than assumed. Cheap poll, no per-frame React work.
+  useEffect(() => {
+    const poll = setInterval(() => {
+      setPreviewing((current) => {
+        const live = runtime.previewingSongId();
+        return live === current ? current : live;
+      });
+    }, 250);
+    return () => clearInterval(poll);
+  }, []);
+
+  // Never leave a song playing behind us — leaving Setup by any route stops the audition.
+  useEffect(() => () => runtime.stopPreview(), []);
+
+  const stopPreview = useCallback(() => {
+    runtime.stopPreview();
+    setPreviewing(null);
+  }, []);
+
+  const togglePreview = useCallback(
+    (entry: SongEntry) => {
+      setPreviewError(null);
+      if (previewing === entry.id) {
+        stopPreview();
+        return;
+      }
+      setPreviewLoading(entry.id);
+      // Called straight from the click handler: this is the gesture that creates the AudioContext.
+      runtime
+        .previewSong(entry.id)
+        .then((manifest) => {
+          setPreviewLoading(null);
+          if (!manifest) {
+            setPreviewError(`"${entry.manifest?.title ?? entry.id}" has no downloaded stems to play.`);
+            return;
+          }
+          setPreviewing(entry.id);
+        })
+        .catch((err: unknown) => {
+          setPreviewLoading(null);
+          setPreviewError(err instanceof Error ? err.message : String(err));
+        });
+    },
+    [previewing, stopPreview],
+  );
+
   const conflicts = useMemo(() => laneConflicts(lanes), [lanes]);
   const blocking = conflicts.filter((c) => c.severity === 'error');
   const movements = movementsFor(mode);
 
   const start = () => {
+    // The audition is a temporary segment the mixer unwinds; stopping it here is belt-and-braces so
+    // the therapist never hears the preview bleed into the count-in.
+    stopPreview();
     void runtime.ensureAudio().catch(() => undefined);
     goto(inputMode === 'camera' ? 'camera' : 'play');
   };
@@ -107,12 +167,35 @@ export default function TherapistSetup() {
                 ))}
               </select>
 
-              <div className="seg" role="group" aria-label={`Lane ${i + 1} side`}>
-                {(['left', 'right'] as Side[]).map((side) => (
-                  <button key={side} aria-pressed={lane.side === side} onClick={() => setLane(i, { side })}>
-                    {side === 'left' ? 'L' : 'R'}
-                  </button>
-                ))}
+              <div className="row" style={{ gap: 12 }}>
+                <div className="seg" role="group" aria-label={`Lane ${i + 1} side`}>
+                  {(['left', 'right'] as Side[]).map((side) => (
+                    <button key={side} aria-pressed={lane.side === side} onClick={() => setLane(i, { side })}>
+                      {side === 'left' ? 'L' : 'R'}
+                    </button>
+                  ))}
+                </div>
+
+                {/* finger_opposition only: which fingertip opposes the thumb. It is not cosmetic —
+                    the feature is `1 - tip-to-thumb distance / palm size` for THIS tip, so the range
+                    is calibrated, stored and judged per fingertip. */}
+                {laneFingertip(lane) && (
+                  <div className="tip-choice">
+                    <span className="eyebrow">Fingertip</span>
+                    <div className="seg seg-sm" role="group" aria-label={`Lane ${i + 1} fingertip`}>
+                      {FINGERTIPS.map((tip) => (
+                        <button
+                          key={tip}
+                          aria-pressed={laneFingertip(lane) === tip}
+                          onClick={() => setLane(i, { fingertip: tip })}
+                          data-testid={`lane-${i}-tip-${tip}`}
+                        >
+                          {FINGERTIP_LABEL[tip]}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
 
               <button
@@ -126,6 +209,13 @@ export default function TherapistSetup() {
             </li>
           ))}
         </ul>
+
+        {lanes.some((l) => laneFingertip(l)) && (
+          <span className="dim">
+            Each fingertip is calibrated and stored separately: opposing the little finger is a different
+            movement from opposing the index, and one range cannot normalise the other.
+          </span>
+        )}
 
         {conflicts.map((c, i) => (
           <Toast key={i} kind={c.severity === 'error' ? 'bad' : 'warn'}>
@@ -198,44 +288,80 @@ export default function TherapistSetup() {
         <h3>Song</h3>
         {catalogError && <Toast kind="bad">Could not read the song list: {catalogError}</Toast>}
         {!catalog && !catalogError && <p className="muted">Loading songs…</p>}
+        {previewError && <Toast kind="bad">{previewError}</Toast>}
         <div className="card-grid">
           {catalog?.map((entry) => {
             const m = entry.manifest;
             const ready = entry.status === 'ready';
+            const isPreviewing = previewing === entry.id;
+            const isLoading = previewLoading === entry.id;
+            const from = m?.previewStart ?? 0;
             return (
-              <button
-                key={entry.id}
-                className="card pick"
-                aria-pressed={songId === entry.id}
-                onClick={() => setSong(entry.id)}
-                disabled={!m}
-                data-testid={`song-${entry.id}`}
-              >
-                <div className="row">
-                  <span
-                    className="art"
-                    aria-hidden="true"
-                    style={{ background: ready ? 'linear-gradient(140deg,#ff3d7f,#35d6ff)' : '#1d2438' }}
-                  >
-                    {ready ? '♫' : '↓'}
-                  </span>
-                  <div className="stack" style={{ gap: 2 }}>
-                    <div className="pick-title">{m?.title ?? entry.id}</div>
-                    <div className="pick-sub">
-                      {m ? `${m.artist} · ${m.bpm} BPM · ${Math.round(m.durationSec)} s` : (entry.error ?? 'Unreadable manifest')}
+              <div key={entry.id} className={songId === entry.id ? 'song-card selected' : 'song-card'}>
+                <button
+                  className="pick"
+                  aria-pressed={songId === entry.id}
+                  onClick={() => setSong(entry.id)}
+                  disabled={!m}
+                  data-testid={`song-${entry.id}`}
+                >
+                  <div className="row">
+                    <span
+                      className="art"
+                      aria-hidden="true"
+                      style={{ background: ready ? 'linear-gradient(140deg,#ff3d7f,#35d6ff)' : '#1d2438' }}
+                    >
+                      {ready ? '♫' : '↓'}
+                    </span>
+                    <div className="stack" style={{ gap: 2 }}>
+                      <div className="pick-title">{m?.title ?? entry.id}</div>
+                      <div className="pick-sub">
+                        {m ? `${m.artist} · ${m.bpm} BPM · ${Math.round(m.durationSec)} s` : (entry.error ?? 'Unreadable manifest')}
+                      </div>
                     </div>
                   </div>
+                </button>
+
+                <div className="song-actions">
+                  <button
+                    className="btn btn-preview"
+                    aria-pressed={isPreviewing}
+                    disabled={!ready || isLoading}
+                    onClick={() => togglePreview(entry)}
+                    data-testid={`preview-${entry.id}`}
+                    aria-label={isPreviewing ? `Stop the preview of ${m?.title ?? entry.id}` : `Hear ${m?.title ?? entry.id}`}
+                  >
+                    {isLoading ? '… loading' : isPreviewing ? '■ Stop' : '▶ Listen'}
+                  </button>
+                  <span className="dim">
+                    {isPreviewing
+                      ? 'Playing — stops itself'
+                      : ready
+                        ? `12 s from ${Math.floor(from / 60)}:${Math.floor(from % 60).toString().padStart(2, '0')}`
+                        : 'no audio yet'}
+                  </span>
+                  {songId === entry.id && (
+                    <>
+                      <div className="grow" />
+                      <span className="badge badge-ok">Prescribed</span>
+                    </>
+                  )}
                 </div>
+
                 {!ready && m && (
                   <span className="badge badge-warn">
                     Needs fetch — {entry.missingStems.length} stem{entry.missingStems.length === 1 ? '' : 's'} missing (npm run fetch-stems)
                   </span>
                 )}
                 {m && <div className="attribution">{attributionText(m)}</div>}
-              </button>
+              </div>
             );
           })}
         </div>
+        <span className="dim">
+          A preview is an audition, not the session: whichever spot you listen to, pressing start begins
+          the prescribed chart at the top of the song.
+        </span>
         {catalog?.some((e) => e.id === songId && e.status !== 'ready') && (
           <Toast>
             This song's stems are not downloaded. The session will still run — the chart plays silently

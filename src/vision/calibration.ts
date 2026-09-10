@@ -14,7 +14,7 @@
  */
 import type { Movement } from '../engine/types.ts';
 import { DEFAULT_FINGERTIP, MOVEMENT_INFO, POSTURE_INFO, baselineFromSamples } from './features.ts';
-import type { CompensationBaseline, CompensationSample, MovementPosture } from './features.ts';
+import type { CompensationBaseline, CompensationSample, FeatureOptions, MovementPosture } from './features.ts';
 import { clamp01 } from './landmarks.ts';
 import type { Fingertip } from './landmarks.ts';
 import { median, percentile } from './stats.ts';
@@ -82,6 +82,20 @@ export interface RomCalibration {
    * movement. Absent on a legacy/hand-built calibration, which is reported as a warning, not a refusal.
    */
   fingertip?: Fingertip;
+  /**
+   * The mirror convention the frames were measured under (FeatureOptions.mirrored; false = raw camera).
+   *
+   * THIS SELECTS THE LIMB, in BOTH modes, which is why it belongs on the calibration and not only on the
+   * pipeline. On flipped frames Pose reports the patient's left leg in the RIGHT_* landmark slots
+   * (poseSideIndices swaps them back) and the Hands model's "Left"/"Right" label means the opposite hand
+   * (labelToPatientSide inverts it). So the SAME lane spec (`seated_march`/`left`) measured under the two
+   * conventions measures the two DIFFERENT LEGS — and for the hemiparetic patient this game is for, the
+   * unaffected limb's range is exactly the one that makes the affected lane unplayable (or trivially
+   * playable). A stored range carries this so a later session under the other convention is refused
+   * instead of silently normalizing one limb by the other's ROM. Absent on a legacy / hand-built
+   * calibration, which is reported as a warning (not a refusal) when the lane is not on the default.
+   */
+  mirrored?: boolean;
   /** Session it was captured in, when the caller supplies one (localStorage history / therapist notes). */
   sessionId?: string;
 }
@@ -94,6 +108,38 @@ export interface RomCalibration {
 export interface CalibrationContext {
   /** finger_opposition: the fingertip this lane opposes in play (default DEFAULT_FINGERTIP). */
   fingertip?: Fingertip;
+  /** The mirror convention the lane plays under (default DEFAULT_MIRRORED = false). Selects the LIMB. */
+  mirrored?: boolean;
+}
+
+/** The mirror convention assumed when nothing says otherwise: raw (un-flipped) camera frames. */
+export const DEFAULT_MIRRORED = false;
+
+/**
+ * The CalibrationContext a lane measuring `movement` with these feature options is in.
+ *
+ * EVERY consumer must derive its context THROUGH THIS FUNCTION rather than assembling a literal. The
+ * bug this file exists to prevent was exactly two hand-built literals that drifted apart: the
+ * constructor path passed `{ fingertip }` and the runtime hand-over (`VisionInput.setCalibration`)
+ * passed nothing, so a therapist-chosen fingertip made the same calibration valid on one path and
+ * invalid on the other. One derivation, from the very options the feature extractor is given, is the
+ * only thing that keeps them equal — including when a new quantity-selecting option is added here.
+ *
+ * WHAT IS IN, AND WHY THE REST IS NOT. Only options that change WHICH QUANTITY (or which limb) is
+ * measured: `fingertip` (index vs pinky are different distances) and `mirrored` (the two conventions
+ * measure OPPOSITE limbs). `minVisibility` is a gate — it decides whether a frame is measured at all,
+ * not what the number means. `xScale` is an aspect CORRECTION whose whole purpose is to make the
+ * feature identical on every camera, so a range measured with the correct one is comparable across
+ * cameras. `worldLandmarks` is per-frame input. None of those make a stored range wrong.
+ *
+ * The fields are deliberately named like `CalibratorOptions`' so a calibration screen can spread the
+ * context straight into the calibrator that will MEASURE the range (`new RomCalibrator(m, {...ctx})`),
+ * which is what stamps it onto the result and closes the loop.
+ */
+export function calibrationContext(movement: Movement, opts?: Pick<FeatureOptions, 'fingertip' | 'mirrored'> | null): CalibrationContext {
+  const ctx: CalibrationContext = { mirrored: opts?.mirrored ?? DEFAULT_MIRRORED };
+  if (movement === 'finger_opposition') ctx.fingertip = opts?.fingertip ?? DEFAULT_FINGERTIP;
+  return ctx;
 }
 
 /**
@@ -104,6 +150,77 @@ export function fingertipMismatch(cal: CalibrationRange | null | undefined, move
   if (!cal || movement !== 'finger_opposition' || cal.fingertip === undefined) return null;
   const playing = ctx?.fingertip ?? DEFAULT_FINGERTIP;
   return cal.fingertip === playing ? null : { calibrated: cal.fingertip, playing };
+}
+
+/**
+ * The mirror-convention mismatch between a stored calibration and the lane about to use it, or null
+ * when there is none (nothing recorded — a legacy calibration — or the two agree).
+ *
+ * Applies to BOTH modes: on flipped frames the leg landmarks arrive under the other side's indices and
+ * the hand labels mean the other hand, so either way the stored range belongs to the OTHER LIMB.
+ */
+export function mirrorMismatch(cal: CalibrationRange | null | undefined, ctx?: CalibrationContext): { calibrated: boolean; playing: boolean } | null {
+  if (!cal || cal.mirrored === undefined) return null;
+  const playing = ctx?.mirrored ?? DEFAULT_MIRRORED;
+  return cal.mirrored === playing ? null : { calibrated: cal.mirrored, playing };
+}
+
+/** How a frame convention reads to a therapist. */
+function mirrorLabel(mirrored: boolean): string {
+  return mirrored ? 'a mirrored (selfie-flipped) camera image' : 'a raw (un-mirrored) camera image';
+}
+
+/** Which lane configuration option a stored calibration disagrees with. */
+export type CalibrationMismatchField = 'movement' | 'fingertip' | 'mirrored';
+
+/**
+ * A stored calibration that measures a DIFFERENT QUANTITY (or a different limb) from the lane about to
+ * use it — not a degraded measurement, so there is nothing to salvage and the therapist has to know
+ * what to do about it. `reason` is therapist-facing and always ends in the action to take.
+ */
+export interface CalibrationMismatch {
+  field: CalibrationMismatchField;
+  reason: string;
+}
+
+/**
+ * The reason this stored range does not describe what this lane measures, or null when it does.
+ *
+ * ONE function, used by isCalibrationValid / calibrationProblem and by anything that offers a SAVED
+ * calibration for reuse (the Setup screen's "use the previous range", a calibration reloaded from
+ * localStorage in a later session whose lane options differ). The alternative — each caller comparing
+ * the fields it happens to remember — is the bug class this whole file guards against.
+ */
+export function calibrationMismatch(cal: CalibrationRange | null | undefined, movement: Movement, ctx?: CalibrationContext): CalibrationMismatch | null {
+  if (!cal) return null;
+  const tip = fingertipMismatch(cal, movement, ctx);
+  if (tip) {
+    // Same class of error as a range measured for another movement: the two numbers are ranges of
+    // different quantities, so normalizing one with the other is not a degraded measurement.
+    return {
+      field: 'fingertip',
+      reason: `it was measured opposing the ${tip.calibrated} finger, but this lane opposes the ${tip.playing} finger — re-calibrate this lane on the ${tip.playing} finger`,
+    };
+  }
+  if (cal.movement && cal.movement !== movement) {
+    // Ranges are in the MOVEMENT'S OWN unit (degrees vs frame-height ratio): normalizing one movement's
+    // feature by another's range is not a degraded measurement, it is a different quantity.
+    return {
+      field: 'movement',
+      reason: `it was measured for ${MOVEMENT_INFO[cal.movement].label.toLowerCase()}, not ${MOVEMENT_INFO[movement].label.toLowerCase()} — re-calibrate this lane`,
+    };
+  }
+  const mir = mirrorMismatch(cal, ctx);
+  if (mir) {
+    return {
+      field: 'mirrored',
+      reason:
+        `it was measured on ${mirrorLabel(mir.calibrated)} and this session runs on ${mirrorLabel(mir.playing)} — ` +
+        'the two conventions swap which side the landmarks belong to, so this range describes the OTHER limb. ' +
+        'Re-calibrate this lane, or set the mirror option back to the one it was measured with',
+    };
+  }
+  return null;
 }
 
 /**
@@ -228,6 +345,13 @@ export interface CalibratorOptions {
    * instead of silently normalizing one quantity by another's range (see fingertipMismatch).
    */
   fingertip?: Fingertip;
+  /**
+   * The mirror convention the frames being measured are in (see RomCalibration.mirrored). Stamped on the
+   * produced calibration so a later session under the OTHER convention is refused rather than playing
+   * the unaffected limb's range on the affected limb. Omitted = not recorded (legacy behaviour).
+   * A calibration screen should pass the lane's own context: `new RomCalibrator(m, { ...ctx })`.
+   */
+  mirrored?: boolean;
   /** Wall clock for the calibration's `capturedAt` provenance (default Date.now). Injectable for tests. */
   now?: () => number;
   /** Session id stamped on the produced calibration (provenance for the localStorage history). */
@@ -275,8 +399,8 @@ export function normalizeFeatureRaw(cal: Pick<RomCalibration, 'min' | 'max'>, fe
 export function isCalibrationValid(cal: CalibrationRange | null | undefined, movement?: Movement, ctx?: CalibrationContext): boolean {
   if (!cal || !Number.isFinite(cal.min) || !Number.isFinite(cal.max)) return false;
   if (!movement) return cal.max - cal.min >= 1e-6;
-  if (cal.movement && cal.movement !== movement) return false; // measured for a different movement/unit
-  if (fingertipMismatch(cal, movement, ctx)) return false; // measured opposing a different fingertip
+  // Movement, fingertip, mirror convention: any of them makes this a range of something else.
+  if (calibrationMismatch(cal, movement, ctx)) return false;
   return cal.max - cal.min >= requiredRom(movement, cal.rest);
 }
 
@@ -285,17 +409,8 @@ export function calibrationProblem(cal: CalibrationRange | null | undefined, mov
   if (!cal) return null;
   if (!Number.isFinite(cal.min) || !Number.isFinite(cal.max)) return 'the range is not a number';
   const info = MOVEMENT_INFO[movement];
-  const tip = fingertipMismatch(cal, movement, ctx);
-  if (tip) {
-    // Same class of error as a range measured for another movement: the two numbers are ranges of
-    // different quantities, so normalizing one with the other is not a degraded measurement.
-    return `it was measured opposing the ${tip.calibrated} finger, but this lane opposes the ${tip.playing} finger`;
-  }
-  if (cal.movement && cal.movement !== movement) {
-    // Ranges are in the MOVEMENT'S OWN unit (degrees vs frame-height ratio): normalizing one movement's
-    // feature by another's range is not a degraded measurement, it is a different quantity.
-    return `it was measured for ${MOVEMENT_INFO[cal.movement].label.toLowerCase()}, not ${info.label.toLowerCase()}`;
-  }
+  const mismatch = calibrationMismatch(cal, movement, ctx);
+  if (mismatch) return mismatch.reason;
   const rom = cal.max - cal.min;
   const needed = requiredRom(movement, cal.rest);
   if (rom >= needed) return null;
@@ -329,6 +444,12 @@ export function calibrationWarnings(cal: CalibrationRange | null | undefined, mo
   // playing the default: the older calibrations that lack the field were all measured on the index.
   if (movement === 'finger_opposition' && cal.fingertip === undefined && (ctx?.fingertip ?? DEFAULT_FINGERTIP) !== DEFAULT_FINGERTIP) {
     out.push(`This range does not record which fingertip it was measured with, and this lane opposes the ${ctx?.fingertip} finger. If it was measured on another finger, re-run the calibration.`);
+  }
+  // Same rule for the mirror convention: a range that does not record one was measured before the field
+  // existed, i.e. on the default (raw) frames — worth saying only when this lane is NOT on the default,
+  // because then the range may well describe the other limb.
+  if (cal.mirrored === undefined && (ctx?.mirrored ?? DEFAULT_MIRRORED) !== DEFAULT_MIRRORED) {
+    out.push('This range does not record whether the camera image was mirrored when it was measured, and this session mirrors it. If it was measured un-mirrored it describes the other limb — re-run the calibration.');
   }
   const fmt = (v: number) => (info.unit === 'deg' ? `${Math.abs(v).toFixed(1)}°` : `${(Math.abs(v) * 100).toFixed(1)}%`);
   const rest = cal.rest;
@@ -366,6 +487,8 @@ export class RomCalibrator {
   readonly sessionId: string | undefined;
   /** finger_opposition only: the fingertip this range is being measured on. */
   readonly fingertip: Fingertip | undefined;
+  /** The mirror convention of the frames being measured (undefined = the caller did not say). */
+  readonly mirrored: boolean | undefined;
   private readonly nowMs: () => number;
 
   private phase: CalibrationPhase = 'rest';
@@ -416,6 +539,7 @@ export class RomCalibrator {
     this.nowMs = opts.now ?? (() => Date.now());
     this.sessionId = opts.sessionId;
     this.fingertip = movement === 'finger_opposition' ? opts.fingertip ?? DEFAULT_FINGERTIP : undefined;
+    this.mirrored = opts.mirrored;
   }
 
   getPhase(): CalibrationPhase {
@@ -710,6 +834,7 @@ export class RomCalibrator {
     };
     if (this.sessionId !== undefined) cal.sessionId = this.sessionId;
     if (this.fingertip !== undefined) cal.fingertip = this.fingertip;
+    if (this.mirrored !== undefined) cal.mirrored = this.mirrored;
     return cal;
   }
 

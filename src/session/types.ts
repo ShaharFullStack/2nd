@@ -4,7 +4,7 @@
  * Everything here is PLAIN JSON — it is written to localStorage and read back by the History screen
  * months later, so nothing in this file may hold a class instance, a DOM node or an audio handle.
  */
-import type { DifficultyName, LaneSpec, Mode, Movement, Side } from '../engine/types.ts';
+import type { DifficultyName, Fingertip, LaneSpec, Mode, Movement, Side } from '../engine/types.ts';
 
 /** Which input drives the lanes. `camera` is the product; the other two are dev/critic affordances. */
 export type InputMode = 'camera' | 'keyboard' | 'autoplay';
@@ -27,6 +27,14 @@ export interface LaneResultSummary {
   lane: number;
   movement: Movement;
   side: Side;
+  /**
+   * finger_opposition ONLY: the fingertip the therapist prescribed for this lane. Recorded because the
+   * feature (and therefore romMean/romBest and the calibrated range below) is a DIFFERENT QUANTITY per
+   * tip — a cross-session ROM trend that pooled an index lane with a pinky lane would show a collapse
+   * in range that is really just a change of finger. Absent on every other movement and on records
+   * written before the therapist could choose.
+   */
+  fingertip?: Fingertip;
   /** "L knee lift" style label. */
   label: string;
   hits: number;

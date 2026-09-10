@@ -1,6 +1,7 @@
 import { formatDuration, formatMs, formatPercent } from '../session/results.ts';
 import { useStore } from '../state/store.ts';
 import { Meter, Screen, Stars, Toast, TopBar } from './common.tsx';
+import LatencyHandover from './LatencyHandover.tsx';
 
 export default function ResultsScreen() {
   const goto = useStore((s) => s.goto);
@@ -18,9 +19,6 @@ export default function ResultsScreen() {
       </Screen>
     );
   }
-
-  const latencySuspect =
-    result.suggestedLatencyMs !== null && Math.abs(result.suggestedLatencyMs - result.latencyOffsetMs) >= 40;
 
   return (
     <Screen testId="results-screen">
@@ -78,13 +76,7 @@ export default function ResultsScreen() {
         </div>
       </div>
 
-      {latencySuspect && (
-        <Toast>
-          The run says the camera offset should have been about <b>{result.suggestedLatencyMs} ms</b>, not{' '}
-          {result.latencyOffsetMs} ms. Re-run the latency check before the next session — a steady bias this size is a
-          calibration error, not the patient.
-        </Toast>
-      )}
+      <LatencyHandover result={result} />
 
       {result.reps > 0 && result.hits === 0 && (
         <Toast kind="bad">

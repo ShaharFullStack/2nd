@@ -43,16 +43,18 @@ export interface GeometryOptions {
   strikeY: number;
   farScale: number;
   roadWidth: number;
-  /** Screen-space speed below the strike line relative to the speed at the line (0.2..1). */
+  /** Screen-space speed below the strike line relative to the speed at the line (MIN_PAST_LINE_SPEED..1). */
   pastLineSpeed: number;
 }
 
 /**
  * Depth over which the below-line scroll speed eases from the approach speed into the slower tail
- * (see module docs). ~0.13 s at the default 1.6 s approach: long enough that the deceleration is
- * not a visible step, short enough that the tail is still nearly its full length.
+ * (see module docs). ~0.11 s at the default 3.6 s approach: long enough that the deceleration is
+ * not a visible step, short enough that the tail is still nearly its full length. It is expressed
+ * in *depth*, so it shrank when `approachSec` grew — the eased stretch is a duration, not a
+ * fraction of the road.
  */
-export const TAIL_BLEND_DEPTH = 0.08;
+export const TAIL_BLEND_DEPTH = 0.03;
 
 export interface HighwayGeometry {
   width: number;
@@ -86,30 +88,63 @@ export interface HighwayGeometry {
   maxDepth: number;
 }
 
+/**
+ * Board proportions. These are the composition, not a detail: a shipped note highway *is* the
+ * frame. The far end sits just under the top edge and dissolves into the backdrop (`FAR_FADE_FRAC`)
+ * instead of ending on a hard horizontal cut, the strike line sits low with ~18 % of the canvas
+ * left below it for receptor hardware and hit bloom, and the board is two thirds of the canvas
+ * wide at the line. Together that is ~71 % of canvas height of note travel (it was 43 %) and
+ * `approachSec` seconds of read-ahead in view at once.
+ *
+ * `farScale` and `approachSec` are tied: screen speed at the strike line is
+ * `(strikeY - horizonY) / (farScale * approachSec)` canvas-heights per second. Lengthening the
+ * board without loosening the taper or slowing the scroll would fling gems past the receptor.
+ *
+ * `approachSec` is longer than a guitar game's (3.6 s, ~2 bars at 120 BPM) for a reason specific to
+ * this product: a rehab chart's density is bounded by the patient, not by the chart generator —
+ * every note is a rep, with a return-to-rest gap after it, which caps a 4-lane medium session at
+ * roughly one note per second. The only way to put a shipped game's 5-8 gems on the board at once
+ * is a longer runway, and a longer runway is separately right here (camera-to-judgment latency is
+ * 80-200 ms and a knee lift takes time to initiate).
+ */
 export const DEFAULT_GEOMETRY_OPTIONS: GeometryOptions = {
-  approachSec: 1.6,
-  horizonY: 0.35,
-  strikeY: 0.78,
-  farScale: 0.28,
-  roadWidth: 0.46,
-  pastLineSpeed: 0.34,
+  approachSec: 3.6,
+  horizonY: 0.11,
+  strikeY: 0.82,
+  farScale: 0.22,
+  roadWidth: 0.64,
+  pastLineSpeed: 0.12,
 };
+
+/**
+ * Fraction of the horizon→strike span over which the far end of the board dissolves into the
+ * backdrop. Nothing — road, beat ladder, rails, gems — may become visible on a hard line.
+ */
+export const FAR_FADE_FRAC = 0.16;
+
+/**
+ * Floor for `pastLineSpeed`. Low, on purpose: with a full-height board the approach speed at the
+ * strike line is high, and the engine's miss verdict lands up to 280 ms *after* the note time — the
+ * gem it is a verdict about has to still be entirely on screen then (`gemVisibleTailSec`).
+ */
+export const MIN_PAST_LINE_SPEED = 0.1;
 
 /** Gem aspect: gems are slightly squashed ellipses viewed from above, GH-style. */
 export const GEM_ASPECT = 0.72;
 
 /**
  * Gem radius as a fraction of lane width. Clone Hero / GH frets fill most of their lane
- * (diameter ≈ 0.8 × lane width) — that is what makes the road read as an instrument rather than a
- * wide empty ramp, so this is deliberately large.
+ * (diameter ≈ 0.75 × lane width) — that is what makes the road read as an instrument rather than a
+ * wide empty ramp, so this is deliberately large. It also fixes the receptor ring at about a fifth
+ * of the board's width at the strike line, which is where shipped fret hardware sits.
  */
-export const GEM_LANE_FRACTION = 0.4;
+export const GEM_LANE_FRACTION = 0.37;
 /** Hard cap on gem radius as a fraction of canvas height (only binds on very wide aspect ratios). */
-export const GEM_HEIGHT_CAP = 0.085;
+export const GEM_HEIGHT_CAP = 0.12;
 /** Receptor ring radius relative to the gem radius (ring sits just outside the gem). */
 export const RECEPTOR_GEM_RATIO = 1.12;
 /** Road width is also capped relative to height so ultrawide canvases don't get a flat, empty road. */
-export const ROAD_HEIGHT_CAP = 0.95;
+export const ROAD_HEIGHT_CAP = 1.3;
 
 /**
  * Clamp to [lo, hi]. NaN-safe on purpose: `NaN` maps to `lo` rather than propagating. A single
@@ -164,7 +199,7 @@ export function makeGeometry(
     horizonY: horizonPx,
     strikeY,
     k,
-    pastLineSpeed: clamp(o.pastLineSpeed, 0.2, 1),
+    pastLineSpeed: clamp(o.pastLineSpeed, MIN_PAST_LINE_SPEED, 1),
     tailBlend: TAIL_BLEND_DEPTH,
     nearHalfWidth,
     laneWidthNear,
@@ -313,8 +348,17 @@ export function visibleTimeWindow(g: HighwayGeometry, songTime: number): { from:
 export const MAX_BEAT_LINES = 64;
 
 /**
+ * Line kinds written into `fillBeatLines`' `outBars`. `BEAT_LINE_BAR === 1` is load-bearing: it is
+ * the flag `beatLineTimes` reports as `bar`, and it predates subdivisions.
+ */
+export const BEAT_LINE_BEAT = 0;
+export const BEAT_LINE_BAR = 1;
+export const BEAT_LINE_SUB = 2;
+
+/**
  * Song times of beat lines currently on the road (from just below the strike line to the horizon),
- * with a flag for bar lines (every `beatsPerBar` beats).
+ * with a flag for bar lines (every `beatsPerBar` beats) and for sub-beat lines (only emitted when
+ * `subdivisions > 1`).
  */
 export function beatLineTimes(
   g: HighwayGeometry,
@@ -323,12 +367,13 @@ export function beatLineTimes(
   beatPhase: number,
   beatsPerBar = 4,
   beatIndexHint?: number,
-): Array<{ time: number; bar: boolean }> {
-  const out: Array<{ time: number; bar: boolean }> = [];
+  subdivisions = 1,
+): Array<{ time: number; bar: boolean; sub: boolean }> {
+  const out: Array<{ time: number; bar: boolean; sub: boolean }> = [];
   const times = new Float64Array(MAX_BEAT_LINES);
   const bars = new Uint8Array(MAX_BEAT_LINES);
-  const n = fillBeatLines(g, songTime, bpm, beatPhase, times, bars, beatsPerBar, beatIndexHint);
-  for (let i = 0; i < n; i++) out.push({ time: times[i], bar: bars[i] === 1 });
+  const n = fillBeatLines(g, songTime, bpm, beatPhase, times, bars, beatsPerBar, beatIndexHint, subdivisions);
+  for (let i = 0; i < n; i++) out.push({ time: times[i], bar: bars[i] === BEAT_LINE_BAR, sub: bars[i] === BEAT_LINE_SUB });
   return out;
 }
 
@@ -345,24 +390,31 @@ export function fillBeatLines(
   outBars: Uint8Array,
   beatsPerBar = 4,
   beatIndexHint?: number,
+  subdivisions = 1,
 ): number {
   if (!(bpm > 0) || !Number.isFinite(bpm)) return 0;
+  const sub = Math.max(1, Math.round(subdivisions));
   const beatSec = 60 / bpm;
+  const stepSec = beatSec / sub;
   const phase = clamp(beatPhase, 0, 0.999999);
   // Beat index of the most recent beat. Without a hint we assume beat 0 at song time 0.
   const beatIndex = beatIndexHint !== undefined && Number.isFinite(beatIndexHint) ? Math.floor(beatIndexHint) : Math.round(songTime / beatSec - phase);
   const lastBeatTime = songTime - phase * beatSec;
-  const first = Math.floor((g.minDepth * g.approachSec) / beatSec) - 1;
-  const last = Math.ceil((g.maxDepth * g.approachSec) / beatSec) + 1;
+  const first = Math.floor((g.minDepth * g.approachSec) / stepSec) - 1;
+  const last = Math.ceil((g.maxDepth * g.approachSec) / stepSec) + 1;
   const cap = Math.min(outTimes.length, outBars.length);
   let count = 0;
   for (let n = first; n <= last && count < cap; n++) {
-    const t = lastBeatTime + n * beatSec;
+    const t = lastBeatTime + n * stepSec;
     const d = depthOf(g, t, songTime);
     if (d < g.minDepth || d > 1) continue;
-    const idx = beatIndex + n;
+    let kind: number = BEAT_LINE_SUB;
+    if (((n % sub) + sub) % sub === 0) {
+      const idx = beatIndex + n / sub;
+      kind = ((idx % beatsPerBar) + beatsPerBar) % beatsPerBar === 0 ? BEAT_LINE_BAR : BEAT_LINE_BEAT;
+    }
     outTimes[count] = t;
-    outBars[count] = ((idx % beatsPerBar) + beatsPerBar) % beatsPerBar === 0 ? 1 : 0;
+    outBars[count] = kind;
     count++;
   }
   return count;

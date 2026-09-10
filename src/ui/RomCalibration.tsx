@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { DIFFICULTIES } from '../engine/difficulty.ts';
 import { runtime } from '../session/runtime.ts';
-import { useStore } from '../state/store.ts';
+import { calibrationKey, laneFingertip, useStore } from '../state/store.ts';
 import { RomCalibrator } from '../vision/calibration.ts';
 import type { CalibrationStatus, RomCalibration } from '../vision/calibration.ts';
 import { MOVEMENT_INFO } from '../vision/features.ts';
@@ -30,16 +30,21 @@ export default function RomCalibrationScreen() {
   const lane = lanes[laneIndex];
   const info = lane ? MOVEMENT_INFO[lane.movement] : null;
   const threshold = DIFFICULTIES[difficulty].thresholdFraction;
-  const previous = lane ? savedCalibrations[`${lane.movement}:${lane.side}`] : undefined;
+  const previous = lane ? savedCalibrations[calibrationKey(lane)] : undefined;
 
   // One calibrator per lane per attempt; the vision pipeline it reads is the SAME object the game
   // will play with, so the calibration and the session see identical smoothing.
   useEffect(() => {
     if (!lane) return;
-    const cal = new RomCalibrator(lane.movement);
+    const vision = runtime.peekVision();
+    // The calibrator MUST be built from the lane's own context (which fingertip it opposes, which
+    // mirror convention its frames are in) — that is what stamps the resulting range with what it
+    // actually measured, so a later session can check it instead of guessing. A bare
+    // `new RomCalibrator(movement)` produces a range no boundary check can validate; it is only the
+    // fallback for the (dev) case where no vision input exists.
+    const cal = vision?.createCalibrator(laneIndex) ?? new RomCalibrator(lane.movement);
     calibrator.current = cal;
 
-    const vision = runtime.peekVision();
     if (!vision) return;
     const off = vision.onFrame((samples) => {
       const sample = samples[laneIndex];
@@ -146,7 +151,7 @@ export default function RomCalibrationScreen() {
     <Screen>
       <TopBar
         eyebrow={`Range of motion — lane ${laneIndex + 1} of ${lanes.length}`}
-        title={`${lane.side === 'left' ? 'Left' : 'Right'} ${info.label.toLowerCase()}`}
+        title={`${lane.side === 'left' ? 'Left' : 'Right'} ${info.label.toLowerCase()}${laneFingertip(lane) ? ` — ${laneFingertip(lane)} finger` : ''}`}
         onBack={() => goto('camera')}
         right={
           <button
@@ -232,6 +237,7 @@ export default function RomCalibrationScreen() {
                 </span>
                 <span className={i === laneIndex ? '' : 'muted'}>
                   {l.side === 'left' ? 'L' : 'R'} {MOVEMENT_INFO[l.movement].label}
+                  {laneFingertip(l) ? ` · ${laneFingertip(l)}` : ''}
                 </span>
                 <div className="grow" />
                 {done[i] && (
@@ -243,7 +249,8 @@ export default function RomCalibrationScreen() {
             ))}
           </ul>
           <span className="dim">
-            Each range is stored with the movement and side it was measured on, so a repeat session can offer it back.
+            Each range is stored with the movement, the side — and, for finger opposition, the fingertip — it was
+            measured on, so a repeat session can offer it back and never hands one finger's range to another.
           </span>
         </div>
       </div>

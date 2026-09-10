@@ -29,11 +29,13 @@
  *    calibrated range stays measurable;
  *  - a lane must MEASURE WHAT IT SAYS IT MEASURES: a reused pipeline (the calibration screen's) whose
  *    mirror convention or opposed fingertip differs from this session's is REFUSED at construction, and
- *    a stored calibration measured on another movement or another fingertip is refused per lane —
- *    a lane silently reading the other limb, or normalizing one quantity by another's range, keeps a
- *    green status and a flat meter and is the worst failure this class can have. The RUNTIME
- *    hand-over (`setCalibration`, what a calibration screen calls per lane) vets with the lane's own
- *    context — its fingertip — exactly as the constructor does;
+ *    a stored calibration measured for another movement, on another fingertip or under the
+ *    other mirror convention is refused per lane — a lane silently reading the other limb, or
+ *    normalizing one quantity by another's range, keeps a green status and a flat meter and is the
+ *    worst failure this class can have. EVERY path that admits a calibration (the constructor and the
+ *    RUNTIME hand-over `setCalibration`, what a calibration screen calls per lane) vets it against ONE
+ *    context derived from the lane's own featureOptions (`laneCalibrationContext`), because the two
+ *    paths building their own context literals is precisely how they came to disagree;
  *  - a lane driven by a hand the detector could not identify (the unilateral lone-hand escape hatch) is
  *    named in `unlabelledHandLanes`: the movement is measured, but WHOSE hand made it is unconfirmed,
  *    and the unaffected hand inflating the affected limb's rep count is a therapist-facing lie;
@@ -54,8 +56,8 @@ import type { CompensationEvent, CtxClock, InputSource, LaneCompensation, LaneIn
 import type { LaneConflict, MovementPosture } from '../vision/features.ts';
 import { POSTURE_INFO, laneConflicts, requiredPostures } from '../vision/features.ts';
 import type { RomCalibration } from '../vision/calibration.ts';
-import { calibrationProblem, calibrationWarnings, isCalibrationValid } from '../vision/calibration.ts';
-import type { CalibrationContext } from '../vision/calibration.ts';
+import { RomCalibrator, calibrationContext, calibrationProblem, calibrationWarnings, isCalibrationValid } from '../vision/calibration.ts';
+import type { CalibrationContext, CalibratorOptions } from '../vision/calibration.ts';
 import { DEFAULT_FINGERTIP, MOVEMENT_INFO, compensationKind } from '../vision/features.ts';
 import type { CompensationBaseline, CompensationKind, FeatureOptions } from '../vision/features.ts';
 import type { Fingertip } from '../vision/landmarks.ts';
@@ -575,6 +577,49 @@ export class VisionInput implements InputSource {
   }
 
   /**
+   * What lane `i` measures, for vetting any calibration handed to it: derived from the SAME merged
+   * feature options the lane's extractor runs with (`laneFeatureOptions`), never assembled by hand.
+   *
+   * THE WHOLE POINT IS THAT THERE IS ONE OF THESE. The constructor used to pass `{ fingertip }` and
+   * `setCalibration` passed nothing, so for a finger_opposition lane on a therapist-chosen fingertip
+   * the two paths disagreed about the same calibration: the range measured on THIS lane's finger was
+   * refused at the hand-over (lane dead all session) while a range measured on the default finger was
+   * accepted (one quantity normalized by another's range). Any future option that changes WHICH
+   * QUANTITY a lane measures joins CalibrationContext and both paths get it at once.
+   */
+  private laneCalibrationContext(i: number): CalibrationContext {
+    return calibrationContext(this.config.lanes[i].movement, this.laneFeatureOptions(i));
+  }
+
+  /**
+   * The context lane `laneIndex` measures in — what a stored calibration has to match to be usable here.
+   * Public so a calibration screen can (a) show it and (b) spread it into the calibrator that measures
+   * the range (`new RomCalibrator(movement, { ...ctx })`), which stamps it onto the result. Without that
+   * stamp the range is a legacy one: it can only ever be warned about, never checked. See createCalibrator.
+   */
+  getCalibrationContext(laneIndex: number): CalibrationContext | null {
+    const i = this.laneConfigIndex(laneIndex);
+    return i < 0 ? null : this.laneCalibrationContext(i);
+  }
+
+  /**
+   * A RomCalibrator for lane `laneIndex`, pre-stamped with that lane's context (fingertip, mirror
+   * convention) so the range it produces records WHAT IT MEASURED and a later session can check it
+   * instead of guessing. This is the intended way for a calibration screen to build one; constructing a
+   * bare `new RomCalibrator(movement)` produces a range that no boundary check can validate.
+   */
+  createCalibrator(laneIndex: number, opts: CalibratorOptions = {}): RomCalibrator | null {
+    const i = this.laneConfigIndex(laneIndex);
+    if (i < 0) return null;
+    return new RomCalibrator(this.config.lanes[i].movement, { ...this.laneCalibrationContext(i), ...opts });
+  }
+
+  /** Position of lane `laneIndex` in config.lanes (-1 when unknown). `lanes` is a 1:1 map of it. */
+  private laneConfigIndex(laneIndex: number): number {
+    return this.lanes.findIndex((x) => x.spec.index === laneIndex);
+  }
+
+  /**
    * Build one lane's runtime — and, when a pipeline is REUSED (the calibration screen hands its own
    * pipelines over so calibration and play share one signal path), check that it measures THE SAME
    * THING this session is configured for.
@@ -598,7 +643,7 @@ export class VisionInput implements InputSource {
     const c = this.config;
     const opts = this.laneFeatureOptions(i);
     const fingertip = this.laneFingertip(i);
-    const vetted = this.vetCalibration(spec, c.calibrations[i] ?? null, { fingertip });
+    const vetted = this.vetCalibration(spec, c.calibrations[i] ?? null, this.laneCalibrationContext(i));
     const cal = vetted.cal;
     let pipeline = c.pipelines?.[i];
     if (pipeline) {
@@ -1377,18 +1422,21 @@ export class VisionInput implements InputSource {
    * the lane is left uncalibrated (reads 0, never triggers) rather than made into a hit generator.
    */
   setCalibration(laneIndex: number, cal: RomCalibration | null): boolean {
-    const i = this.lanes.findIndex((x) => x.spec.index === laneIndex);
+    const i = this.laneConfigIndex(laneIndex);
     if (i < 0) return false;
     const l = this.lanes[i];
-    // The lane's CalibrationContext must come along: for a finger_opposition lane the therapist may have
-    // chosen a fingertip other than the default, and `1 - min(tip..thumb)/palm` measured against the
-    // PINKY is a different quantity from the same expression measured against the INDEX. Vetting without
-    // it did the two things this module calls its worst failures: it REFUSED the calibration that was
-    // actually measured on this lane's fingertip (lane dead for the session) and ACCEPTED one measured on
-    // the default fingertip (one quantity normalized by another's range — meter and reported ROM% wrong).
-    // The constructor path has always passed it; this runtime hand-over API is what a calibration screen
-    // calls after every lane finishes, so it must vet identically.
-    const vetted = this.vetCalibration(l.spec, cal, { fingertip: this.laneFingertip(i) });
+    // The lane's CalibrationContext must come along, and it is derived exactly where the constructor
+    // derives it (laneCalibrationContext) — not rebuilt from the fields this method happens to remember.
+    // For a finger_opposition lane the therapist may have chosen a fingertip other than the default, and
+    // `1 - min(tip..thumb)/palm` measured against the PINKY is a different quantity from the same
+    // expression measured against the INDEX; under the other mirror convention the same lane spec
+    // measures the OTHER limb. Vetting without that context did the two things this module calls its
+    // worst failures: it REFUSED the calibration that was actually measured on this lane (dead lane for
+    // the whole session) and ACCEPTED one measured on something else (one quantity normalized by
+    // another's range — meter, thresholds and reported ROM% all wrong, with a green status over them).
+    // This runtime hand-over is what a calibration screen calls after every lane finishes, so it must
+    // vet identically to the constructor.
+    const vetted = this.vetCalibration(l.spec, cal, this.laneCalibrationContext(i));
     l.calibrationProblem = vetted.problem;
     l.calibrationWarnings = vetted.warnings;
     l.pipeline.setCalibration(vetted.cal);

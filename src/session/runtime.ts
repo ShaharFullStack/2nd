@@ -13,9 +13,10 @@ import { Sfx } from '../audio/sfx.ts';
 import { StemMixer } from '../audio/StemMixer.ts';
 import type { LoadProgress } from '../audio/StemMixer.ts';
 import { DIFFICULTIES } from '../engine/difficulty.ts';
-import type { DifficultyName, LaneSpec, Mode } from '../engine/types.ts';
+import type { DifficultyName, Fingertip, LaneSpec, Mode } from '../engine/types.ts';
 import { VisionInput } from '../input/VisionInput.ts';
 import type { RomCalibration } from '../vision/calibration.ts';
+import { laneFingertip } from '../state/store.ts';
 import type { GameRunner } from './GameRunner.ts';
 
 export interface AudioHandles {
@@ -32,8 +33,23 @@ export interface VisionRequest {
   mirrored: boolean;
 }
 
-function laneKey(req: VisionRequest): string {
-  return `${req.mode}|${req.mirrored}|${req.lanes.map((l) => `${l.movement}:${l.side}`).join(',')}`;
+/**
+ * Identity of the vision pipeline a request needs. The FINGERTIP is part of it: a finger_opposition
+ * lane measures `1 - tip-to-thumb distance / palm size` for one specific tip, so re-pointing a live
+ * index pipeline at the pinky would keep normalizing the new movement by the old tip's range (and
+ * VisionInput refuses the pairing outright). Changing it must rebuild, exactly like changing the side.
+ */
+export function visionLaneKey(req: Pick<VisionRequest, 'mode' | 'mirrored' | 'lanes'>): string {
+  const lane = (l: LaneSpec): string => `${l.movement}:${l.side}${laneFingertip(l) ? `:${laneFingertip(l)}` : ''}`;
+  return `${req.mode}|${req.mirrored}|${req.lanes.map(lane).join(',')}`;
+}
+
+/** Per-lane feature options for a prescription — today, the therapist's fingertip choice. */
+export function laneFeatureOptions(lanes: readonly LaneSpec[]): ({ fingertip?: Fingertip } | undefined)[] {
+  return lanes.map((l) => {
+    const fingertip = laneFingertip(l);
+    return fingertip ? { fingertip } : undefined;
+  });
 }
 
 class SessionRuntime {
@@ -74,6 +90,9 @@ class SessionRuntime {
    */
   async loadSong(songId: string, onProgress?: (p: LoadProgress) => void): Promise<SongManifest | null> {
     const { mixer } = await this.ensureAudio();
+    // A song-select audition must never survive into the load of another song (its fade-out timer and
+    // its held-aside position both belong to the song being replaced).
+    this.stopPreview();
     if (this.loadedSongId === songId && mixer.isLoaded) return mixer.manifest;
     if (this.loading && this.loadingId === songId) return this.loading;
     this.loadingId = songId;
@@ -99,13 +118,46 @@ class SessionRuntime {
     return this.audio?.mixer.manifest ?? null;
   }
 
+  // ------------------------------------------------------------------ song audition (Setup screen)
+
+  /**
+   * Audition `songId` from its manifest `previewStart` for `durationSec`, fading out at the end and
+   * stopping itself. MUST be called from a user gesture (it creates/resumes the AudioContext).
+   *
+   * Returns the manifest that is playing, or null when the song has no playable stems (the therapist
+   * is told; the session would run silently too).
+   *
+   * A preview is a TEMPORARY segment: the mixer holds the transport's real position aside and puts it
+   * back when the preview ends, so pressing Start straight after an audition begins the prescribed
+   * session at song time 0 — not 30 s in. See StemMixer.playPreview and previewFlow.test.ts.
+   */
+  async previewSong(songId: string, durationSec?: number): Promise<SongManifest | null> {
+    const { mixer } = await this.ensureAudio();
+    const manifest = await this.loadSong(songId);
+    if (!manifest || !mixer.isLoaded) return null;
+    mixer.playPreview(durationSec);
+    return manifest;
+  }
+
+  /** Stop a running audition and put the transport back where it was (no-op otherwise). */
+  stopPreview(): void {
+    const mixer = this.audio?.mixer;
+    if (mixer?.isPreviewing) mixer.pause();
+  }
+
+  /** The song currently being auditioned, or null when nothing is. */
+  previewingSongId(): string | null {
+    const mixer = this.audio?.mixer;
+    return mixer?.isPreviewing ? (mixer.manifest?.id ?? this.loadedSongId) : null;
+  }
+
   /**
    * The camera input for this prescription, created once and kept alive from the camera check through
    * calibration into play (re-opening the camera between screens costs seconds and loses the filter
    * state). Changing the lanes / mirror convention rebuilds it.
    */
   async ensureVision(req: VisionRequest): Promise<VisionInput> {
-    const key = laneKey(req);
+    const key = visionLaneKey(req);
     if (this.vision && this.visionKey === key) {
       req.calibrations.forEach((cal, i) => {
         if (cal) this.vision?.setCalibration(i, cal);
@@ -123,6 +175,7 @@ class SessionRuntime {
       thresholdFraction: DIFFICULTIES[req.difficulty].thresholdFraction,
       audioContext: ctx,
       mirrored: req.mirrored,
+      featureOptions: laneFeatureOptions(req.lanes),
     });
     this.vision = vision;
     this.visionKey = key;

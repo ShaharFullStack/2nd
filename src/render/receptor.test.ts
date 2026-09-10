@@ -74,7 +74,7 @@ describe('receptorLook — the meter means what the engine means', () => {
   });
 
   it('receptorLookInto reuses the caller object (hot path allocates nothing)', () => {
-    const out: ReceptorLook = { fill: 0, willFire: false, locked: false, resetProgress: 0, resetLevel: 0.6, glowTarget: 0, tracking: true };
+    const out: ReceptorLook = { fill: 0, over: 0, willFire: false, locked: false, resetProgress: 0, resetLevel: 0.6, glowTarget: 0, tracking: true };
     const a = receptorLookInto(out, { value: 0.9, armed: true }, T, DEFAULT_REARM_FRACTION);
     expect(a).toBe(out);
     expect(out.willFire).toBe(true);

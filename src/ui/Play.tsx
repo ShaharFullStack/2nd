@@ -15,9 +15,6 @@ import { DEFAULT_REARM_FRACTION } from '../render/receptor.ts';
 import { CameraPreview } from './CameraPreview.tsx';
 import { Meter, Toast } from './common.tsx';
 
-/** Seconds the Guitar-Hero style attribution card stays on screen (CSS fades it at 5 s). */
-const LOWER_THIRD_SEC = 6.5;
-
 function LaneMeters({ source, threshold }: { source: InputSource; threshold: number }) {
   const host = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -68,11 +65,8 @@ export default function PlayScreen() {
   const [progress, setProgress] = useState(0);
   const [loadNote, setLoadNote] = useState('Preparing session');
   const [error, setError] = useState<string | null>(null);
-  const [manifest, setManifest] = useState<SongManifest | null>(null);
   const [warnings, setWarnings] = useState<string[]>([]);
   const [paused, setPaused] = useState(false);
-  const [showCard, setShowCard] = useState(false);
-  const cardShown = useRef(false);
   const [input, setInput] = useState<InputSource | null>(null);
 
   const threshold = DIFFICULTIES[useStore.getState().difficulty].thresholdFraction;
@@ -80,7 +74,6 @@ export default function PlayScreen() {
   useEffect(() => {
     let alive = true;
     let ownedInput: InputSource | null = null;
-    let cardTimer: ReturnType<typeof setTimeout> | null = null;
 
     const boot = async () => {
       const st = useStore.getState();
@@ -99,7 +92,6 @@ export default function PlayScreen() {
         console.warn('[play] song load failed, running silently', err);
       }
       if (!alive) return;
-      setManifest(songManifest);
 
       const grid = songManifest ? songGridOf(songManifest) : SILENT_GRID;
       const built = buildSessionChart(grid, config, songManifest);
@@ -167,12 +159,6 @@ export default function PlayScreen() {
         onHud: (h) => {
           setHud(h);
           setPaused(h.phase === 'paused');
-          // The attribution card belongs to the song, not the count-in: show it on the first beat.
-          if (!cardShown.current && h.phase === 'playing' && songManifest) {
-            cardShown.current = true;
-            setShowCard(true);
-            cardTimer = setTimeout(() => alive && setShowCard(false), LOWER_THIRD_SEC * 1000);
-          }
         },
         onEnd: (summary) => {
           const store = useStore.getState();
@@ -220,7 +206,6 @@ export default function PlayScreen() {
 
     return () => {
       alive = false;
-      if (cardTimer) clearTimeout(cardTimer);
       window.removeEventListener('resize', onResize);
       window.removeEventListener('keydown', onKey);
       runnerRef.current?.dispose();
@@ -241,15 +226,6 @@ export default function PlayScreen() {
           <div className="countdown">
             {countdown}
             <small>get ready</small>
-          </div>
-        )}
-
-        {showCard && manifest && (
-          <div className="lower-third">
-            <div className="lt-title">{manifest.title}</div>
-            <div className="lt-sub">
-              {manifest.artist} ({manifest.license})
-            </div>
           </div>
         )}
 
@@ -278,10 +254,13 @@ export default function PlayScreen() {
           </div>
         )}
 
-        {inputMode !== 'camera' && input && (
+        {/* Dev affordance, not product chrome: the keyboard fallback needs to show which key is which,
+            the autoplay bot does not — it only ever appeared in screenshots, as a debug widget in
+            the corner of the play field. */}
+        {inputMode === 'keyboard' && input && (
           <div className="pip">
             <LaneMeters source={input} threshold={threshold} />
-            <div className="pip-note">{inputMode === 'keyboard' ? 'keys 1–4 / D F J K' : 'autoplay bot'}</div>
+            <div className="pip-note">keys 1–4 / D F J K</div>
           </div>
         )}
 

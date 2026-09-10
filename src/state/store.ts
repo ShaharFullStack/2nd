@@ -7,8 +7,8 @@
  */
 import { create } from 'zustand';
 import { DIFFICULTIES, clampWindowScale } from '../engine/difficulty.ts';
-import type { DifficultyName, LaneSpec, Mode, Movement, Side } from '../engine/types.ts';
-import { HAND_MOVEMENTS, LEG_MOVEMENTS } from '../engine/types.ts';
+import type { DifficultyName, Fingertip, LaneSpec, Mode, Movement, Side } from '../engine/types.ts';
+import { FINGERTIPS, HAND_MOVEMENTS, LEG_MOVEMENTS } from '../engine/types.ts';
 import type { RomCalibration } from '../vision/calibration.ts';
 import type { InputMode, SessionConfig, SessionResult } from '../session/types.ts';
 import { readJson, writeJson } from './persist.ts';
@@ -78,17 +78,54 @@ export function movementsFor(mode: Mode): Movement[] {
 
 /** Renumber `index` to the array position — every lane-indexed API in the app relies on it. */
 export function normalizeLanes(lanes: LaneSpec[]): LaneSpec[] {
-  return lanes.map((l, i) => (l.index === i ? l : { ...l, index: i }));
+  return lanes.map((l, i) => normalizeLaneFingertip(l.index === i ? l : { ...l, index: i }));
 }
 
-/** Calibrations are keyed by movement+side so a second session on the same lane can reuse them. */
-export function calibrationKey(spec: Pick<LaneSpec, 'movement' | 'side'>): string {
-  return `${spec.movement}:${spec.side}`;
+/** The fingertip a finger_opposition lane opposes when the therapist has not chosen one. */
+export const DEFAULT_LANE_FINGERTIP: Fingertip = 'index';
+
+/**
+ * The fingertip lane `spec` is actually measured on: the therapist's choice for finger_opposition,
+ * and undefined for every other movement (which has no fingertip dimension at all).
+ */
+export function laneFingertip(spec: Pick<LaneSpec, 'movement' | 'fingertip'>): Fingertip | undefined {
+  if (spec.movement !== 'finger_opposition') return undefined;
+  return spec.fingertip && FINGERTIPS.includes(spec.fingertip) ? spec.fingertip : DEFAULT_LANE_FINGERTIP;
+}
+
+/**
+ * Drop a fingertip a movement cannot carry, and give finger_opposition the default when it has none.
+ * Applied on every write so a lane switched away from finger_opposition and back does not resurrect
+ * the old tip, and so the calibration key of a lane never depends on a stale field.
+ */
+export function normalizeLaneFingertip(spec: LaneSpec): LaneSpec {
+  const tip = laneFingertip(spec);
+  if (tip === spec.fingertip) return spec;
+  if (tip === undefined) {
+    const { fingertip: _drop, ...rest } = spec;
+    return rest;
+  }
+  return { ...spec, fingertip: tip };
+}
+
+/**
+ * Calibrations are keyed by movement+side (+fingertip, for finger_opposition) so a second session on
+ * the same lane can reuse them.
+ *
+ * The fingertip is part of the key because it selects WHICH QUANTITY was measured: the feature is
+ * `1 - tip-to-thumb distance / palm size` for that one tip, and a hand that pinches its index to the
+ * thumb reaches ~1.0 while the same hand's pinky peaks well below the index range's max. Keying them
+ * together would hand a pinky lane the index range and produce a lane that cannot score all song.
+ */
+export function calibrationKey(spec: Pick<LaneSpec, 'movement' | 'side' | 'fingertip'>): string {
+  const tip = laneFingertip(spec);
+  return tip ? `${spec.movement}:${spec.side}:${tip}` : `${spec.movement}:${spec.side}`;
 }
 
 function isLaneSpec(v: unknown): v is LaneSpec {
   const l = v as LaneSpec | null;
-  return !!l && typeof l.index === 'number' && typeof l.movement === 'string' && (l.side === 'left' || l.side === 'right');
+  if (!(!!l && typeof l.index === 'number' && typeof l.movement === 'string' && (l.side === 'left' || l.side === 'right'))) return false;
+  return l.fingertip === undefined || FINGERTIPS.includes(l.fingertip);
 }
 
 function validateSettings(raw: unknown): Settings | null {
@@ -137,6 +174,13 @@ function validateCalibrations(raw: unknown): Record<string, RomCalibration> | nu
   return out;
 }
 
+/** What `applySuggestedLatency` did: the offset before, the offset after, both in milliseconds. */
+export interface LatencyChange {
+  previousMs: number;
+  appliedMs: number;
+  deltaMs: number;
+}
+
 export interface AppState {
   screen: Screen;
   /** Screen the user came from, so Back on a leaf screen is not a guess. */
@@ -168,7 +212,7 @@ export interface AppState {
   setInputMode: (m: InputMode) => void;
   setMode: (m: Mode) => void;
   setLanes: (lanes: LaneSpec[]) => void;
-  setLane: (index: number, patch: Partial<Pick<LaneSpec, 'movement' | 'side'>>) => void;
+  setLane: (index: number, patch: Partial<Pick<LaneSpec, 'movement' | 'side' | 'fingertip'>>) => void;
   addLane: () => void;
   removeLane: (index: number) => void;
   setDifficulty: (d: DifficultyName) => void;
@@ -178,6 +222,12 @@ export interface AppState {
   setCalibration: (lane: number, cal: RomCalibration | null) => void;
   clearCalibrations: () => void;
   setLatency: (sec: number, measured: boolean, note?: string) => void;
+  /**
+   * Adopt the offset a finished run suggests as the one the NEXT session runs with. Returns the
+   * before/after pair (ms) so the screen can show the therapist exactly what changed, or null when
+   * there was nothing usable to apply.
+   */
+  applySuggestedLatency: (suggestedMs: number, source?: string) => LatencyChange | null;
   updateSettings: (patch: Partial<Settings>) => void;
   addResult: (r: SessionResult) => void;
   clearHistory: () => void;
@@ -251,7 +301,7 @@ export const useStore = create<AppState>((set, get) => {
     setLane: (index, patch) => {
       set((s) => {
         if (index < 0 || index >= s.lanes.length) return s;
-        const lanes = s.lanes.map((l, i) => (i === index ? { ...l, ...patch } : l));
+        const lanes = s.lanes.map((l, i) => (i === index ? normalizeLaneFingertip({ ...l, ...patch }) : l));
         const calibrations = s.calibrations.slice();
         // A different movement or side is a different quantity: the old range must not carry over.
         calibrations[index] = s.savedCalibrations[calibrationKey(lanes[index])] ?? null;
@@ -268,14 +318,15 @@ export const useStore = create<AppState>((set, get) => {
         let pick: LaneSpec | null = null;
         for (const movement of options) {
           for (const side of ['left', 'right'] as Side[]) {
-            if (!used.has(`${movement}:${side}`)) {
-              pick = { index: s.lanes.length, movement, side };
+            const candidate: LaneSpec = normalizeLaneFingertip({ index: s.lanes.length, movement, side });
+            if (!used.has(calibrationKey(candidate))) {
+              pick = candidate;
               break;
             }
           }
           if (pick) break;
         }
-        const lane = pick ?? { index: s.lanes.length, movement: options[0], side: 'left' as Side };
+        const lane = normalizeLaneFingertip(pick ?? { index: s.lanes.length, movement: options[0], side: 'left' as Side });
         return { lanes: [...s.lanes, lane], calibrations: [...s.calibrations, s.savedCalibrations[calibrationKey(lane)] ?? null] };
       });
       persistConfig();
@@ -324,6 +375,17 @@ export const useStore = create<AppState>((set, get) => {
       const latencyOffsetSec = Number.isFinite(sec) ? Math.max(0, Math.min(1, sec)) : 0;
       set({ latencyOffsetSec, latencyMeasured: measured, latencyNote: note });
       writeJson(LATENCY_KEY, latencyOffsetSec);
+    },
+
+    applySuggestedLatency: (suggestedMs, source = '') => {
+      if (!Number.isFinite(suggestedMs)) return null;
+      const previousMs = Math.round(get().latencyOffsetSec * 1000);
+      const appliedSec = Math.max(0, Math.min(1, suggestedMs / 1000));
+      const appliedMs = Math.round(appliedSec * 1000);
+      // `measured` stays true: the value came from a whole run's worth of judged crossings, which is
+      // strictly more evidence than the ten taps of the latency screen.
+      get().setLatency(appliedSec, true, source ? `${appliedMs} ms measured from ${source}` : `${appliedMs} ms measured from the last run`);
+      return { previousMs, appliedMs, deltaMs: appliedMs - previousMs };
     },
 
     updateSettings: (patch) => {

@@ -3,9 +3,17 @@ import type { HitEvent, LaneSpec } from '../engine/types';
 import { DEFAULT_HIGHWAY_OPTIONS, Highway, MISS_CUE_MARGIN_U, POPUP_MAX_RISE_FRAC, makeFrame } from './Highway';
 import { createMockCanvas, mockCanvasFactory, type MockCanvas } from './canvasMock';
 import { runDemo } from './demo';
-import { laneX, roadEdgeX, visibleTailSec } from './geometry';
+import { GEM_ASPECT, laneX, roadEdgeX, visibleTailSec } from './geometry';
+import { GH_PALETTE } from './palette';
 import { TextCache, type Ctx2D } from './text';
 import type { CanvasLike, RenderFrame, RenderNote } from './types';
+
+/** Mirrors of the receptor's private drawing constants (Highway.ts). */
+const METER_WELL = '#080a12';
+const WHITE = '#ffffff';
+const METER_TARGET_POS = 0.76;
+/** Re-arm line / chevron / return-to-rest arc — violet, a hue no lane palette contains. */
+const LOCK_HINT = '#c08cff';
 
 const LANES: LaneSpec[] = [
   { index: 0, movement: 'seated_march', side: 'left' },
@@ -111,7 +119,7 @@ describe('Highway construction / resize', () => {
 
   it('exposes options and lets them be changed at runtime', () => {
     const { hw } = setup();
-    expect(hw.options.approachSec).toBe(1.6);
+    expect(hw.options.approachSec).toBe(DEFAULT_HIGHWAY_OPTIONS.approachSec);
     hw.setOptions({ approachSec: 2.2, highContrast: true });
     expect(hw.geometry.approachSec).toBe(2.2);
     expect(hw.options.highContrast).toBe(true);
@@ -372,10 +380,13 @@ describe('Highway.draw', () => {
     hw.draw(makeFrame({ lanes: LANES, songTime: 1 }));
     hw.draw(makeFrame({ lanes: LANES, songTime: 1.02, recentHits: ev(1) }));
     const burst = hw.getStats().particles;
-    for (let t = 1.05; t < 5; t += 0.05) hw.draw(makeFrame({ lanes: LANES, songTime: t }));
+    // Retention is `approachSec + 1` (a note can never be culled, forgotten and then resurrected
+    // while still on screen), so wait past that before reusing the id.
+    const later = 2 + hw.options.approachSec + 1;
+    for (let t = 1.05; t < later; t += 0.05) hw.draw(makeFrame({ lanes: LANES, songTime: t }));
     expect(hw.getStats().particles).toBe(0);
-    // Same note id 4 s later (e.g. a chart that reuses ids per section) fires again.
-    hw.draw(makeFrame({ lanes: LANES, songTime: 5.02, recentHits: ev(5) }));
+    // Same note id a full retention window later (e.g. a chart that reuses ids per section) fires again.
+    hw.draw(makeFrame({ lanes: LANES, songTime: later + 0.02, recentHits: ev(later) }));
     expect(hw.getStats().particles).toBe(burst);
   });
 
@@ -481,19 +492,27 @@ describe('Highway.draw', () => {
     expect(hw.getStats().sprites).toBeGreaterThan(0);
   });
 
-  it('receptor meter fill follows lane value (clip + fillRect) and glow grows toward threshold', () => {
+  it('receptor meter fill follows lane value (clip + fillRect), and the well is drawn even when empty', () => {
     const { canvas, hw } = setup();
     hw.resize(1280, 720, 1);
-    const idle = makeFrame({ lanes: LANES, songTime: 1, laneStates: LANES.map(() => ({ value: 0, armed: true, tracking: true })) });
-    hw.draw(idle);
-    canvas.ctx.reset();
-    hw.draw({ ...idle, songTime: 1.02 });
-    const clipsIdle = canvas.ctx.count('clip');
-    const active = makeFrame({ lanes: LANES, songTime: 1.04, laneStates: LANES.map(() => ({ value: 0.8, armed: true, tracking: true })), thresholdFraction: 0.6 });
-    canvas.ctx.reset();
-    hw.draw(active);
-    // One clip per lane for the meter fill.
-    expect(canvas.ctx.count('clip')).toBeGreaterThanOrEqual(clipsIdle + 4);
+    const at = (t: number, value: number): void => {
+      canvas.ctx.reset();
+      hw.draw(makeFrame({ lanes: LANES, songTime: t, laneStates: LANES.map(() => ({ value, armed: true, tracking: true })), thresholdFraction: 0.6 }));
+    };
+    // One clip per lane, every frame: the gauge exists at rest too (an empty gauge is a reading).
+    at(1, 0);
+    expect(canvas.ctx.count('clip')).toBeGreaterThanOrEqual(4);
+    expect(wellRect(canvas, hw, 0)).toBeDefined();
+    expect(liquidRect(canvas, hw, 0)).toBeUndefined();
+    // ...and liquid appears, rising, once there is a value.
+    at(1.02, 0.2);
+    const low = liquidRect(canvas, hw, 0);
+    at(1.04, 0.5);
+    const high = liquidRect(canvas, hw, 0);
+    expect(low).toBeDefined();
+    expect(high).toBeDefined();
+    expect((high as MeterRect).y).toBeLessThan((low as MeterRect).y);
+    expect((high as MeterRect).h).toBeGreaterThan((low as MeterRect).h);
   });
 
   it('keeps stats moving averages and resetStats clears max', () => {
@@ -607,26 +626,113 @@ describe('judgment feedback is never dropped', () => {
     expect(hw.getStats().particles).toBe(0);
   });
 
-  it('keeps every popup on screen when the same lane is hit twice inside a popup lifetime', () => {
-    // 8th notes at 120 BPM are 250 ms apart and the popup lives 750 ms: with one slot per lane the
-    // first PERFECT! was cancelled mid-flight.
+  it('shows exactly one judgment label at a time, however fast the hits come', () => {
+    // Two PERFECT! labels on screen at once — one of them orphaned in empty lane space, or both
+    // stacked over the receptor the patient is trying to read — was the defect all three blind
+    // critics called a duplication bug. A new verdict retires the previous label; the combo, the
+    // lane flash and the burst carry everything the second label would have said.
     const { canvas, hw, scratch } = setup();
     hw.resize(1280, 720, 1);
     hw.draw(makeFrame({ lanes: LANES, songTime: 1 }));
     hw.draw(makeFrame({ lanes: LANES, songTime: 1.02, recentHits: [{ noteId: 1, lane: 2, judgment: 'perfect', deltaMs: 3, time: 1.02 }] }));
+    const countPopups = (): number => {
+      const sprites = scratch.filter((c) => c.ctx.calls.some((k) => k.name === 'fillText' && k.args[0] === 'PERFECT!'));
+      return canvas.ctx.calls.filter((c) => c.name === 'drawImage' && sprites.includes(c.args[0] as MockCanvas)).length;
+    };
+    canvas.ctx.reset();
+    hw.draw(makeFrame({ lanes: LANES, songTime: 1.12 }));
+    expect(countPopups(), 'the first label is up').toBe(1);
+    // Same lane, an 8th note later (250 ms at 120 BPM) — well inside the old 750 ms lifetime.
     canvas.ctx.reset();
     hw.draw(makeFrame({ lanes: LANES, songTime: 1.27, recentHits: [{ noteId: 2, lane: 2, judgment: 'perfect', deltaMs: 3, time: 1.27 }] }));
-    const popupSprites = scratch.filter((c) => c.ctx.calls.some((k) => k.name === 'fillText' && k.args[0] === 'PERFECT!'));
-    expect(popupSprites.length).toBeGreaterThan(0);
-    const blits = canvas.ctx.calls.filter((c) => c.name === 'drawImage' && popupSprites.includes(c.args[0] as MockCanvas));
-    expect(blits.length, 'both popups drawn').toBe(2);
-    // The second popup is stacked above the first rather than drawn on top of it. Compare text
-    // anchors (blit y + half the blit height) — the blit's own top edge moves with the pop scale.
-    const ys = blits.map((b) => {
-      const a = b.args as [unknown, number, number, number, number];
-      return a[2] + a[4] / 2;
-    });
-    expect(Math.abs(ys[0] - ys[1])).toBeGreaterThan(10);
+    expect(countPopups(), 'one label, not two').toBe(1);
+    // ...and a different lane replaces it just the same, rather than sitting beside it.
+    canvas.ctx.reset();
+    hw.draw(makeFrame({ lanes: LANES, songTime: 1.3, recentHits: [{ noteId: 3, lane: 0, judgment: 'perfect', deltaMs: 3, time: 1.3 }] }));
+    expect(countPopups(), 'one label across lanes').toBe(1);
+  });
+
+  it('anchors the judgment label above the receptor ring it belongs to, never over it', () => {
+    const { canvas, hw, scratch } = setup();
+    hw.resize(1280, 720, 1);
+    const g = hw.geometry;
+    hw.draw(makeFrame({ lanes: LANES, songTime: 1 }));
+    canvas.ctx.reset();
+    hw.draw(makeFrame({ lanes: LANES, songTime: 1.02, recentHits: [{ noteId: 1, lane: 2, judgment: 'perfect', deltaMs: 3, time: 1.02 }] }));
+    const sprites = scratch.filter((c) => c.ctx.calls.some((k) => k.name === 'fillText' && k.args[0] === 'PERFECT!'));
+    const blit = canvas.ctx.calls.find((c) => c.name === 'drawImage' && sprites.includes(c.args[0] as MockCanvas));
+    expect(blit).toBeDefined();
+    const a = (blit as { args: unknown[] }).args as [unknown, number, number, number, number];
+    // Bottom edge of the label clears the top of the receptor ring.
+    expect(a[2] + a[4]).toBeLessThan(g.strikeY - g.receptorRadius * GEM_ASPECT);
+    // ...and it is over the lane that was hit.
+    expect(Math.abs(a[1] + a[3] / 2 - laneX(g, 2, 0))).toBeLessThan(g.laneWidthNear * 0.5);
+  });
+});
+
+describe('the board reads as a shipped highway', () => {
+  it('fades gems in over the far dissolve instead of popping them onto a hard edge', () => {
+    const { canvas, hw } = setup(1920, 1080);
+    hw.resize(1920, 1080, 1);
+    const g = hw.geometry;
+    const approach = hw.options.approachSec;
+    const notes: RenderNote[] = [
+      { id: 1, lane: 0, time: approach * 0.99, state: 'pending' }, // at the far edge
+      { id: 2, lane: 1, time: approach * 0.4, state: 'pending' }, // well down the board
+    ];
+    canvas.ctx.reset();
+    hw.draw(makeFrame({ lanes: LANES, songTime: 0, notes }));
+    // Gem blits, identified by their y: the far one sits just under the horizon.
+    const blits = canvas.ctx.calls.filter((c) => c.name === 'drawImage' && c.args.length === 5);
+    const alphaAt = (yLo: number, yHi: number): number => {
+      let a = -1;
+      canvas.ctx.calls.forEach((c, i) => {
+        if (!blits.includes(c)) return;
+        const cy = (c.args[2] as number) + (c.args[4] as number) / 2;
+        if (cy < yLo || cy > yHi) return;
+        a = Math.max(a, canvas.ctx.propBefore(i, 'globalAlpha') as number);
+      });
+      return a;
+    };
+    const fadeEnd = g.horizonY + (g.strikeY - g.horizonY) * 0.16;
+    const far = alphaAt(g.horizonY - 40, fadeEnd);
+    const near = alphaAt(fadeEnd + 40, g.strikeY);
+    expect(far, 'a gem at the far edge is nearly transparent').toBeGreaterThanOrEqual(0);
+    expect(far).toBeLessThan(0.4);
+    expect(near, 'a gem on the board proper is at full alpha').toBeCloseTo(1, 2);
+  });
+
+  it('keeps the HUD in the flanks: nothing it paints sits on the board', () => {
+    // The song caption used to render straight through the multiplier badge in the bottom-left
+    // corner, and the badge itself sat where the caption lived. Combo + multiplier are now one
+    // group on the right flank, the rock meter is the whole of the left flank, and the board
+    // between the rails belongs to the chart.
+    const { canvas, hw, scratch } = setup(1920, 1080);
+    hw.resize(1920, 1080, 1);
+    const g = hw.geometry;
+    canvas.ctx.reset();
+    hw.draw(makeFrame({ lanes: LANES, songTime: 4, combo: 22, multiplier: 3, score: 3698, health: 0.8 }));
+    const centreOf = (text: string): { x: number; y: number } | null => {
+      const sprites = scratch.filter((c) => c.ctx.calls.some((k) => k.name === 'fillText' && k.args[0] === text));
+      const blit = canvas.ctx.calls.find((c) => c.name === 'drawImage' && sprites.includes(c.args[0] as MockCanvas));
+      if (!blit) return null;
+      const a = blit.args as [unknown, number, number, number, number];
+      return { x: a[1] + a[3] / 2, y: a[2] + a[4] / 2 };
+    };
+    const mult = centreOf('x3');
+    const combo = centreOf('COMBO');
+    const rock = centreOf('ROCK');
+    expect(mult).not.toBeNull();
+    expect(combo).not.toBeNull();
+    expect(rock).not.toBeNull();
+    const left = roadEdgeX(g, -1, 0);
+    const right = roadEdgeX(g, 1, 0);
+    expect((mult as { x: number }).x, 'multiplier badge is in the right flank').toBeGreaterThan(right);
+    expect((combo as { x: number }).x, 'combo is in the right flank').toBeGreaterThan(right);
+    expect((rock as { x: number }).x, 'rock meter is in the left flank').toBeLessThan(left);
+    // Multiplier reads as part of the streak group, directly under the combo, not in a far corner.
+    expect((mult as { y: number }).y).toBeGreaterThan((combo as { y: number }).y);
+    expect((mult as { y: number }).y - (combo as { y: number }).y).toBeLessThan(g.height * 0.15);
   });
 });
 
@@ -655,7 +761,7 @@ describe('runtime options actually take effect', () => {
         .slice(from)
         .flatMap((c) => c.ctx.calls.filter((k) => k.name === 'createRadialGradient' && (k.args as number[])[3] === 640))
         .map((k) => (k.args as number[])[4]);
-    expect(hazeCentres(0)).toContain(0.35 * 720);
+    expect(hazeCentres(0)).toContain(DEFAULT_HIGHWAY_OPTIONS.horizonY * 720);
     const before = scratch.length;
     hw.setOptions({ horizonY: 0.15 });
     expect(hw.geometry.horizonY).toBeCloseTo(0.15 * 720);
@@ -1099,6 +1205,75 @@ function haloBlits(canvas: MockCanvas, hw: Highway): number {
   return n;
 }
 
+/**
+ * The receptor's meter well is built from full-width `fillRect`s, and each one is identifiable by
+ * the fill style in force when it was issued:
+ *   - the WELL ground   → the flat dark `#080a12` (drawn every frame, empty or not)
+ *   - the LIQUID        → a cached gradient, i.e. an *object* rather than a colour string
+ *   - the LEVEL LINE    → the lane's `bright` colour (white `#ffffff` at the trigger point)
+ *   - the TARGET LINE   → white `#ffffff`, ~2 px, at a fixed height
+ * `i` is the call index, which is how the tests prove the marks are painted ON TOP of the receptor
+ * sprite rather than under its translucent button face.
+ */
+interface MeterRect {
+  y: number;
+  h: number;
+  style: unknown;
+  i: number;
+}
+function meterRects(canvas: MockCanvas, hw: Highway, lane: number): MeterRect[] {
+  const g = hw.geometry;
+  const out: MeterRect[] = [];
+  canvas.ctx.calls.forEach((c, i) => {
+    if (c.name !== 'fillRect') return;
+    const [x, y, w, h] = c.args as number[];
+    if (w < g.receptorRadius * 1.4) return;
+    if (Math.abs(x + w / 2 - laneX(g, lane, 0)) > 0.5) return;
+    out.push({ y, h, style: canvas.ctx.propBefore(i, 'fillStyle'), i });
+  });
+  return out;
+}
+/** The liquid column (the only meter mark filled with a gradient). */
+function liquidRect(canvas: MockCanvas, hw: Highway, lane: number): MeterRect | undefined {
+  return meterRects(canvas, hw, lane).find((m) => typeof m.style === 'object' && m.style !== null);
+}
+/** The flat dark ground of the well (drawn whether or not there is any liquid). */
+function wellRect(canvas: MockCanvas, hw: Highway, lane: number): MeterRect | undefined {
+  return meterRects(canvas, hw, lane).find((m) => m.style === METER_WELL);
+}
+/** The fixed threshold line across the well (`undefined` when the lane does not draw one). */
+function targetLine(canvas: MockCanvas, hw: Highway, lane: number): MeterRect | undefined {
+  const g = hw.geometry;
+  return meterRects(canvas, hw, lane).find((m) => m.style === WHITE && m.h < g.receptorRadius * 0.2);
+}
+/** The moving level line at the patient's current value (lane-coloured, white-hot at threshold). */
+function levelLine(canvas: MockCanvas, hw: Highway, lane: number, bright: string): MeterRect | undefined {
+  return meterRects(canvas, hw, lane).find((m) => m.style === bright);
+}
+/** The two threshold ticks outside the ring — short bars flush against the ring outline. */
+function targetTicks(canvas: MockCanvas, hw: Highway, lane: number): Array<{ x: number; y: number; w: number }> {
+  const g = hw.geometry;
+  const cx = laneX(g, lane, 0);
+  const out: Array<{ x: number; y: number; w: number }> = [];
+  canvas.ctx.calls.forEach((c, i) => {
+    if (c.name !== 'fillRect') return;
+    const [x, y, w, h] = c.args as number[];
+    if (canvas.ctx.propBefore(i, 'fillStyle') !== WHITE) return;
+    if (h > g.receptorRadius * 0.2 || w > g.receptorRadius * 0.5 || w < 2) return;
+    if (Math.abs(Math.abs(x + w / 2 - cx) - g.receptorRadius * 0.9) > g.receptorRadius * 0.6) return;
+    out.push({ x, y, w });
+  });
+  return out;
+}
+/** Where the meter well's value axis lives for a lane (reduced motion ⇒ no beat pulse, so exact). */
+function meterAxis(hw: Highway): { yBot: number; span: number; yTarget: number } {
+  const g = hw.geometry;
+  const wry = g.receptorRadius * GEM_ASPECT * 0.9;
+  const yBot = g.strikeY + wry;
+  const span = wry * 2;
+  return { yBot, span, yTarget: yBot - METER_TARGET_POS * span };
+}
+
 const serialize = (canvas: MockCanvas): string[] => canvas.ctx.calls.map((c) => `${c.name}(${JSON.stringify(c.args.map((a) => (typeof a === 'number' ? Math.round(a * 100) / 100 : typeof a === 'object' ? 'obj' : a)))})`);
 
 /** Multiset symmetric difference between two recorded frames. */
@@ -1140,7 +1315,7 @@ describe('receptor tells the truth about whether the lane can fire', () => {
 
     // 2. The locked lane gets its own cues: a re-arm line and a "lower to reset" chevron.
     const hint = (c: MockCanvas): number =>
-      c.ctx.calls.filter((k) => (k.name === 'set:fillStyle' || k.name === 'set:strokeStyle') && k.args[0] === '#ffcf5a').length;
+      c.ctx.calls.filter((k) => (k.name === 'set:fillStyle' || k.name === 'set:strokeStyle') && k.args[0] === LOCK_HINT).length;
     expect(hint(held.canvas)).toBeGreaterThanOrEqual(4 * 2); // per lane: dashes + chevron
     expect(hint(live.canvas)).toBe(0);
 
@@ -1229,7 +1404,7 @@ describe('receptor tells the truth about whether the lane can fire', () => {
       });
       hw.draw(f);
       // First dash of the first lane's re-arm line.
-      const i = canvas.ctx.calls.findIndex((c) => c.name === 'set:fillStyle' && c.args[0] === '#ffcf5a');
+      const i = canvas.ctx.calls.findIndex((c) => c.name === 'set:fillStyle' && c.args[0] === LOCK_HINT);
       expect(i).toBeGreaterThan(-1);
       const dash = canvas.ctx.calls.slice(i).find((c) => c.name === 'fillRect');
       return (dash as { args: number[] }).args[1];
@@ -1238,6 +1413,344 @@ describe('receptor tells the truth about whether the lane can fire', () => {
     // ring, i.e. at a *larger* y.
     expect(lineY(0.3)).toBeGreaterThan(lineY(0.6));
     expect(lineY(undefined)).toBeCloseTo(lineY(0.6), 6);
+  });
+});
+
+// -------------------------------------------------------------------------------------------------
+// Four input states, four receptor looks. A patient reads this from ~2 m mid-exercise, so the
+// difference between "keep going", "that scored", "come back down first" and "I cannot see you"
+// cannot be a brightness step: each state has to change WHICH marks are on screen.
+// -------------------------------------------------------------------------------------------------
+
+describe('the receptor draws four distinct states', () => {
+  const THRESH = 0.6;
+  const LOST_RING = '#a9b0bb'; // broken "no signal" ring
+  type Rec = { canvas: MockCanvas; hw: Highway; scratch: MockCanvas[] };
+
+  /** Warm the smoothed halo up on one lane state, then record exactly one frame of it. */
+  const record = (value: number, armed: boolean, tracking = true, beatPhase = 0.5): Rec => {
+    const s = setup(1280, 720);
+    s.hw.resize(1280, 720, 1);
+    const ls = LANES.map((l) => ({ lane: l.index, value, armed, tracking }));
+    const frame = (t: number): RenderFrame =>
+      makeFrame({ lanes: LANES, songTime: t, laneStates: ls, thresholdFraction: THRESH, rearmFraction: 0.6, beatPhase });
+    for (let i = 0; i < 40; i++) s.hw.draw(frame(1 + i * 0.016));
+    s.canvas.ctx.reset();
+    s.hw.draw(frame(1.64));
+    return s;
+  };
+
+  /** Lanes whose gauge has liquid in it (the gradient-filled column). */
+  const meterFills = (s: Rec): number => LANES.filter((l) => liquidRect(s.canvas, s.hw, l.index)).length;
+  /** Lanes whose gauge exists at all (well ground, drawn whenever there is a measurement). */
+  const meterWells = (s: Rec): number => LANES.filter((l) => wellRect(s.canvas, s.hw, l.index)).length;
+  /** Lanes showing the fixed threshold line, and lanes showing its two ticks outside the ring. */
+  const targetLines = (s: Rec): number => LANES.filter((l) => targetLine(s.canvas, s.hw, l.index)).length;
+  const tickCount = (s: Rec): number => LANES.reduce((n, l) => n + targetTicks(s.canvas, s.hw, l.index).length, 0);
+
+  /** Additive rings stroked on a receptor — the "this rep is scoring" rim + corona. */
+  const willFireRings = (s: Rec): number => {
+    const g = s.hw.geometry;
+    let n = 0;
+    s.canvas.ctx.calls.forEach((c, i) => {
+      if (c.name !== 'ellipse' || Math.abs((c.args[1] as number) - g.strikeY) > 0.5) return;
+      if (s.canvas.ctx.propBefore(i, 'globalCompositeOperation') !== 'lighter') return;
+      n++;
+    });
+    return n;
+  };
+
+  /** Arc segments of the broken "no signal" ring (a partial ellipse in the lost-tracking grey). */
+  const brokenArcs = (s: Rec): Array<{ rx: number; ry: number }> => {
+    const g = s.hw.geometry;
+    const out: Array<{ rx: number; ry: number }> = [];
+    s.canvas.ctx.calls.forEach((c, i) => {
+      if (c.name !== 'ellipse' || c.args.length < 7) return;
+      if (Math.abs((c.args[1] as number) - g.strikeY) > 0.5) return;
+      if ((c.args[6] as number) - (c.args[5] as number) >= Math.PI * 2 - 1e-6) return;
+      if (s.canvas.ctx.propBefore(i, 'strokeStyle') !== LOST_RING) return;
+      out.push({ rx: c.args[2] as number, ry: c.args[3] as number });
+    });
+    return out;
+  };
+
+  /** Ring-sized sprite blits centred on a receptor (the solid lane / grey ring, never the halo). */
+  const solidRings = (s: Rec): number => {
+    const g = s.hw.geometry;
+    let n = 0;
+    s.canvas.ctx.calls.forEach((c, i) => {
+      if (c.name !== 'drawImage' || c.args.length !== 5) return;
+      const dx = c.args[1] as number;
+      const dy = c.args[2] as number;
+      const dw = c.args[3] as number;
+      const dh = c.args[4] as number;
+      if (Math.abs(dy + dh / 2 - g.strikeY) > 1 || dw < g.receptorRadius * 2) return;
+      if (s.canvas.ctx.propBefore(i, 'globalCompositeOperation') === 'lighter') return; // halo
+      if (LANES.some((l) => Math.abs(dx + dw / 2 - laneX(g, l.index, 0)) < 1)) n++;
+    });
+    return n;
+  };
+
+  const lockHints = (s: Rec): number =>
+    s.canvas.ctx.calls.filter((c) => (c.name === 'set:fillStyle' || c.name === 'set:strokeStyle') && c.args[0] === LOCK_HINT).length;
+
+  /** Was the "?" glyph rasterized at all (the text cache is per-Highway, so per recorded state)? */
+  const questionGlyph = (s: Rec): boolean => s.scratch.some((c) => c.ctx.calls.some((k) => k.name === 'fillText' && k.args[0] === '?'));
+
+  // (a) rising toward threshold, armed   (b) at threshold, armed
+  // (c) at threshold, NOT armed          (d) tracking lost (with a stale value still in the meter)
+  const rising = (): Rec => record(0.36, true);
+  const firing = (): Rec => record(0.75, true);
+  const locked = (): Rec => record(0.75, false);
+  const lost = (): Rec => record(0.75, true, false);
+
+  it('gives each of the four states its own set of marks, not its own brightness', () => {
+    const a = rising();
+    const b = firing();
+    const c = locked();
+    const d = lost();
+
+    // (a) rising: a gauge with liquid in it, a moving level line, the fixed target line and its two
+    //     ticks outside the ring, a halo that is not yet full — and no "will fire" rings, no lock
+    //     cues, no broken ring. "Keep going, this much further."
+    expect(meterWells(a)).toBe(4);
+    expect(meterFills(a)).toBe(4);
+    expect(targetLines(a)).toBe(4);
+    expect(tickCount(a)).toBe(8); // two per lane, one either side of the ring
+    expect(haloBlits(a.canvas, a.hw)).toBe(4);
+    expect(willFireRings(a)).toBe(0);
+    expect(lockHints(a)).toBe(0);
+    expect(brokenArcs(a)).toHaveLength(0);
+    expect(solidRings(a)).toBe(4);
+
+    // (b) at/over threshold and armed: the only state with the additive rim + corona, and the only
+    //     one whose fill is drawn from the hot gradient (a separate cached gradient per lane). It
+    //     keeps the target line — it has to, because the liquid now stands *above* it.
+    expect(willFireRings(b)).toBe(8); // rim + corona per lane
+    expect(haloBlits(b.canvas, b.hw)).toBe(4);
+    expect(targetLines(b)).toBe(4);
+    expect(tickCount(b)).toBe(8);
+    expect(lockHints(b)).toBe(0);
+    expect(brokenArcs(b)).toHaveLength(0);
+    expect(solidRings(b)).toBe(4);
+
+    // (c) at/over threshold but NOT armed: no halo, no "will fire" ring, and — just as important —
+    //     no target line and no ticks anywhere, because the threshold is not what the patient is
+    //     aiming at any more. Instead, the return-to-rest cues. This is the state the whole
+    //     contract exists for.
+    expect(haloBlits(c.canvas, c.hw)).toBe(0);
+    expect(willFireRings(c)).toBe(0);
+    expect(targetLines(c)).toBe(0);
+    expect(tickCount(c)).toBe(0);
+    expect(lockHints(c)).toBeGreaterThanOrEqual(8); // dashes + chevron per lane
+    expect(meterFills(c)).toBe(4); // the height is still the patient's real value
+    expect(brokenArcs(c)).toHaveLength(0);
+    expect(solidRings(c)).toBe(4);
+
+    // (d) tracking lost: nothing that encodes a value is drawn at all — no well, no fill, no target
+    //     line, no halo, no lock cues, no solid ring — just the broken ring and the "?".
+    expect(meterWells(d)).toBe(0);
+    expect(meterFills(d)).toBe(0);
+    expect(targetLines(d)).toBe(0);
+    expect(tickCount(d)).toBe(0);
+    expect(haloBlits(d.canvas, d.hw)).toBe(0);
+    expect(willFireRings(d)).toBe(0);
+    expect(lockHints(d)).toBe(0);
+    expect(solidRings(d)).toBe(0);
+    expect(brokenArcs(d)).toHaveLength(4 * 4); // four arcs per lane
+    expect(questionGlyph(d)).toBe(true);
+    expect(questionGlyph(a) || questionGlyph(b) || questionGlyph(c)).toBe(false);
+  });
+
+  // -----------------------------------------------------------------------------------------------
+  // (a) is the state the ring exists for: during the rise the patient must be able to tell "half
+  // way" from "nearly there" at 2 m. These tests are about that, and about the reason it used to be
+  // impossible — the gauge was painted UNDER the receptor sprite's translucent dark button face.
+  // -----------------------------------------------------------------------------------------------
+
+  it('paints the whole gauge ON TOP of the receptor sprite, never under its button face', () => {
+    // The sprite is an opaque-ish dark disc across the entire ellipse. Anything drawn before it is
+    // seen through a scrim: measured on real pixels, that turned a 0 → 100 % ramp into a diffuse
+    // warm-up with no resolvable level and a +19/255 meniscus. Draw order IS the fix, so it is what
+    // this asserts: for every lane, every meter mark is issued after that lane's ring blit.
+    const s = rising();
+    const g = s.hw.geometry;
+    for (const l of LANES) {
+      const ringAt = s.canvas.ctx.calls.findIndex((c, i) => {
+        if (c.name !== 'drawImage' || c.args.length !== 5) return false;
+        const [, dx, dy, dw, dh] = c.args as [unknown, number, number, number, number];
+        if (Math.abs(dy + dh / 2 - g.strikeY) > 1 || dw < g.receptorRadius * 2) return false;
+        if (s.canvas.ctx.propBefore(i, 'globalCompositeOperation') === 'lighter') return false; // halo
+        return Math.abs(dx + dw / 2 - laneX(g, l.index, 0)) < 1;
+      });
+      expect(ringAt, `lane ${l.index} ring`).toBeGreaterThan(-1);
+      const marks = meterRects(s.canvas, s.hw, l.index);
+      expect(marks.length, `lane ${l.index} marks`).toBeGreaterThanOrEqual(3); // well + liquid + target
+      for (const m of marks) expect(m.i, `lane ${l.index} mark at ${m.i} vs ring at ${ringAt}`).toBeGreaterThan(ringAt);
+    }
+  });
+
+  it('reads out the whole rise, not just "not yet / there"', () => {
+    // A gauge, not a glow: the level line and the top of the liquid move by a real distance for
+    // each step of effort, and every step is measured against the SAME fixed target line.
+    const { canvas, hw } = setup(1280, 720, { reducedMotion: true });
+    hw.resize(1280, 720, 1);
+    const axis = meterAxis(hw);
+    const bright = GH_PALETTE.lanes[0].bright;
+    const at = (fraction: number): { level: number; liquid: number } => {
+      canvas.ctx.reset();
+      hw.draw(
+        makeFrame({
+          lanes: LANES,
+          songTime: 1 + fraction,
+          laneStates: LANES.map((l) => ({ lane: l.index, value: THRESH * fraction, armed: true, tracking: true })),
+          thresholdFraction: THRESH,
+        }),
+      );
+      const line = levelLine(canvas, hw, 0, bright);
+      const liquid = liquidRect(canvas, hw, 0);
+      expect(line).toBeDefined();
+      expect(liquid).toBeDefined();
+      return { level: (line as MeterRect).y + (line as MeterRect).h / 2, liquid: (liquid as MeterRect).y };
+    };
+    const steps = [0.2, 0.4, 0.6, 0.8, 0.99].map(at);
+    for (let i = 1; i < steps.length; i++) {
+      // Monotonic, and each 20 % of the rise moves the level by a fifth of the target height —
+      // ~4 % of the receptor's height per step is what "a little higher" has to look like.
+      expect(steps[i].level).toBeLessThan(steps[i - 1].level);
+      expect(steps[i - 1].level - steps[i].level).toBeGreaterThan(axis.span * METER_TARGET_POS * 0.15);
+      expect(steps[i].liquid).toBeCloseTo(steps[i].level, 0);
+    }
+    // The rise is measured against the target line, which never moves and is never reached early.
+    const target = targetLine(canvas, hw, 0) as MeterRect;
+    expect(target).toBeDefined();
+    expect(target.y + target.h / 2).toBeCloseTo(axis.yTarget, 1);
+    for (const st of steps) expect(st.level).toBeGreaterThan(axis.yTarget); // still below the line
+    // Halfway up is halfway to the line, not 45 % of a bar with no line on it.
+    expect(at(0.5).level).toBeCloseTo(axis.yBot - 0.5 * METER_TARGET_POS * axis.span, 1);
+  });
+
+  it('is the only state that paints liquid above the target line, and only once it really fires', () => {
+    const { canvas, hw } = setup(1280, 720, { reducedMotion: true });
+    hw.resize(1280, 720, 1);
+    const axis = meterAxis(hw);
+    const topOfLiquid = (value: number, armed = true): number => {
+      canvas.ctx.reset();
+      hw.draw(
+        makeFrame({
+          lanes: LANES,
+          songTime: 1 + value,
+          laneStates: LANES.map((l) => ({ lane: l.index, value, armed, tracking: true })),
+          thresholdFraction: THRESH,
+        }),
+      );
+      return (liquidRect(canvas, hw, 0) as MeterRect).y;
+    };
+    expect(topOfLiquid(THRESH * 0.99)).toBeGreaterThan(axis.yTarget); // below the line
+    expect(topOfLiquid(THRESH)).toBeCloseTo(axis.yTarget, 1); // exactly on it
+    expect(topOfLiquid(THRESH * 1.25)).toBeLessThan(axis.yTarget - 1); // into the headroom
+    expect(topOfLiquid(THRESH * 1.5)).toBeLessThan(topOfLiquid(THRESH * 1.25)); // and further
+    // A locked lane at the same value never gets above the line's height either — it has no line,
+    // and the headroom is a "you cleared the target" cue it has not earned.
+    expect(topOfLiquid(THRESH * 1.5, false)).toBeGreaterThan(axis.yTarget - 1);
+  });
+
+  it('no two of the four states paint the same frame', () => {
+    const frames: Array<[string, string[]]> = [
+      ['rising', serialize(rising().canvas)],
+      ['firing', serialize(firing().canvas)],
+      ['locked', serialize(locked().canvas)],
+      ['lost', serialize(lost().canvas)],
+    ];
+    for (let i = 0; i < frames.length; i++) {
+      for (let j = i + 1; j < frames.length; j++) {
+        const diff = callDiff(frames[i][1], frames[j][1]);
+        // Far more than a globalAlpha or two: a whole class of marks differs in every pair.
+        expect(diff, `${frames[i][0]} vs ${frames[j][0]}`).toBeGreaterThan(20);
+      }
+    }
+  });
+
+  it('a full meter alone never claims "ready" — only armed + tracked + full does', () => {
+    // Same value, same threshold, three different truths about whether the next rep can register.
+    expect(willFireRings(firing())).toBeGreaterThan(0);
+    expect(willFireRings(locked())).toBe(0);
+    expect(willFireRings(lost())).toBe(0);
+    // ...and the halo, the other "you are there" cue, follows the same rule.
+    expect(haloBlits(firing().canvas, firing().hw)).toBe(4);
+    expect(haloBlits(locked().canvas, locked().hw)).toBe(0);
+    expect(haloBlits(lost().canvas, lost().hw)).toBe(0);
+  });
+
+  it('the lost-tracking receptor ignores a stale value and does not dance with the beat', () => {
+    // A lane-level dropout leaves the last sample behind; VisionInput reports value 0 for a dead
+    // stream. Either way the number is not a measurement, so a 0.95 value paints exactly what a 0
+    // value paints.
+    const hot = serialize(record(0.95, true, false).canvas);
+    const zero = serialize(record(0, true, false).canvas);
+    expect(callDiff(hot, zero)).toBe(0);
+    // The live ring pulses on the beat; a dead signal must not, or "no data" reads as rhythm.
+    const onBeat = brokenArcs(record(0.5, true, false, 0));
+    const offBeat = brokenArcs(record(0.5, true, false, 0.5));
+    expect(onBeat).toHaveLength(16);
+    expect(offBeat).toHaveLength(16);
+    expect(onBeat[0].rx).toBeCloseTo(offBeat[0].rx, 6);
+    expect(onBeat[0].ry).toBeCloseTo(offBeat[0].ry, 6);
+    // The live receptor, by contrast, does change size with the beat.
+    const ringSize = (s: Rec): number => {
+      const g = s.hw.geometry;
+      let w = 0;
+      s.canvas.ctx.calls.forEach((c, i) => {
+        if (c.name !== 'drawImage' || c.args.length !== 5) return;
+        const dy = c.args[2] as number;
+        const dh = c.args[4] as number;
+        if (Math.abs(dy + dh / 2 - g.strikeY) > 1) return;
+        if (s.canvas.ctx.propBefore(i, 'globalCompositeOperation') === 'lighter') return; // halo
+        if (Math.abs((c.args[1] as number) + (c.args[3] as number) / 2 - laneX(g, 0, 0)) > 1) return;
+        w = Math.max(w, c.args[3] as number);
+      });
+      return w;
+    };
+    expect(ringSize(record(0.36, true, true, 0))).toBeGreaterThan(ringSize(record(0.36, true, true, 0.5)));
+  });
+
+  it('grows the return-to-rest arc as the patient lowers back toward the re-arm level', () => {
+    // Re-arm happens below threshold * 0.6 = 0.36 of ROM. The arc answers "how much further?", so
+    // it must be absent while they are still at the top and closed at the line.
+    const sweep = (value: number): number => {
+      const s = record(value, false);
+      const g = s.hw.geometry;
+      let span = 0;
+      s.canvas.ctx.calls.forEach((c, i) => {
+        if (c.name !== 'ellipse' || c.args.length < 7) return;
+        if (Math.abs((c.args[1] as number) - g.strikeY) > 0.5) return;
+        // The arc sits just outside the ring; the meter's clip ellipse is inside it.
+        if (Math.abs((c.args[2] as number) - g.receptorRadius * 1.16) > 0.5) return;
+        if (s.canvas.ctx.propBefore(i, 'strokeStyle') !== LOCK_HINT) return;
+        span = Math.max(span, (c.args[6] as number) - (c.args[5] as number));
+      });
+      return span;
+    };
+    // The arc spans at most 1.5π, leaving the top quarter of the ring permanently open: a cue that
+    // closed into a complete ring would read as a lit ring, which is what (c) may never look like.
+    expect(sweep(0.6)).toBe(0); // at threshold: nothing given back yet, no arc at all
+    expect(sweep(0.54)).toBeGreaterThan(0);
+    expect(sweep(0.48)).toBeCloseTo(Math.PI * 0.75, 2); // half way down
+    expect(sweep(0.36)).toBeCloseTo(Math.PI * 1.5, 6); // at the re-arm line: complete, still open
+    expect(sweep(0.48)).toBeGreaterThan(sweep(0.54));
+    // It is a locked-lane cue only: a live lane never draws it.
+    const live = record(0.48, true);
+    expect(lockHints(live)).toBe(0);
+  });
+
+  it('tracking loss outranks the hysteresis lockout (one cue at a time, and it is the true one)', () => {
+    // A lane can be both unarmed and untracked (the tracker dropped out mid-hold). Telling the
+    // patient to "lower to reset" while the camera cannot see them is advice they cannot act on.
+    const both = record(0.75, false, false);
+    expect(lockHints(both)).toBe(0);
+    expect(meterFills(both)).toBe(0);
+    expect(brokenArcs(both)).toHaveLength(16);
+    expect(callDiff(serialize(both.canvas), serialize(lost().canvas))).toBe(0);
   });
 });
 
@@ -1330,7 +1843,7 @@ describe('the miss cue lands inside the canvas', () => {
       if (c.name !== 'drawImage' || c.args.length !== 5) return;
       const dy = c.args[2] as number;
       const dh = c.args[4] as number;
-      if (dy + dh / 2 < g.strikeY + g.receptorRadius) return; // above / at the receptors
+      if (dy + dh / 2 < g.strikeY + g.receptorRadius * 0.5) return; // above / at the receptors
       if (canvas.ctx.propBefore(i, 'globalCompositeOperation') === 'lighter') additiveBelowLine++;
       else {
         normalBelowLine++;
@@ -1502,17 +2015,13 @@ describe('degenerate frame values are treated as missing, not as extremes', () =
 
 describe('lanes are matched by identity, not by array position', () => {
   const THRESH = 1;
-  /** Meter fill top edge per lane x, read off the receptor meter fillRects. */
+  /** Liquid top edge per lane — the height the patient reads as "this is where I am". */
   function meterTops(canvas: MockCanvas, hw: Highway): number[] {
     const g = hw.geometry;
     const out = new Array<number>(g.laneCount).fill(Number.NaN);
-    for (const c of canvas.ctx.calls) {
-      if (c.name !== 'fillRect') continue;
-      const [x, y, w] = c.args as number[];
-      for (let lane = 0; lane < g.laneCount; lane++) {
-        // The meter fill spans the full ring width and starts at the value's height.
-        if (Math.abs(x + w / 2 - laneX(g, lane, 0)) < 0.5 && Math.abs(w - g.receptorRadius * 2) < 0.5 && Number.isNaN(out[lane])) out[lane] = y;
-      }
+    for (let lane = 0; lane < g.laneCount; lane++) {
+      const m = liquidRect(canvas, hw, lane);
+      if (m) out[lane] = m.y;
     }
     return out;
   }
