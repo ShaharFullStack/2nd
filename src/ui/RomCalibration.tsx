@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { DIFFICULTIES } from '../engine/difficulty.ts';
+import type { InvalidCalibration } from '../input/VisionInput.ts';
 import { runtime } from '../session/runtime.ts';
 import { calibrationKey, laneFingertip, useStore } from '../state/store.ts';
-import { RomCalibrator } from '../vision/calibration.ts';
-import type { CalibrationStatus, RomCalibration } from '../vision/calibration.ts';
+import { RomCalibrator, calibrationMismatch } from '../vision/calibration.ts';
+import type { CalibrationMismatch, CalibrationStatus, RomCalibration } from '../vision/calibration.ts';
 import { MOVEMENT_INFO } from '../vision/features.ts';
 import { CameraPreview } from './CameraPreview.tsx';
 import { Meter, ProgressRing, Screen, Toast, TopBar } from './common.tsx';
@@ -14,18 +15,41 @@ interface Live {
   tracking: boolean;
 }
 
+/**
+ * What the RUNTIME thinks of the ranges this screen has handed it, re-read on a timer exactly the way
+ * CameraCheck re-reads getStatus().
+ *
+ * This screen used to be the only reader of a verdict it never asked for: `setCalibration` returns
+ * false and `getInvalidCalibrations()` fills with an actionable sentence, and the screen painted a
+ * green ✓, a min→max readout and an enabled "Next lane →" over a lane the engine had just killed. A
+ * refusal that only reaches console.error is the same silent acceptance the module boundary exists to
+ * prevent, moved up one layer.
+ */
+interface Vetting {
+  /** Lanes VisionInput is currently refusing to score, with the therapist-facing reason. */
+  refusals: InvalidCalibration[];
+  /** Why the saved range offered by "Reuse last session's range" does not apply here (null = it does). */
+  previousProblem: CalibrationMismatch | null;
+}
+
+const NO_VETTING: Vetting = { refusals: [], previousProblem: null };
+
 export default function RomCalibrationScreen() {
   const goto = useStore((s) => s.goto);
   const lanes = useStore((s) => s.lanes);
   const difficulty = useStore((s) => s.difficulty);
   const setCalibration = useStore((s) => s.setCalibration);
   const savedCalibrations = useStore((s) => s.savedCalibrations);
+  const persistenceFailed = useStore((s) => s.persistenceFailed);
 
   const [laneIndex, setLaneIndex] = useState(0);
   const [live, setLive] = useState<Live | null>(null);
   const [done, setDone] = useState<(RomCalibration | null)[]>(() => lanes.map(() => null));
   const calibrator = useRef<RomCalibrator | null>(null);
   const [generation, setGeneration] = useState(0);
+  /** The reason the runtime refused THIS lane's freshly measured range (null = nothing refused). */
+  const [rejected, setRejected] = useState<string | null>(null);
+  const [vetting, setVetting] = useState<Vetting>(NO_VETTING);
 
   const lane = lanes[laneIndex];
   const info = lane ? MOVEMENT_INFO[lane.movement] : null;
@@ -44,6 +68,9 @@ export default function RomCalibrationScreen() {
     // fallback for the (dev) case where no vision input exists.
     const cal = vision?.createCalibrator(laneIndex) ?? new RomCalibrator(lane.movement);
     calibrator.current = cal;
+    // A new attempt starts with a clean verdict: the previous refusal described a range that no longer
+    // exists, and leaving it up would block the auto-finish guard from ever running again.
+    setRejected(null);
 
     if (!vision) return;
     const off = vision.onFrame((samples) => {
@@ -70,10 +97,38 @@ export default function RomCalibrationScreen() {
     };
   }, [lane, laneIndex, generation]);
 
+  /**
+   * Hand a measured range to the runtime and BELIEVE ITS ANSWER.
+   *
+   * `VisionInput.setCalibration` returns false when it refuses the range (too narrow to tell movement
+   * from noise, or measured on another fingertip / under the other mirror convention, i.e. a range of
+   * a different quantity or of the other limb). A refused lane reads 0 and never triggers for the whole
+   * song, so every state that follows from "this lane is calibrated" — the ✓, the min→max readout, the
+   * enabled Next button and the localStorage write that offers this range back next week — is a lie
+   * unless the runtime accepted it. The refusal is shown here, on the screen that can fix it, because
+   * this is the only screen that can.
+   */
   const finishLane = useCallback(
     (result: RomCalibration) => {
+      const vision = runtime.peekVision();
+      if (vision) {
+        const accepted = vision.setCalibration(laneIndex, result);
+        if (!accepted) {
+          const reason =
+            vision.getInvalidCalibrations().find((c) => c.lane === laneIndex)?.reason ??
+            'the calibrated range is unusable';
+          setRejected(reason);
+          setDone((d) => {
+            if (d[laneIndex] === null) return d;
+            const next = d.slice();
+            next[laneIndex] = null;
+            return next;
+          });
+          return;
+        }
+      }
+      setRejected(null);
       setCalibration(laneIndex, result);
-      runtime.peekVision()?.setCalibration(laneIndex, result);
       setDone((d) => {
         const next = d.slice();
         next[laneIndex] = result;
@@ -83,15 +138,46 @@ export default function RomCalibrationScreen() {
     [laneIndex, setCalibration],
   );
 
-  // Auto-finish as soon as the calibrator says it is done.
+  // Auto-finish as soon as the calibrator says it is done. `rejected` is part of the guard: without it
+  // a refused range is re-offered on every 80 ms poll (the calibrator stays in 'done' forever), which
+  // is an infinite refusal loop instead of one message.
   useEffect(() => {
     if (!live || live.status.phase !== 'done') return;
     const cal = calibrator.current;
     const result = cal?.getResult() ?? null;
-    if (result && !done[laneIndex]) finishLane(result);
-  }, [live, done, laneIndex, finishLane]);
+    if (result && !done[laneIndex] && rejected === null) finishLane(result);
+  }, [live, done, laneIndex, rejected, finishLane]);
 
-  const laneDone = done[laneIndex] ?? null;
+  /**
+   * Re-read the runtime's verdicts (refused lanes; whether the saved range on offer applies to THIS
+   * lane's context) on a timer, the way CameraCheck re-reads getStatus. It is polled rather than
+   * computed once because both inputs can change under the screen: another lane's calibration is
+   * handed over as the therapist works down the list, and the vision input is created asynchronously.
+   */
+  useEffect(() => {
+    const read = () => {
+      const vision = runtime.peekVision();
+      const refusals = vision?.getInvalidCalibrations() ?? [];
+      // The lane's OWN context, derived by VisionInput from the very feature options its extractor
+      // runs with — never rebuilt here from the fields this screen happens to remember.
+      const ctx = vision?.getCalibrationContext(laneIndex) ?? undefined;
+      const previousProblem = lane && previous ? calibrationMismatch(previous, lane.movement, ctx) : null;
+      setVetting((v) =>
+        v.previousProblem?.reason === previousProblem?.reason &&
+        v.refusals.length === refusals.length &&
+        v.refusals.every((r, i) => r.lane === refusals[i].lane && r.reason === refusals[i].reason)
+          ? v
+          : { refusals, previousProblem },
+      );
+    };
+    read();
+    const poll = setInterval(read, 300);
+    return () => clearInterval(poll);
+  }, [lane, laneIndex, previous, generation]);
+
+  // "Done" means the RUNTIME holds a usable range for this lane, not that this screen measured one.
+  const laneRefused = vetting.refusals.some((r) => r.lane === laneIndex) || rejected !== null;
+  const laneDone = laneRefused ? null : (done[laneIndex] ?? null);
   const status = live?.status ?? null;
   const restPhase = status?.phase === 'rest';
 
@@ -121,8 +207,18 @@ export default function RomCalibrationScreen() {
     }
   };
 
+  /**
+   * Offer last session's range ONLY when it describes what this lane measures now.
+   *
+   * The saved-calibration key is `movement:side[:fingertip]` — it does not carry the mirror
+   * convention, and the convention selects WHICH LIMB every lane reads. So a range saved un-mirrored
+   * and reused after the mirror switch is flipped is a genuinely inapplicable range that the store
+   * will happily hand over: it has to be refused HERE, with the reason and the action, rather than
+   * pushed at a runtime that refuses it where no therapist is looking.
+   */
+  const previousProblem = vetting.previousProblem;
   const usePrevious = () => {
-    if (previous) finishLane(previous);
+    if (previous && !previousProblem) finishLane(previous);
   };
 
   const ringValue = useMemo(() => {
@@ -207,6 +303,42 @@ export default function RomCalibrationScreen() {
             <Toast key={i}>{w}</Toast>
           ))}
 
+          {/* The runtime refused the range this screen just measured. Loudest thing on the screen: the
+              lane is dead until it is re-done, and this is where it gets re-done. */}
+          {rejected && (
+            <Toast kind="bad">
+              <strong data-testid="rom-rejected">This range was not accepted for lane {laneIndex + 1}:</strong> {rejected}.
+            </Toast>
+          )}
+
+          {/* Any OTHER lane the runtime is refusing — including one killed by a setting changed after
+              it was calibrated (flip the mirror switch and every stored range belongs to the other
+              limb). Without this the therapist would have to walk back through the lanes to find it. */}
+          {vetting.refusals
+            .filter((r) => r.lane !== laneIndex || !rejected)
+            .map((r) => (
+              <Toast kind="bad" key={r.lane}>
+                <strong data-testid={`rom-refusal-${r.lane}`}>
+                  Lane {r.lane + 1} ({MOVEMENT_INFO[r.movement].label}) will not score:
+                </strong>{' '}
+                {r.reason}.
+              </Toast>
+            ))}
+
+          {previous && !laneDone && previousProblem && (
+            <Toast kind="bad">
+              <strong data-testid="rom-reuse-problem">Last session's range cannot be reused here:</strong>{' '}
+              {previousProblem.reason}.
+            </Toast>
+          )}
+
+          {persistenceFailed && (
+            <Toast kind="bad">
+              This tablet is not saving calibrations (its storage is full or blocked), so nothing measured here will be
+              offered back next session. Free up browser storage, or expect to re-calibrate every time.
+            </Toast>
+          )}
+
           <div className="row">
             <button className="btn" onClick={retry} data-testid="rom-redo">
               Redo this lane
@@ -218,8 +350,13 @@ export default function RomCalibrationScreen() {
               Harder (+5% top)
             </button>
             {previous && !laneDone && (
-              <button className="btn btn-ghost" onClick={usePrevious}>
-                Reuse last session's range
+              <button
+                className="btn btn-ghost"
+                onClick={usePrevious}
+                disabled={previousProblem !== null}
+                data-testid="rom-reuse"
+              >
+                {previousProblem ? 'Cannot reuse last session’s range' : "Reuse last session's range"}
               </button>
             )}
           </div>
@@ -230,27 +367,40 @@ export default function RomCalibrationScreen() {
           <CameraPreview overlay />
           <h3>Lanes</h3>
           <ul className="list-reset">
-            {lanes.map((l, i) => (
-              <li key={i} className="row">
-                <span className={done[i] ? 'badge badge-ok' : i === laneIndex ? 'badge' : 'badge badge-warn'}>
-                  {done[i] ? '✓' : i === laneIndex ? '●' : '—'}
-                </span>
-                <span className={i === laneIndex ? '' : 'muted'}>
-                  {l.side === 'left' ? 'L' : 'R'} {MOVEMENT_INFO[l.movement].label}
-                  {laneFingertip(l) ? ` · ${laneFingertip(l)}` : ''}
-                </span>
-                <div className="grow" />
-                {done[i] && (
-                  <span className="dim mono">
-                    {(done[i] as RomCalibration).min.toFixed(2)}→{(done[i] as RomCalibration).max.toFixed(2)}
+            {lanes.map((l, i) => {
+              // A lane the runtime is refusing is NOT done, whatever this screen measured: the ✓ and the
+              // min→max readout describe a range that will not score a single note.
+              const refused = vetting.refusals.some((r) => r.lane === i) || (i === laneIndex && rejected !== null);
+              const cal = refused ? null : done[i];
+              return (
+                <li key={i} className="row">
+                  <span
+                    className={
+                      refused ? 'badge badge-bad' : cal ? 'badge badge-ok' : i === laneIndex ? 'badge' : 'badge badge-warn'
+                    }
+                    data-testid={`rom-lane-badge-${i}`}
+                  >
+                    {refused ? '✕' : cal ? '✓' : i === laneIndex ? '●' : '—'}
                   </span>
-                )}
-              </li>
-            ))}
+                  <span className={i === laneIndex ? '' : 'muted'}>
+                    {l.side === 'left' ? 'L' : 'R'} {MOVEMENT_INFO[l.movement].label}
+                    {laneFingertip(l) ? ` · ${laneFingertip(l)}` : ''}
+                  </span>
+                  <div className="grow" />
+                  {refused && <span className="dim">not calibrated</span>}
+                  {cal && (
+                    <span className="dim mono">
+                      {cal.min.toFixed(2)}→{cal.max.toFixed(2)}
+                    </span>
+                  )}
+                </li>
+              );
+            })}
           </ul>
           <span className="dim">
-            Each range is stored with the movement, the side — and, for finger opposition, the fingertip — it was
-            measured on, so a repeat session can offer it back and never hands one finger's range to another.
+            Each range is stored with the movement, the side, the mirror convention — and, for finger opposition, the
+            fingertip — it was measured on. A repeat session offers a range back only when all of those still match, and
+            says so here when they do not, so one finger's (or one limb's) range is never handed to another.
           </span>
         </div>
       </div>

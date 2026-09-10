@@ -4,6 +4,7 @@ import { laneFingertip, useStore } from '../state/store.ts';
 import { MOVEMENT_INFO, requiredPostures } from '../vision/features.ts';
 import { POSTURE_INFO } from '../vision/features.ts';
 import type { VisionStatus } from '../input/types.ts';
+import type { InvalidCalibration } from '../input/VisionInput.ts';
 import type { DetectionResult } from '../vision/mediapipe.ts';
 import { drawDetection } from './overlay.ts';
 import CameraFallback from './CameraFallback.tsx';
@@ -22,6 +23,8 @@ export default function CameraCheck() {
   const canvas = useRef<HTMLCanvasElement>(null);
   const latest = useRef<DetectionResult | null>(null);
   const [status, setStatus] = useState<VisionStatus | null>(null);
+  /** Lanes the runtime is refusing to score, with the reason (see the refusal block in the panel). */
+  const [refusals, setRefusals] = useState<InvalidCalibration[]>([]);
   /** The thrown value, not a string: CameraFallback classifies a DOMException by its `name`. */
   const [error, setError] = useState<unknown>(null);
   const [starting, setStarting] = useState(true);
@@ -73,7 +76,14 @@ export default function CameraCheck() {
 
     const poll = setInterval(() => {
       const vision = runtime.peekVision();
-      if (vision) setStatus(vision.getStatus());
+      if (!vision) return;
+      setStatus(vision.getStatus());
+      const bad = vision.getInvalidCalibrations();
+      setRefusals((prev) =>
+        prev.length === bad.length && prev.every((r, i) => r.lane === bad[i].lane && r.reason === bad[i].reason)
+          ? prev
+          : bad,
+      );
     }, 300);
 
     return () => {
@@ -84,6 +94,7 @@ export default function CameraCheck() {
       // Reset on teardown so a restart (mirror toggle, lane change) shows "starting" again.
       setStarting(true);
       setStatus(null);
+      setRefusals([]);
     };
   }, [mode, lanes, calibrations, difficulty, settings.mirrored, attempt]);
 
@@ -96,6 +107,7 @@ export default function CameraCheck() {
     runtime.disposeVision();
     setError(null);
     setStatus(null);
+    setRefusals([]);
     setStarting(true);
     setAttempt((n) => n + 1);
     // One frame of grace so the effect's teardown/setup pair has run before the button re-enables.
@@ -142,9 +154,26 @@ export default function CameraCheck() {
               <span className="badge mono">{status ? `${status.inferenceMs.toFixed(0)} ms/frame` : '– ms'}</span>
               <span className="badge">{status?.delegate ?? 'starting'}</span>
             </div>
-            {/* Calibration/compensation warnings are guaranteed here — ROM calibration is the NEXT
+            {/* A REFUSAL is not a warning: the lane is dead until it is re-calibrated, and the most
+                common way to earn one is on THIS screen — flipping the mirror switch below makes every
+                stored range describe the other limb. It is shown here, with the way out. */}
+            {refusals.map((r) => (
+              <Toast kind="bad" key={r.lane}>
+                <strong data-testid={`camera-refusal-${r.lane}`}>
+                  Lane {r.lane + 1} ({MOVEMENT_INFO[r.movement].label}) will not score:
+                </strong>{' '}
+                {r.reason}.
+              </Toast>
+            ))}
+            {refusals.length > 0 && (
+              <button className="btn btn-primary" onClick={() => goto('rom')} data-testid="camera-recalibrate">
+                Re-calibrate {refusals.length > 1 ? 'these lanes' : 'this lane'} →
+              </button>
+            )}
+            {/* SOFT calibration/compensation warnings are guaranteed here — ROM calibration is the NEXT
                 screen — so they would train the therapist to ignore this panel. They belong (and are
-                shown) on the calibration screen itself. */}
+                shown) on the calibration screen itself. Refusals, above, do not: they are not fixed by
+                walking forward, and nothing downstream used to show them at all. */}
             {status?.warnings
               ?.filter((w) => !/calibrat|compensation/i.test(w))
               .slice(0, 3)

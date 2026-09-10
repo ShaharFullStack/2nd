@@ -1,19 +1,33 @@
 import { useEffect, useRef, useState } from 'react';
-import { attributionText } from '../audio/manifest.ts';
 import type { SongManifest } from '../audio/manifest.ts';
 import { DIFFICULTIES, windowsForLanes } from '../engine/difficulty.ts';
 import { AutoplayInput } from '../input/AutoplayInput.ts';
 import { KeyboardInput } from '../input/KeyboardInput.ts';
 import type { InputSource } from '../input/types.ts';
+import type { InvalidCalibration } from '../input/VisionInput.ts';
 import { GameRunner } from '../session/GameRunner.ts';
 import type { HudSnapshot } from '../session/GameRunner.ts';
 import { SILENT_GRID, buildSessionChart, songGridOf } from '../session/chart.ts';
 import { buildSessionResult } from '../session/results.ts';
 import { runtime } from '../session/runtime.ts';
 import { useStore } from '../state/store.ts';
+import { MOVEMENT_INFO } from '../vision/features.ts';
 import { DEFAULT_REARM_FRACTION } from '../render/receptor.ts';
 import { CameraPreview } from './CameraPreview.tsx';
 import { Meter, Toast } from './common.tsx';
+
+/**
+ * The credit line drawn in the corner of the play screen.
+ *
+ * NOT `attributionText()`: that is the full licence sentence (a paragraph — "…is an original demo
+ * track synthesized in-repo by scripts/gen-demo-stems.mjs…"), which has to be ellipsized to fit a
+ * corner block and then reads as a truncated dev string sitting on live gameplay. The full text is
+ * still shown in full where the licence asks for it — song select and the results screen. What a
+ * clinic screen needs mid-song is who made it and under what licence.
+ */
+function playCredit(m: SongManifest): string {
+  return `${m.artist} · ${m.license}`;
+}
 
 function LaneMeters({ source, threshold }: { source: InputSource; threshold: number }) {
   const host = useRef<HTMLDivElement>(null);
@@ -61,7 +75,9 @@ export default function PlayScreen() {
   const runnerRef = useRef<GameRunner | null>(null);
 
   const [hud, setHud] = useState<HudSnapshot | null>(null);
-  const [phase, setPhase] = useState<'loading' | 'running' | 'error'>('loading');
+  const [phase, setPhase] = useState<'loading' | 'running' | 'error' | 'blocked'>('loading');
+  /** Lanes the camera input refuses to score — the session is not started at all while this is set. */
+  const [blocked, setBlocked] = useState<InvalidCalibration[]>([]);
   const [progress, setProgress] = useState(0);
   const [loadNote, setLoadNote] = useState('Preparing session');
   const [error, setError] = useState<string | null>(null);
@@ -118,13 +134,27 @@ export default function PlayScreen() {
           return bot;
         };
       } else {
-        source = await runtime.ensureVision({
+        const vision = await runtime.ensureVision({
           mode: config.mode,
           lanes: config.lanes,
           calibrations: st.calibrations,
           difficulty: config.difficulty,
           mirrored: settings.mirrored,
         });
+        if (!alive) return;
+        // A LANE THAT PROVABLY CANNOT SCORE IS A HARD STOP, NOT A WARNING TO READ AFTERWARDS.
+        // VisionInput refuses a range that measures a different quantity (another fingertip) or the
+        // other limb (the other mirror convention), and a refused lane reads 0 and never triggers: the
+        // patient would work through a whole song on a flat lane and meet the verdict as a 0% row on
+        // the results screen. The app knows this BEFORE a note is scheduled, so it says so here — with
+        // the reason and the way back to the screen that can fix it.
+        const refused = vision.getInvalidCalibrations();
+        if (refused.length > 0) {
+          setBlocked(refused);
+          setPhase('blocked');
+          return;
+        }
+        source = vision;
       }
       if (!alive) return;
 
@@ -145,7 +175,7 @@ export default function PlayScreen() {
         thresholdFraction: DIFFICULTIES[config.difficulty].thresholdFraction,
         rearmFraction: DEFAULT_REARM_FRACTION,
         songTitle: songManifest?.title,
-        attribution: songManifest ? attributionText(songManifest) : undefined,
+        attribution: songManifest ? playCredit(songManifest) : undefined,
         highwayOptions: {
           approachSec: settings.scrollSec,
           highContrast: settings.highContrast,
@@ -272,6 +302,38 @@ export default function PlayScreen() {
                 <Meter value={progress} label="loading" />
               </div>
               <p className="muted">Stems are loaded whole so every instrument stays sample-locked to the chart.</p>
+            </div>
+          </div>
+        )}
+
+        {phase === 'blocked' && (
+          <div className="overlay" data-testid="play-blocked">
+            <div className="card stack">
+              <h2>{blocked.length > 1 ? `${blocked.length} lanes are not calibrated` : 'A lane is not calibrated'}</h2>
+              <p className="muted">
+                The session was not started: {blocked.length > 1 ? 'these lanes' : 'this lane'} would score nothing all
+                song, and the patient would have no way to tell.
+              </p>
+              {blocked.map((b) => (
+                <Toast kind="bad" key={b.lane}>
+                  <strong data-testid={`play-blocked-${b.lane}`}>
+                    Lane {b.lane + 1} ({MOVEMENT_INFO[b.movement].label}, {b.side}):
+                  </strong>{' '}
+                  {b.reason}.
+                </Toast>
+              ))}
+              <div className="row">
+                <button
+                  className="btn btn-primary btn-lg grow"
+                  onClick={() => goto('rom')}
+                  data-testid="play-recalibrate"
+                >
+                  Re-calibrate {blocked.length > 1 ? 'these lanes' : 'this lane'} →
+                </button>
+                <button className="btn btn-lg" onClick={() => goto('setup')}>
+                  Back to setup
+                </button>
+              </div>
             </div>
           </div>
         )}

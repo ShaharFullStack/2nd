@@ -152,10 +152,16 @@ describe('the board is the composition, not an element in it', () => {
     }
   });
 
-  it('tapers strongly but never to a pinhole, and dissolves rather than ending on a line', () => {
+  it('tapers clearly but keeps the far half of the run readable', () => {
     const g = makeGeometry(1920, 1080, 4);
-    expect(DEFAULT_GEOMETRY_OPTIONS.farScale).toBeGreaterThanOrEqual(0.15);
-    expect(DEFAULT_GEOMETRY_OPTIONS.farScale).toBeLessThanOrEqual(0.3);
+    // Lower bound: still an unmistakable road. Upper bound: a taper this loose is what keeps the
+    // far half of the runway legible — at 0.22 the stretch from depth 0.5 to the horizon was 13 %
+    // of frame height and the gems in it were 30 px ghosts, so a board carrying eight notes read
+    // as a board carrying three. Tightening this again gives that wedge back.
+    expect(DEFAULT_GEOMETRY_OPTIONS.farScale).toBeGreaterThanOrEqual(0.3);
+    expect(DEFAULT_GEOMETRY_OPTIONS.farScale).toBeLessThanOrEqual(0.45);
+    // Half the read-ahead time must land in the upper half of the run, not in a sliver at the top.
+    expect(yAt(g, 0.5) / 1080).toBeGreaterThanOrEqual(0.28);
     // The dissolve band is a real stretch of board, not a hairline, and it ends well clear of the
     // read-ahead zone.
     expect(FAR_FADE_FRAC).toBeGreaterThanOrEqual(0.1);

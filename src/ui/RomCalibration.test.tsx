@@ -1,0 +1,205 @@
+/**
+ * The ROM calibration screen is where a refused calibration has to become VISIBLE.
+ *
+ * VisionInput vets every range it is handed against the lane's own CalibrationContext (which fingertip
+ * the lane opposes, which mirror convention its frames are in) and refuses one that measures a
+ * different quantity or the other limb. That verdict used to reach nobody: `setCalibration`'s boolean
+ * was discarded here, so the screen painted a green ✓, a min→max readout and an enabled "Next lane →"
+ * over a lane the engine had just killed, and the only trace was console.error. These tests pin the
+ * therapist-facing half: the refusal is on screen, in the therapist's words, ending in the action to
+ * take — and no green tick sits over a dead lane.
+ *
+ * The runtime is mocked (a real one opens an AudioContext and pulls in MediaPipe); the store, the
+ * calibration vetting rules and the screen itself are the real thing.
+ */
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import type { LaneSpec } from '../engine/types.ts';
+import { DEFAULT_SETTINGS, calibrationKey, useStore } from '../state/store.ts';
+import { RomCalibrator, calibrationContext } from '../vision/calibration.ts';
+import type { CalibrationContext, RomCalibration } from '../vision/calibration.ts';
+import type { InvalidCalibration } from '../input/VisionInput.ts';
+
+const LANES: LaneSpec[] = [
+  { index: 0, movement: 'finger_opposition', side: 'right', fingertip: 'pinky' },
+  { index: 1, movement: 'hand_open_close', side: 'right' },
+];
+
+/** The lane contexts the fake VisionInput reports — derived, never hand-built (calibrationContext). */
+const laneCtx = (i: number, mirrored: boolean): CalibrationContext =>
+  calibrationContext(LANES[i].movement, { fingertip: LANES[i].fingertip, mirrored });
+
+/** A finished pinch range stamped with what it measured, exactly as `createCalibrator` would stamp it. */
+function pinchCal(fingertip: 'index' | 'pinky', mirrored: boolean): RomCalibration {
+  return { min: 0.05, max: 0.85, samples: 120, movement: 'finger_opposition', fingertip, mirrored, capturedAt: Date.now() };
+}
+
+/** The mocked runtime: one fake VisionInput whose verdicts each test sets up front. */
+const fake = {
+  /** What `setCalibration` answers — false = refused. */
+  accept: true,
+  /** What `getInvalidCalibrations()` reports (the refusal the screen must poll and show). */
+  refusals: [] as InvalidCalibration[],
+  /** The session's mirror convention, i.e. what the lanes' contexts say. */
+  mirrored: false,
+  setCalibration: vi.fn((lane: number, cal: RomCalibration | null): boolean => {
+    if (fake.accept) return true;
+    fake.refusals = [
+      {
+        lane,
+        movement: LANES[lane].movement,
+        side: LANES[lane].side,
+        reason:
+          'the range measured is 0.01 wide, which is below the minimum for finger opposition — re-calibrate this lane',
+      },
+    ];
+    void cal;
+    return false;
+  }),
+};
+
+const vision = {
+  createCalibrator: (i: number) => new RomCalibrator(LANES[i].movement, { ...laneCtx(i, fake.mirrored) }),
+  getCalibrationContext: (i: number) => laneCtx(i, fake.mirrored),
+  getPipeline: () => null,
+  onFrame: () => () => {},
+  getInvalidCalibrations: () => fake.refusals,
+  /** CameraPreview asks for this; there is no camera in jsdom. */
+  getVideoElement: () => null,
+  setCalibration: (lane: number, cal: RomCalibration | null) => fake.setCalibration(lane, cal),
+};
+
+vi.mock('../session/runtime.ts', () => ({ runtime: { peekVision: () => vision } }));
+
+const { default: RomCalibrationScreen } = await import('./RomCalibration.tsx');
+
+beforeEach(() => {
+  fake.accept = true;
+  fake.refusals = [];
+  fake.mirrored = false;
+  fake.setCalibration.mockClear();
+  localStorage.clear();
+  useStore.setState({
+    screen: 'rom',
+    mode: 'hand',
+    lanes: LANES,
+    calibrations: [null, null],
+    savedCalibrations: {},
+    difficulty: 'medium',
+    windowScale: 1,
+    inputMode: 'camera',
+    persistenceFailed: false,
+    settings: { ...DEFAULT_SETTINGS },
+  });
+});
+
+afterEach(cleanup);
+
+/** Put a range in the store's saved map, the way a previous session left it there. */
+function saveRange(cal: RomCalibration): void {
+  useStore.setState({ savedCalibrations: { [calibrationKey(LANES[0])]: cal } });
+}
+
+describe('a saved range is only offered when it describes what this lane measures now', () => {
+  it('offers it when the context matches, and the accepted range shows as done', async () => {
+    fake.mirrored = true;
+    saveRange(pinchCal('pinky', true));
+    render(<RomCalibrationScreen />);
+
+    const reuse = (await screen.findByTestId('rom-reuse')) as HTMLButtonElement;
+    expect(reuse.disabled).toBe(false);
+    expect(screen.queryByTestId('rom-reuse-problem')).toBeNull();
+
+    fireEvent.click(reuse);
+
+    expect(fake.setCalibration).toHaveBeenCalledWith(0, expect.objectContaining({ fingertip: 'pinky', mirrored: true }));
+    await waitFor(() => expect(screen.getByTestId('rom-lane-badge-0').textContent).toBe('✓'));
+    expect((screen.getByTestId('rom-next') as HTMLButtonElement).disabled).toBe(false);
+    // Only an ACCEPTED range reaches the store, so next week's session is offered a range that works.
+    expect(useStore.getState().calibrations[0]).not.toBeNull();
+  });
+
+  it('refuses to offer a range measured under the other mirror convention, and says what to do', async () => {
+    // The store's key is movement:side:fingertip — it does NOT carry the mirror convention, and the
+    // convention selects WHICH LIMB the lane reads. This is the one live path that can hand a lane a
+    // genuinely inapplicable saved range, so the screen has to catch it before the runtime does.
+    fake.mirrored = true;
+    saveRange(pinchCal('pinky', false));
+    render(<RomCalibrationScreen />);
+
+    const problem = await screen.findByTestId('rom-reuse-problem');
+    const toast = problem.closest('.toast') as HTMLElement;
+    expect(toast.className).toContain('toast-bad');
+    expect(toast.textContent).toMatch(/other limb/i);
+    // Therapist-facing, and it ENDS in the action to take.
+    expect(toast.textContent).toMatch(/Re-calibrate this lane, or set the mirror option back/i);
+
+    expect((screen.getByTestId('rom-reuse') as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByTestId('rom-reuse'));
+    expect(fake.setCalibration).not.toHaveBeenCalled();
+    expect(screen.getByTestId('rom-lane-badge-0').textContent).toBe('●');
+    expect((screen.getByTestId('rom-next') as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('refuses to offer a range measured on another fingertip', async () => {
+    fake.mirrored = false;
+    // Filed under this lane's key but stamped with the other tip (a migrated or hand-edited blob).
+    saveRange(pinchCal('index', false));
+    render(<RomCalibrationScreen />);
+
+    const problem = await screen.findByTestId('rom-reuse-problem');
+    expect((problem.closest('.toast') as HTMLElement).textContent).toMatch(
+      /measured opposing the index finger.*re-calibrate this lane on the pinky finger/i,
+    );
+  });
+});
+
+describe('a refused hand-over is visible on the screen that can fix it', () => {
+  it('shows the runtime\'s reason, keeps the lane not-done and never writes the range to the store', async () => {
+    fake.mirrored = true;
+    fake.accept = false;
+    saveRange(pinchCal('pinky', true));
+    render(<RomCalibrationScreen />);
+
+    fireEvent.click(await screen.findByTestId('rom-reuse'));
+
+    const rejected = await screen.findByTestId('rom-rejected');
+    const toast = rejected.closest('.toast') as HTMLElement;
+    expect(toast.className).toContain('toast-bad');
+    expect(toast.textContent).toMatch(/below the minimum for finger opposition — re-calibrate this lane/i);
+
+    // The three states that used to proceed as if the range had been accepted.
+    expect(screen.getByTestId('rom-lane-badge-0').textContent).toBe('✕');
+    expect((screen.getByTestId('rom-next') as HTMLButtonElement).disabled).toBe(true);
+    expect(useStore.getState().calibrations[0]).toBeNull();
+    expect(screen.queryByText(/0\.05→0\.85/)).toBeNull();
+  });
+
+  it('polls the runtime, so a lane refused elsewhere (a flipped mirror switch) surfaces here too', async () => {
+    fake.refusals = [
+      {
+        lane: 1,
+        movement: 'hand_open_close',
+        side: 'right',
+        reason:
+          'it was measured on a raw (un-mirrored) camera image and this session runs on a mirrored (selfie-flipped) camera image — ' +
+          'the two conventions swap which side the landmarks belong to, so this range describes the OTHER limb. ' +
+          'Re-calibrate this lane, or set the mirror option back to the one it was measured with',
+      },
+    ];
+    render(<RomCalibrationScreen />);
+
+    const refusal = await screen.findByTestId('rom-refusal-1');
+    expect(refusal.textContent).toMatch(/Lane 2 \(.*\) will not score/i);
+    expect((refusal.closest('.toast') as HTMLElement).textContent).toMatch(/Re-calibrate this lane/i);
+    await waitFor(() => expect(screen.getByTestId('rom-lane-badge-1').textContent).toBe('✕'));
+  });
+});
+
+describe('storage that is not storing is said out loud', () => {
+  it('warns the therapist when the tablet refused to persist a calibration', async () => {
+    useStore.setState({ persistenceFailed: true });
+    render(<RomCalibrationScreen />);
+    expect(await screen.findByText(/not saving calibrations/i)).toBeTruthy();
+  });
+});

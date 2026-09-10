@@ -77,9 +77,9 @@ export default function Home() {
             <input
               id="scroll"
               type="range"
-              min={0.9}
-              max={2.6}
-              step={0.1}
+              min={2}
+              max={6}
+              step={0.2}
               value={settings.scrollSec}
               onChange={(e) => updateSettings({ scrollSec: Number(e.target.value) })}
             />

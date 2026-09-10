@@ -106,8 +106,10 @@ async function main() {
     await page.waitForTimeout(700);
     await shoot('intro');
 
-    // stream: let the bot build a few seconds of traffic, then catch a plain approach frame.
-    await page.waitForTimeout(4000);
+    // stream: a plain approach frame — but taken deep enough into the song that the HUD is showing
+    // what it is for. At +4 s the bot is still at combo 7 / x1 / 3-digit score, i.e. the game in its
+    // least interesting state, which is exactly what the last blind round called out.
+    await page.waitForTimeout(9000);
     await shoot('stream');
 
     // combo: the autoplay bot only climbs, so a few more seconds gives a high multiplier.

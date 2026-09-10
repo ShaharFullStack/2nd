@@ -49,7 +49,7 @@ export interface GeometryOptions {
 
 /**
  * Depth over which the below-line scroll speed eases from the approach speed into the slower tail
- * (see module docs). ~0.11 s at the default 3.6 s approach: long enough that the deceleration is
+ * (see module docs). ~0.12 s at the default 4 s approach: long enough that the deceleration is
  * not a visible step, short enough that the tail is still nearly its full length. It is expressed
  * in *depth*, so it shrank when `approachSec` grew — the eased stretch is a duration, not a
  * fraction of the road.
@@ -91,29 +91,43 @@ export interface HighwayGeometry {
 /**
  * Board proportions. These are the composition, not a detail: a shipped note highway *is* the
  * frame. The far end sits just under the top edge and dissolves into the backdrop (`FAR_FADE_FRAC`)
- * instead of ending on a hard horizontal cut, the strike line sits low with ~18 % of the canvas
- * left below it for receptor hardware and hit bloom, and the board is two thirds of the canvas
- * wide at the line. Together that is ~71 % of canvas height of note travel (it was 43 %) and
- * `approachSec` seconds of read-ahead in view at once.
+ * instead of ending on a hard horizontal cut, the strike line sits low with ~20 % of the canvas
+ * left below it for receptor hardware and hit bloom, and the board is ~74 % of the canvas wide at
+ * the line. Together that is ~68 % of canvas height of note travel and `approachSec` seconds of
+ * read-ahead in view at once.
+ *
+ * `farScale` is the number this board lives or dies by, and it is deliberately *loose*. At the old
+ * 0.22 the road's far half was crushed into 13 % of frame height: a 4 s runway genuinely carried
+ * eight gems, but four of them were 30 px wide ghosts stacked in a wedge nobody could read, so the
+ * board looked empty while doing the most work. At 0.38 the same eight gems are spread over the
+ * whole run — depth 0.5 lands at 32 % of frame height instead of 24 %, and the furthest gem is
+ * 1.7x the diameter it was. The trapezoid also stops being a dart: its far edge is 28 % of frame
+ * width, which is what turns the two dead gutters into a stage.
  *
  * `farScale` and `approachSec` are tied: screen speed at the strike line is
- * `(strikeY - horizonY) / (farScale * approachSec)` canvas-heights per second. Lengthening the
- * board without loosening the taper or slowing the scroll would fling gems past the receptor.
+ * `(strikeY - vpY)·k / approachSec` px per second, and k = 1/farScale - 1. Loosening the taper
+ * therefore *halves* the near-line speed at a fixed `approachSec` (968 → 483 px/s at 1080p) — which
+ * is the other half of the win, not a cost: the old board barely moved for two seconds and then
+ * accelerated 4x through the judgment window, and a gem is hardest to read exactly where it is
+ * fastest. Average speed over the runway is nearly unchanged (213 → 184 px/s).
  *
- * `approachSec` is longer than a guitar game's (3.6 s, ~2 bars at 120 BPM) for a reason specific to
+ * `approachSec` is longer than a guitar game's (4 s, ~2 bars at 120 BPM) for a reason specific to
  * this product: a rehab chart's density is bounded by the patient, not by the chart generator —
- * every note is a rep, with a return-to-rest gap after it, which caps a 4-lane medium session at
- * roughly one note per second. The only way to put a shipped game's 5-8 gems on the board at once
- * is a longer runway, and a longer runway is separately right here (camera-to-judgment latency is
- * 80-200 ms and a knee lift takes time to initiate).
+ * every note is a rep with a return-to-rest gap after it. Medium is one note per beat, so 4 s of
+ * runway is ~8 gems on the board at 120 BPM, and a longer runway is separately right here
+ * (camera-to-judgment latency is 80-200 ms and a knee lift takes time to initiate).
+ *
+ * `pastLineSpeed` is high enough (0.3) that a gem which was *not* hit clears the receptor ring in
+ * well under a second. At 0.12 — tuned against the old, 2x faster approach — a gem sat blended into
+ * the same-coloured ring for over a second, which reads as a note that failed to despawn.
  */
 export const DEFAULT_GEOMETRY_OPTIONS: GeometryOptions = {
-  approachSec: 3.6,
-  horizonY: 0.11,
-  strikeY: 0.82,
-  farScale: 0.22,
-  roadWidth: 0.64,
-  pastLineSpeed: 0.12,
+  approachSec: 4,
+  horizonY: 0.12,
+  strikeY: 0.8,
+  farScale: 0.38,
+  roadWidth: 0.74,
+  pastLineSpeed: 0.3,
 };
 
 /**
@@ -139,8 +153,13 @@ export const GEM_ASPECT = 0.72;
  * of the board's width at the strike line, which is where shipped fret hardware sits.
  */
 export const GEM_LANE_FRACTION = 0.37;
-/** Hard cap on gem radius as a fraction of canvas height (only binds on very wide aspect ratios). */
-export const GEM_HEIGHT_CAP = 0.12;
+/**
+ * Hard cap on gem radius as a fraction of canvas height (only binds on wide/short canvases and on
+ * low lane counts, where a lane is very wide). 0.14 rather than 0.12 because the wider board made
+ * lanes wider everywhere: at 1280x720 with two lanes the cap, not `GEM_LANE_FRACTION`, was setting
+ * the gem size, and a gem that fills 64 % of its lane instead of 74 % stops reading as a fret.
+ */
+export const GEM_HEIGHT_CAP = 0.14;
 /** Receptor ring radius relative to the gem radius (ring sits just outside the gem). */
 export const RECEPTOR_GEM_RATIO = 1.12;
 /** Road width is also capped relative to height so ultrawide canvases don't get a flat, empty road. */

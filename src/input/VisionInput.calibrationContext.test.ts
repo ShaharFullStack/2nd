@@ -13,7 +13,7 @@
  * the hand-over passed no context at all, so a therapist-chosen fingertip made it refuse the range that
  * was measured correctly and accept one measured on a different finger, both silently.
  */
-import { describe, expect, it, beforeEach } from 'vitest';
+import { describe, expect, it, beforeEach, vi } from 'vitest';
 import type { LaneSpec } from '../engine/types.ts';
 import { VisionInput } from './VisionInput.ts';
 import type { LaneInputEvent } from './types.ts';
@@ -286,9 +286,13 @@ describe('a calibration saved by the store survives localStorage and is re-vette
   });
 
   it('REFUSES it, actionably, when the later session configured the lane differently', () => {
-    // The saved-calibration key is `movement:side`, so it does NOT distinguish the fingertip or the
-    // mirror setting: the same key is offered back to a lane that measures something else. That offer is
-    // caught HERE, at the boundary, instead of silently normalizing one quantity by another's range.
+    // The saved-calibration key (`calibrationKey`, src/state/store.ts) is `movement:side[:fingertip]`,
+    // so it DOES separate the two fingertips but NOT the mirror convention — and the convention selects
+    // which LIMB every lane reads. The mirror half below is therefore the live real-world path: a range
+    // saved un-mirrored is offered straight back to a lane playing mirrored. The fingertip half is a
+    // boundary test of a state the store cannot reach on its own (a migrated / hand-edited blob, which
+    // `validateCalibrations` now also drops on load) — kept because the boundary must hold either way.
+    // Both are caught HERE instead of silently normalizing one quantity by another's range.
     useStore.getState().setCalibration(0, pinchCal('pinky', true));
     const reloaded = reloadSaved()[calibrationKey(laneSpec)];
 
@@ -308,5 +312,42 @@ describe('a calibration saved by the store survives localStorage and is re-vette
     const input = makeVision({ calibrations: [reloaded], featureOptions: [{ fingertip: 'pinky' }], mirrored: true });
     expect(input.getInvalidCalibrations()).toEqual([]);
     expect(input.getLaneDebug()[0].calibration?.max).toBeCloseTo(reloaded.max, 10);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * 6. Boot: a saved blob whose STAMP disagrees with its KEY
+ * ------------------------------------------------------------------ */
+
+describe('the store drops a saved range that is filed under a key it does not describe', () => {
+  /** Re-import the store with localStorage already seeded, i.e. the way a later session boots. */
+  async function bootWith(saved: Record<string, unknown>): Promise<Record<string, RomCalibration>> {
+    localStorage.setItem(`${STORAGE_PREFIX}calibrations`, JSON.stringify(saved));
+    vi.resetModules();
+    const fresh = await import('../state/store.ts');
+    return fresh.useStore.getState().savedCalibrations;
+  }
+
+  it('keeps a blob whose movement and fingertip agree with its key', async () => {
+    const saved = await bootWith({ 'finger_opposition:right:pinky': pinchCal('pinky', true) });
+    expect(saved['finger_opposition:right:pinky']?.fingertip).toBe('pinky');
+  });
+
+  it('drops one stamped with another movement, so it is never OFFERED as this lane\'s last range', async () => {
+    // Degrees would be normalizing a frame-height ratio. VisionInput refuses it at the boundary either
+    // way (that is where the authority lives), but a provably mis-filed range must not reach the
+    // therapist as "Reuse last session's range" in the first place.
+    const saved = await bootWith({ 'seated_march:left': { ...marchCal(false), movement: 'knee_extension' } });
+    expect(saved['seated_march:left']).toBeUndefined();
+  });
+
+  it('drops one stamped with another fingertip than the key it sits under', async () => {
+    const saved = await bootWith({ 'finger_opposition:right:pinky': pinchCal('index', false) });
+    expect(saved['finger_opposition:right:pinky']).toBeUndefined();
+  });
+
+  it('keeps a legacy blob that carries no stamp at all (it can only be warned about, not refused)', async () => {
+    const saved = await bootWith({ 'seated_march:left': { min: 0.1, max: 0.5, samples: 60 } });
+    expect(saved['seated_march:left']?.max).toBe(0.5);
   });
 });

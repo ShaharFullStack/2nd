@@ -11,3 +11,5 @@ public/songs/*/stems/*.flac
 test-results
 playwright-report
 critic/screenshots/*.png
+critic/_tmp_*
+critic/scratch/

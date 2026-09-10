@@ -115,6 +115,7 @@ import {
   movementLabel,
   multiplierTier,
   withAlpha,
+  type LaneColor,
   type LanePalette,
 } from './palette';
 import { PARTICLE_RING, PARTICLE_SMOKE, PARTICLE_SPARK, PARTICLE_STREAK, ParticlePool, emitHitBurst, makeRng } from './particles';
@@ -168,16 +169,30 @@ const MAX_LANES = 8;
 const POPUP_SLOTS = 4;
 /** Judgment popup lifetime (s). Short: it is redundant feedback sitting in the approach path. */
 const POPUP_SEC = 0.5;
+
+/** Song seconds the title / attribution block stays at full strength before it fades out. */
+const META_HOLD_SEC = 7;
+/** Seconds the title / attribution block takes to fade out once `META_HOLD_SEC` has passed. */
+const META_FADE_SEC = 1.6;
 /** Popup anchor above the strike line, in receptor radii — clear of the receptor ring's top. */
 const POPUP_BASE_R = 1.0;
 /** How far a popup (anchor + rise) may sit above the strike line, as a fraction of horizon→strike. */
-export const POPUP_MAX_RISE_FRAC = 0.34;
+export const POPUP_MAX_RISE_FRAC = 0.26;
 /** Popup float distance over its life, in receptor radii (a third of that under reduced motion). */
 const POPUP_RISE_R = 0.35;
 /** How far up the board a lane flash reaches, as a fraction of the strike→horizon span. */
 const LANE_FLASH_REACH = 0.5;
 /** Half-height of the strike line glow band, in UI units. */
 const STRIKE_BAND_H = 16;
+
+/**
+ * Gem opacity once it has materialised at the far end of the board (see `drawNotes`). A gem is
+ * information — the patient is reading the chart from it — so it holds near full opacity for the
+ * whole runway, while the road surface under it still dissolves into the backdrop.
+ */
+const GEM_FAR_ALPHA = 0.85;
+/** Fraction of the board's dissolve band over which a gem ramps up from nothing to `GEM_FAR_ALPHA`. */
+const GEM_FADE_IN_FRAC = 0.35;
 /** Beat-ladder subdivision: 2 = an eighth-note hairline between every pair of beat lines. */
 const BEAT_SUBDIVISIONS = 2;
 /** Ladder stroke passes, faintest first so heavier rungs land on top. */
@@ -197,6 +212,11 @@ const MISS_COLOR_INDEX = 251;
 const BEAM_SPRITE_W = 128;
 const BEAM_SPRITE_H = 256;
 const BEAM_HEX = ['#aab4ff', '#6eff8c', '#78aaff', '#ffd65a'];
+
+/** Where the front row of the crowd stands, as a fraction of canvas height. */
+const CROWD_BASE_FRAC = 0.78;
+/** Height of the crowd band (head-and-shoulders of both ranks), as a fraction of canvas height. */
+const CROWD_H_FRAC = 0.2;
 // Static gradient-cache keys (avoid building strings on the hot path).
 const BAND_KEYS = ['band1', 'band2', 'band3', 'band4'];
 const BADGE_KEYS = ['badge1', 'badge2', 'badge3', 'badge4'];
@@ -303,10 +323,13 @@ export class Highway {
   private readonly particles: ParticlePool;
   private readonly rng = makeRng(0xbeef);
 
-  // Static background layer (gradient) and star tiles for parallax.
+  // Static backdrop (arena: gradient, haze, stage glow, truss, PA stacks) + the crowd silhouette
+  // band, which is a separate layer because it bobs on the beat.
   private bgLayer: CanvasLike | null = null;
-  private starFar: CanvasLike | null = null;
-  private starNear: CanvasLike | null = null;
+  private crowdLayer: CanvasLike | null = null;
+
+  /** Locked-lane ring colours, memoized by the live lane colour's base hex (see `lockedColor`). */
+  private lockedColors = new Map<string, LaneColor>();
 
   // Cached CanvasGradient objects (static per geometry / palette); alpha is applied via globalAlpha.
   private grads = new Map<string, CanvasGradient>();
@@ -566,6 +589,21 @@ export class Highway {
     this.grads.clear();
   }
 
+  /**
+   * Bake the backdrop.
+   *
+   * What is off the road matters as much as what is on it. This used to be a blue gradient with two
+   * parallax starfields and three light cones: ~35 % of the frame, static, saying nothing — the
+   * single most common tell of an unfinished rhythm-game frame, and the thing three blind critics
+   * named independently. It is now a venue seen from the player's seat: a lit back wall, a lighting
+   * truss across the top the beams actually hang from, a PA stack in each outer corner (exactly
+   * where the road's taper leaves the most empty pixels) and a crowd silhouette line in front of
+   * the glow.
+   *
+   * Every value here is deliberately low: the brightest thing in the venue is dimmer than the
+   * dimmest thing on the road. A patient with low vision reads the board, and the room is texture
+   * that must never compete with a gem, a receptor ring or a lane label for attention.
+   */
   private buildBackground(): void {
     const W = this.width;
     const H = this.height;
@@ -586,31 +624,162 @@ export class Highway {
       haze.addColorStop(1, 'rgba(0,0,0,0)');
       bctx.fillStyle = haze;
       bctx.fillRect(0, 0, W, H);
+      // Stage wash behind the crowd line: a wide, very dim ellipse of warm light that gives the
+      // silhouettes something to be silhouettes *against*.
+      const wash = bctx.createRadialGradient(W / 2, CROWD_BASE_FRAC * H, 0, W / 2, CROWD_BASE_FRAC * H, W * 0.62);
+      wash.addColorStop(0, 'rgba(104,126,224,0.30)');
+      wash.addColorStop(0.55, 'rgba(64,78,160,0.11)');
+      wash.addColorStop(1, 'rgba(0,0,0,0)');
+      bctx.fillStyle = wash;
+      bctx.fillRect(0, H * 0.25, W, H * 0.75);
+      // Floor / pit: the crowd band ends at `CROWD_BASE_FRAC`, and without this the silhouette mass
+      // stopped on a hard horizontal line across the gutters. Below the front row the room is dark.
+      const floor = bctx.createLinearGradient(0, (CROWD_BASE_FRAC - 0.04) * H, 0, H);
+      floor.addColorStop(0, 'rgba(3,4,9,0)');
+      floor.addColorStop(0.3, 'rgba(3,4,9,0.8)');
+      floor.addColorStop(1, 'rgba(2,3,7,0.95)');
+      bctx.fillStyle = floor;
+      bctx.fillRect(0, (CROWD_BASE_FRAC - 0.04) * H, W, H * (1.04 - CROWD_BASE_FRAC));
+      this.drawTruss(bctx, W, H);
+      this.drawStacks(bctx, W, H);
       this.bgLayer = bg;
     } else {
       this.bgLayer = null;
     }
-    this.starFar = this.makeStarTile(W, H * 0.5, 90, 1.1, 0.55, 11);
-    this.starNear = this.makeStarTile(W, H * 0.5, 40, 1.9, 0.85, 23);
+    this.crowdLayer = this.makeCrowdTile(W, H * CROWD_H_FRAC);
   }
 
-  private makeStarTile(w: number, h: number, count: number, size: number, alpha: number, seed: number): CanvasLike | null {
-    const tile = this.factory(w * this.dpr, h * this.dpr);
+  /** Lighting truss across the top of the frame, with the cans the stage beams hang from. */
+  private drawTruss(ctx: Ctx2D, W: number, H: number): void {
+    const top = H * 0.012;
+    const h = H * 0.052;
+    ctx.strokeStyle = 'rgba(150,168,215,0.20)';
+    ctx.lineWidth = Math.max(1, 2 * this.u);
+    ctx.beginPath();
+    ctx.moveTo(0, top);
+    ctx.lineTo(W, top);
+    ctx.moveTo(0, top + h);
+    ctx.lineTo(W, top + h);
+    ctx.stroke();
+    // Lattice.
+    ctx.strokeStyle = 'rgba(150,168,215,0.11)';
+    ctx.lineWidth = Math.max(1, 1.4 * this.u);
+    ctx.beginPath();
+    const step = h * 1.15;
+    for (let x = -h; x < W + h; x += step) {
+      ctx.moveTo(x, top + h);
+      ctx.lineTo(x + step * 0.5, top);
+      ctx.moveTo(x + step * 0.5, top);
+      ctx.lineTo(x + step, top + h);
+    }
+    ctx.stroke();
+    // Hanging cans, aligned with the beam origins in drawBackground.
+    const cans = 6;
+    for (let i = 0; i < cans; i++) {
+      const x = (W * (i + 0.5)) / cans;
+      ctx.fillStyle = 'rgba(120,136,180,0.22)';
+      ctx.fillRect(x - h * 0.16, top + h, h * 0.32, h * 0.42);
+      ctx.fillStyle = 'rgba(200,220,255,0.14)';
+      ctx.beginPath();
+      ctx.ellipse(x, top + h * 1.42, h * 0.2, h * 0.09, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  /** PA stacks in the two outer corners — the emptiest pixels in the frame once the road tapers. */
+  private drawStacks(ctx: Ctx2D, W: number, H: number): void {
+    const w = Math.min(W * 0.105, H * 0.19);
+    const top = H * 0.42;
+    const bottom = H * 0.99;
+    for (let side = 0; side < 2; side++) {
+      const x = side === 0 ? W * 0.012 : W - W * 0.012 - w;
+      const inner = side === 0 ? x + w : x; // edge facing the road, catches the rim light
+      const boxes = 4;
+      const bh = (bottom - top) / boxes;
+      for (let i = 0; i < boxes; i++) {
+        const y = top + i * bh;
+        const face = ctx.createLinearGradient(x, y, x + w, y);
+        face.addColorStop(0, side === 0 ? 'rgba(8,10,18,0.98)' : 'rgba(26,32,52,0.98)');
+        face.addColorStop(1, side === 0 ? 'rgba(26,32,52,0.98)' : 'rgba(8,10,18,0.98)');
+        ctx.fillStyle = face;
+        ctx.fillRect(x, y, w, bh - 2 * this.u);
+        // Lit top edge — the cabinets are under the truss, so the light comes from above.
+        ctx.fillStyle = 'rgba(150,172,230,0.20)';
+        ctx.fillRect(x, y, w, Math.max(1, 2 * this.u));
+        ctx.strokeStyle = 'rgba(120,140,200,0.16)';
+        ctx.lineWidth = Math.max(1, 1.2 * this.u);
+        ctx.strokeRect(x + 0.5, y + 0.5, w, bh - 2 * this.u);
+        // Driver.
+        ctx.fillStyle = 'rgba(0,0,0,0.55)';
+        ctx.beginPath();
+        ctx.ellipse(x + w / 2, y + bh * 0.45, w * 0.3, bh * 0.26, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(130,150,210,0.20)';
+        ctx.beginPath();
+        ctx.ellipse(x + w / 2, y + bh * 0.45, w * 0.3, bh * 0.26, 0, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+      // Rim light down the road-facing edge.
+      ctx.strokeStyle = 'rgba(150,180,255,0.16)';
+      ctx.lineWidth = Math.max(1, 2 * this.u);
+      ctx.beginPath();
+      ctx.moveTo(inner, top);
+      ctx.lineTo(inner, bottom);
+      ctx.stroke();
+    }
+  }
+
+  /**
+   * The crowd: one baked band of overlapping head-and-shoulders silhouettes, darker than the wash
+   * behind them, with a thin cool rim on top (stage light from behind). Drawn per frame with a
+   * beat-driven bob, which is the whole animation — a crowd that slides sideways reads as a
+   * parallax layer, a crowd that lifts on the beat reads as a crowd.
+   */
+  private makeCrowdTile(w: number, h: number): CanvasLike | null {
+    const tile = this.factory(Math.max(1, w * this.dpr), Math.max(1, h * this.dpr));
     const ctx = tile.getContext('2d');
     if (!ctx) return null;
     ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
-    const rng = makeRng(seed);
-    for (let i = 0; i < count; i++) {
-      const x = rng() * w;
-      const y = rng() * h;
-      const r = size * (0.4 + rng() * 0.8) * this.u;
-      const a = alpha * (0.4 + rng() * 0.6);
-      const g = ctx.createRadialGradient(x, y, 0, x, y, r * 2.5);
-      g.addColorStop(0, `rgba(255,255,255,${a.toFixed(2)})`);
-      g.addColorStop(0.4, `rgba(200,215,255,${(a * 0.35).toFixed(2)})`);
-      g.addColorStop(1, 'rgba(200,215,255,0)');
-      ctx.fillStyle = g;
-      ctx.fillRect(x - r * 2.5, y - r * 2.5, r * 5, r * 5);
+    const rng = makeRng(1972);
+    // Two ranks: the back one smaller, dimmer and higher up, the front one bigger and blacker.
+    for (const rank of [0, 1]) {
+      const headR = h * (rank === 0 ? 0.1 : 0.15);
+      const baseY = h * (rank === 0 ? 0.62 : 1.0);
+      const count = Math.max(6, Math.round(w / (headR * (rank === 0 ? 2.1 : 2.8))));
+      ctx.fillStyle = rank === 0 ? 'rgba(6,8,16,0.72)' : 'rgba(3,4,9,0.94)';
+      for (let i = 0; i < count; i++) {
+        const x = ((i + 0.5) / count) * w + (rng() - 0.5) * headR * 1.5;
+        const r = headR * (0.78 + rng() * 0.5);
+        const y = baseY - r * (1.7 + rng() * 0.5);
+        ctx.beginPath();
+        ctx.ellipse(x, y, r, r * 1.08, 0, 0, Math.PI * 2);
+        ctx.fill();
+        // Shoulders.
+        ctx.beginPath();
+        ctx.ellipse(x, y + r * 2.5, r * 2.0, r * 2.1, 0, 0, Math.PI * 2);
+        ctx.fill();
+        // A few raised arms.
+        if (rank === 1 && rng() < 0.22) {
+          const ax = x + (rng() < 0.5 ? -1 : 1) * r * 1.1;
+          ctx.save();
+          ctx.lineCap = 'round';
+          ctx.strokeStyle = 'rgba(3,4,9,0.94)';
+          ctx.lineWidth = r * 0.44;
+          ctx.beginPath();
+          ctx.moveTo(ax, y + r * 1.9);
+          ctx.lineTo(ax + (rng() - 0.5) * r, y - r * 1.6);
+          ctx.stroke();
+          ctx.restore();
+        }
+      }
+      // Cool rim along the top of the rank.
+      ctx.globalCompositeOperation = 'source-atop';
+      const rim = ctx.createLinearGradient(0, baseY - headR * 3.2, 0, baseY - headR * 1.2);
+      rim.addColorStop(0, 'rgba(150,180,255,0.26)');
+      rim.addColorStop(1, 'rgba(150,180,255,0)');
+      ctx.fillStyle = rim;
+      ctx.fillRect(0, 0, w, h);
+      ctx.globalCompositeOperation = 'source-over';
     }
     return tile;
   }
@@ -667,13 +836,17 @@ export class Highway {
     this.drawLaneFlashes(ctx, st);
     this.drawStrikeLine(ctx, frame, beatPulse);
     this.drawReceptors(ctx, frame, dt, beatPulse);
-    // Popups go *under* the gems on purpose: judgment text is redundant feedback (the lane flash,
-    // the burst and the combo all say the same thing), the next target is not. Drawing them here
-    // means a popup can never hide an oncoming note even if it overlaps one.
-    this.drawPopups(ctx, st);
     this.stats.notesDrawn = this.drawNotes(ctx, frame);
     this.particles.update(dt);
     this.drawParticles(ctx);
+    // Popups go LAST, over the burst they belong to. They used to be drawn under the gems and under
+    // the particle layer, on the theory that judgment text is redundant feedback and the next target
+    // is not — but the burst is emitted at the same point the word is anchored to, so in practice
+    // every PERFECT! was struck through by its own spark streaks and read as a rendering bug. A
+    // judgment word that cannot be read is not redundant feedback, it is noise. The rise cap
+    // (`POPUP_MAX_RISE_FRAC`) keeps it in the receptor's own band rather than up the approach path,
+    // and it is gone in half a second.
+    this.drawPopups(ctx, st);
     this.drawHud(ctx, frame, dt, beatPulse);
     this.drawCombo(ctx, frame, st);
     if (this.opts.showLabels) this.drawLabels(ctx, frame);
@@ -716,22 +889,15 @@ export class Highway {
     }
     const eff = this.eff;
     const still = this.opts.reducedMotion;
-    const intensity = (0.55 + (mult - 1) * 0.15 + energy * 0.5) * eff;
-    // Parallax star layers (wrap horizontally). Positive modulo: songTime is negative in a count-in.
-    // Reduced motion freezes the scroll (the layers still light the stage, they just stop moving).
     const t = this.stNow;
-    if (intensity > 0.01) {
-      ctx.globalCompositeOperation = 'lighter';
-      this.drawStarLayer(ctx, this.starFar, still ? 0 : (((t * 6) % W) + W) % W, 0.35 * intensity);
-      this.drawStarLayer(ctx, this.starNear, still ? 0 : (((t * 14) % W) + W) % W, 0.5 * intensity);
-    }
 
-    // Stage light cones from the top edge, slowly sweeping: soft pre-rendered sprites rotated
-    // about their apex (no per-frame gradients, no hard edges).
+    // Stage light cones, hung from the truss and slowly sweeping: soft pre-rendered sprites rotated
+    // about their apex (no per-frame gradients, no hard edges). They are drawn *behind* the crowd,
+    // so the silhouettes cut into them the way a real house rig looks from the floor.
     const tierIdx = clamp(Math.floor(mult) - 1, 0, 3);
     const beamSprite = eff > 0.02 ? this.sprites.beam(BEAM_HEX[tierIdx], BEAM_SPRITE_W, BEAM_SPRITE_H) : null;
     if (beamSprite) {
-      const beams = mult >= 3 ? 4 : 3;
+      const beams = mult >= 3 ? 6 : 3;
       const baseAlpha = clamp((0.16 + (mult - 1) * 0.05 + energy * 0.22) * (0.75 + beatPulse * 0.45) * eff, 0, 0.7);
       const len = H * 0.95;
       const wide = W * 0.22 * (1 + energy * 0.5);
@@ -741,7 +907,7 @@ export class Highway {
         const sweep = still ? 0 : Math.sin(t * 0.5 + i * 1.7) * 0.42;
         const angle = sweep - ((ox - W / 2) / W) * 0.5;
         ctx.save();
-        ctx.translate(ox, -H * 0.02);
+        ctx.translate(ox, H * 0.062);
         ctx.rotate(angle);
         ctx.globalAlpha = baseAlpha;
         ctx.drawImage(beamSprite.canvas as unknown as CanvasImageSource, -wide / 2, 0, wide, len);
@@ -750,6 +916,7 @@ export class Highway {
       ctx.globalAlpha = 1;
     }
     ctx.globalCompositeOperation = 'source-over';
+
 
     // Side panels: dark slabs filling the space outside the road, with a beat-pulsing glow band
     // hugging each road edge.
@@ -760,11 +927,14 @@ export class Highway {
     const glowA = (0.1 + beatPulse * 0.18 + energy * 0.12) * eff;
     const tier = multiplierTier(mult);
     const bandW = 26 * this.u;
+    // Scrim, not a slab. It used to run to 0.92 alpha, which was correct when the only thing behind
+    // it was a starfield and wrong now that there is a room back there: at 0.55 the road still wins
+    // the contrast fight (its own asphalt is opaque) and the venue survives.
     const panelGrad = this.grad('panel', () => {
       const lp = ctx.createLinearGradient(0, panelTop, 0, H);
       lp.addColorStop(0, withAlpha(UI_COLORS.panel, 0));
-      lp.addColorStop(0.35, withAlpha(UI_COLORS.panel, 0.7));
-      lp.addColorStop(1, withAlpha(UI_COLORS.panel, 0.92));
+      lp.addColorStop(0.35, withAlpha(UI_COLORS.panel, 0.38));
+      lp.addColorStop(1, withAlpha(UI_COLORS.panel, 0.55));
       return lp;
     });
     const bandGrad = this.grad(BAND_KEYS[tierIdx], () => {
@@ -802,18 +972,21 @@ export class Highway {
       ctx.globalAlpha = 1;
       ctx.globalCompositeOperation = 'source-over';
     }
-  }
 
-  private drawStarLayer(ctx: Ctx2D, tile: CanvasLike | null, offset: number, alpha: number): void {
-    if (!tile) return;
-    const W = this.width;
-    const h = this.height * 0.5;
-    ctx.globalAlpha = clamp(alpha, 0, 1);
-    const img = tile as unknown as CanvasImageSource;
-    const ox = -offset; // in (-W, 0]: the two tiles always cover [0, W)
-    ctx.drawImage(img, ox, 0, W, h);
-    ctx.drawImage(img, ox + W, 0, W, h);
-    ctx.globalAlpha = 1;
+    // Crowd, LAST in the backdrop: one full-width baked band of silhouettes, lifted on the beat.
+    // It goes over the side scrim rather than under it — the scrim exists to keep the gutters from
+    // competing with the road, and a crowd it has dimmed to nothing is back to being a gradient.
+    // The road itself is drawn after all of this and covers the middle, so only the outer thirds
+    // (the ones three reviewers called dead space) ever show it. Reduced motion holds the bob;
+    // it does not remove the crowd.
+    if (this.crowdLayer) {
+      const bob = still ? 0 : beatPulse * H * 0.007 * (0.6 + energy * 0.8);
+      const ch = H * CROWD_H_FRAC;
+      const cy = CROWD_BASE_FRAC * H - ch - bob;
+      ctx.globalAlpha = clamp(0.9 + energy * 0.1, 0, 1);
+      ctx.drawImage(this.crowdLayer as unknown as CanvasImageSource, 0, cy, W, ch);
+      ctx.globalAlpha = 1;
+    }
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -1082,6 +1255,27 @@ export class Highway {
     return tagged > 0;
   }
 
+  /**
+   * Lane colour as it looks while the lane is locked out: pulled most of the way toward the dead
+   * grey but keeping the lane's hue, and matte (no specular) so it cannot be mistaken for live.
+   * Memoized by base hex — it feeds `SpriteCache.receptor`, which caches by that key.
+   */
+  private lockedColor(color: LaneColor, lock: LaneColor): LaneColor {
+    let c = this.lockedColors.get(color.base);
+    if (!c) {
+      c = {
+        name: `${color.name}-locked`,
+        base: mixHex(color.base, lock.base, 0.62),
+        bright: mixHex(color.bright, lock.bright, 0.62),
+        dark: mixHex(color.dark, lock.dark, 0.5),
+        glow: mixHex(color.glow, lock.glow, 0.62),
+        matte: true,
+      };
+      this.lockedColors.set(color.base, c);
+    }
+    return c;
+  }
+
   /** The lane meter for a lane index, honouring `RenderLaneState.lane` (see `resolveLaneMaps`). */
   private laneState(frame: RenderFrame, lane: number): RenderLaneState | undefined {
     const i = this.stateIdx[lane];
@@ -1219,8 +1413,16 @@ export class Highway {
       // real pixels, empty→full moved the ring's mean luminance 38→79 as a diffuse warm-up with no
       // resolvable level line, and the meniscus was +19/255 over 2 px. At 2 m that is a binary
       // "not yet / there" — the entire effortful phase of every rep, the one thing the ring exists
-      // to coach, was invisible. Locked lanes get the dead grey ring, not a dimmed coloured one.
-      const ringColor = look.locked ? lockColor : color;
+      // to coach, was invisible.
+      //
+      // A locked ring is *desaturated toward* the dead grey, not replaced by it (`lockedColor`).
+      // Replacing it meant the lane lost its colour identity for the whole lockout — which starts
+      // on the frame the note is struck, so the receptor went grey-white at the exact instant the
+      // patient looked at it, and blind reviewers read the struck fret as a stray sprite rather
+      // than as "that lane, resetting". Lockout is still unmistakable: the ring shrinks 12 %, drops
+      // to 60 % alpha, loses its halo, loses its target ticks and gains the violet chevron and the
+      // return-to-rest arc — five marks, none of which is hue.
+      const ringColor = look.locked ? this.lockedColor(color, lockColor) : color;
       const spr = this.sprites.receptor(ringColor, r);
       ctx.globalAlpha = clamp((look.locked ? 0.6 : 1) + popK * 0.4, 0, 1);
       if (spr) blit(ctx, spr, x, y, pulse);
@@ -1469,11 +1671,21 @@ export class Highway {
         // Pending gem past the line: keep full colour (a late hit may still land) but dim gently
         // toward the bottom so it reads as "getting away".
         alpha = 1 - 0.3 * clamp(d / g.minDepth, 0, 1);
+        // ...and stop growing. Below the line the perspective tail magnifies, so an un-hit gem used
+        // to swell past the receptor ring it was sitting on and the two of them merged into one
+        // same-coloured blob at the single most important pixel event on the board. A gem is never
+        // bigger than it was at the moment it was judged.
+        radius = Math.min(radius, g.gemRadiusNear);
       }
-      // Fade in over exactly the stretch the board itself dissolves over (see drawRoad), so a gem
-      // materialises out of the fog instead of appearing at full alpha on the far edge.
+      // Fade in over the *top third* of the stretch the board itself dissolves over (see drawRoad),
+      // then hold at `GEM_FAR_ALPHA`. The road may dissolve; the notes on it may not. Fading gems
+      // over the full band cost the far half of the runway: the board genuinely carried eight
+      // notes and showed three, because the rest were 15 %-alpha ghosts.
       const fadeSpan = this.farFadeY - g.horizonY;
-      if (fadeSpan > 0 && y < this.farFadeY) alpha *= clamp((y - g.horizonY) / fadeSpan, 0, 1);
+      if (fadeSpan > 0 && y < this.farFadeY) {
+        const t = clamp((y - g.horizonY) / fadeSpan, 0, 1);
+        alpha *= clamp(t / GEM_FADE_IN_FRAC, 0, 1) * (GEM_FAR_ALPHA + (1 - GEM_FAR_ALPHA) * t);
+      }
       if (alpha <= 0.01) continue;
       // `gemSprite` + `bucketedRadius` rather than `gem()`: no result object per note per frame.
       const gem = this.sprites.gemSprite(color, radius);
@@ -1805,7 +2017,10 @@ export class Highway {
       const above = Math.min(g.strikeY - p.y + rise, cap);
       // Pop: overshoot then settle.
       const pop = still ? 1 : age < 0.12 ? 0.7 + (age / 0.12) * 0.5 : age < 0.22 ? 1.2 - ((age - 0.12) / 0.1) * 0.2 : 1;
-      const alpha = t < 0.6 ? 1 : 1 - (t - 0.6) / 0.4;
+      // Full strength for most of its life, then off quickly. A long linear tail left a ~25 %-alpha
+      // word hanging in empty lane space with no burst under it any more — which is exactly what a
+      // still frame catches, and it reads as leftover garbage rather than as feedback.
+      const alpha = t < 0.74 ? 1 : 1 - (t - 0.74) / 0.26;
       const style = this.style(p.judgment === 'perfect' ? 'popupPerfect' : p.judgment === 'good' ? 'popupGood' : 'popupMiss');
       this.text.draw(ctx, JUDGMENT_STYLE[p.judgment].text, p.x, g.strikeY - above, style, pop, alpha);
     }
@@ -2003,12 +2218,21 @@ export class Highway {
     const titleStyle = this.style('title');
     const titlePx = fontPx(titleStyle.font);
     const titleY = pad + titlePx * 0.62;
-    if (frame.songTitle) {
-      this.text.draw(ctx, this.fitHud(0, frame.songTitle, titleStyle, textRoom), pad, titleY, titleStyle, 1, 1, 'left');
-    }
-    if (frame.attribution) {
-      const aStyle = this.style('attribution');
-      this.text.draw(ctx, this.fitHud(1, frame.attribution, aStyle, textRoom), pad, titleY + titlePx * 0.62 + fontPx(aStyle.font) * 0.72, aStyle, 1, 1, 'left');
+    // ...and it does not stay all song. A shipped title shows the song block over the intro bars and
+    // then gets out of the way; ours is also the only HUD element that is prose, so it is the one
+    // most worth spending only the intro on. It is still on screen for `META_HOLD_SEC` — long
+    // enough to read, and the attribution is repeated in song select and in the results screen, so
+    // the licence obligation does not depend on this fade.
+    const metaAge = this.stNow - META_HOLD_SEC;
+    const metaAlpha = metaAge <= 0 ? 1 : clamp(1 - metaAge / META_FADE_SEC, 0, 1);
+    if (metaAlpha > 0.01) {
+      if (frame.songTitle) {
+        this.text.draw(ctx, this.fitHud(0, frame.songTitle, titleStyle, textRoom), pad, titleY, titleStyle, 1, metaAlpha, 'left');
+      }
+      if (frame.attribution) {
+        const aStyle = this.style('attribution');
+        this.text.draw(ctx, this.fitHud(1, frame.attribution, aStyle, textRoom), pad, titleY + titlePx * 0.62 + fontPx(aStyle.font) * 0.72, aStyle, 1, metaAlpha, 'left');
+      }
     }
 
     // Rock meter (left, arc gauge)

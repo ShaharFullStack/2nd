@@ -110,8 +110,8 @@ describe('Highway construction / resize', () => {
 
   it('pre-renders background layers into scratch canvases', () => {
     const { scratch } = setup();
-    // bg gradient + two star tiles at minimum
-    expect(scratch.length).toBeGreaterThanOrEqual(3);
+    // The baked venue (gradient, haze, stage wash, truss, PA stacks) + the crowd band.
+    expect(scratch.length).toBeGreaterThanOrEqual(2);
     const bg = scratch[0];
     expect(bg.ctx.count('fillRect')).toBeGreaterThan(0);
     expect(bg.ctx.count('createLinearGradient')).toBeGreaterThan(0);
@@ -390,22 +390,35 @@ describe('Highway.draw', () => {
     expect(hw.getStats().particles).toBe(burst);
   });
 
-  it('parallax star tiles always cover the full width, including during a negative count-in', () => {
+  it('fills the outer thirds with a venue: the crowd band spans the full width on every frame', () => {
     const { canvas, hw } = setup(1280, 720);
     hw.resize(1280, 720, 1);
+    // The crowd band is the one backdrop layer that moves; it must be present (and full width) at
+    // every song time, including a negative count-in, or the gutters are a gradient again.
     for (const t of [-3, -0.5, 0, 7.3, 200.1]) {
       canvas.ctx.reset();
-      hw.draw(makeFrame({ lanes: LANES, songTime: t }));
-      const tiles = canvas.ctx.calls.filter((c) => c.name === 'drawImage' && c.args.length === 5 && c.args[3] === 1280 && c.args[4] === 360);
-      expect(tiles.length).toBe(4);
-      for (let i = 0; i < tiles.length; i += 2) {
-        const dx0 = tiles[i].args[1] as number;
-        const dx1 = tiles[i + 1].args[1] as number;
-        expect(dx0, `t=${t}`).toBeLessThanOrEqual(0);
-        expect(dx0).toBeGreaterThan(-1280);
-        expect(dx1).toBeCloseTo(dx0 + 1280);
-      }
+      hw.draw(makeFrame({ lanes: LANES, songTime: t, beatPhase: 0 }));
+      const band = canvas.ctx.calls.filter((c) => c.name === 'drawImage' && c.args.length === 5 && c.args[3] === 1280 && Math.abs((c.args[4] as number) - 720 * 0.2) < 1);
+      expect(band.length, `t=${t}`).toBe(1);
+      const y = band[0].args[2] as number;
+      expect(y, `t=${t}`).toBeGreaterThan(0);
+      expect(y + 720 * 0.2, `t=${t}`).toBeLessThanOrEqual(720);
     }
+  });
+
+  it('bobs the crowd on the beat and holds it still under reduced motion', () => {
+    const bandY = (opts: Record<string, unknown>, beatPhase: number): number => {
+      const { canvas, hw } = setup(1280, 720, opts);
+      hw.resize(1280, 720, 1);
+      canvas.ctx.reset();
+      hw.draw(makeFrame({ lanes: LANES, songTime: 4, beatPhase }));
+      const band = canvas.ctx.calls.find((c) => c.name === 'drawImage' && c.args.length === 5 && c.args[3] === 1280 && Math.abs((c.args[4] as number) - 144) < 1);
+      expect(band).toBeDefined();
+      return (band as { args: unknown[] }).args[2] as number;
+    };
+    // On the beat the band lifts; off the beat it sits back down.
+    expect(bandY({}, 0)).toBeLessThan(bandY({}, 0.9));
+    expect(bandY({ reducedMotion: true }, 0)).toBeCloseTo(bandY({ reducedMotion: true }, 0.9), 6);
   });
 
   it('re-sizes lane labels when the lane count changes on a reused instance', () => {
@@ -767,7 +780,7 @@ describe('runtime options actually take effect', () => {
     expect(hw.geometry.horizonY).toBeCloseTo(0.15 * 720);
     // A fresh background layer was rasterized, with the haze at the new horizon (a stale layer left
     // a glow blob floating in the middle of the sky).
-    expect(scratch.length).toBeGreaterThanOrEqual(before + 3);
+    expect(scratch.length).toBeGreaterThanOrEqual(before + 2);
     expect(hazeCentres(before)).toContain(0.15 * 720);
   });
 
@@ -808,21 +821,23 @@ describe('runtime options actually take effect', () => {
     expect(calm.tint).toBeGreaterThanOrEqual(loud.tint - 1); // lane flash trapezoid still drawn
   });
 
-  it('reducedMotion freezes the parallax layers and the beat pulse', () => {
-    const offsets = (reducedMotion: boolean): number[] => {
+  it('reducedMotion freezes the sweeping stage rig and the beat pulse', () => {
+    const angles = (reducedMotion: boolean): number[] => {
       const { canvas, hw } = setup(1280, 720, { reducedMotion });
       hw.resize(1280, 720, 1);
       const out: number[] = [];
       for (const t of [0, 0.5, 1.25]) {
         canvas.ctx.reset();
         hw.draw(makeFrame({ lanes: LANES, songTime: t, beatPhase: (t * 2) % 1 }));
-        const tiles = canvas.ctx.calls.filter((c) => c.name === 'drawImage' && c.args.length === 5 && c.args[3] === 1280 && c.args[4] === 360);
-        out.push(tiles[0].args[1] as number);
+        // Each beam is rotated about its hanging point; the first rotate of the frame is enough.
+        const rot = canvas.ctx.calls.find((c) => c.name === 'rotate');
+        expect(rot).toBeDefined();
+        out.push((rot as { args: unknown[] }).args[0] as number);
       }
       return out;
     };
-    const moving = offsets(false);
-    const still = offsets(true);
+    const moving = angles(false);
+    const still = angles(true);
     expect(new Set(still).size).toBe(1);
     expect(new Set(moving).size).toBeGreaterThan(1);
   });

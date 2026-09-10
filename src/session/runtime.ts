@@ -159,9 +159,25 @@ class SessionRuntime {
   async ensureVision(req: VisionRequest): Promise<VisionInput> {
     const key = visionLaneKey(req);
     if (this.vision && this.visionKey === key) {
+      // Hand EVERY lane's calibration over, including a null one. `visionLaneKey` deliberately does not
+      // include the ranges, so a reused VisionInput is the only record of them: skipping the nulls left
+      // a cleared or removed calibration LIVE inside the pipeline, still scoring, with the store
+      // believing the lane was uncalibrated.
+      //
+      // The boolean is the vetting verdict (a range measured on another fingertip, or under the other
+      // mirror convention, is refused here) and it is not thrown away: the refused lane keeps its
+      // reason in `getInvalidCalibrations()`, which the camera-check, ROM and play screens read and
+      // show. Collected so this boundary can say out loud what it refused, rather than only the module.
+      const refused: number[] = [];
       req.calibrations.forEach((cal, i) => {
-        if (cal) this.vision?.setCalibration(i, cal);
+        const laneIndex = req.lanes[i]?.index ?? i;
+        if (this.vision?.setCalibration(laneIndex, cal ?? null) === false) refused.push(laneIndex + 1);
       });
+      if (refused.length > 0) {
+        console.error(
+          `[runtime] lane${refused.length > 1 ? 's' : ''} ${refused.join(', ')}: the stored calibration was refused and will not score. See VisionInput.getInvalidCalibrations() — the camera check, calibration and play screens show the reason.`,
+        );
+      }
       this.vision.setThresholdFraction(DIFFICULTIES[req.difficulty].thresholdFraction);
       if (!this.vision.isRunning()) await this.vision.start();
       return this.vision;

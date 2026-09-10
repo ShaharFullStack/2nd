@@ -29,7 +29,12 @@ export interface Settings {
   sfx: boolean;
   /** Rehab-friendly high-contrast lane colors instead of the Guitar Hero palette. */
   highContrast: boolean;
-  /** Seconds a note takes to travel the highway (lower = faster scroll). */
+  /**
+   * Seconds a note takes to travel the highway (lower = faster scroll). This is the renderer's
+   * read-ahead window: at medium (one note per beat) a 120 BPM chart puts `scrollSec × 2` gems on
+   * the board at once, so it is also the number that decides whether the highway looks occupied or
+   * abandoned. Keep it in step with `DEFAULT_GEOMETRY_OPTIONS.approachSec` in src/render/geometry.ts.
+   */
   scrollSec: number;
   /** Freeze parallax/shake for vestibular sensitivity. */
   reducedMotion: boolean;
@@ -44,7 +49,9 @@ export interface Settings {
 export const DEFAULT_SETTINGS: Settings = {
   sfx: true,
   highContrast: false,
-  scrollSec: 1.6,
+  // 4 s = DEFAULT_GEOMETRY_OPTIONS.approachSec (src/render/geometry.ts). At 1.6 s this default
+  // silently overrode the renderer's whole composition: three gems on a board built for eight.
+  scrollSec: 4,
   reducedMotion: false,
   effectIntensity: 1,
   showMissPopup: false,
@@ -134,7 +141,7 @@ function validateSettings(raw: unknown): Settings | null {
   return {
     sfx: typeof r.sfx === 'boolean' ? r.sfx : DEFAULT_SETTINGS.sfx,
     highContrast: typeof r.highContrast === 'boolean' ? r.highContrast : DEFAULT_SETTINGS.highContrast,
-    scrollSec: Number.isFinite(r.scrollSec) ? Math.min(3, Math.max(0.8, r.scrollSec as number)) : DEFAULT_SETTINGS.scrollSec,
+    scrollSec: Number.isFinite(r.scrollSec) ? Math.min(6, Math.max(2, r.scrollSec as number)) : DEFAULT_SETTINGS.scrollSec,
     reducedMotion: typeof r.reducedMotion === 'boolean' ? r.reducedMotion : DEFAULT_SETTINGS.reducedMotion,
     effectIntensity: Number.isFinite(r.effectIntensity) ? Math.min(1, Math.max(0, r.effectIntensity as number)) : DEFAULT_SETTINGS.effectIntensity,
     showMissPopup: typeof r.showMissPopup === 'boolean' ? r.showMissPopup : DEFAULT_SETTINGS.showMissPopup,
@@ -164,12 +171,35 @@ function validateConfig(raw: unknown): Partial<SessionConfig> | null {
   };
 }
 
+/**
+ * Reload saved ranges, dropping any whose STAMP disagrees with the KEY it is filed under.
+ *
+ * A calibration is a range OF SOMETHING and the key (`movement:side[:fingertip]`) is this file's claim
+ * about what that something is. Checking only that min/max are finite let a blob that says
+ * `movement: 'knee_extension'` be served to a `seated_march` lane — degrees normalizing a frame-height
+ * ratio. VisionInput would refuse it at the boundary (which is the right architecture: the runtime is
+ * the authority), but a range that is provably mis-filed should never be offered to the therapist as
+ * "last session's range" in the first place. Reachable from a migrated or hand-edited localStorage,
+ * and from any future change to the key format — the entries written under the old shape are still
+ * there. The mirror convention is NOT in the key (it is session-wide, not per-lane), so it stays a
+ * boundary check against the lane's live context, not a filing check.
+ */
 function validateCalibrations(raw: unknown): Record<string, RomCalibration> | null {
   if (!raw || typeof raw !== 'object') return null;
   const out: Record<string, RomCalibration> = {};
   for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
     const c = v as Partial<RomCalibration> | null;
-    if (c && Number.isFinite(c.min) && Number.isFinite(c.max)) out[k] = c as RomCalibration;
+    if (!c || !Number.isFinite(c.min) || !Number.isFinite(c.max)) continue;
+    const [movement, , tip] = k.split(':');
+    if (c.movement !== undefined && c.movement !== movement) {
+      console.warn(`[store] dropping saved calibration "${k}": it is stamped ${c.movement}, which is not what that key measures. Re-calibrate that lane.`);
+      continue;
+    }
+    if (c.fingertip !== undefined && tip !== undefined && c.fingertip !== tip) {
+      console.warn(`[store] dropping saved calibration "${k}": it was measured on the ${c.fingertip} finger, not the ${tip} finger. Re-calibrate that lane.`);
+      continue;
+    }
+    out[k] = c as RomCalibration;
   }
   return out;
 }
@@ -253,6 +283,12 @@ export const useStore = create<AppState>((set, get) => {
   const persistHistory = (h: SessionResult[]): void => {
     if (!writeJson(HISTORY_KEY, h)) set({ persistenceFailed: true });
   };
+  // Calibrations are persisted through the same failure-reporting path as settings and history: on a
+  // shared clinic tablet the quota is small, and a write that silently fails loses every range the
+  // therapist just measured with nothing on screen to say so (see `persistenceFailed`, surfaced on the
+  // ROM calibration screen).
+  // Returns the flag rather than calling `set` because its only caller is inside a `set` updater.
+  const persistCalibrations = (c: Record<string, RomCalibration>): boolean => writeJson(CALIBRATION_KEY, c);
   const persistConfig = (): void => {
     const s = get();
     writeJson(CONFIG_KEY, { mode: s.mode, lanes: s.lanes, difficulty: s.difficulty, windowScale: s.windowScale, songId: s.songId });
@@ -365,8 +401,8 @@ export const useStore = create<AppState>((set, get) => {
         calibrations[lane] = cal;
         const savedCalibrations = { ...s.savedCalibrations };
         if (cal) savedCalibrations[calibrationKey(s.lanes[lane])] = cal;
-        writeJson(CALIBRATION_KEY, savedCalibrations);
-        return { calibrations, savedCalibrations };
+        const stored = persistCalibrations(savedCalibrations);
+        return { calibrations, savedCalibrations, persistenceFailed: s.persistenceFailed || !stored };
       }),
 
     clearCalibrations: () => set((s) => ({ calibrations: s.lanes.map(() => null) })),
