@@ -7,6 +7,29 @@ import type { Side } from '../engine/types.ts';
 import { HAND, HAND_LANDMARK_COUNT, POSE, POSE_LANDMARK_COUNT } from './landmarks.ts';
 import type { Landmark } from './landmarks.ts';
 
+/**
+ * Re-normalize landmarks captured in a frame of aspect `fromAspect` (width/height) into a frame of
+ * aspect `toAspect` showing the SAME physical scene at the same vertical scale.
+ *
+ * The rigs below are built for a SQUARE frame (fromAspect 1), which is exactly why they cannot, on their
+ * own, catch the anisotropy bug: MediaPipe normalizes x by the frame width and y by the height, so a
+ * real 16:9 webcam reports the same physical pose with x compressed by 16/9 relative to a square frame.
+ * Feeding `reNormalizeAspect(pose, 1, 16/9)` to an extractor with `xScale: 16/9` must produce the same
+ * number as the original pose with `xScale: 1` — that equality IS the guarantee "a fixed guard means the
+ * same physical amount on any webcam".
+ * y is unchanged (same fraction of frame height); x is re-expressed about the centre, and z with it
+ * (MediaPipe documents z as "roughly the same scale as x").
+ */
+export function reNormalizeAspect(landmarks: readonly Landmark[], fromAspect: number, toAspect: number): Landmark[] {
+  const k = fromAspect / toAspect;
+  return landmarks.map((l) => ({ x: 0.5 + (l.x - 0.5) * k, y: l.y, z: l.z * k, visibility: l.visibility }));
+}
+
+/** Translate every landmark (a chair scoot / camera bump: the whole scene shifts, the patient does not move). */
+export function translateLandmarks(landmarks: readonly Landmark[], dx: number, dy: number): Landmark[] {
+  return landmarks.map((l) => ({ x: l.x + dx, y: l.y + dy, z: l.z, visibility: l.visibility }));
+}
+
 export interface SeatedPoseParams {
   /** Knee lift (seated march) 0..1. */
   kneeLift?: number;
@@ -14,7 +37,11 @@ export interface SeatedPoseParams {
   kneeExtension?: number;
   /** Toe lift (dorsiflexion) 0..1. */
   toeLift?: number;
-  /** Knee moved laterally (abduction) 0..1. */
+  /**
+   * Knee moved laterally 0..1 = ABduction (outward). NEGATIVE values are ADduction (the knee pulled
+   * inward across the midline) — the compensatory pattern hip_abduction is prescribed to correct, which
+   * must NOT score.
+   */
   abduction?: number;
   /** Heel lifted off the floor 0..1 (compensation). */
   heelLift?: number;
@@ -97,6 +124,8 @@ export const seatedKneeLifted = (amount = 1, side: Side = 'left') => seatedPose(
 export const seatedLegExtended = (amount = 1, side: Side = 'left') => seatedPose({ kneeExtension: amount, side });
 export const seatedToesLifted = (amount = 1, side: Side = 'left') => seatedPose({ toeLift: amount, side });
 export const seatedKneeAbducted = (amount = 1, side: Side = 'left') => seatedPose({ abduction: amount, side });
+/** Knee pulled INWARD across the midline (adduction): the wrong direction for hip_abduction. */
+export const seatedKneeAdducted = (amount = 1, side: Side = 'left') => seatedPose({ abduction: -amount, side });
 
 export interface HandParams {
   /** 0 = fist, 1 = fully open (default 1). */
@@ -190,6 +219,21 @@ export const handWristExtended = (amount = 1) => handPose({ wristExtension: amou
 export const handWristRaised = (amount = 1) => handPose({ wristRaise: amount });
 export const handPinch = (amount = 1) => handPose({ pinch: amount });
 export const handSpread = (amount = 1) => handPose({ spread: amount });
+
+/**
+ * A geometrically impossible hand that the real HandLandmarker can still emit for a half-occluded hand:
+ * all 21 landmarks present and finite, but every fingertip collapsed onto the wrist. Used to test the
+ * plausibility gate (the real detector never returns FEWER than 21 landmarks, so slicing an array is not
+ * a realistic failure mode).
+ */
+export function handCollapsed(): Landmark[] {
+  const hand = handPose();
+  const wrist = hand[HAND.WRIST];
+  for (const t of [HAND.THUMB_TIP, HAND.INDEX_TIP, HAND.MIDDLE_TIP, HAND.RING_TIP, HAND.PINKY_TIP]) {
+    hand[t] = { x: wrist.x, y: wrist.y, z: wrist.z };
+  }
+  return hand;
+}
 
 /**
  * A synthetic rep sequence: `reps` smooth bumps from 0 to `amplitude` over `repDurationSec` each after

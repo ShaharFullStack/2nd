@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { LaneSpec } from '../engine/types.ts';
 import { VisionInput, visionStatusMessage } from './VisionInput.ts';
 import type { LaneInputEvent, LaneRepEvent, CompensationEvent } from './types.ts';
-import type { DetectionResult, LandmarkDetector } from '../vision/mediapipe.ts';
+import type { CameraSession, DetectionResult, LandmarkDetector } from '../vision/mediapipe.ts';
 import { extractFeature, captureCompensationBaseline } from '../vision/features.ts';
 import { handPose, repSequence, seatedPose, seatedPoseWorld, seatedRest } from '../vision/fixtures.ts';
 import type { Landmark } from '../vision/landmarks.ts';
@@ -386,5 +386,388 @@ describe('VisionInput with a driven loop (fake camera + rVFC)', () => {
     expect(input.getStats().frames).toBe(frames.length);
     input.stop();
     expect(stopped).toBe(true);
+  });
+});
+
+describe('VisionInput never awards an unearned hit (rising edge only)', () => {
+  const lanes: LaneSpec[] = [{ index: 0, movement: 'seated_march', side: 'left' }];
+  const cal = calFor('seated_march', 'left', (a) => seatedPose({ kneeLift: a }));
+  const make = (clock: FakeClock, extra: Partial<Record<string, unknown>> = {}) =>
+    new VisionInput({ mode: 'leg', lanes, calibrations: [cal], thresholdFraction: 0.65, audioContext: clock, detector: fakeDetector('leg', []), driveLoop: false, smoothing: { kind: 'none' }, ...extra });
+
+  it('(A) a limb already held at 0.95 of ROM when the session starts scores nothing', async () => {
+    const input = make(new FakeClock());
+    const events: LaneInputEvent[] = [];
+    input.onEvent((e) => events.push(e));
+    await input.start();
+    for (let i = 0; i < 10; i++) input.processDetection({ tMs: 0, pose: seatedPose({ kneeLift: 0.95 }), hands: [] }, i / 30);
+    expect(input.getLaneStates()[0].value).toBeGreaterThan(0.9);
+    expect(events).toHaveLength(0);
+    expect(input.getLaneDebug()[0].triggerState).toBe('unconfirmed');
+    // Lower the knee and lift it again: that IS a rep.
+    input.processDetection({ tMs: 0, pose: seatedRest(), hands: [] }, 1);
+    input.processDetection({ tMs: 0, pose: seatedPose({ kneeLift: 0.95 }), hands: [] }, 1.05);
+    expect(events).toHaveLength(1);
+    input.stop();
+  });
+
+  it('(B) setCalibration mid-play does not re-score the rep that is still in progress', async () => {
+    const input = make(new FakeClock());
+    const events: LaneInputEvent[] = [];
+    input.onEvent((e) => events.push(e));
+    await input.start();
+    input.processDetection({ tMs: 0, pose: seatedRest(), hands: [] }, 0);
+    input.processDetection({ tMs: 0, pose: seatedPose({ kneeLift: 0.95 }), hands: [] }, 0.05);
+    expect(events).toHaveLength(1);
+    input.setCalibration(0, cal); // therapist nudges the range while the knee is still up
+    for (let i = 0; i < 10; i++) input.processDetection({ tMs: 0, pose: seatedPose({ kneeLift: 0.95 }), hands: [] }, 0.1 + i / 30);
+    expect(events).toHaveLength(1);
+    input.processDetection({ tMs: 0, pose: seatedRest(), hands: [] }, 1);
+    input.processDetection({ tMs: 0, pose: seatedPose({ kneeLift: 0.95 }), hands: [] }, 1.05);
+    expect(events).toHaveLength(2);
+    input.stop();
+  });
+
+  it('(C) recovering from an occlusion with the limb already up scores nothing', async () => {
+    const input = make(new FakeClock());
+    const events: LaneInputEvent[] = [];
+    input.onEvent((e) => events.push(e));
+    await input.start();
+    input.processDetection({ tMs: 0, pose: seatedRest(), hands: [] }, 0);
+    input.processDetection({ tMs: 0, pose: null, hands: [] }, 0.05); // tracking lost mid-rep
+    input.processDetection({ tMs: 0, pose: seatedPose({ kneeLift: 0.95 }), hands: [] }, 0.1);
+    expect(events).toHaveLength(0);
+    expect(input.getLaneStates()[0].value).toBeGreaterThan(0.9);
+    input.processDetection({ tMs: 0, pose: seatedRest(), hands: [] }, 0.2);
+    input.processDetection({ tMs: 0, pose: seatedPose({ kneeLift: 0.95 }), hands: [] }, 0.25);
+    expect(events).toHaveLength(1);
+    input.stop();
+  });
+});
+
+describe('VisionInput rehab metrics honesty', () => {
+  const lanes: LaneSpec[] = [{ index: 0, movement: 'seated_march', side: 'left' }];
+
+  it('reports an UNCLAMPED peak so exceeding the calibrated ROM stays measurable', async () => {
+    const clock = new FakeClock();
+    // Calibrated on a modest rep (60% of what the patient can now do).
+    const cal = calFor('seated_march', 'left', (a) => seatedPose({ kneeLift: a * 0.6 }));
+    const input = new VisionInput({ mode: 'leg', lanes, calibrations: [cal], thresholdFraction: 0.65, audioContext: clock, detector: fakeDetector('leg', []), driveLoop: false, smoothing: { kind: 'none' } });
+    const events: LaneInputEvent[] = [];
+    const reps: LaneRepEvent[] = [];
+    input.onEvent((e) => events.push(e));
+    input.onRep((r) => reps.push(r));
+    await input.start();
+    let maxRaw = 0;
+    for (const { t, amount } of repSequence({ restSec: 0.5, reps: 1, repDurationSec: 1 })) {
+      input.processDetection({ tMs: 0, pose: seatedPose({ kneeLift: amount }), hands: [] }, t);
+      maxRaw = Math.max(maxRaw, input.getLaneDebug()[0].rawValue);
+    }
+    expect(maxRaw).toBeGreaterThan(1); // the live debug value is unclamped too
+    expect(reps).toHaveLength(1);
+    expect(reps[0].peak).toBe(1); // display value saturates ...
+    expect(reps[0].rawPeak!).toBeCloseTo(1 / 0.6, 1); // ... the recorded ROM does not
+    expect(events[0].strength).toBeLessThanOrEqual(1);
+    expect(events[0].rawStrength!).toBeGreaterThan(events[0].strength - 1e-9);
+    input.stop();
+  });
+
+  it('surfaces reps whose crossing was swallowed by the min re-trigger interval (emitted:false)', async () => {
+    const clock = new FakeClock();
+    const cal = calFor('seated_march', 'left', (a) => seatedPose({ kneeLift: a }));
+    const input = new VisionInput({ mode: 'leg', lanes, calibrations: [cal], thresholdFraction: 0.5, audioContext: clock, detector: fakeDetector('leg', []), driveLoop: false, smoothing: { kind: 'none' } });
+    const events: LaneInputEvent[] = [];
+    const reps: LaneRepEvent[] = [];
+    input.onEvent((e) => events.push(e));
+    input.onRep((r) => reps.push(r));
+    await input.start();
+    // 4 Hz reps: far faster than the 300 ms same-lane guard allows to score.
+    for (let i = 0; i * (1 / 60) <= 3.34; i++) {
+      const t = i / 60;
+      const amount = 0.5 * (1 - Math.cos(2 * Math.PI * 4 * t));
+      input.processDetection({ tMs: 0, pose: seatedPose({ kneeLift: amount }), hands: [] }, t);
+    }
+    expect(reps.length).toBeGreaterThan(events.length);
+    expect(reps.filter((r) => r.emitted === false).length).toBeGreaterThan(0);
+    expect(reps.filter((r) => r.emitted).length).toBe(events.length);
+    input.stop();
+  });
+
+  it('hands each onFrame listener an array it may retain (no aliasing of the next frame)', async () => {
+    const clock = new FakeClock();
+    const cal = calFor('seated_march', 'left', (a) => seatedPose({ kneeLift: a }));
+    const input = new VisionInput({ mode: 'leg', lanes, calibrations: [cal], thresholdFraction: 0.5, audioContext: clock, detector: fakeDetector('leg', []), driveLoop: false, smoothing: { kind: 'none' } });
+    const kept: Array<readonly { value: number }[]> = [];
+    input.onFrame((samples) => kept.push(samples));
+    await input.start();
+    input.processDetection({ tMs: 0, pose: seatedRest(), hands: [] }, 0);
+    input.processDetection({ tMs: 0, pose: seatedPose({ kneeLift: 1 }), hands: [] }, 0.1);
+    expect(kept).toHaveLength(2);
+    expect(kept[0]).not.toBe(kept[1]);
+    expect(kept[0][0].value).toBeLessThan(0.05);
+    expect(kept[1][0].value).toBeGreaterThan(0.9);
+    input.stop();
+  });
+});
+
+describe('VisionInput fails loudly when frames stop arriving', () => {
+  const lanes: LaneSpec[] = [{ index: 0, movement: 'seated_march', side: 'left' }];
+  const cal = calFor('seated_march', 'left', (a) => seatedPose({ kneeLift: a }));
+
+  it('a stalled camera becomes "stalled", never a frozen meter under a green OK', async () => {
+    const clock = new FakeClock();
+    let now = 1000;
+    const input = new VisionInput({
+      mode: 'leg', lanes, calibrations: [cal], thresholdFraction: 0.65, audioContext: clock,
+      detector: fakeDetector('leg', []), driveLoop: false, smoothing: { kind: 'none' },
+      nowMs: () => now, staleFrameSec: 0.5,
+    });
+    await input.start();
+    input.processDetection({ tMs: 0, pose: seatedPose({ kneeLift: 0.9 }), hands: [] }, 1);
+    expect(input.getStatus()).toMatchObject({ tracking: true, reason: 'ok' });
+    expect(input.getLaneStates()[0].value).toBeGreaterThan(0.8);
+    now += 400; // still within the watchdog window
+    expect(input.getStatus().reason).toBe('ok');
+    now += 30_000; // the camera wedged / the tab went to the background
+    const st = input.getStatus();
+    expect(st.tracking).toBe(false);
+    expect(st.reason).toBe('stalled');
+    expect(st.message).toMatch(/stopped sending frames/i);
+    expect(st.fps).toBe(0);
+    expect(st.frameAgeSec).toBeGreaterThan(30);
+    // The meter does not sit pinned at 90% behind a dead camera.
+    expect(input.getLaneStates()[0]).toMatchObject({ value: 0, tracking: false });
+    // Recovery: a frame clears the stall, and the still-raised limb does NOT score across the gap.
+    const events: LaneInputEvent[] = [];
+    input.onEvent((e) => events.push(e));
+    input.processDetection({ tMs: 0, pose: seatedPose({ kneeLift: 0.9 }), hands: [] }, 31.5);
+    expect(input.getStatus().reason).toBe('ok');
+    expect(events).toHaveLength(0);
+    input.stop();
+    expect(input.getStatus().reason).toBe('stopped');
+  });
+
+  it('a camera track that ends surfaces as camera_ended', async () => {
+    const clock = new FakeClock();
+    let now = 1000;
+    const cbs: Array<(now: number, meta: { captureTime?: number }) => void> = [];
+    const video = {
+      requestVideoFrameCallback: (cb: (n: number, m: { captureTime?: number }) => void) => cbs.push(cb),
+      cancelVideoFrameCallback: () => {},
+    } as unknown as HTMLVideoElement;
+    const camera: CameraSession = { video, stream: {} as MediaStream, width: 640, height: 480, ended: false, onEnded: null, stop: () => {} };
+    const input = new VisionInput({
+      mode: 'leg', lanes, calibrations: [cal], thresholdFraction: 0.65, audioContext: clock,
+      detector: fakeDetector('leg', [{ tMs: 0, pose: seatedRest(), hands: [] }]),
+      camera: () => Promise.resolve(camera), nowMs: () => now, staleFrameSec: 0.5,
+    });
+    await input.start();
+    cbs[0](performance.now(), {});
+    expect(input.getStatus().reason).toBe('ok');
+    // The OS/browser ends the track (unplugged, revoked, stolen by another app).
+    camera.ended = true;
+    camera.onEnded?.();
+    const st = input.getStatus();
+    expect(st.reason).toBe('camera_ended');
+    expect(st.tracking).toBe(false);
+    expect(st.message).toMatch(/disconnected|switched off/i);
+    expect(input.getLaneStates()[0].tracking).toBe(false);
+    input.stop();
+  });
+});
+
+describe('VisionInput hand-side safety', () => {
+  it('never lets a single unlabelled hand drive a side lane, and honours minHandScore', async () => {
+    const clock = new FakeClock();
+    const lanes: LaneSpec[] = [
+      { index: 0, movement: 'hand_open_close', side: 'left' },
+      { index: 1, movement: 'hand_open_close', side: 'right' },
+    ];
+    const cals = [
+      calFor('hand_open_close', 'left', (a) => handPose({ openness: a })),
+      calFor('hand_open_close', 'right', (a) => handPose({ openness: a })),
+    ];
+    const input = new VisionInput({ mode: 'hand', lanes, calibrations: cals, thresholdFraction: 0.6, audioContext: clock, detector: fakeDetector('hand', []), driveLoop: false, smoothing: { kind: 'none' }, minHandScore: 0.6 });
+    const events: LaneInputEvent[] = [];
+    input.onEvent((e) => events.push(e));
+    await input.start();
+    // A bilateral session: ONE hand in view whose handedness is not usable. It must drive neither lane,
+    // or the unaffected hand silently inflates the affected lane's reps.
+    for (const { t, amount } of repSequence({ restSec: 0.3, reps: 2, repDurationSec: 0.6 })) {
+      input.processDetection({ tMs: 0, pose: null, hands: [{ landmarks: handPose({ openness: amount, centerX: 0.5 }), label: 'Right', score: 0.4 }] }, t);
+    }
+    expect(events).toHaveLength(0);
+    expect(input.getStatus().reason).toBe('hand_missing');
+    expect(input.getStatus().untrackedLanes).toEqual([0, 1]);
+    // Two hands, one below minHandScore: position assigns it, but the confidence gate rejects it.
+    input.processDetection({ tMs: 0, pose: null, hands: [
+      { landmarks: handPose({ centerX: 0.7 }), label: 'Right', score: 0.95 },
+      { landmarks: handPose({ centerX: 0.3 }), label: '', score: 0.5 },
+    ] }, 5);
+    expect(input.getStatus().untrackedLanes).toEqual([1]);
+    input.stop();
+  });
+});
+
+describe('VisionInput compensation flags describe the rep they are attached to', () => {
+  const lanes: LaneSpec[] = [{ index: 0, movement: 'ankle_dorsiflexion', side: 'left' }];
+  const cal = calFor('ankle_dorsiflexion', 'left', (a) => seatedPose({ toeLift: a }));
+  const baseline = captureCompensationBaseline('ankle_dorsiflexion', seatedRest(), 'left');
+  const make = (clock: FakeClock) => new VisionInput({
+    mode: 'leg', lanes, calibrations: [cal], thresholdFraction: 0.7, audioContext: clock,
+    detector: fakeDetector('leg', []), driveLoop: false, compensationBaselines: [baseline], smoothing: { kind: 'none' },
+  });
+
+  it('a sustained SUB-THRESHOLD movement with a heel lift does not latch onto the next clean rep', async () => {
+    const input = make(new FakeClock());
+    const events: LaneInputEvent[] = [];
+    const reps: LaneRepEvent[] = [];
+    const comps: CompensationEvent[] = [];
+    input.onEvent((e) => events.push(e));
+    input.onRep((r) => reps.push(r));
+    input.onCompensation((c) => comps.push(c));
+    await input.start();
+    // 55% of ROM: above the re-arm level (0.42) so it is "movement", below the threshold (0.7) so no rep
+    // ever completes to consume the flag. The heel is up the whole time.
+    for (let i = 0; i < 20; i++) {
+      input.processDetection({ tMs: 0, pose: seatedPose({ toeLift: 0.55, heelLift: 1 }), hands: [] }, 1 + i / 30);
+    }
+    expect(events).toHaveLength(0);
+    expect(reps).toHaveLength(0);
+    expect(comps.length).toBeGreaterThanOrEqual(1); // live coaching still fires
+    // A fully clean rep 5 s later, heel flat throughout.
+    for (const { t, amount } of repSequence({ restSec: 0.5, reps: 1, repDurationSec: 1 })) {
+      input.processDetection({ tMs: 0, pose: seatedPose({ toeLift: amount }), hands: [] }, 6 + t);
+    }
+    expect(events).toHaveLength(1);
+    expect(events[0].compensation).toBeUndefined();
+    expect(reps).toHaveLength(1);
+    expect(reps[0].compensation).toBeUndefined();
+    input.stop();
+  });
+
+  it('a tracking dropout outside a rep clears the flag, but a rep in progress keeps its own', async () => {
+    const input = make(new FakeClock());
+    const reps: LaneRepEvent[] = [];
+    input.onRep((r) => reps.push(r));
+    await input.start();
+    // (a) sub-threshold compensated movement, then the lane goes dark, then a clean rep.
+    for (let i = 0; i < 10; i++) input.processDetection({ tMs: 0, pose: seatedPose({ toeLift: 0.55, heelLift: 1 }), hands: [] }, 1 + i / 30);
+    input.processDetection({ tMs: 0, pose: null, hands: [] }, 1.4);
+    for (const { t, amount } of repSequence({ restSec: 0.5, reps: 1, repDurationSec: 1 })) {
+      input.processDetection({ tMs: 0, pose: seatedPose({ toeLift: amount }), hands: [] }, 2 + t);
+    }
+    expect(reps).toHaveLength(1);
+    expect(reps[0].compensation).toBeUndefined();
+    // (b) a rep that IS in progress when tracking blinks keeps the compensation observed during it.
+    let t = 10;
+    const push = (toeLift: number, heelLift: number) => {
+      input.processDetection({ tMs: 0, pose: seatedPose({ toeLift, heelLift }), hands: [] }, t);
+      t += 1 / 30;
+    };
+    push(0, 0);
+    push(0.5, 1);
+    push(0.9, 1); // crossing, heel up => rep opens flagged
+    input.processDetection({ tMs: 0, pose: null, hands: [] }, t); // blink mid-rep
+    t += 1 / 30;
+    push(0.9, 0);
+    push(0, 0); // rep completes
+    expect(reps).toHaveLength(2);
+    expect(reps[1].compensation?.kind).toBe('heel_lift');
+    input.stop();
+  });
+});
+
+describe('VisionInput prescription guards and HUD honesty', () => {
+  it('reports a same-hand posture mismatch as a BLOCKING conflict (wrist_extension vs palm-to-camera)', async () => {
+    const clock = new FakeClock();
+    const lanes: LaneSpec[] = [
+      { index: 0, movement: 'wrist_extension', side: 'left' },
+      { index: 1, movement: 'hand_open_close', side: 'left' },
+    ];
+    const cals = [
+      calFor('wrist_extension', 'left', (a) => handPose({ wristExtension: a })),
+      calFor('hand_open_close', 'left', (a) => handPose({ openness: a })),
+    ];
+    const input = new VisionInput({ mode: 'hand', lanes, calibrations: cals, thresholdFraction: 0.6, audioContext: clock, detector: fakeDetector('hand', []), driveLoop: false, smoothing: { kind: 'none' } });
+    const conflicts = input.getLaneConflicts();
+    expect(conflicts).toHaveLength(1);
+    expect(conflicts[0].severity).toBe('error');
+    expect(conflicts[0].kind).toBe('posture');
+    expect(input.hasBlockingConflict()).toBe(true);
+    expect(input.getRequiredPostures().map((p) => p.posture)).toEqual(['hand_over_edge', 'palm_to_camera']);
+
+    // The reason it is an ERROR: pure wrist-extension reps at CONSTANT hand openness would otherwise
+    // score on the hand_open_close lane (a rigid rotation sweeps that 2D feature across its whole range).
+    const events: LaneInputEvent[] = [];
+    input.onEvent((e) => events.push(e));
+    await input.start();
+    for (const { t, amount } of repSequence({ restSec: 0.5, reps: 4, repDurationSec: 0.8 })) {
+      input.processDetection({ tMs: 0, pose: null, hands: [{ landmarks: handPose({ wristExtension: amount, openness: 0.5 }), label: 'Right', score: 0.95 }] }, t);
+    }
+    const byLane = [0, 1].map((l) => events.filter((e) => e.lane === l).length);
+    expect(byLane[0]).toBe(4); // the movement actually performed
+    expect(byLane[1]).toBeGreaterThan(0); // the phantom lane — which is exactly why the setup is refused
+    input.stop();
+  });
+
+  it('a unilateral hand session accepts the lone hand even with a weak handedness label', async () => {
+    const clock = new FakeClock();
+    // Every lane on ONE side: the standard unilateral (affected-hand-only) prescription.
+    const lanes: LaneSpec[] = [{ index: 0, movement: 'wrist_extension', side: 'left' }];
+    const cal = calFor('wrist_extension', 'left', (a) => handPose({ wristExtension: a }));
+    const input = new VisionInput({ mode: 'hand', lanes, calibrations: [cal], thresholdFraction: 0.6, audioContext: clock, detector: fakeDetector('hand', []), driveLoop: false, smoothing: { kind: 'none' } });
+    expect(input.getLaneConflicts()).toEqual([]);
+    expect(input.isUnilateral()).toBe(true);
+    const events: LaneInputEvent[] = [];
+    input.onEvent((e) => events.push(e));
+    await input.start();
+    // Handedness confidence collapses in the fingers-at-the-camera posture; the lane must still work.
+    for (const { t, amount } of repSequence({ restSec: 0.5, reps: 1, repDurationSec: 0.8 })) {
+      input.processDetection({ tMs: 0, pose: null, hands: [{ landmarks: handPose({ wristExtension: amount }), label: 'Right', score: 0.35 }] }, t);
+    }
+    expect(input.getStatus().reason).toBe('ok');
+    expect(events).toHaveLength(1);
+    expect(events[0].lane).toBe(0);
+    input.stop();
+
+    // Explicitly disabling the escape hatch restores the strict (bilateral) rule.
+    const strict = new VisionInput({ mode: 'hand', lanes, calibrations: [cal], thresholdFraction: 0.6, audioContext: clock, detector: fakeDetector('hand', []), driveLoop: false, smoothing: { kind: 'none' }, acceptLoneHand: false });
+    await strict.start();
+    strict.processDetection({ tMs: 0, pose: null, hands: [{ landmarks: handPose({ wristExtension: 0.5 }), label: 'Right', score: 0.35 }] }, 1);
+    expect(strict.getStatus().reason).toBe('hand_missing');
+    strict.stop();
+  });
+
+  it('the hand-mode status hint matches the lanes’ posture, and a dead stream reports 0 fps AND 0 ms', async () => {
+    expect(visionStatusMessage('no_hand', 'hand', [{ index: 0, movement: 'wrist_extension', side: 'left' }])).toMatch(/over the edge/);
+    expect(visionStatusMessage('no_hand', 'hand', [{ index: 0, movement: 'hand_open_close', side: 'left' }])).toMatch(/palm facing the camera/);
+
+    const clock = new FakeClock();
+    let now = 1000;
+    const lanes: LaneSpec[] = [{ index: 0, movement: 'seated_march', side: 'left' }];
+    const cal = calFor('seated_march', 'left', (a) => seatedPose({ kneeLift: a }));
+    const input = new VisionInput({
+      mode: 'leg', lanes, calibrations: [cal], thresholdFraction: 0.65, audioContext: clock,
+      detector: fakeDetector('leg', []), driveLoop: false, smoothing: { kind: 'none' }, nowMs: () => now, staleFrameSec: 0.5,
+    });
+    await input.start();
+    input.processDetection({ tMs: 0, pose: seatedPose({ kneeLift: 0.9 }), hands: [] }, 1);
+    // getLaneStates is memoized per processed frame: a 60 fps HUD polling a 30 fps camera must not see a
+    // new object (and re-render) when nothing changed.
+    const first = input.getLaneStates();
+    expect(input.getLaneStates()).toBe(first);
+    input.processDetection({ tMs: 0, pose: seatedPose({ kneeLift: 0.5 }), hands: [] }, 1.05);
+    const second = input.getLaneStates();
+    expect(second).not.toBe(first);
+    expect(second[0].value).toBeLessThan(first[0].value);
+    now += 30_000;
+    const st = input.getStatus();
+    expect(st.reason).toBe('stalled');
+    expect(st.fps).toBe(0);
+    expect(st.inferenceMs).toBe(0); // no "0 fps / 18 ms" on the HUD
+    expect(input.getLaneStates()).not.toBe(second); // liveness flipped => fresh (zeroed) states
+    expect(input.getLaneStates()[0].value).toBe(0);
+    input.stop();
   });
 });

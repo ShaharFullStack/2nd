@@ -32,21 +32,23 @@ export interface EmitOptions {
 }
 
 export class ParticlePool {
-  readonly capacity: number;
+  capacity: number;
   private n = 0;
-  readonly x: Float32Array;
-  readonly y: Float32Array;
-  readonly vx: Float32Array;
-  readonly vy: Float32Array;
-  readonly age: Float32Array;
-  readonly life: Float32Array;
-  readonly size: Float32Array;
-  readonly endSize: Float32Array;
-  readonly gravity: Float32Array;
-  readonly drag: Float32Array;
-  readonly alpha: Float32Array;
-  readonly color: Uint16Array;
-  readonly kind: Uint8Array;
+  /** Round-robin recycle cursor used when the pool is saturated (O(1) per emit). */
+  private cursor = 0;
+  x: Float32Array;
+  y: Float32Array;
+  vx: Float32Array;
+  vy: Float32Array;
+  age: Float32Array;
+  life: Float32Array;
+  size: Float32Array;
+  endSize: Float32Array;
+  gravity: Float32Array;
+  drag: Float32Array;
+  alpha: Float32Array;
+  color: Uint16Array;
+  kind: Uint8Array;
 
   constructor(capacity: number) {
     this.capacity = Math.max(1, Math.floor(capacity));
@@ -72,24 +74,51 @@ export class ParticlePool {
   }
 
   /**
-   * Spawn a particle. When the pool is full the oldest-by-slot particle (index 0) is recycled
-   * so bursts never silently vanish. Returns the slot index.
+   * Change the pool capacity at runtime (therapist "calmer effects" control). Reallocates the
+   * backing arrays once and keeps the first `min(count, capacity)` live particles; a no-op when the
+   * capacity is unchanged, so it is safe to call from a `setOptions()` patch that doesn't touch it.
+   */
+  setCapacity(capacity: number): void {
+    const c = Math.max(1, Math.floor(capacity));
+    if (c === this.capacity) return;
+    const keep = Math.min(this.n, c);
+    const grow = <T extends Float32Array | Uint16Array | Uint8Array>(src: T, make: (n: number) => T): T => {
+      const dst = make(c);
+      for (let i = 0; i < keep; i++) dst[i] = src[i];
+      return dst;
+    };
+    const f32 = (n: number): Float32Array => new Float32Array(n);
+    this.x = grow(this.x, f32);
+    this.y = grow(this.y, f32);
+    this.vx = grow(this.vx, f32);
+    this.vy = grow(this.vy, f32);
+    this.age = grow(this.age, f32);
+    this.life = grow(this.life, f32);
+    this.size = grow(this.size, f32);
+    this.endSize = grow(this.endSize, f32);
+    this.gravity = grow(this.gravity, f32);
+    this.drag = grow(this.drag, f32);
+    this.alpha = grow(this.alpha, f32);
+    this.color = grow(this.color, (n) => new Uint16Array(n));
+    this.kind = grow(this.kind, (n) => new Uint8Array(n));
+    this.capacity = c;
+    this.n = keep;
+    this.cursor = 0;
+  }
+
+  /**
+   * Spawn a particle. When the pool is saturated the slot under a round-robin cursor is recycled,
+   * so a burst never silently vanishes and an emit is always O(1) (a scan for the particle closest
+   * to death costs O(capacity) *per emit*, i.e. ~60k iterations for four simultaneous bursts into a
+   * full 600-slot pool). Returns the slot index.
    */
   emit(o: EmitOptions): number {
     let i: number;
     if (this.n < this.capacity) {
       i = this.n++;
     } else {
-      // Recycle the particle closest to death.
-      i = 0;
-      let best = -Infinity;
-      for (let j = 0; j < this.n; j++) {
-        const r = this.age[j] / this.life[j];
-        if (r > best) {
-          best = r;
-          i = j;
-        }
-      }
+      i = this.cursor;
+      this.cursor = (this.cursor + 1) % this.capacity;
     }
     this.x[i] = o.x;
     this.y[i] = o.y;
@@ -107,13 +136,19 @@ export class ParticlePool {
     return i;
   }
 
-  /** Advance all particles by dt seconds, removing dead ones (order not preserved). */
+  /**
+   * Advance all particles by dt seconds, removing dead ones (order not preserved). A non-finite
+   * `dt` is ignored entirely, and any particle whose age has become non-finite is retired rather
+   * than kept: the comparisons are written so that NaN takes the *remove* branch. (A NaN age used
+   * to make a particle immortal — never swap-removed, permanently holding a pool slot until the
+   * round-robin recycler started cannibalising live bursts.)
+   */
   update(dt: number): void {
-    if (dt <= 0) return;
+    if (!(dt > 0)) return;
     let i = 0;
     while (i < this.n) {
       const a = this.age[i] + dt;
-      if (a >= this.life[i]) {
+      if (!(a < this.life[i])) {
         this.swapRemove(i);
         continue;
       }
@@ -148,6 +183,7 @@ export class ParticlePool {
 
   clear(): void {
     this.n = 0;
+    this.cursor = 0;
   }
 
   private swapRemove(i: number): void {
@@ -183,7 +219,11 @@ export function makeRng(seed: number): () => number {
   };
 }
 
-/** Emit a Guitar-Hero style hit burst: radial sparks + a few streaks + a shockwave ring. */
+/**
+ * Emit a Guitar-Hero style hit burst: radial sparks + a few streaks + a shockwave ring.
+ * `intensity` scales both the count and the speed of the debris (0 → ring only), which is what the
+ * renderer's `effectIntensity` option dials for a calmer clinical presentation.
+ */
 export function emitHitBurst(
   pool: ParticlePool,
   rng: () => number,
@@ -193,7 +233,7 @@ export function emitHitBurst(
   color: number,
   intensity = 1,
 ): void {
-  const sparks = Math.round(14 * intensity) + 6;
+  const sparks = Math.max(0, Math.round(20 * intensity));
   for (let i = 0; i < sparks; i++) {
     const ang = rng() * Math.PI * 2;
     const speed = radius * (6 + rng() * 10) * intensity;
@@ -211,7 +251,7 @@ export function emitHitBurst(
       kind: PARTICLE_SPARK,
     });
   }
-  const streaks = Math.round(5 * intensity) + 2;
+  const streaks = Math.max(0, Math.round(7 * intensity));
   for (let i = 0; i < streaks; i++) {
     const ang = -Math.PI / 2 + (rng() - 0.5) * 1.6;
     const speed = radius * (14 + rng() * 10) * intensity;

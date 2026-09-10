@@ -10,6 +10,9 @@
  *     import('./render/demo').then((m) => m.runDemo(canvas));
  *   } else { ...render React... }
  *
+ * (`node src/render/pixel-check.mjs` renders this demo in headless Chromium and saves a screenshot
+ * of it as `demo-gameplay.png`, alongside its pixel assertions.)
+ *
  * Drives a synthetic 120 BPM chart with scripted hits/misses and animated lane meters, looping forever.
  * Judgment timing mimics the real engine: hits land at note time + deltaMs, misses are declared at
  * note time + goodMs (180) + miss grace (100) = 280 ms, with the miss event's `time` = note time +
@@ -128,6 +131,12 @@ export function runDemo(canvas: CanvasLike, options: DemoOptions = {}): DemoHand
   const recent: HitEvent[] = [];
   const laneStates: RenderLaneState[] = lanes.map(() => ({ value: 0, armed: true, tracking: true }));
   const judged = new Set<number>();
+  /**
+   * Events held back by one frame. Every third note is judged the way many integrators actually
+   * wire it up — the note's `state` flips on the verdict frame and the `HitEvent` only reaches
+   * `recentHits` on the next one — so the demo exercises both feedback paths for real.
+   */
+  const deferred: HitEvent[] = [];
   let combo = 0;
   let score = 0;
   let health = 0.6;
@@ -136,6 +145,7 @@ export function runDemo(canvas: CanvasLike, options: DemoOptions = {}): DemoHand
   const resetLoop = (): void => {
     judged.clear();
     recent.length = 0;
+    deferred.length = 0;
     for (const n of chart) n.state = 'pending';
     combo = 0;
     score = 0;
@@ -144,6 +154,8 @@ export function runDemo(canvas: CanvasLike, options: DemoOptions = {}): DemoHand
   };
 
   const buildFrame = (songTime: number): RenderFrame => {
+    // Events whose note state flipped on the previous frame arrive now.
+    while (deferred.length) recent.push(deferred.shift() as HitEvent);
     // Judge notes whose scripted time has passed.
     for (const n of chart) {
       if (judged.has(n.id)) continue;
@@ -153,13 +165,15 @@ export function runDemo(canvas: CanvasLike, options: DemoOptions = {}): DemoHand
         judged.add(n.id);
         n.state = miss ? 'miss' : 'hit';
         n.judgment = n.outcome;
-        recent.push({
+        const ev: HitEvent = {
           noteId: n.id,
           lane: n.lane,
           judgment: n.outcome,
           deltaMs: miss ? DEMO_GOOD_MS : n.deltaMs,
           time: miss ? n.time + DEMO_GOOD_MS / 1000 : judgeAt,
-        });
+        };
+        if (n.id % 3 === 0) deferred.push(ev);
+        else recent.push(ev);
         if (n.outcome === 'miss') {
           combo = 0;
           health = Math.max(0, health - 0.08);
@@ -244,9 +258,18 @@ export function runDemo(canvas: CanvasLike, options: DemoOptions = {}): DemoHand
   };
   let removeResize: (() => void) | null = null;
   if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
-    const onResize = (): void => highway.resize();
+    // Coalesce resize storms (a window drag fires dozens of events a second) into one resize per
+    // animation frame; Highway.resize() itself is a no-op when nothing actually changed.
+    let pending = 0;
+    const onResize = (): void => {
+      if (pending) return;
+      pending = typeof requestAnimationFrame === 'function' ? requestAnimationFrame(() => { pending = 0; highway.resize(); }) : (setTimeout(() => { pending = 0; highway.resize(); }, 80) as unknown as number);
+    };
     window.addEventListener('resize', onResize);
-    removeResize = () => window.removeEventListener('resize', onResize);
+    removeResize = () => {
+      window.removeEventListener('resize', onResize);
+      if (pending && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(pending);
+    };
   }
   tick();
   return {

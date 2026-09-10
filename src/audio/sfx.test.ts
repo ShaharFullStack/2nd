@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { DEFAULT_SFX_LEVELS, LANE_SEMITONES, SFX_PEAKS, Sfx, laneRatio, type SfxKind } from './sfx';
+import {
+  DEFAULT_SFX_LEVELS, LANE_SEMITONES, SFX_CUE_PEAKS, SFX_PEAKS, Sfx, cueTones, envelopeAt,
+  laneRatio, sfxBusPeak, type SfxKind,
+} from './sfx';
 
 // ---------------------------------------------------------------- fake Web Audio
 
@@ -56,6 +59,46 @@ function tail(o: FakeOsc): FakeNode {
 }
 
 const KINDS: SfxKind[] = ['hit', 'perfect', 'miss', 'combo'];
+
+describe('cueTones (the single source of truth for what Sfx schedules)', () => {
+  it('is exactly what play() puts on the graph, so the headroom budget measures the real cues', () => {
+    for (const kind of KINDS) {
+      const ctx = new FakeCtx();
+      ctx.currentTime = 2;
+      const sfx = new Sfx(asCtx(ctx), undefined, 1);
+      sfx.perLane = false;
+      sfx.play(kind, 2, { milestone: 100 });
+      const specs = cueTones(kind, { level: DEFAULT_SFX_LEVELS[kind], milestone: 100 });
+      expect(ctx.oscs).toHaveLength(specs.length);
+      expect(ctx.oscs.map((o) => o.startAt)).toEqual(specs.map((s) => 2 + s.start));
+      expect(ctx.oscs.map((o) => o.frequency.value)).toEqual(specs.map((s) => s.freq));
+      expect(ctx.oscs.map(envPeak)).toEqual(specs.map((s) => s.peak));
+    }
+  });
+
+  it('busPeak scales the loudest cue by the volume and tracks per-kind levels', () => {
+    const sfx = new Sfx(asCtx(new FakeCtx()), undefined, 1);
+    expect(sfx.busPeak()).toBeCloseTo(sfxBusPeak(1), 12);
+    expect(sfx.busPeak()).toBeGreaterThan(SFX_PEAKS.hit); // partials sum above the loudest one
+    sfx.volume = 0.25;
+    expect(sfx.busPeak()).toBeCloseTo(sfxBusPeak(1) * 0.25, 12);
+    sfx.volume = 1;
+    sfx.setLevel('hit', 0);
+    sfx.setLevel('perfect', 0);
+    sfx.setLevel('combo', 0);
+    // with the loud cues silenced the bus peak is the miss cue's
+    expect(sfx.busPeak()).toBeCloseTo(SFX_CUE_PEAKS.miss * DEFAULT_SFX_LEVELS.miss, 12);
+  });
+
+  it('envelopeAt is zero outside the partial and peaks at the end of the attack', () => {
+    const [spec] = cueTones('hit');
+    expect(envelopeAt(spec, -1)).toBe(0);
+    expect(envelopeAt(spec, spec.start)).toBe(0);
+    expect(envelopeAt(spec, spec.start + spec.dur)).toBe(0);
+    expect(envelopeAt(spec, spec.start + (spec.attack ?? 0.002))).toBeCloseTo(spec.peak, 9);
+    expect(envelopeAt(spec, spec.start + spec.dur / 2)).toBeLessThan(spec.peak);
+  });
+});
 
 describe('Sfx', () => {
   it('routes through one output gain at the requested volume to the given destination', () => {
@@ -251,8 +294,8 @@ describe('per-lane hit layer', () => {
     const out = ctx.gains[0];
     sfx.volume = 1; // 0 → 1 over [1, 1.02]
     ctx.currentTime = 1.01;
-    sfx.volume = 0.2; // anchored at 0.5 although the fake param reports 1
-    expect(out.gain.value).toBe(1);
+    sfx.volume = 0.2; // half-way through the previous ramp: anchored at 0.5, not at its target 1
+    expect(out.gain.value).toBeCloseTo(0.5, 12); // the anchor setValueAtTime wrote by the fake
     expect(out.gain.events.slice(-3)).toEqual([['cancel', 0, 1.01], ['set', expect.closeTo(0.5, 12), 1.01], ['lin', 0.2, expect.closeTo(1.03, 12)]]);
   });
 });

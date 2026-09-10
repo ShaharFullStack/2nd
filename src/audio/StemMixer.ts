@@ -3,8 +3,9 @@
  * player-stem ducking (docs/ARCHITECTURE.md "Audio contract").
  *
  * Graph:  source ─ duck ─ volume ─┐
- *         source ─ duck ─ volume ─┼─ transport ─ master ─ [limiter] ─ destination
- *         …                        ┘
+ *         source ─ duck ─ volume ─┼─ transport ─┐
+ *         …                        ┘             ├─ master ─ [limiter] ─ destination
+ *                          Sfx ─ sfxBus ────────┘
  *
  * `transport` is a GainNode used only for click-free stops: pause/seek/stop/unload ramp it to
  * MIN_GAIN over `STOP_FADE_SEC` and stop the sources after the fade; play() ramps it back up so
@@ -22,6 +23,13 @@
  * (`engine.start(mixer.play(at), from)`, `engine.pause(mixer.pause())`,
  * `engine.resume(await mixer.resume())`) and the two clocks agree exactly.
  *
+ * The song↔ctx mapping (`ctxTimeForSongTime` / `ctxTimeToSongTime`) is exact and invertible in
+ * EVERY transport state, not only while playing: the ctx time of song time 0 is stored when a
+ * segment starts (play/seek/stop) and is deliberately left alone by pause(), so a stamp taken
+ * just before a pause still resolves to the ctx time it really happened at — the same rule the
+ * engine SongClock follows. An input source that stamps events with `ctxTimeForSongTime()` may
+ * therefore be ticked while the therapist has the session paused.
+ *
  * Verified start: `play()` schedules every source at `startAt = now + startLeadSec` (default
  * 100 ms — a MediaPipe inference frame on the main thread can block for >30 ms) and then re-reads
  * `ctx.currentTime`. If the main thread stalled long enough that the deadline is within
@@ -29,22 +37,29 @@
  * early time, so they are discarded and rescheduled from the new `now`. The returned start time
  * is therefore the time the audio thread actually starts the buffers.
  *
- * Master stage / headroom. The four shipped demo stems sum to a sample peak of 1.78 / 1.83, and
- * 2.03 with the +2 dB streak boost on the drums (see headroom.test.ts, which measures the
- * committed WAVs). Without the limiter the master default is 0.45 so that 2.03 × 0.45 = 0.91
- * never hard-clips at the destination. With the limiter (DynamicsCompressorNode, threshold −3 dB,
- * ratio 20, knee 0, 1 ms attack, 50 ms release — a limiter, not a program compressor, which would
- * release when the player stem is ducked and swell the other stems) the master default is 0.8:
- * the peak into the limiter is 1.62 (+4.2 dBFS); Chromium/WebKit/Gecko's kernel catches it with
- * its ~6 ms look-ahead and applies an automatic make-up gain of (1/curve(0 dB))^0.6 ≈ +1.7 dB
- * (`limiterOutputPeak` models this), for an output ceiling of ≈0.90. A limiter with this
- * threshold only reaches 0 dBFS for inputs ≥ +23 dBFS.
+ * Master stage / headroom — every figure below is measured by headroom.test.ts from the committed
+ * WAVs and from the SFX specs `Sfx` actually schedules, and asserted there to two decimals, so a
+ * regeneration that moves them fails the suite instead of leaving this comment wrong.
+ *
+ * Worst realistic sum at the destination = four stems summed sample-wise (2.05 groove /
+ * 1.99 sunrise), with the +2 dB streak boost on the player stem (2.28 / 2.23), plus the loudest
+ * SFX cue at the top of the slider (the hit tick, 0.62 — SFX ride on `sfxBus`, which joins the
+ * master bus, so they are inside the budget rather than clipping past it). Worst case: 2.90.
+ *  - without the limiter the master default is 0.32, so 2.90 × 0.32 = 0.93 never hard-clips;
+ *  - with the limiter (DynamicsCompressorNode, threshold −3 dB, ratio 20, knee 0, 1 ms attack,
+ *    50 ms release — a limiter, not a program compressor, which would release when the player
+ *    stem is ducked and swell the other stems) the master default is 0.8: the peak into the
+ *    limiter is 2.32 (+7.3 dBFS); Chromium/WebKit/Gecko's kernel catches it with its ~6 ms
+ *    look-ahead and applies an automatic make-up gain of (1/curve(0 dB))^0.6 ≈ +1.7 dB
+ *    (`limiterOutputPeak` models this), for an output ceiling of ≈0.91. A limiter with this
+ *    threshold only reaches 0 dBFS for inputs ≥ +20 dBFS.
  */
 
 import type { FetchLike, SongManifest, StemSpec } from './manifest';
 import { stemUrl } from './manifest';
 import type { SongTimeSource } from '../input/types';
 import { DuckController, MIN_GAIN, SmoothGain, rampValueAt, scheduleRamp, type DuckOptions, type RampState } from './ducking';
+import { Sfx, type SfxLevels } from './sfx';
 
 export type MixerState = 'idle' | 'loading' | 'ready' | 'playing' | 'paused' | 'ended';
 
@@ -81,7 +96,7 @@ export interface StemMixerOptions {
 }
 
 /** Default master headroom (see the module comment). */
-export const DEFAULT_MASTER_GAIN = { limiter: 0.8, none: 0.45 } as const;
+export const DEFAULT_MASTER_GAIN = { limiter: 0.8, none: 0.32 } as const;
 
 /** Limiter settings applied to the master DynamicsCompressorNode. */
 export const LIMITER_SETTINGS = { threshold: -3, knee: 0, ratio: 20, attack: 0.001, release: 0.05 } as const;
@@ -189,8 +204,14 @@ export async function readBodyWithProgress(
   const reader = body.getReader();
   const onAbort = () => { void reader.cancel().catch(() => undefined); };
   signal?.addEventListener('abort', onAbort, { once: true });
+  // With a Content-Length the body is written straight into one final buffer: keeping the chunks
+  // and then copying them costs a second full copy of every stem, and four parallel 8.5 MB stems
+  // on a clinic tablet already carry ~70 MB of decoded AudioBuffers. `chunks` is only the fallback
+  // for a chunked/compressed response (no usable Content-Length) or a body longer than announced.
+  let out: Uint8Array | null = total !== null ? new Uint8Array(total) : null;
   const chunks: Uint8Array[] = [];
   let received = 0;
+  let complete = false;
   try {
     onChunk(0, total);
     for (;;) {
@@ -198,17 +219,26 @@ export async function readBodyWithProgress(
       if (signal?.aborted) throw abortError();
       if (done) break;
       if (!value) continue;
-      chunks.push(value);
+      if (out && received + value.byteLength <= out.length) out.set(value, received);
+      else { if (out) { chunks.push(out.subarray(0, received)); out = null; } chunks.push(value); }
       received += value.byteLength;
       onChunk(received, total);
     }
+    complete = true;
   } finally {
     signal?.removeEventListener('abort', onAbort);
+    // Abort, network error or a throwing onChunk leaves the body half-read: cancel the reader so
+    // the socket is released now instead of at GC time (loadSong aborts its SIBLING downloads, but
+    // nothing else releases the stream that threw).
+    if (!complete) { try { void reader.cancel().catch(() => undefined); } catch { /* already errored */ } }
   }
-  const out = new Uint8Array(received);
+  // `.buffer` is typed ArrayBufferLike (it could be a SharedArrayBuffer for a view we did not
+  // allocate); these two were allocated here, so they are plain ArrayBuffers.
+  if (out) return (received === out.length ? out.buffer : out.buffer.slice(0, received)) as ArrayBuffer;
+  const joined = new Uint8Array(received);
   let off = 0;
-  for (const c of chunks) { out.set(c, off); off += c.byteLength; }
-  return out.buffer;
+  for (const c of chunks) { joined.set(c, off); off += c.byteLength; }
+  return joined.buffer;
 }
 
 interface StemLoadState { received: number; total: number | null; fetched: boolean; decoded: boolean }
@@ -243,6 +273,12 @@ export class StemMixer implements SongTimeSource {
   readonly ctx: AudioContext;
   /** Click-free stop/start fades (between the stem sum and the master). */
   readonly transport: GainNode;
+  /**
+   * Bus for feedback SFX: post-transport (so cues are not faded out by pause/seek) but PRE-master
+   * and pre-limiter, so they share the song's headroom instead of clipping past it. Connect an
+   * `Sfx` here — `mixer.createSfx()` does it for you.
+   */
+  readonly sfxBus: GainNode;
   readonly master: GainNode;
   /** The master limiter (a DynamicsCompressorNode with `LIMITER_SETTINGS`), or null when disabled. */
   readonly compressor: DynamicsCompressorNode | null;
@@ -263,13 +299,24 @@ export class StemMixer implements SongTimeSource {
   private duckController: DuckController | null = null;
 
   private mixerState: MixerState = 'idle';
+  /** Song time the current segment started from (while paused/stopped/ended: the position). */
   private offsetSec = 0;
+  /** ctx time at which the current segment started (i.e. at which song time `offsetSec` occurred). */
   private startCtxTime = 0;
+  /**
+   * ctx time of song time 0 on the CURRENT mapping — the single source of truth for
+   * song↔ctx conversion. Kept as its own field (rather than derived from
+   * `startCtxTime - offsetSec`) because `pause()` moves `offsetSec` to the pause point while
+   * `startCtxTime` still refers to the start of the segment; deriving it there shifted the whole
+   * mapping by the elapsed playback time. Rebased by play/seek/stop, NOT by pause (a paused
+   * mapping still resolves stamps up to the pause point, like the engine SongClock).
+   */
+  private songStartCtx = 0;
   private playGeneration = 0;
   private loadGeneration = 0;
   private loadAbort: AbortController | null = null;
   private previewTimer: ReturnType<typeof setTimeout> | null = null;
-  private retireTimers = new Set<ReturnType<typeof setTimeout>>();
+  private retireTimers = new Map<ReturnType<typeof setTimeout>, () => void>();
   private endedListeners = new Set<() => void>();
 
   constructor(options: StemMixerOptions = {}) {
@@ -285,6 +332,9 @@ export class StemMixer implements SongTimeSource {
     this.master = this.ctx.createGain();
     this.masterCtl = new SmoothGain(this.master.gain, options.masterGain ?? (useLimiter ? DEFAULT_MASTER_GAIN.limiter : DEFAULT_MASTER_GAIN.none));
     this.transport.connect(this.master);
+    this.sfxBus = this.ctx.createGain();
+    this.sfxBus.gain.value = 1;
+    this.sfxBus.connect(this.master);
     if (useLimiter) {
       const c = this.ctx.createDynamicsCompressor();
       c.threshold.value = LIMITER_SETTINGS.threshold;
@@ -333,6 +383,16 @@ export class StemMixer implements SongTimeSource {
    * failure of the *current* load rejects (state returns to 'idle', nothing half-loaded).
    */
   async loadSong(manifest: SongManifest, baseUrl: string = '/songs', onProgress?: (p: LoadProgress) => void): Promise<void> {
+    // Validate BEFORE touching the mixer: `parseManifest` guards this for loaded song.json files,
+    // but a hand-built manifest whose playerStem is not a stem would otherwise download and decode
+    // everything and only then throw out of setPlayerStem, leaving a 'ready' mixer with no duck
+    // controller (onHit/onMiss silently doing nothing for the rest of the session).
+    if (manifest.stems.length === 0) throw new Error(`song "${manifest.id}": manifest has no stems`);
+    const ids = new Set(manifest.stems.map((s) => s.id));
+    if (ids.size !== manifest.stems.length) throw new Error(`song "${manifest.id}": stem ids must be unique`);
+    if (!ids.has(manifest.playerStem)) {
+      throw new Error(`song "${manifest.id}": playerStem "${manifest.playerStem}" is not one of the stems (${[...ids].join(', ')})`);
+    }
     this.unload();
     const gen = ++this.loadGeneration;
     const abort = new AbortController();
@@ -389,8 +449,9 @@ export class StemMixer implements SongTimeSource {
       this.stemOrder.push(spec.id);
     }
     this.offsetSec = 0;
+    this.songStartCtx = this.ctx.currentTime;
+    this.setPlayerStem(manifest.playerStem); // validated above; state flips only once it succeeded
     this.mixerState = 'ready';
-    this.setPlayerStem(manifest.playerStem);
   }
 
   /** Drop the loaded song (keeps the master chain); aborts an in-flight loadSong(). */
@@ -408,6 +469,7 @@ export class StemMixer implements SongTimeSource {
     this.playerStemId = null;
     this.duckController = null;
     this.offsetSec = 0;
+    this.songStartCtx = this.ctx.currentTime;
     this.mixerState = 'idle';
   }
 
@@ -417,16 +479,29 @@ export class StemMixer implements SongTimeSource {
    * Start every stem at the same ctx time (sample-accurate). `atCtxTime` defaults to
    * now + startLead; `fromSongTime` defaults to the current position (0 after load/stop,
    * the pause point after pause). Returns the ctx time at which audio actually starts (verified
-   * against the audio thread, see the module comment).
-   * Starting at/after the end of every stem ends the song immediately (state 'ended', listeners fire).
+   * against the audio thread, see the module comment) — so `engine.start(mixer.play())` always
+   * starts the engine clock on a song that is really sounding.
+   *
+   * play() therefore never returns silently: an implicit position at/after the end of the song
+   * (the song ended, or `seek()` was clamped to the end) restarts from 0, and an explicit
+   * `fromSongTime` past the end is a programming error and throws `RangeError` — use
+   * `seek(getDuration())` if you mean "jump to the end".
    */
   play(atCtxTime?: number, fromSongTime?: number): number {
     if (this.stems.size === 0) throw new Error('StemMixer.play(): no song loaded');
+    const duration = this.getDuration();
+    if (fromSongTime !== undefined) {
+      if (!Number.isFinite(fromSongTime)) throw new RangeError(`StemMixer.play(): fromSongTime must be finite, got ${fromSongTime}`);
+      if (duration > 0 && fromSongTime >= duration) {
+        throw new RangeError(`StemMixer.play(): fromSongTime ${fromSongTime.toFixed(3)} s is at/after the end of "${this.currentManifest?.id ?? 'song'}" (${duration.toFixed(3)} s)`);
+      }
+    }
     this.clearPreviewTimer();
-    this.stopSources();
+    const wasAudible = this.stopSources();
     if (fromSongTime !== undefined) this.offsetSec = fromSongTime;
-    else if (this.mixerState === 'ended') this.offsetSec = 0;
     this.offsetSec = Math.max(0, this.offsetSec);
+    // 'ended', or a position parked at the end by seek(): start over rather than start silent
+    if (duration > 0 && this.offsetSec >= duration) this.offsetSec = 0;
 
     const gen = ++this.playGeneration;
     const active: Stem[] = [];
@@ -438,17 +513,22 @@ export class StemMixer implements SongTimeSource {
     }
     const now = this.ctx.currentTime;
     if (!longest) {
-      // nothing left to play (offset ≥ every stem's duration): end right away
+      // Defensive: unreachable for a normal song (the position was clamped into [0, duration)
+      // above), only a zero-length buffer set can land here. End right away rather than pretend.
       this.startCtxTime = now;
-      this.duckController?.reset(now);
+      this.songStartCtx = now - this.offsetSec;
+      this.duckController?.reset(now, wasAudible ? STOP_FADE_SEC : 0);
       this.finishPlayback();
       return now;
     }
 
     const startAt = this.scheduleSources(active, atCtxTime);
     this.startCtxTime = startAt;
+    this.songStartCtx = startAt - this.offsetSec;
     this.rampTransportIn(startAt, this.offsetSec > 0);
-    this.duckController?.reset(now);
+    // Anchored ramp, not a hard write: the sources stopped above are still audible for
+    // STOP_FADE_SEC, and a ducked player stem stepping 0.05 → 1.0 in one sample would click.
+    this.duckController?.reset(now, wasAudible ? STOP_FADE_SEC : 0);
     longest.source!.onended = () => {
       if (gen !== this.playGeneration || this.mixerState !== 'playing') return;
       this.finishPlayback();
@@ -460,6 +540,10 @@ export class StemMixer implements SongTimeSource {
   /**
    * Pause (click-free fade, then the sources stop). Returns the ctx time of the pause point, i.e.
    * the value to hand to an external clock's `pause(ctxTime)`. Returns null when not playing.
+   *
+   * `songStartCtx` is deliberately NOT touched: while paused, `ctxTimeForSongTime()` keeps mapping
+   * on the segment that was running, so a not-yet-delivered input stamped before the pause still
+   * resolves to the ctx time it really happened at (engine SongClock semantics).
    */
   pause(): number | null {
     if (this.mixerState !== 'playing') return null;
@@ -491,24 +575,42 @@ export class StemMixer implements SongTimeSource {
   }
 
   /**
-   * Jump to `songTime`. While playing the sources are faded out and restarted (returns the ctx
-   * time at which audio resumes at the new position — re-base an external clock with
-   * `start(ctxTime, songTime)`); otherwise only the position moves (returns null).
+   * Jump to `songTime` (clamped to [0, duration]). While playing the sources are faded out and
+   * restarted, and the ctx time at which audio resumes at the new position is returned — re-base
+   * an external clock with `start(ctxTime, songTime)`. Returns null when no audio was (re)started:
+   * not playing, or seeking to the very end, which ends the song (state 'ended', listeners fire).
    */
   seek(songTime: number): number | null {
-    const t = Math.max(0, Math.min(songTime, this.getDuration()));
-    if (this.mixerState === 'playing') return this.play(undefined, t);
+    const duration = this.getDuration();
+    const t = Math.max(0, Math.min(songTime, duration));
+    if (this.mixerState === 'playing') {
+      if (duration > 0 && t >= duration) {
+        const now = this.ctx.currentTime;
+        const wasAudible = this.stopSources();
+        this.clearPreviewTimer();
+        this.startCtxTime = now;
+        this.songStartCtx = now - t;
+        this.duckController?.reset(now, wasAudible ? STOP_FADE_SEC : 0);
+        this.finishPlayback();
+        return null;
+      }
+      return this.play(undefined, t);
+    }
     this.offsetSec = t;
+    this.songStartCtx = this.ctx.currentTime - t; // the frozen position maps to now
     if (this.mixerState === 'ended') this.mixerState = 'ready';
     return null;
   }
 
   stop(): void {
     this.clearPreviewTimer();
-    this.stopSources();
+    const wasAudible = this.stopSources();
+    const now = this.ctx.currentTime;
     this.offsetSec = 0;
+    this.songStartCtx = now;
     if (this.stems.size > 0) this.mixerState = 'ready';
-    this.duckController?.reset(this.ctx.currentTime);
+    // ramped while the stopped sources are still fading out (see play())
+    this.duckController?.reset(now, wasAudible ? STOP_FADE_SEC : 0);
   }
 
   /**
@@ -517,7 +619,11 @@ export class StemMixer implements SongTimeSource {
    * Returns the ctx start time.
    */
   playPreview(durationSec: number = DEFAULT_PREVIEW_SEC, fadeSec: number = DEFAULT_PREVIEW_FADE_SEC, fromSongTime?: number): number {
-    const from = fromSongTime ?? this.currentManifest?.previewStart ?? 0;
+    const requested = fromSongTime ?? this.currentManifest?.previewStart ?? 0;
+    const duration = this.getDuration();
+    // a previewStart past the end (or a longer manifest than the stems) previews from the top
+    // rather than throwing out of play()
+    const from = Number.isFinite(requested) && requested > 0 && (duration <= 0 || requested < duration) ? requested : 0;
     const startAt = this.play(undefined, from);
     if (this.mixerState !== 'playing') return startAt;
     const remaining = Math.max(0, this.getDuration() - this.offsetSec);
@@ -556,15 +662,41 @@ export class StemMixer implements SongTimeSource {
 
   /**
    * ctx time at which song time `songTime` occurs, on the mapping of the current/last play
-   * segment (exact while playing; while paused it is the mapping that was valid before the pause,
-   * matching the engine SongClock's semantics).
+   * segment. Exact inverse of `ctxTimeToSongTime()` in every state, and identical to the engine
+   * SongClock's `ctxTimeForSongTime()`:
+   *  - playing: `ctxTimeForSongTime(songTime(t)) === t` for every t;
+   *  - paused: the segment mapping is kept, so the pause point maps back to the ctx time of the
+   *    pause (a stamp taken just before the pause resolves to when it really happened);
+   *  - ready/ended after stop/seek: the position maps to the ctx time of that stop/seek.
    */
-  ctxTimeForSongTime(songTime: number): number { return this.getSongStartCtxTime() + songTime; }
+  ctxTimeForSongTime(songTime: number): number { return this.songStartCtx + songTime; }
+
+  /**
+   * Delay between a sample leaving the graph and reaching the speaker: `ctx.outputLatency` where
+   * the browser reports it (10–60 ms wired, 150 ms+ over Bluetooth), else `ctx.baseLatency`, else 0.
+   *
+   * JUDGMENT is unaffected — the latency probe closes the loop through the same speakers, so its
+   * `inputLatencySec` already contains this term. RENDERING is affected: `songTime()` is the time
+   * the graph is *producing*, which is `outputLatencySec` AHEAD of what the patient hears. A
+   * renderer that draws `songTime()` shows the note hitting the line while the beat is still in
+   * the buffer. Draw `displaySongTime()` instead.
+   */
+  get outputLatencySec(): number {
+    const ctx = this.ctx as AudioContext & { outputLatency?: number; baseLatency?: number };
+    const out = typeof ctx.outputLatency === 'number' && Number.isFinite(ctx.outputLatency) ? ctx.outputLatency : 0;
+    const base = typeof ctx.baseLatency === 'number' && Number.isFinite(ctx.baseLatency) ? ctx.baseLatency : 0;
+    return Math.max(0, out || base);
+  }
+
+  /** Song time the listener is *hearing* at `nowCtx` — what a renderer should draw. */
+  displaySongTime(nowCtx: number = this.ctx.currentTime): number {
+    return this.songTime(nowCtx) - this.outputLatencySec;
+  }
 
   /** Alias of `songTime()` (kept for the original API). */
   getSongTime(): number { return this.songTime(); }
-  /** ctx time corresponding to song time 0 (valid while playing). */
-  getSongStartCtxTime(): number { return this.startCtxTime - this.offsetSec; }
+  /** ctx time corresponding to song time 0 on the current mapping (see `ctxTimeForSongTime`). */
+  getSongStartCtxTime(): number { return this.songStartCtx; }
   songTimeToCtxTime(songTime: number): number { return this.ctxTimeForSongTime(songTime); }
   ctxTimeToSongTime(ctxTime: number): number { return ctxTime - this.getSongStartCtxTime(); }
 
@@ -600,23 +732,43 @@ export class StemMixer implements SongTimeSource {
   /** Analytic gain of the player stem right now (for a UI meter). */
   getPlayerStemGain(): number { return this.duckController?.valueAt(this.ctx.currentTime) ?? 1; }
 
+  // ------------------------------------------------------------------ sfx
+
+  /**
+   * Feedback SFX routed through this mixer's `sfxBus` (so they share the master gain and the
+   * limiter). Prefer this over `new Sfx(ctx)`, which would bypass the master chain and clip.
+   * The mixer does not own the returned object: dispose it yourself.
+   */
+  createSfx(volume?: number, levels?: Partial<SfxLevels>): Sfx {
+    return new Sfx(this.ctx, this.sfxBus, volume, levels);
+  }
+
   // ------------------------------------------------------------------ teardown
 
   /**
    * Unload (fading out if playing), disconnect the master chain and close an owned context.
-   * The disconnect/close is deferred past the fade when something was playing.
+   * The disconnect/close is deferred past the fade when something was playing; every other
+   * pending retire timer is cancelled and its work run immediately, so nothing survives dispose().
    */
   dispose(): void {
     const wasPlaying = this.mixerState === 'playing';
     this.unload();
     this.endedListeners.clear();
     const teardown = () => {
+      this.flushRetireTimers();
       this.transport.disconnect();
+      this.sfxBus.disconnect();
       this.master.disconnect();
       this.compressor?.disconnect();
       if (this.ownsContext && this.ctx.state !== 'closed') void this.ctx.close().catch(() => undefined);
     };
-    if (wasPlaying) this.retire(teardown); else teardown();
+    if (wasPlaying) {
+      // one last timer, past the fade: it flushes the rest (including itself, already removed)
+      const timer = setTimeout(() => { this.retireTimers.delete(timer); teardown(); }, STOP_FADE_SEC * 1000 + 20);
+      this.retireTimers.set(timer, teardown);
+    } else {
+      teardown();
+    }
   }
 
   // ------------------------------------------------------------------ internals
@@ -702,7 +854,18 @@ export class StemMixer implements SongTimeSource {
   /** Run `fn` after the stop fade has completed (nodes stay referenced until then). */
   private retire(fn: () => void): void {
     const timer = setTimeout(() => { this.retireTimers.delete(timer); fn(); }, STOP_FADE_SEC * 1000 + 20);
-    this.retireTimers.add(timer);
+    this.retireTimers.set(timer, fn);
+  }
+
+  /**
+   * Cancel every pending retire timer and run its work now. Called from dispose(): letting the
+   * timers fire after teardown keeps the mixer (and its buffers) reachable for another ~28 ms
+   * each, which is noise under hot-reload and repeated test construction.
+   */
+  private flushRetireTimers(): void {
+    const pending = [...this.retireTimers];
+    this.retireTimers.clear();
+    for (const [timer, fn] of pending) { clearTimeout(timer); fn(); }
   }
 
   private clearPreviewTimer(): void {

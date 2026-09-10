@@ -70,8 +70,30 @@ class ProbeContext {
   }
 }
 
+/** Ink box of a run of text: how far the glyphs actually extend above / below the baseline. */
+export interface InkBox {
+  ascent: number;
+  descent: number;
+  width: number;
+}
+
+/**
+ * Measure the ink box of `text` with an already-configured context, falling back to font-size
+ * ratios when the engine does not report `actualBoundingBox*` (jsdom stubs, old Safari).
+ */
+export function measureInk(ctx: Ctx2D, text: string, px: number): InkBox {
+  const m = ctx.measureText(text) as TextMetrics | undefined;
+  const width = m && typeof m.width === 'number' && m.width > 0 ? m.width : text.length * px * 0.6;
+  const a = m && typeof m.actualBoundingBoxAscent === 'number' && m.actualBoundingBoxAscent > 0 ? m.actualBoundingBoxAscent : px * 0.72;
+  const d = m && typeof m.actualBoundingBoxDescent === 'number' && m.actualBoundingBoxDescent >= 0 ? m.actualBoundingBoxDescent : px * 0.02;
+  return { ascent: a, descent: d, width };
+}
+
 export class TextCache {
   private map = new Map<string, TextSprite>();
+  /** Cached advance widths (cold path: label fitting, not per-frame drawing). */
+  private widths = new Map<string, number>();
+  private fits = new Map<string, string>();
   private readonly max: number;
   private readonly factory: CanvasFactory;
   private readonly probe: ProbeContext;
@@ -90,6 +112,53 @@ export class TextCache {
 
   clear(): void {
     this.map.clear();
+    this.widths.clear();
+    this.fits.clear();
+  }
+
+  /**
+   * Advance width of `text` in logical px, without rasterizing anything. Cached, and meant for the
+   * cold path (fitting a label to a lane on resize) rather than per-frame use.
+   */
+  measure(text: string, style: TextStyle): number {
+    const k = `${style.font}|${text}`;
+    const hit = this.widths.get(k);
+    if (hit !== undefined) return hit;
+    const px = fontPx(style.font);
+    let w = text.length * px * 0.6;
+    const probe = this.probe.get();
+    if (probe) {
+      probe.font = style.font;
+      const m = probe.measureText(text);
+      if (m && typeof m.width === 'number' && m.width > 0) w = m.width;
+    }
+    if (this.widths.size > 512) this.widths.clear();
+    this.widths.set(k, w);
+    return w;
+  }
+
+  /**
+   * Longest prefix of `text` that fits `maxWidth`, with a trailing ellipsis when it had to cut
+   * (returns `text` unchanged when it already fits). Used for lane labels on narrow canvases, where
+   * an untruncated label would collide with its neighbours. Cached; cold path only.
+   */
+  fit(text: string, style: TextStyle, maxWidth: number): string {
+    if (!(maxWidth > 0)) return '';
+    if (this.measure(text, style) <= maxWidth) return text;
+    const k = `${style.font}|${Math.round(maxWidth)}|${text}`;
+    const hit = this.fits.get(k);
+    if (hit !== undefined) return hit;
+    let out = '';
+    for (let n = text.length - 1; n >= 1; n--) {
+      const candidate = `${text.slice(0, n).trimEnd()}…`;
+      if (this.measure(candidate, style) <= maxWidth) {
+        out = candidate;
+        break;
+      }
+    }
+    if (this.fits.size > 256) this.fits.clear();
+    this.fits.set(k, out);
+    return out;
   }
 
   private key(text: string, s: TextStyle): string {
@@ -163,6 +232,41 @@ export class TextCache {
   }
 
   /**
+   * Draw a short string as a row of per-character sprites, centred at (x, y). Costs one cached
+   * sprite per distinct *character* rather than per distinct *string*, so a value that changes
+   * every few frames (the combo counter) never rasterizes a new canvas mid-song and can never
+   * flood the LRU with large glowing sprites. Use `draw()` for static strings (labels, titles).
+   * Returns the drawn width in logical px.
+   */
+  drawChars(ctx: Ctx2D, text: string, x: number, y: number, style: TextStyle, scale = 1, alpha = 1): number {
+    let total = 0;
+    for (let i = 0; i < text.length; i++) {
+      const sp = this.get(text[i], style);
+      if (!sp) return this.draw(ctx, text, x, y, style, scale, alpha);
+      total += sp.textWidth;
+    }
+    const w = total * scale;
+    let cx = x - w / 2;
+    const prev = ctx.globalAlpha;
+    if (alpha !== 1) ctx.globalAlpha = prev * alpha;
+    for (let i = 0; i < text.length; i++) {
+      const sp = this.get(text[i], style);
+      if (!sp) continue;
+      const cw = sp.textWidth * scale;
+      ctx.drawImage(
+        sp.canvas as unknown as CanvasImageSource,
+        cx + cw / 2 - (sp.width * scale) / 2,
+        y - (sp.height * scale) / 2,
+        sp.width * scale,
+        sp.height * scale,
+      );
+      cx += cw;
+    }
+    if (alpha !== 1) ctx.globalAlpha = prev;
+    return w;
+  }
+
+  /**
    * Draw cached text centred at (x, y) in logical pixels. `scale` scales around the centre.
    * `align` shifts the anchor: 'center' (default) | 'left' | 'right'.
    */
@@ -207,13 +311,28 @@ export class TextCache {
 }
 
 /**
- * Rolling-digit number display (odometer style). Digits 0-9 are rasterized once into a
- * vertical strip; each digit cell shows a fractional scroll between consecutive digits.
+ * Rolling-digit number display (odometer style). Digits 0-9 are rasterized once into a vertical
+ * strip and a rolling digit scrolls from one glyph to the next behind a one-glyph-tall window.
+ *
+ * The roll pitch is the *ink box* of the digits (`glyphH`), not the strip's cell height: the strip
+ * cells are padded so each digit's glow/stroke can be baked in without bleeding into its
+ * neighbours, but rolling by the padded pitch would put that padding — i.e. a blank band as tall as
+ * a third of the glyph — through the middle of the window on every roll, which reads as a rendering
+ * fault rather than an odometer. Rolling by `glyphH` keeps the outgoing and incoming glyphs exactly
+ * contiguous, so the digit column is never empty at any point of a 0→1 roll.
+ *
+ * A settled digit (roll ≈ 0) is blitted whole and unclipped, so its glow is intact; only a rolling
+ * digit is clipped to the one-glyph window (where the clipped halo is invisible because it moves).
  */
 export class DigitRoller {
   private strip: CanvasLike | null = null;
+  /** Horizontal advance per digit (the layout pitch). */
+  private advW = 0;
+  /** Source cell size in the strip: the advance box plus padding for glow / stroke. */
   private cellW = 0;
   private cellH = 0;
+  /** Roll pitch = the digits' ink height. The visible window is exactly this tall. */
+  private glyphH = 0;
   private stripDpr = 1;
   private stripKey = '';
   private readonly factory: CanvasFactory;
@@ -225,20 +344,32 @@ export class DigitRoller {
   }
 
   private ensure(style: TextStyle, dpr: number): void {
-    const key = `${style.font}|${style.color}|${style.glow ?? ''}|${dpr}`;
+    const key = `${style.font}|${style.color}|${style.glow ?? ''}|${style.stroke ?? ''}|${dpr}`;
     if (this.strip && this.stripKey === key) return;
     const px = fontPx(style.font);
+    const blur = style.glow ? (style.glowBlur ?? px * 0.25) : 0;
+    const sw = style.stroke ? (style.strokeWidth ?? Math.max(1, px * 0.08)) : 0;
     const probe = this.probe.get();
     let w = px * 0.62;
+    let ascent = px * 0.72;
+    let descent = px * 0.02;
     if (probe) {
       probe.font = style.font;
       for (let d = 0; d < 10; d++) {
-        const m = probe.measureText(String(d));
-        if (m && m.width > w) w = m.width;
+        const ink = measureInk(probe, String(d), px);
+        if (ink.width > w) w = ink.width;
+        if (ink.ascent > ascent) ascent = ink.ascent;
+        if (ink.descent > descent) descent = ink.descent;
       }
     }
-    this.cellW = Math.ceil(w + px * 0.1);
-    this.cellH = Math.ceil(px * 1.2);
+    // Padding must cover everything painted outside the glyph box (glow + stroke) so a cell blit
+    // never carries a neighbouring digit's ink. It is padding, not pitch: the layout advance
+    // (`advW`) and the roll pitch (`glyphH`) both stay tight to the glyphs.
+    const pad = Math.ceil(blur + sw + 1);
+    this.glyphH = Math.max(1, Math.ceil(ascent + descent));
+    this.advW = Math.ceil(w + px * 0.1);
+    this.cellW = this.advW + pad * 2;
+    this.cellH = this.glyphH + pad * 2;
     this.stripDpr = dpr;
     const canvas = this.factory(this.cellW * dpr, this.cellH * 10 * dpr);
     const ctx = canvas.getContext('2d');
@@ -249,22 +380,36 @@ export class DigitRoller {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.font = style.font;
     ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillStyle = style.color;
+    ctx.textBaseline = 'alphabetic';
     if (style.glow) {
       ctx.shadowColor = style.glow;
-      ctx.shadowBlur = px * 0.25;
+      ctx.shadowBlur = blur;
     }
+    // Ink box of cell d spans [d*cellH + padY, d*cellH + padY + glyphH], i.e. it is centred in the
+    // cell, so a cell blit positioned by its glyph centre lands the glyph exactly on that centre.
     for (let d = 0; d < 10; d++) {
-      ctx.fillText(String(d), this.cellW / 2, this.cellH * d + this.cellH / 2);
+      const baseline = this.cellH * d + pad + ascent;
+      if (style.stroke) {
+        ctx.lineJoin = 'round';
+        ctx.lineWidth = sw * 2;
+        ctx.strokeStyle = style.stroke;
+        ctx.strokeText(String(d), this.cellW / 2, baseline);
+      }
+      ctx.fillStyle = style.color;
+      ctx.fillText(String(d), this.cellW / 2, baseline);
     }
     this.strip = canvas;
     this.stripKey = key;
   }
 
-  /** Digit cell width in logical px (after ensure). */
+  /** Digit advance (layout pitch) in logical px (after ensure). */
   get digitWidth(): number {
-    return this.cellW;
+    return this.advW;
+  }
+
+  /** Roll pitch / visible window height in logical px (after ensure). */
+  get digitHeight(): number {
+    return this.glyphH;
   }
 
   /**
@@ -273,11 +418,13 @@ export class DigitRoller {
    */
   draw(ctx: Ctx2D, value: number, rightX: number, centerY: number, style: TextStyle, minDigits = 6, dpr = 1): number {
     this.ensure(style, dpr);
-    const v = Math.max(0, value);
+    const v = Number.isFinite(value) ? Math.max(0, value) : 0;
     const intPart = Math.floor(v);
     const digits = Math.max(minDigits, String(intPart).length);
+    const aw = this.advW;
     const cw = this.cellW;
     const ch = this.cellH;
+    const gh = this.glyphH;
     if (!this.strip) {
       ctx.save();
       ctx.font = style.font;
@@ -286,14 +433,10 @@ export class DigitRoller {
       ctx.textBaseline = 'middle';
       ctx.fillText(String(intPart).padStart(minDigits, '0'), rightX, centerY);
       ctx.restore();
-      return cw * digits;
+      return aw * digits;
     }
     const strip = this.strip as unknown as CanvasImageSource;
     const sdpr = this.stripDpr;
-    ctx.save();
-    ctx.beginPath();
-    ctx.rect(rightX - cw * digits, centerY - ch / 2, cw * digits, ch);
-    ctx.clip();
     // Fractional roll: the lowest digit rolls by frac; higher digits roll only while lower ones wrap 9→0.
     const frac = v - intPart;
     let carry = frac;
@@ -301,18 +444,27 @@ export class DigitRoller {
     for (let i = 0; i < digits; i++) {
       const digit = Math.floor(intPart / pow) % 10;
       const roll = carry; // 0..1 offset toward digit+1
-      const x = rightX - cw * (i + 1);
-      const offset = roll * ch;
-      // current digit scrolled up by offset, next digit follows below
-      ctx.drawImage(strip, 0, digit * ch * sdpr, cw * sdpr, ch * sdpr, x, centerY - ch / 2 - offset, cw, ch);
+      // Cell blits are centred on the digit's advance box, so the padding never shifts the layout.
+      const cx = rightX - aw * (i + 0.5);
+      const x = cx - cw / 2;
       if (roll > 0.0001) {
+        // Rolling: clip to exactly one glyph height (full cell width, so the halo stays intact
+        // sideways) and scroll two contiguous glyphs through it.
+        const offset = roll * gh;
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(x, centerY - gh / 2, cw, gh);
+        ctx.clip();
+        ctx.drawImage(strip, 0, digit * ch * sdpr, cw * sdpr, ch * sdpr, x, centerY - ch / 2 - offset, cw, ch);
         const next = (digit + 1) % 10;
-        ctx.drawImage(strip, 0, next * ch * sdpr, cw * sdpr, ch * sdpr, x, centerY - ch / 2 - offset + ch, cw, ch);
+        ctx.drawImage(strip, 0, next * ch * sdpr, cw * sdpr, ch * sdpr, x, centerY - ch / 2 - offset + gh, cw, ch);
+        ctx.restore();
+      } else {
+        ctx.drawImage(strip, 0, digit * ch * sdpr, cw * sdpr, ch * sdpr, x, centerY - ch / 2, cw, ch);
       }
       carry = digit === 9 ? carry : 0;
       pow *= 10;
     }
-    ctx.restore();
-    return cw * digits;
+    return aw * digits;
   }
 }

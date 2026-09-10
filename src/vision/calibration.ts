@@ -32,6 +32,8 @@ export interface RomCalibration {
   movement?: Movement;
   /** Rest-phase compensation baseline (median over the rest window), when the movement monitors one. */
   compensationBaseline?: CompensationBaseline | null;
+  /** True when a therapist adjusted the range by hand (nudge/setRange) rather than it being measured. */
+  manual?: boolean;
 }
 
 export type CalibrationPhase = 'rest' | 'move' | 'done';
@@ -63,9 +65,22 @@ export interface CalibratorOptions {
   minRestSamples?: number;
   /**
    * Stillness guard: the rest window's 10th..90th percentile spread must be below this fraction of
-   * minRom before auto-advancing (default 0.75). The window keeps sliding until the patient is still.
+   * minRom before auto-advancing (default 0.35). The window keeps sliding until the patient is still.
+   *
+   * WHY 0.35 AND NOT MORE: `min` is the MEDIAN of this window and every normalized value in the session
+   * is measured from it. At 0.75 a rest window drifting 42% of seated_march's minimum ROM counted as
+   * "still", so `min` was a median over a moving target and the whole normalization could be biased by
+   * a third of the guard value — the patient then plays a game whose zero is somewhere inside their
+   * movement. Spread alone is also not enough: a slow, steady drift has a small spread at every instant,
+   * so `restDriftFraction` additionally bounds the trend across the window.
    */
   stillnessFraction?: number;
+  /**
+   * Trend guard: |median(first half of the rest window) - median(second half)| must be below this
+   * fraction of minRom (default 0.2). Catches a steadily drifting rest position, which a percentile
+   * spread over the same window barely registers.
+   */
+  restDriftFraction?: number;
   /** Give up waiting for stillness and advance after this many seconds of rest (default 10). */
   restTimeoutSec?: number;
   /** Reps to collect (default 3). */
@@ -94,15 +109,52 @@ export interface CalibrationSample {
 
 /** clamp((feature - min)/(max - min), 0, 1). Returns 0 for a degenerate range. */
 export function normalizeFeature(cal: Pick<RomCalibration, 'min' | 'max'>, feature: number): number {
-  const range = cal.max - cal.min;
-  if (!(range > 1e-9)) return 0;
-  return clamp01((feature - cal.min) / range);
+  return clamp01(normalizeFeatureRaw(cal, feature));
 }
 
+/**
+ * (feature - min)/(max - min) WITHOUT the 0..1 clamp. Returns 0 for a degenerate range.
+ * Cross-session ROM gain is the therapeutic outcome, so a patient who outgrows their calibration must
+ * stay measurable: the clamped value drives thresholds/meters, this one drives the recorded metrics
+ * (LaneRepEvent.rawPeak / LaneInputEvent.rawStrength).
+ */
+export function normalizeFeatureRaw(cal: Pick<RomCalibration, 'min' | 'max'>, feature: number): number {
+  const range = cal.max - cal.min;
+  if (!(range > 1e-9)) return 0;
+  return (feature - cal.min) / range;
+}
+
+/**
+ * True when a calibration spans at least the movement's minimum ROM (its `minRom`), i.e. when
+ * normalizing against it is meaningful.
+ *
+ * THIS IS A BOUNDARY CHECK, NOT A FORMALITY. `setManualRange` accepts anything, `reconcile` only keeps
+ * max above min by 1e-6, `getProvisional` hands back the range of an ERRORED calibration, and a stale
+ * calibration can arrive from localStorage months later. Any of those can produce a range of, say,
+ * 0.001 on seated_march (minRom 0.12) — and then 1% of the patient's real ROM is a full-scale hit, so
+ * hand tremor scores. Every consumer that turns a feature into a SCORE must run this first; VisionInput
+ * does, and refuses to play a lane that fails (see VisionInput.getInvalidCalibrationLanes).
+ */
 export function isCalibrationValid(cal: Pick<RomCalibration, 'min' | 'max'> | null | undefined, movement?: Movement): boolean {
   if (!cal || !Number.isFinite(cal.min) || !Number.isFinite(cal.max)) return false;
   const minRom = movement ? MOVEMENT_INFO[movement].minRom : 1e-6;
   return cal.max - cal.min >= minRom;
+}
+
+/** Why a calibration was rejected (null = usable). Suitable for a therapist-facing message. */
+export function calibrationProblem(cal: Pick<RomCalibration, 'min' | 'max'> | null | undefined, movement: Movement): string | null {
+  if (!cal) return null;
+  if (!Number.isFinite(cal.min) || !Number.isFinite(cal.max)) return 'the range is not a number';
+  const info = MOVEMENT_INFO[movement];
+  const rom = cal.max - cal.min;
+  if (rom >= info.minRom) return null;
+  // Keep a tiny range legible: "0%" reads as a formatting bug, "0.1%" reads as the actual problem.
+  const fmt = (v: number) => {
+    if (info.unit === 'deg') return `${v < 1 ? v.toFixed(1) : v.toFixed(0)}°`;
+    const pct = v * 100;
+    return `${pct > 0 && pct < 1 ? pct.toFixed(1) : pct.toFixed(0)}%`;
+  };
+  return `the calibrated range is only ${fmt(rom)}, below the ${fmt(info.minRom)} minimum for ${info.label.toLowerCase()}`;
 }
 
 export class RomCalibrator {
@@ -110,6 +162,7 @@ export class RomCalibrator {
   readonly restDurationSec: number;
   readonly minRestSamples: number;
   readonly stillnessFraction: number;
+  readonly restDriftFraction: number;
   readonly restTimeoutSec: number;
   readonly repsRequired: number;
   readonly minRom: number;
@@ -123,7 +176,9 @@ export class RomCalibrator {
   /** Rest samples with times; only the trailing restDurationSec window is used. */
   private restSamples: number[] = [];
   private restTimes: number[] = [];
+  /** Compensation samples with THEIR OWN times: they are sparser than the feature samples. */
   private restComp: CompensationSample[] = [];
+  private restCompTimes: number[] = [];
   private restStart = NaN;
   private restEnd = NaN;
   private restTotal = 0;
@@ -134,6 +189,9 @@ export class RomCalibrator {
   private max: number | null = null;
   private baseline: CompensationBaseline | null = null;
   private peaks: number[] = [];
+  private manualAdjusted = false;
+  /** Highest feature seen in the move phase, so a 'no_reps' lane still offers a starting range. */
+  private moveMax = -Infinity;
   // peak detection
   private trough = Infinity;
   private candidate = -Infinity;
@@ -143,7 +201,8 @@ export class RomCalibrator {
     this.movement = movement;
     this.restDurationSec = opts.restDurationSec ?? 2;
     this.minRestSamples = opts.minRestSamples ?? 30;
-    this.stillnessFraction = opts.stillnessFraction ?? 0.75;
+    this.stillnessFraction = opts.stillnessFraction ?? 0.35;
+    this.restDriftFraction = opts.restDriftFraction ?? 0.2;
     this.restTimeoutSec = opts.restTimeoutSec ?? 10;
     this.repsRequired = opts.reps ?? 3;
     this.minRom = opts.minRom ?? MOVEMENT_INFO[movement].minRom;
@@ -196,13 +255,25 @@ export class RomCalibrator {
       this.restTotal++;
       this.restSamples.push(feature);
       this.restTimes.push(tSec);
-      if (comp) this.restComp.push(comp);
+      if (comp) {
+        this.restComp.push(comp);
+        this.restCompTimes.push(tSec);
+      }
       // Slide the window: keep only the trailing restDurationSec (but never fewer than minRestSamples).
       while (this.restSamples.length > this.minRestSamples && this.restTimes[0] < tSec - this.restDurationSec) {
         this.restSamples.shift();
         this.restTimes.shift();
       }
-      while (this.restComp.length > Math.max(this.restSamples.length, 1)) this.restComp.shift();
+      // The compensation baseline MUST describe the same rest window as `min`, so it is windowed on its
+      // OWN timestamps against the feature window's start. Compensation is measured far less often than
+      // the feature (the heel is the least reliably visible pose landmark), so a length-match would let
+      // the baseline span several times the rest window and describe a completely different posture.
+      // Only when every comp sample predates the window is the most recent one kept (best available).
+      const windowStart = this.restTimes[0];
+      while (this.restCompTimes.length > 1 && this.restCompTimes[0] < windowStart) {
+        this.restComp.shift();
+        this.restCompTimes.shift();
+      }
       const windowFull = tSec - this.restStart >= this.restDurationSec && this.restSamples.length >= this.minRestSamples;
       this.restStill = windowFull && this.computeStillness();
       const timedOut = tSec - this.restStart >= this.restTimeoutSec && this.restSamples.length >= this.minRestSamples;
@@ -210,6 +281,7 @@ export class RomCalibrator {
     } else if (this.phase === 'move') {
       if (Number.isNaN(this.moveStart)) this.moveStart = tSec;
       this.moveSamples++;
+      if (feature > this.moveMax) this.moveMax = feature;
       this.detectPeak(feature);
       if (this.peaks.length >= this.repsRequired) this.finish();
       else if (tSec - this.moveStart > this.moveTimeoutSec) {
@@ -226,7 +298,20 @@ export class RomCalibrator {
   private computeStillness(): boolean {
     if (this.restSamples.length < 2) return false;
     const spread = percentile(this.restSamples, 0.9) - percentile(this.restSamples, 0.1);
-    return spread <= this.minRom * this.stillnessFraction;
+    if (spread > this.minRom * this.stillnessFraction) return false;
+    // Trend guard: a slow steady drift keeps the instantaneous spread small but moves the median the
+    // whole session is normalized from. Compare the two halves of the window.
+    const half = this.restSamples.length >> 1;
+    if (half < 2) return true;
+    const drift = Math.abs(median(this.restSamples.slice(this.restSamples.length - half)) - median(this.restSamples.slice(0, half)));
+    return drift <= this.minRom * this.restDriftFraction;
+  }
+
+  /** Drift of the rest window (second-half median minus first-half median), for a calibration screen. */
+  restDrift(): number {
+    const half = this.restSamples.length >> 1;
+    if (half < 2) return 0;
+    return median(this.restSamples.slice(this.restSamples.length - half)) - median(this.restSamples.slice(0, half));
   }
 
   /** Manually end the rest phase (e.g. therapist pressed "Next"). Requires at least one rest sample. */
@@ -237,6 +322,7 @@ export class RomCalibrator {
     this.phase = 'move';
     this.moveStart = NaN;
     this.moveSamples = 0;
+    this.moveMax = -Infinity;
     this.peaks = [];
     this.trough = this.min;
     this.candidate = -Infinity;
@@ -279,11 +365,24 @@ export class RomCalibrator {
     return this.phase;
   }
 
-  /** Restart the move phase (after insufficient_range), keeping the rest baseline. */
-  retryMove(): void {
+  /**
+   * Restart the move phase (after insufficient_range / no_reps), keeping the rest baseline.
+   * Returns true when the rest baseline could be reused and the calibrator is back in 'move'.
+   *
+   * When there are no rest samples to reuse — the therapist called setManualRange() straight from the
+   * rest phase, or reset() ran — it falls back to a FULL RESET and returns false, so a "try again"
+   * button restarts the rest hold instead of silently doing nothing (it used to leave the phase at
+   * 'rest' with the old error intact, which reads to the therapist as a dead button).
+   */
+  retryMove(): boolean {
+    if (this.restSamples.length === 0) {
+      this.reset();
+      return false;
+    }
     this.phase = 'rest';
     this.max = null;
-    this.beginMove();
+    this.error = null;
+    return this.beginMove();
   }
 
   reset(): void {
@@ -292,16 +391,19 @@ export class RomCalibrator {
     this.restSamples = [];
     this.restTimes = [];
     this.restComp = [];
+    this.restCompTimes = [];
     this.restStart = NaN;
     this.restEnd = NaN;
     this.restTotal = 0;
     this.restStill = false;
     this.moveStart = NaN;
     this.moveSamples = 0;
+    this.moveMax = -Infinity;
     this.min = null;
     this.max = null;
     this.baseline = null;
     this.peaks = [];
+    this.manualAdjusted = false;
     this.trough = Infinity;
     this.candidate = -Infinity;
     this.rising = false;
@@ -313,6 +415,7 @@ export class RomCalibrator {
   nudge(minDelta: number, maxDelta: number): void {
     if (this.min !== null) this.min += minDelta;
     if (this.max !== null) this.max += maxDelta;
+    this.manualAdjusted = true;
     this.reconcile();
   }
 
@@ -320,13 +423,21 @@ export class RomCalibrator {
   setRange(min: number | null, max: number | null): void {
     if (min !== null) this.min = min;
     if (max !== null) this.max = max;
+    this.manualAdjusted = true;
     this.reconcile();
   }
 
+  /**
+   * After a therapist override the range is whatever they set, so BOTH failure modes are rescuable:
+   * 'insufficient_range' (the reps were too small) and 'no_reps' (the peak detector never saw a rep —
+   * a slow, smooth patient, or a lane that lost tracking mid-attempt). Clearing only the former left
+   * getResult() null forever, so a lane the therapist had explicitly measured by hand could not be
+   * played at all. A manual range that is still below the movement's minimum ROM stays an error.
+   */
   private reconcile(): void {
     if (this.min !== null && this.max !== null && this.max < this.min + 1e-6) this.max = this.min + 1e-6;
     if (this.phase === 'done' && this.min !== null && this.max !== null) {
-      this.error = this.max - this.min < this.minRom ? 'insufficient_range' : this.error === 'insufficient_range' ? null : this.error;
+      this.error = this.max - this.min < this.minRom ? 'insufficient_range' : null;
     }
   }
 
@@ -338,6 +449,7 @@ export class RomCalibrator {
       peaks: this.peaks.slice(),
       movement: this.movement,
       compensationBaseline: this.baseline,
+      manual: this.manualAdjusted,
     };
   }
 
@@ -347,10 +459,39 @@ export class RomCalibrator {
     return this.build(this.min, this.max);
   }
 
-  /** Best-effort calibration even when errored (for therapist override). */
+  /**
+   * Full therapist override from ANY phase: set both ends of the range and finish the calibration.
+   * The escape hatch for a lane the automatic path cannot measure (a patient too slow/smooth for the
+   * peak detector, a joint the therapist goniometers by hand): without it, a 'no_reps' lane could only
+   * be retried, never overridden, and the session would have to drop the lane.
+   * The rest-phase compensation baseline collected so far is kept.
+   */
+  setManualRange(min: number, max: number): void {
+    if (this.phase === 'rest' && this.restSamples.length > 0 && this.baseline === null) {
+      this.baseline = baselineFromSamples(this.restComp);
+    }
+    this.min = min;
+    this.max = max;
+    this.manualAdjusted = true;
+    this.phase = 'done';
+    this.reconcile();
+  }
+
+  /** True when the current range came from (or was adjusted by) a therapist override. */
+  isManual(): boolean {
+    return this.manualAdjusted;
+  }
+
+  /**
+   * Best-effort calibration even when errored (for therapist override). When no rep was detected at all
+   * ('no_reps' leaves `max` unset) the largest feature seen during the move phase stands in, so the
+   * therapist screen has a real starting range to nudge instead of nothing at all.
+   */
   getProvisional(): RomCalibration | null {
-    if (this.min === null || this.max === null) return null;
-    return this.build(this.min, this.max);
+    if (this.min === null) return null;
+    const max = this.max ?? (this.moveMax > this.min ? this.moveMax : null);
+    if (max === null) return null;
+    return this.build(this.min, max);
   }
 
   /** Rest-phase compensation baseline (median), available from the move phase on. */
@@ -364,6 +505,25 @@ export class RomCalibrator {
     return normalizeFeature({ min: this.min, max: this.max }, feature);
   }
 
+  /** Same as normalize() but unclamped, so exceeding the calibrated ROM stays measurable (>1). */
+  normalizeRaw(feature: number): number {
+    if (this.min === null || this.max === null) return 0;
+    return normalizeFeatureRaw({ min: this.min, max: this.max }, feature);
+  }
+
+  /**
+   * The rest window `min` and the compensation baseline are BOTH taken from (seconds, sample counts).
+   * Exposed so a calibration screen (and the tests) can prove the two describe the same window.
+   */
+  getRestWindow(): { startSec: number; endSec: number; samples: number; compensationSamples: number } {
+    return {
+      startSec: this.restTimes.length > 0 ? this.restTimes[0] : NaN,
+      endSec: this.restTimes.length > 0 ? this.restTimes[this.restTimes.length - 1] : NaN,
+      samples: this.restSamples.length,
+      compensationSamples: this.restComp.length,
+    };
+  }
+
   getStatus(): CalibrationStatus {
     const info = MOVEMENT_INFO[this.movement];
     let message: string;
@@ -375,7 +535,7 @@ export class RomCalibrator {
       message = `Not enough movement was detected (${this.formatRom()}). Try a bigger movement, move closer to the camera, or let the therapist adjust the range manually.`;
     } else if (this.error === 'no_reps') {
       message = 'No repetitions were detected. Make sure the whole limb is visible and try again.';
-    } else message = 'Calibration complete.';
+    } else message = this.manualAdjusted ? 'Range set manually by the therapist.' : 'Calibration complete.';
     const min = this.phase === 'rest' ? (this.restSamples.length > 0 ? median(this.restSamples) : null) : this.min;
     return {
       phase: this.phase,

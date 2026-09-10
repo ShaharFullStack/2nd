@@ -38,18 +38,42 @@ describe('ParticlePool', () => {
     expect(p.x[0]).toBe(2);
   });
 
-  it('recycles the oldest particle when full instead of dropping the new one', () => {
+  it('recycles round-robin when full instead of dropping the new one (O(1) per emit)', () => {
     const p = new ParticlePool(3);
-    p.emit({ x: 0, y: 0, life: 1, size: 1, color: 10 });
-    p.emit({ x: 0, y: 0, life: 1, size: 1, color: 11 });
-    p.emit({ x: 0, y: 0, life: 1, size: 1, color: 12 });
-    p.update(0.5); // all at 50%
-    p.age[1] = 0.9; // make slot 1 the oldest
-    const slot = p.emit({ x: 0, y: 0, life: 1, size: 1, color: 99 });
-    expect(slot).toBe(1);
+    for (let i = 0; i < 3; i++) p.emit({ x: 0, y: 0, life: 1, size: 1, color: 10 + i });
+    p.update(0.5);
+    // Saturated: each further emit lands in the next slot and never drops the newcomer.
+    for (let i = 0; i < 5; i++) {
+      const slot = p.emit({ x: 0, y: 0, life: 1, size: 1, color: 90 + i });
+      expect(slot).toBe(i % 3);
+      expect(p.count).toBe(3);
+      expect(p.color[slot]).toBe(90 + i);
+      expect(p.age[slot]).toBe(0);
+    }
+  });
+
+  it('setCapacity resizes the pool at runtime, keeping live particles and clamping the count', () => {
+    const p = new ParticlePool(8);
+    for (let i = 0; i < 8; i++) p.emit({ x: i, y: 0, life: 1, size: 1, color: i });
+    expect(p.count).toBe(8);
+    p.setCapacity(3);
+    expect(p.capacity).toBe(3);
     expect(p.count).toBe(3);
-    expect(p.color[1]).toBe(99);
-    expect(p.age[1]).toBe(0);
+    expect(p.x.length).toBe(3);
+    expect(Array.from(p.x)).toEqual([0, 1, 2]);
+    // Still usable (and still saturating at the new capacity).
+    for (let i = 0; i < 6; i++) p.emit({ x: 99, y: 0, life: 1, size: 1, color: 5 });
+    expect(p.count).toBe(3);
+    // Growing keeps what is live and accepts more.
+    p.setCapacity(10);
+    expect(p.capacity).toBe(10);
+    expect(p.count).toBe(3);
+    p.emit({ x: 7, y: 0, life: 1, size: 1, color: 1 });
+    expect(p.count).toBe(4);
+    // A no-op patch does not reallocate.
+    const xs = p.x;
+    p.setCapacity(10);
+    expect(p.x).toBe(xs);
   });
 
   it('does not allocate arrays after construction (typed arrays are stable)', () => {
@@ -87,6 +111,35 @@ describe('ParticlePool', () => {
     p.update(0);
     p.update(-1);
     expect(p.x[0]).toBe(5);
+  });
+
+  it('update ignores a NaN dt rather than poisoning every live particle', () => {
+    const p = new ParticlePool(4);
+    p.emit({ x: 5, y: 5, vx: 10, life: 1, size: 1, color: 0 });
+    p.update(Number.NaN);
+    expect(p.x[0]).toBe(5);
+    expect(p.age[0]).toBe(0);
+    expect(p.count).toBe(1);
+    // ...and it keeps working afterwards.
+    p.update(0.5);
+    expect(p.age[0]).toBeCloseTo(0.5);
+  });
+
+  it('retires a particle whose age went non-finite instead of making it immortal', () => {
+    // A NaN age used to fail `age >= life`, so the slot was never swap-removed: it held a pool slot
+    // for the rest of the song and the round-robin recycler started eating live bursts.
+    const p = new ParticlePool(64);
+    p.emit({ x: 0, y: 0, life: 10, size: 1, color: 0 });
+    p.emit({ x: 1, y: 1, life: 10, size: 1, color: 1 });
+    p.age[0] = Number.NaN;
+    p.update(0.016);
+    expect(p.count).toBe(1);
+    expect(p.color[0]).toBe(1);
+    // The freed slot is reusable and no dead particle lingers: the pool drains back to the survivor.
+    for (let i = 0; i < 50; i++) p.emit({ x: 0, y: 0, life: 0.01, size: 1, color: 2 });
+    expect(p.count).toBe(51);
+    p.update(0.05);
+    expect(p.count).toBe(1);
   });
 });
 

@@ -13,11 +13,19 @@
  *
  * Below the strike line (d < 0) the true perspective curve would fling gems off the bottom of
  * the canvas ~150 ms after the note time — long before the engine declares a miss
- * (note.time + goodMs 110–180 ms + 100 ms grace = 210–280 ms). So the tail is linear instead:
- * s(d) = 1 - d·k·pastLineSpeed, i.e. constant screen-space speed equal to `pastLineSpeed` × the
- * speed at the strike line. Because x offsets and radius still scale with (y - vpY) the road
- * edges stay perfectly straight (no kink at the line); only the vertical speed changes. With the
- * default pastLineSpeed a gem stays on screen ≥ 400 ms past the line at 720p / 1080p / portrait.
+ * (note.time + goodMs 110–180 ms + 100 ms grace = 210–280 ms). So the tail settles to a constant
+ * screen-space speed equal to `pastLineSpeed` × the speed at the strike line.
+ *
+ * It *eases* into that speed rather than switching to it: over the first `tailBlend` of depth below
+ * the line, ds/dd ramps smoothly from the approach speed at the line down to the tail speed
+ * (quadratic in depth, i.e. C¹ at both ends). A hard switch made every un-hit gem visibly brake to
+ * 42 % speed exactly as it touched the receptor — a tell no Clone Hero gem has. Beyond `tailBlend`
+ * the tail is exactly linear again, which keeps `depthAtY` closed-form (and therefore culling and
+ * the panel geometry exact).
+ *
+ * Because x offsets and radius still scale with (y - vpY) the road edges stay perfectly straight
+ * (no kink at the line); only the vertical speed changes. With the default pastLineSpeed a gem
+ * stays on screen ≥ 400 ms past the line at 720p / 1080p / portrait.
  */
 
 export interface GeometryOptions {
@@ -29,6 +37,13 @@ export interface GeometryOptions {
   /** Screen-space speed below the strike line relative to the speed at the line (0.2..1). */
   pastLineSpeed: number;
 }
+
+/**
+ * Depth over which the below-line scroll speed eases from the approach speed into the slower tail
+ * (see module docs). ~0.13 s at the default 1.6 s approach: long enough that the deceleration is
+ * not a visible step, short enough that the tail is still nearly its full length.
+ */
+export const TAIL_BLEND_DEPTH = 0.08;
 
 export interface HighwayGeometry {
   width: number;
@@ -46,6 +61,8 @@ export interface HighwayGeometry {
   k: number;
   /** Linear tail speed factor below the strike line (see module docs). */
   pastLineSpeed: number;
+  /** Depth below the line over which the scroll speed eases into the tail speed. */
+  tailBlend: number;
   /** Road half-width at the strike line (px). */
   nearHalfWidth: number;
   /** Lane width at the strike line (px). */
@@ -65,22 +82,45 @@ export const DEFAULT_GEOMETRY_OPTIONS: GeometryOptions = {
   horizonY: 0.35,
   strikeY: 0.82,
   farScale: 0.28,
-  roadWidth: 0.6,
-  pastLineSpeed: 0.45,
+  roadWidth: 0.46,
+  pastLineSpeed: 0.42,
 };
 
+/**
+ * Gem radius as a fraction of lane width. Clone Hero / GH frets fill most of their lane
+ * (diameter ≈ 0.8 × lane width) — that is what makes the road read as an instrument rather than a
+ * wide empty ramp, so this is deliberately large.
+ */
+export const GEM_LANE_FRACTION = 0.4;
+/** Hard cap on gem radius as a fraction of canvas height (only binds on very wide aspect ratios). */
+export const GEM_HEIGHT_CAP = 0.085;
+/** Receptor ring radius relative to the gem radius (ring sits just outside the gem). */
+export const RECEPTOR_GEM_RATIO = 1.12;
+/** Road width is also capped relative to height so ultrawide canvases don't get a flat, empty road. */
+export const ROAD_HEIGHT_CAP = 0.95;
+
+/**
+ * Clamp to [lo, hi]. NaN-safe on purpose: `NaN` maps to `lo` rather than propagating. A single
+ * non-finite frame out of a live audio/vision pipeline (an unarmed song clock, a dropped tracker
+ * sample) used to poison every smoothed accumulator in the renderer for the rest of the session.
+ */
 export function clamp(v: number, lo: number, hi: number): number {
-  return v < lo ? lo : v > hi ? hi : v;
+  return v >= lo ? (v <= hi ? v : hi) : lo;
 }
 
 export function lerp(a: number, b: number, t: number): number {
   return a + (b - a) * t;
 }
 
-/** Road width factor by lane count: fewer lanes → narrower road so gems stay a sane size. */
+/**
+ * Road width factor by lane count. Close to `lanes / 4`, so removing a lane removes a lane's worth
+ * of road instead of stretching the remaining lanes: the fret board keeps its proportions and the
+ * gems keep filling their lanes. The small upward bias at 1–3 lanes (0.58 vs 0.5 at two lanes) gives
+ * the rehab-friendly low lane counts slightly larger targets without emptying out the road.
+ */
 export function roadWidthFactor(laneCount: number): number {
   const n = clamp(Math.round(laneCount), 1, 5);
-  return { 1: 0.4, 2: 0.62, 3: 0.84, 4: 1, 5: 1.12 }[n] ?? 1;
+  return { 1: 0.34, 2: 0.58, 3: 0.8, 4: 1, 5: 1.16 }[n] ?? 1;
 }
 
 export function makeGeometry(
@@ -97,10 +137,11 @@ export function makeGeometry(
   const horizonPx = o.horizonY * height;
   // vpY + (strikeY - vpY) * farScale = horizonPx  =>  vpY = (horizonPx - strikeY*farScale) / (1 - farScale)
   const vpY = (horizonPx - strikeY * farScale) / (1 - farScale);
-  const nearHalfWidth = (width * o.roadWidth * roadWidthFactor(lanes)) / 2;
+  const roadPx = Math.min(width * o.roadWidth, height * ROAD_HEIGHT_CAP) * roadWidthFactor(lanes);
+  const nearHalfWidth = roadPx / 2;
   const laneWidthNear = (nearHalfWidth * 2) / lanes;
-  const gemRadiusNear = Math.min(laneWidthNear * 0.36, height * 0.05);
-  const receptorRadius = gemRadiusNear * 1.18;
+  const gemRadiusNear = Math.min(laneWidthNear * GEM_LANE_FRACTION, height * GEM_HEIGHT_CAP);
+  const receptorRadius = gemRadiusNear * RECEPTOR_GEM_RATIO;
   const g: HighwayGeometry = {
     width,
     height,
@@ -112,6 +153,7 @@ export function makeGeometry(
     strikeY,
     k,
     pastLineSpeed: clamp(o.pastLineSpeed, 0.2, 1),
+    tailBlend: TAIL_BLEND_DEPTH,
     nearHalfWidth,
     laneWidthNear,
     gemRadiusNear,
@@ -130,11 +172,19 @@ export function depthOf(g: HighwayGeometry, noteTime: number, songTime: number):
 }
 
 /**
- * Perspective scale at depth d (1 at strike line, farScale at horizon). Below the line the
- * scale grows linearly (constant screen speed, see module docs).
+ * Perspective scale at depth d (1 at strike line, farScale at horizon). Below the line the scale
+ * grows with a speed that eases from the approach speed into `pastLineSpeed` × it over `tailBlend`
+ * of depth, then linearly (see module docs). ds/dd is continuous everywhere, so a gem crossing the
+ * receptor never visibly brakes.
  */
 export function scaleAt(g: HighwayGeometry, d: number): number {
-  if (d < 0) return 1 - d * g.k * g.pastLineSpeed;
+  if (d < 0) {
+    const u = -d;
+    const p = g.pastLineSpeed;
+    const b = g.tailBlend;
+    if (b > 0 && u < b) return 1 + g.k * (u - ((1 - p) * u * u) / (2 * b));
+    return 1 + g.k * ((b * (1 + p)) / 2 + p * (u - b));
+  }
   return 1 / (1 + g.k * d);
 }
 
@@ -143,11 +193,23 @@ export function yAt(g: HighwayGeometry, d: number): number {
   return g.vpY + (g.strikeY - g.vpY) * scaleAt(g, d);
 }
 
-/** Inverse of yAt: depth for a screen y (y must be below vpY). */
+/** Inverse of yAt: depth for a screen y (y must be below vpY). Exact, including the eased tail. */
 export function depthAtY(g: HighwayGeometry, y: number): number {
   const s = (y - g.vpY) / (g.strikeY - g.vpY);
   if (s <= 0) return Number.POSITIVE_INFINITY;
-  if (s > 1) return (1 - s) / (g.k * g.pastLineSpeed);
+  if (s > 1) {
+    const p = g.pastLineSpeed;
+    const b = g.tailBlend;
+    const sBlendEnd = 1 + g.k * ((b * (1 + p)) / 2);
+    if (b > 0 && s <= sBlendEnd) {
+      // Invert s = 1 + k(u - (1-p)u²/(2b)) on u ∈ [0, b] — the smaller quadratic root.
+      const a = (g.k * (1 - p)) / (2 * b);
+      if (a < 1e-12) return -(s - 1) / g.k;
+      const disc = Math.max(0, g.k * g.k - 4 * a * (s - 1));
+      return -((g.k - Math.sqrt(disc)) / (2 * a));
+    }
+    return -(b + (s - sBlendEnd) / (g.k * p));
+  }
   return (1 / s - 1) / g.k;
 }
 

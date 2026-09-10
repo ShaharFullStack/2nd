@@ -23,8 +23,22 @@ export const GEM_BUCKETS = 12;
 /** Gem aspect: gems are slightly squashed ellipses viewed from above, GH-style. */
 export const GEM_ASPECT = 0.72;
 
+/**
+ * Sprite lookups happen once per note, per lane and per particle colour batch, *every frame*.
+ * They are therefore keyed by nested maps on values the caller already holds (a palette colour
+ * string, a bucket index, a rounded radius) rather than by a template-string key: a `Map.get` with
+ * an existing string allocates nothing, whereas `` `gem|${color}|${b}` `` allocates a string per
+ * lookup — roughly 1200 short-lived strings a second at 60 fps.
+ */
 export class SpriteCache {
-  private map = new Map<string, Sprite>();
+  /** colour → sprite per size bucket. */
+  private gems = new Map<string, Array<Sprite | null>>();
+  /** colour → radius → sprite. */
+  private glows = new Map<string, Map<number, Sprite>>();
+  private receptors = new Map<string, Map<number, Sprite>>();
+  /** colour → (width, height) packed → sprite. */
+  private beams = new Map<string, Map<number, Sprite>>();
+  private n = 0;
   private readonly factory: CanvasFactory;
   dpr = 1;
   minRadius = 4;
@@ -35,11 +49,15 @@ export class SpriteCache {
   }
 
   get size(): number {
-    return this.map.size;
+    return this.n;
   }
 
   clear(): void {
-    this.map.clear();
+    this.gems.clear();
+    this.glows.clear();
+    this.receptors.clear();
+    this.beams.clear();
+    this.n = 0;
   }
 
   /** Configure the radius range covered by the size buckets (call on resize). */
@@ -51,30 +69,52 @@ export class SpriteCache {
     if (changed) this.clear();
   }
 
-  /** Gem sprite for a colour at (approximately) the given radius. Returns null without a 2D context. */
-  gem(color: LaneColor, radius: number): { sprite: Sprite; radius: number } | null {
+  /** The bucketed radius a gem of `radius` is actually rasterized at. */
+  bucketedRadius(radius: number): number {
+    return bucketRadius(radiusBucket(radius, this.minRadius, this.maxRadius, GEM_BUCKETS), this.minRadius, this.maxRadius, GEM_BUCKETS);
+  }
+
+  /** Gem sprite for a colour at (approximately) the given radius. Allocation-free on a cache hit. */
+  gemSprite(color: LaneColor, radius: number): Sprite | null {
     const b = radiusBucket(radius, this.minRadius, this.maxRadius, GEM_BUCKETS);
-    const r = bucketRadius(b, this.minRadius, this.maxRadius, GEM_BUCKETS);
-    const key = `gem|${color.base}|${b}`;
-    let s = this.map.get(key);
-    if (!s) {
-      const made = this.makeGem(color, r);
-      if (!made) return null;
-      s = made;
-      this.map.set(key, s);
+    let arr = this.gems.get(color.base);
+    if (!arr) {
+      arr = new Array<Sprite | null>(GEM_BUCKETS).fill(null);
+      this.gems.set(color.base, arr);
     }
-    return { sprite: s, radius: r };
+    let s = arr[b];
+    if (!s) {
+      s = this.makeGem(color, bucketRadius(b, this.minRadius, this.maxRadius, GEM_BUCKETS));
+      if (!s) return null;
+      arr[b] = s;
+      this.n++;
+    }
+    return s;
+  }
+
+  /**
+   * Gem sprite plus the radius it was rasterized at. Convenience wrapper (it allocates the result
+   * object); the renderer's hot path uses `gemSprite` + `bucketedRadius` instead.
+   */
+  gem(color: LaneColor, radius: number): { sprite: Sprite; radius: number } | null {
+    const sprite = this.gemSprite(color, radius);
+    return sprite ? { sprite, radius: this.bucketedRadius(radius) } : null;
   }
 
   /** Soft radial glow halo in a colour (drawn additively at various sizes). */
   glow(colorHex: string, radius = 32): Sprite | null {
-    const key = `glow|${colorHex}|${radius}`;
-    let s = this.map.get(key);
+    let m = this.glows.get(colorHex);
+    if (!m) {
+      m = new Map<number, Sprite>();
+      this.glows.set(colorHex, m);
+    }
+    let s = m.get(radius);
     if (!s) {
       const made = this.makeGlow(colorHex, radius);
       if (!made) return null;
       s = made;
-      this.map.set(key, s);
+      m.set(radius, s);
+      this.n++;
     }
     return s;
   }
@@ -84,13 +124,19 @@ export class SpriteCache {
    * edge and a vertical falloff. Drawn additively with a rotation around the apex.
    */
   beam(colorHex: string, width = 128, height = 256): Sprite | null {
-    const key = `beam|${colorHex}|${width}x${height}`;
-    let s = this.map.get(key);
+    let m = this.beams.get(colorHex);
+    if (!m) {
+      m = new Map<number, Sprite>();
+      this.beams.set(colorHex, m);
+    }
+    const k = Math.round(width) * 8192 + Math.round(height);
+    let s = m.get(k);
     if (!s) {
       const made = this.makeBeam(colorHex, width, height);
       if (!made) return null;
       s = made;
-      this.map.set(key, s);
+      m.set(k, s);
+      this.n++;
     }
     return s;
   }
@@ -98,13 +144,18 @@ export class SpriteCache {
   /** Receptor ring (empty gem outline) for the strike line. */
   receptor(color: LaneColor, radius: number): Sprite | null {
     const r = Math.round(radius);
-    const key = `rec|${color.base}|${r}`;
-    let s = this.map.get(key);
+    let m = this.receptors.get(color.base);
+    if (!m) {
+      m = new Map<number, Sprite>();
+      this.receptors.set(color.base, m);
+    }
+    let s = m.get(r);
     if (!s) {
       const made = this.makeReceptor(color, r);
       if (!made) return null;
       s = made;
-      this.map.set(key, s);
+      m.set(r, s);
+      this.n++;
     }
     return s;
   }
@@ -156,16 +207,17 @@ export class SpriteCache {
     ctx.ellipse(cx, cy, r * 0.64, ry * 0.6, 0, 0, Math.PI * 2);
     ctx.fill();
 
-    // Coloured centre dot
-    ctx.fillStyle = color.base;
+    // Coloured centre dot (matte gems stay unlit)
+    ctx.fillStyle = color.matte ? withAlpha(color.dark, 0.9) : color.base;
     ctx.beginPath();
     ctx.ellipse(cx, cy, r * 0.34, ry * 0.32, 0, 0, Math.PI * 2);
     ctx.fill();
 
     // Bright specular highlight on the rim
+    const spec = color.matte ? 0.18 : 1;
     const hl = ctx.createRadialGradient(cx - r * 0.35, cy - ry * 0.55, 0, cx - r * 0.35, cy - ry * 0.55, r * 0.5);
-    hl.addColorStop(0, 'rgba(255,255,255,0.95)');
-    hl.addColorStop(0.5, 'rgba(255,255,255,0.35)');
+    hl.addColorStop(0, `rgba(255,255,255,${0.95 * spec})`);
+    hl.addColorStop(0.5, `rgba(255,255,255,${0.35 * spec})`);
     hl.addColorStop(1, 'rgba(255,255,255,0)');
     ctx.fillStyle = hl;
     ctx.beginPath();

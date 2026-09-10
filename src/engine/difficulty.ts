@@ -32,13 +32,52 @@ export function isFineMotor(movement: Movement): boolean {
 export const MIN_WINDOW_SCALE = 0.25;
 export const MAX_WINDOW_SCALE = 4;
 
+export type WindowScaleIssue = 'ok' | 'non_finite' | 'below_min' | 'above_max';
+
+/** What `checkWindowScale` found: the value that will actually be used, and whether it was changed. */
+export interface WindowScaleCheck {
+  /** The scale that `windowsFor` will apply. */
+  value: number;
+  /** True when `value` differs from what was asked for. */
+  clamped: boolean;
+  reason: WindowScaleIssue;
+  /** Ready-to-show explanation when `clamped`, else null. */
+  message: string | null;
+}
+
 /**
- * Clamp a therapist window scale to [0.25, 4]; non-finite values become 1.
- * Keep the value in session settings (e.g. the zustand store) and pass it to `windowsFor`.
+ * Validate a therapist window scale WITHOUT silently deciding for them.
+ *
+ * `clampWindowScale` (and therefore `windowsFor`) has to clamp — non-positive or absurd windows
+ * blow up inside `Judge` at Play time, far from the control that caused it — but a clinical control
+ * must not apply a different number than the one the therapist typed and say nothing: typing 0.1
+ * yields 0.25, i.e. 2.5x what was asked for. Call this from the Setup screen and show `message`
+ * next to the field; call `clampWindowScale` when you only need the number.
+ */
+export function checkWindowScale(scale: number): WindowScaleCheck {
+  if (!Number.isFinite(scale)) {
+    return { value: 1, clamped: true, reason: 'non_finite', message: `window scale ${String(scale)} is not a number; using 1x` };
+  }
+  if (scale < MIN_WINDOW_SCALE) {
+    return { value: MIN_WINDOW_SCALE, clamped: true, reason: 'below_min', message: `window scale ${scale} is below the minimum ${MIN_WINDOW_SCALE}x; using ${MIN_WINDOW_SCALE}x (windows this tight are unhittable)` };
+  }
+  if (scale > MAX_WINDOW_SCALE) {
+    return { value: MAX_WINDOW_SCALE, clamped: true, reason: 'above_max', message: `window scale ${scale} is above the maximum ${MAX_WINDOW_SCALE}x; using ${MAX_WINDOW_SCALE}x (wider windows stop measuring timing)` };
+  }
+  return { value: scale, clamped: false, reason: 'ok', message: null };
+}
+
+/**
+ * Clamp a therapist window scale (or an explicit fine-motor multiplier) to [0.25, 4]; non-finite
+ * values become 1. Keep the value in session settings (e.g. the zustand store) and pass it to
+ * `windowsFor`, which clamps both of its multipliers with this.
+ *
+ * This clamp is SILENT by design (it is on the hot path of window construction). Any UI that lets a
+ * therapist type the number must run `checkWindowScale` too and show `message` when `clamped` —
+ * otherwise a clinical control applies a value nobody chose.
  */
 export function clampWindowScale(scale: number): number {
-  if (!Number.isFinite(scale)) return 1;
-  return Math.min(MAX_WINDOW_SCALE, Math.max(MIN_WINDOW_SCALE, scale));
+  return checkWindowScale(scale).value;
 }
 
 export function scaleWindows(w: TimingWindows, k: number): TimingWindows {
@@ -48,7 +87,14 @@ export function scaleWindows(w: TimingWindows, k: number): TimingWindows {
 /**
  * Timing windows for a movement at a difficulty.
  * Fine-motor movements get ×FINE_MOTOR_WINDOW_MULTIPLIER (unless `multiplierOverride` is given);
- * the result is additionally multiplied by `scale` (therapist tuning, clamped to [0.25, 4]; default 1).
+ * the result is additionally multiplied by `scale` (therapist tuning; default 1).
+ *
+ * Both `multiplierOverride` and `scale` are clamped to [MIN_WINDOW_SCALE, MAX_WINDOW_SCALE] and
+ * non-finite values become 1 — a therapist control that produces 0 or a negative number must not
+ * hand back `{perfectMs: 0, goodMs: 0}` / negative windows that only blow up later inside `Judge`
+ * at Play time, far from the control that caused it. The clamp is silent here: run
+ * `checkWindowScale(scale)` in the Setup screen and show its `message` so the therapist learns that
+ * the value in force is not the one they typed.
  * Pure: no hidden global state.
  */
 export function windowsFor(
@@ -58,7 +104,7 @@ export function windowsFor(
   scale = 1,
 ): TimingWindows {
   const base = resolveDifficulty(difficulty).windows;
-  const mult = multiplierOverride ?? (isFineMotor(movement) ? FINE_MOTOR_WINDOW_MULTIPLIER : 1);
+  const mult = multiplierOverride === undefined ? (isFineMotor(movement) ? FINE_MOTOR_WINDOW_MULTIPLIER : 1) : clampWindowScale(multiplierOverride);
   return scaleWindows(base, mult * clampWindowScale(scale));
 }
 

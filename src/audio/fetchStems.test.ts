@@ -138,4 +138,42 @@ describe('scripts/fetch-stems.mjs against a local HTTP server', () => {
     expect(await run(['--root', empty])).toEqual({ status: 0, out: `no songs found under ${empty}\n` });
     fs.rmSync(empty, { recursive: true, force: true });
   });
+
+  // song.json is data: ccmixter-README.md tells users to paste manifests in from third parties.
+  it('refuses to write outside the song directory, whatever song.json asks for', async () => {
+    const evil = fs.mkdtempSync(path.join(os.tmpdir(), 'beat-rehab-evil-'));
+    const outsideRel = path.join(evil, 'pwned-relative.wav');
+    const outsideAbs = path.join(evil, 'pwned-absolute.wav');
+    fs.mkdirSync(path.join(evil, 'root', 'bad'), { recursive: true });
+    fs.writeFileSync(path.join(evil, 'root', 'bad', 'song.json'), JSON.stringify({
+      id: 'bad', title: 't', artist: 'a', license: 'CC BY 4.0',
+      stems: [
+        { id: 'up', file: '../../pwned-relative.wav' },
+        { id: 'abs', file: outsideAbs },
+        { id: 'sneaky', file: 'stems/../../../pwned-relative.wav' },
+      ],
+      remoteStems: [
+        { id: 'up', url: `${base}/ok.wav` },
+        { id: 'abs', url: `${base}/ok.wav` },
+        { id: 'sneaky', url: `${base}/ok.wav` },
+      ],
+    }));
+    const { status, out } = await run(['--root', path.join(evil, 'root'), '--retries', '0', '--timeout', '2']);
+    expect(status).toBe(1);
+    expect(out).toMatch(/up: REFUSED unsafe target[\s\S]*must not contain "\.\." segments/);
+    expect(out).toMatch(/abs: REFUSED unsafe target[\s\S]*must be relative to the song directory/);
+    expect(out).toMatch(/sneaky: REFUSED unsafe target/);
+    expect(out).toContain('3 stem(s) failed to download.');
+    expect(fs.existsSync(outsideRel)).toBe(false);
+    expect(fs.existsSync(outsideAbs)).toBe(false);
+    fs.rmSync(evil, { recursive: true, force: true });
+  }, 30_000);
+
+  it('refuses a --song that is a path rather than a song id', async () => {
+    for (const bad of ['../..', 'a/b', '/etc', '..']) {
+      const r = await run(['--root', root, '--song', bad]);
+      expect(r.status, bad).toBe(2);
+      expect(r.out, bad).toMatch(/expects a song id/);
+    }
+  });
 });

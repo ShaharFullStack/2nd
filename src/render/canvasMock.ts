@@ -10,12 +10,19 @@ export interface RecordedCall {
 }
 
 export interface MockContext {
+  /**
+   * Every method call in order. Property assignments are recorded here too, as
+   * `{ name: 'set:globalAlpha', args: [value] }`, so a test can tell which alpha / composite mode
+   * was in force for a given draw call.
+   */
   calls: RecordedCall[];
   props: Record<string, unknown>;
   /** Number of calls with this method name. */
   count(name: string): number;
   /** Distinct method names called. */
   names(): Set<string>;
+  /** Value of `set:<prop>` most recently assigned before call index `i` (undefined if never). */
+  propBefore(i: number, prop: string): unknown;
   reset(): void;
 }
 
@@ -55,6 +62,11 @@ export function createMockContext(canvas: CanvasLike): MockContext & CanvasRende
     props,
     count: (name) => calls.reduce((n, c) => (c.name === name ? n + 1 : n), 0),
     names: () => new Set(calls.map((c) => c.name)),
+    propBefore: (i, prop) => {
+      const key = `set:${prop}`;
+      for (let j = Math.min(i, calls.length) - 1; j >= 0; j--) if (calls[j].name === key) return calls[j].args[0];
+      return undefined;
+    },
     reset: () => {
       calls.length = 0;
     },
@@ -91,7 +103,10 @@ export function createMockContext(canvas: CanvasLike): MockContext & CanvasRende
       };
     },
     set(_target, key: string | symbol, value) {
-      if (typeof key === 'string') props[key] = value;
+      if (typeof key === 'string') {
+        props[key] = value;
+        calls.push({ name: `set:${key}`, args: [value] });
+      }
       return true;
     },
   });

@@ -102,6 +102,57 @@ describe('RomCalibrator', () => {
     expect(cal.getResult()!.max).toBeCloseTo(1.58, 2);
   });
 
+  it('a therapist override rescues a no_reps lane (not only insufficient_range)', () => {
+    // The peak detector can miss a slow, smooth patient entirely. Before, only 'insufficient_range' was
+    // clearable, so a lane the therapist measured by hand stayed unplayable forever.
+    const cal = new RomCalibrator('finger_spread', { moveTimeoutSec: 5 });
+    for (let t = 0; t < 8; t += 1 / 30) cal.push(30, t);
+    expect(cal.getError()).toBe('no_reps');
+    expect(cal.getResult()).toBeNull();
+    const min = cal.getStatus().min!;
+    expect(cal.getProvisional()).toBeNull(); // nothing moved at all: no range to offer yet
+    cal.setRange(null, min + 25); // 25 deg > minRom 12
+    expect(cal.getError()).toBeNull();
+    const res = cal.getResult()!;
+    expect(res.max - res.min).toBeCloseTo(25, 6);
+    expect(res.manual).toBe(true);
+    expect(cal.isManual()).toBe(true);
+    expect(cal.getStatus().message).toMatch(/manually/i);
+    // Still guarded: an override below the movement's minimum ROM is an error again.
+    cal.nudge(0, -20);
+    expect(cal.getError()).toBe('insufficient_range');
+    expect(cal.getResult()).toBeNull();
+
+    // When the patient DID move but no clean peak was found, the provisional range is the largest
+    // feature seen, so the therapist screen starts from something real instead of nothing.
+    const slow = new RomCalibrator('finger_spread', { moveTimeoutSec: 3, autoAdvance: false });
+    for (let i = 0; i < 40; i++) slow.push(30, i / 30);
+    slow.beginMove();
+    for (let i = 0; i < 150; i++) slow.push(30 + i * 0.05, 2 + i / 30); // a slow ramp, never coming back
+    expect(slow.getError()).toBe('no_reps');
+    const prov = slow.getProvisional()!;
+    expect(prov.manual).toBe(false);
+    expect(prov.max).toBeGreaterThan(prov.min);
+  });
+
+  it('setManualRange finishes a calibration from any phase (full therapist override)', () => {
+    const cal = new RomCalibrator('knee_extension');
+    for (let i = 0; i < 20; i++) cal.push(90, i / 30); // still resting, nowhere near done
+    expect(cal.getPhase()).toBe('rest');
+    expect(cal.getResult()).toBeNull();
+    cal.setManualRange(92, 150);
+    expect(cal.getPhase()).toBe('done');
+    expect(cal.getError()).toBeNull();
+    expect(cal.getResult()).toMatchObject({ min: 92, max: 150, manual: true });
+    expect(cal.normalize(121)).toBeCloseTo(0.5, 2);
+    // A degenerate manual range is still refused.
+    cal.setManualRange(92, 95);
+    expect(cal.getError()).toBe('insufficient_range');
+    expect(cal.getResult()).toBeNull();
+    cal.reset();
+    expect(cal.isManual()).toBe(false);
+  });
+
   it('errors with no_reps when nothing happens in the move phase, and can retry', () => {
     const cal = new RomCalibrator('finger_spread', { moveTimeoutSec: 5 });
     for (let t = 0; t < 8; t += 1 / 30) cal.push(30, t);
@@ -146,6 +197,51 @@ describe('RomCalibrator guards (sample count, stillness, compensation baseline)'
     const never = new RomCalibrator('knee_extension', { restTimeoutSec: 5 });
     for (let s = 0; s < 5.5; s += 1 / 30) never.push(90 + 40 * Math.sin(s * 6), s);
     expect(never.getPhase()).toBe('move'); // timed out, best effort
+  });
+
+  it('takes the compensation baseline from the SAME rest window as min, even when comp is sparse', () => {
+    // Patient fidgets for 5 s with the heel UP (comp 0.6), then holds still 5 s with the heel DOWN
+    // (comp 0.9). The heel is the least reliably visible pose landmark, so measureCompensation returns a
+    // sample on only 1 frame in 3 — the case that used to make the baseline span the fidgety period.
+    const run = (compEveryNthFrame: number) => {
+      const cal = new RomCalibrator('ankle_dorsiflexion');
+      for (let i = 0; i < 300; i++) {
+        const t = i / 30;
+        const still = t >= 5;
+        const smoothed = still ? 88 : 88 + 20 * Math.sin(t * 7);
+        const sample: Parameters<typeof cal.pushSample>[0] = { smoothed, t };
+        if (i % compEveryNthFrame === 0) sample.compensationSample = { kind: 'heel_lift', value: still ? 0.9 : 0.6, scale: 0.25 };
+        cal.pushSample(sample);
+        if (cal.getPhase() !== 'rest') break;
+      }
+      return cal;
+    };
+    for (const nth of [1, 3, 7]) {
+      const cal = run(nth);
+      expect(cal.getPhase(), `every ${nth} frames`).toBe('move');
+      expect(cal.getStatus().min, `every ${nth} frames`).toBeCloseTo(88, 6);
+      // The baseline describes the still (heel-down) window, not the fidgety one.
+      expect(cal.getCompensationBaseline()!.value, `every ${nth} frames`).toBeCloseTo(0.9, 6);
+      const w = cal.getRestWindow();
+      expect(w.startSec).toBeGreaterThan(4.5);
+      expect(w.compensationSamples).toBeGreaterThan(0);
+      expect(w.compensationSamples).toBeLessThanOrEqual(w.samples);
+    }
+  });
+
+  it('keeps the most recent compensation sample when every one predates the rest window', () => {
+    const cal = new RomCalibrator('seated_march', { autoAdvance: false });
+    for (let i = 0; i < 150; i++) {
+      const t = i / 30;
+      const sample: Parameters<typeof cal.pushSample>[0] = { smoothed: 0.1, t };
+      if (i < 3) sample.compensationSample = { kind: 'trunk_lean', value: 4 + i, scale: 1 };
+      cal.pushSample(sample);
+    }
+    expect(cal.getRestWindow().startSec).toBeGreaterThan(2); // the comp samples are long out of window
+    expect(cal.beginMove()).toBe(true);
+    // Only stale samples exist: the newest is kept as the best available estimate rather than dropped.
+    expect(cal.getCompensationBaseline()!.value).toBe(6);
+    expect(cal.getCompensationBaseline()!.samples).toBe(1);
   });
 
   it('accumulates the rest-phase compensation baseline as a median', () => {

@@ -23,6 +23,14 @@ export interface SongManifest {
   offset: number;
   durationSec: number;
   previewStart?: number;
+  /**
+   * Rhythmic feel: the fraction of a 16th-note step by which the ODD 16ths are played late
+   * (0/absent = straight, 1/3 = a triplet shuffle — the long:short ratio is (1+s):(1−s)).
+   * A chart that places notes on odd 16ths of a swung song MUST apply it (see `stepTimeSec`),
+   * otherwise the note and the drum hit it is asking for diverge by `swing × 15/bpm` seconds.
+   * Notes on downbeats and straight 8ths (even 16ths) are unaffected.
+   */
+  swing?: number;
   stems: StemSpec[];
   playerStem: string;
   remoteStems?: RemoteStemSpec[];
@@ -119,10 +127,30 @@ export function parseManifest(json: unknown): SongManifest {
     offset: json.offset as number,
     durationSec: json.durationSec as number,
     previewStart: isFiniteNumber(json.previewStart) ? json.previewStart : undefined,
+    swing: isFiniteNumber(json.swing) && json.swing !== 0 ? Math.min(Math.max(json.swing, 0), 0.9) : undefined,
     stems,
     playerStem: json.playerStem as string,
     remoteStems,
   };
+}
+
+/**
+ * Song time (seconds) of grid step `step`, counted in `stepsPerBeat` steps per beat from the
+ * first downbeat — `manifest.offset` plus the step position plus the song's swing, so a chart
+ * generator gets note times that land on the audio instead of near it.
+ *
+ * Swing (`manifest.swing`, a fraction of a 16th) delays the odd 16ths only; with the default
+ * `stepsPerBeat` of 4 that is every other step, with 2 (straight 8ths) no step is affected, and
+ * a step that does not fall on a 16th boundary (a triplet or a 32nd) is left where it is.
+ */
+export function stepTimeSec(m: SongManifest, step: number, stepsPerBeat = 4): number {
+  const beatSec = 60 / m.bpm;
+  const sixteenthSec = beatSec / 4;
+  const t = m.offset + (step * beatSec) / stepsPerBeat;
+  const sixteenth = (step * 4) / stepsPerBeat;
+  const swing = m.swing ?? 0;
+  if (swing === 0 || !Number.isInteger(sixteenth) || Math.abs(sixteenth % 2) !== 1) return t;
+  return t + swing * sixteenthSec;
 }
 
 /** Human-readable attribution line (CC BY requires title, author, source and licence). */
@@ -170,13 +198,26 @@ export async function loadManifest(id: string, baseUrl: string = DEFAULT_SONGS_B
   return manifest;
 }
 
-/** HEAD-probe a stem URL. Dev servers answer missing files with 404 (or an HTML fallback page). */
+/**
+ * Probe a stem URL. HEAD first (cheap); on ANY non-2xx answer retry with a 1-byte ranged GET
+ * before giving up — plenty of CDNs and object stores answer HEAD with 403/404/405 for a file
+ * that a GET serves happily, and a false negative here shows a fully downloaded song as
+ * "needs fetch" in song select. A missing file fails both, so the extra request is only paid
+ * once per genuinely absent stem.
+ *
+ * Dev servers answer missing files with 404 or with an HTML fallback page (SPA rewrite), so an
+ * `text/html` body counts as absent whatever the status.
+ */
 export async function stemExists(url: string, opts?: LoaderOptions): Promise<boolean> {
   const f = getFetch(opts);
   try {
     let res = await f(url, { method: 'HEAD' });
-    if (res.status === 405 || res.status === 501) res = await f(url, { method: 'GET', headers: { Range: 'bytes=0-0' } });
-    if (!res.ok) return false;
+    if (!res.ok) {
+      res = await f(url, { method: 'GET', headers: { Range: 'bytes=0-0' } });
+      // A server that ignores Range would otherwise stream the whole stem into the void.
+      try { void res.body?.cancel?.()?.catch?.(() => undefined); } catch { /* no body / already consumed */ }
+      if (!res.ok) return false;
+    }
     const type = res.headers.get('content-type') ?? '';
     return !/text\/html/i.test(type);
   } catch {

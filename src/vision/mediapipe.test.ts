@@ -1,5 +1,5 @@
-import { describe, expect, it, vi } from 'vitest';
-import { DetectLoop, labelToPatientSide, openCamera, pickHand, waitForVideoReady } from './mediapipe.ts';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { DetectLoop, createDetector, labelToPatientSide, openCamera, pickHand, resetMediaPipeCache, waitForVideoReady } from './mediapipe.ts';
 import type { DetectionResult, HandDetection, LandmarkDetector } from './mediapipe.ts';
 import { handPose } from './fixtures.ts';
 
@@ -52,12 +52,50 @@ describe('handedness convention', () => {
     expect(pickHand(bothOther, 'left', false)).toBe(bothOther[1]);
   });
 
+  it('acceptLoneHand rescues a UNILATERAL session whose lone hand has a weak label', () => {
+    // Handedness confidence is exactly what degrades in the fingers-at-the-camera wrist_extension
+    // posture; in a one-sided prescription there is no other lane to protect, so the lone hand is used.
+    const weak = [hand('Right', 0.4, 0.5)];
+    expect(pickHand(weak, 'left', false)).toBeNull(); // default (bilateral-safe) behaviour is unchanged
+    expect(pickHand(weak, 'left', false, { acceptLoneHand: true })).toBe(weak[0]);
+    expect(pickHand(weak, 'right', false, { acceptLoneHand: true })).toBe(weak[0]);
+    expect(pickHand([hand('', 0, 0.5)], 'right', false, { acceptLoneHand: true })).not.toBeNull();
+    // A CONFIDENT label for the other side is still believed: that is the unaffected hand.
+    const confident = [hand('Right', 0.95, 0.5)]; // "Right" = patient's LEFT in a raw stream
+    expect(pickHand(confident, 'left', false, { acceptLoneHand: true })).toBe(confident[0]);
+    expect(pickHand(confident, 'right', false, { acceptLoneHand: true })).toBeNull();
+    // With two hands in frame the escape hatch does nothing: position is meaningful again.
+    const pair = [hand('', 0, 0.3), hand('', 0, 0.7)];
+    expect(pickHand(pair, 'right', false, { acceptLoneHand: true })).toBe(pair[0]);
+    expect(pickHand(pair, 'left', false, { acceptLoneHand: true })).toBe(pair[1]);
+    // minLabelScore is configurable: the same 0.4 label counts once the bar is lowered ("Right" on a raw
+    // stream is the patient's LEFT hand), and stops counting when it is raised.
+    expect(pickHand(weak, 'left', false, { minLabelScore: 0.3 })).toBe(weak[0]);
+    expect(pickHand(weak, 'right', false, { minLabelScore: 0.3 })).toBeNull();
+    expect(pickHand([hand('Right', 0.95, 0.5)], 'left', false, { minLabelScore: 0.99 })).toBeNull();
+  });
+
   it('pickHand with a single hand', () => {
     const only = [hand('Left', 0.9, 0.5)];
     expect(pickHand(only, 'right', false)).toBe(only[0]);
     expect(pickHand(only, 'left', false)).toBeNull();
-    expect(pickHand([hand('', 0, 0.5)], 'left', false)).not.toBeNull();
     expect(pickHand([], 'left')).toBeNull();
+  });
+
+  it('a single hand with no usable label goes to NEITHER lane (never lets the good hand score)', () => {
+    // One hand, handedness score below minLabelScore: position cannot disambiguate a lone hand, and in a
+    // bilateral session giving it to both lanes would let the unaffected hand score the affected lane.
+    const unlabelled = [hand('Right', 0.4, 0.5)];
+    expect(pickHand(unlabelled, 'left', false)).toBeNull();
+    expect(pickHand(unlabelled, 'right', false)).toBeNull();
+    expect(pickHand([hand('', 0, 0.5)], 'left', false)).toBeNull();
+    expect(pickHand([hand('', 0, 0.5)], 'right', false)).toBeNull();
+    // A confident label on a lone hand still resolves that one side only.
+    expect(pickHand([hand('Right', 0.9, 0.5)], 'left', false)).not.toBeNull();
+    expect(pickHand([hand('Right', 0.9, 0.5)], 'right', false)).toBeNull();
+    // With TWO hands position is meaningful again, so an unlabelled hand is still assignable.
+    const pair = [hand('Left', 0.9, 0.3), hand('', 0, 0.7)];
+    expect(pickHand(pair, 'left', false)).toBe(pair[1]);
   });
 });
 
@@ -88,6 +126,9 @@ describe('DetectLoop', () => {
     expect(results).toHaveLength(2);
     expect(results[0][1]).toBe(90);
     expect(results[1][1]).toBe(133);
+    // The MediaPipe timestamp is the frame's CAPTURE time (90), not the callback's wall time (100).
+    expect(results[0][0].tMs).toBe(90);
+    expect(detector.detect).toHaveBeenCalledWith(video, 90);
     expect(results[1][0].tMs).toBe(133);
     const stats = loop.getStats();
     expect(stats.frames).toBe(2);
@@ -231,5 +272,189 @@ describe('openCamera', () => {
     const p = waitForVideoReady(failing as unknown as HTMLVideoElement, 1000);
     failing.onerror?.();
     await expect(p).rejects.toThrow(/failed to load/);
+  });
+});
+
+/* ---------------- createDetector (mocked @mediapipe/tasks-vision) ---------------- */
+
+/**
+ * The runtime wrapper is the one part of the module that cannot be exercised without the real MediaPipe
+ * bundle, so the bundle is mocked and the CONTRACT is pinned here: local asset paths (no CDN), VIDEO
+ * running mode, numHands 2, strictly increasing timestamps, and both delegate fallbacks — at creation
+ * (documented) and at the FIRST INFERENCE (the common clinic-laptop failure: a GPU landmarker that is
+ * created successfully and then throws on the first detectForVideo).
+ */
+const mp = vi.hoisted(() => {
+  interface FakeTask {
+    kind: 'pose' | 'hand';
+    delegate: 'GPU' | 'CPU';
+    opts: Record<string, unknown>;
+    closed: boolean;
+    timestamps: number[];
+    detectForVideo(frame: unknown, ts: number): unknown;
+    close(): void;
+  }
+  const state = {
+    wasmPaths: [] as string[],
+    created: [] as Array<{ kind: 'pose' | 'hand'; delegate: 'GPU' | 'CPU'; opts: Record<string, unknown> }>,
+    tasks: [] as FakeTask[],
+    failGpuCreate: false,
+    failGpuInference: false,
+    failCpuCreate: false,
+  };
+  const make = (kind: 'pose' | 'hand', opts: Record<string, unknown>): FakeTask => {
+    const base = opts.baseOptions as { delegate: 'GPU' | 'CPU' };
+    const task: FakeTask = {
+      kind,
+      delegate: base.delegate,
+      opts,
+      closed: false,
+      timestamps: [],
+      detectForVideo(_frame: unknown, ts: number) {
+        task.timestamps.push(ts);
+        if (task.delegate === 'GPU' && state.failGpuInference) throw new Error('WebGL context lost');
+        return kind === 'pose'
+          ? { landmarks: [[{ x: 0.5, y: 0.5, z: 0, visibility: 0.9 }]], worldLandmarks: [[{ x: 0.1, y: 0.2, z: 0.3 }]] }
+          : { landmarks: [[{ x: 0.4, y: 0.6, z: 0 }]], handedness: [[{ categoryName: 'Left', score: 0.87 }]] };
+      },
+      close() {
+        task.closed = true;
+      },
+    };
+    state.tasks.push(task);
+    return task;
+  };
+  const creator = (kind: 'pose' | 'hand') => async (_fileset: unknown, opts: Record<string, unknown>) => {
+    const delegate = (opts.baseOptions as { delegate: 'GPU' | 'CPU' }).delegate;
+    state.created.push({ kind, delegate, opts });
+    if (delegate === 'GPU' && state.failGpuCreate) throw new Error('GPU delegate unavailable');
+    if (delegate === 'CPU' && state.failCpuCreate) throw new Error('CPU create failed');
+    return make(kind, opts);
+  };
+  const reset = () => {
+    state.wasmPaths = [];
+    state.created = [];
+    state.tasks = [];
+    state.failGpuCreate = false;
+    state.failGpuInference = false;
+    state.failCpuCreate = false;
+  };
+  return { state, creator, reset };
+});
+
+vi.mock('@mediapipe/tasks-vision', () => ({
+  FilesetResolver: {
+    forVisionTasks: async (path: string) => {
+      mp.state.wasmPaths.push(path);
+      return { wasm: path };
+    },
+  },
+  PoseLandmarker: { createFromOptions: mp.creator('pose') },
+  HandLandmarker: { createFromOptions: mp.creator('hand') },
+}));
+
+describe('createDetector', () => {
+  const frame = {} as unknown as HTMLVideoElement;
+  beforeEach(() => {
+    mp.reset();
+    resetMediaPipeCache();
+  });
+
+  const flush = async () => {
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+  };
+
+  it('uses LOCAL assets, VIDEO mode and one pose, and forces strictly increasing timestamps', async () => {
+    const det = await createDetector({ mode: 'leg' });
+    expect(mp.state.wasmPaths).toEqual(['/wasm']); // local wasm directory, never a CDN
+    const opts = mp.state.created[0].opts;
+    expect((opts.baseOptions as { modelAssetPath: string }).modelAssetPath).toBe('/models/pose_landmarker_lite.task');
+    expect(opts.runningMode).toBe('VIDEO');
+    expect(opts.numPoses).toBe(1);
+    expect(det.mode).toBe('leg');
+    expect(det.delegate).toBe('GPU');
+
+    const a = det.detect(frame, 100);
+    expect(a.tMs).toBe(100);
+    expect(a.pose).toHaveLength(1);
+    expect(a.poseWorld).toHaveLength(1);
+    // A frame whose capture time did not advance (or went backwards) must still get a larger timestamp:
+    // MediaPipe rejects non-monotonic ones and would throw for the rest of the session.
+    expect(det.detect(frame, 100).tMs).toBe(101);
+    expect(det.detect(frame, 50).tMs).toBe(102);
+    expect(mp.state.tasks[0].timestamps).toEqual([100, 101, 102]);
+    det.close();
+    expect(mp.state.tasks[0].closed).toBe(true);
+  });
+
+  it('hand mode requests 2 hands from the local model and maps handedness', async () => {
+    const det = await createDetector({ mode: 'hand' });
+    const opts = mp.state.created[0].opts;
+    expect((opts.baseOptions as { modelAssetPath: string }).modelAssetPath).toBe('/models/hand_landmarker.task');
+    expect(opts.runningMode).toBe('VIDEO');
+    expect(opts.numHands).toBe(2);
+    const res = det.detect(frame, 10);
+    expect(res.pose).toBeNull();
+    expect(res.hands).toHaveLength(1);
+    expect(res.hands[0].label).toBe('Left');
+    expect(res.hands[0].score).toBeCloseTo(0.87, 6);
+    det.close();
+  });
+
+  it('caches the fileset per wasm path until resetMediaPipeCache()', async () => {
+    (await createDetector({ mode: 'leg' })).close();
+    (await createDetector({ mode: 'hand' })).close();
+    expect(mp.state.wasmPaths).toEqual(['/wasm']);
+    resetMediaPipeCache();
+    (await createDetector({ mode: 'leg' })).close();
+    expect(mp.state.wasmPaths).toEqual(['/wasm', '/wasm']);
+  });
+
+  it('falls back to CPU when the GPU delegate cannot be CREATED', async () => {
+    mp.state.failGpuCreate = true;
+    const det = await createDetector({ mode: 'leg' });
+    expect(mp.state.created.map((c) => c.delegate)).toEqual(['GPU', 'CPU']);
+    expect(det.delegate).toBe('CPU');
+    expect(det.detect(frame, 1).pose).toHaveLength(1);
+    det.close();
+    // Pinned to GPU: no silent CPU fallback, the error surfaces.
+    mp.state.created = [];
+    await expect(createDetector({ mode: 'leg', delegate: 'GPU' })).rejects.toThrow(/GPU delegate unavailable/);
+    expect(mp.state.created.map((c) => c.delegate)).toEqual(['GPU']);
+  });
+
+  it('re-creates the detector on CPU when the FIRST INFERENCE fails on GPU', async () => {
+    mp.state.failGpuInference = true;
+    const det = await createDetector({ mode: 'hand' });
+    expect(det.delegate).toBe('GPU');
+    // The failing frame yields "nothing detected" (lanes read not-tracking) instead of throwing at the
+    // DetectLoop, which would otherwise pin the session at reason 'error' forever.
+    const during = det.detect(frame, 5);
+    expect(during.hands).toEqual([]);
+    expect(during.tMs).toBe(5);
+    // ... and it says WHY it is empty, so the patient is told "switching engines" rather than the lie
+    // "no hand detected — put your hand in view", which they cannot act on.
+    expect(det.recovering).toBe(true);
+    await flush();
+    expect(det.recovering).toBe(false);
+    expect(det.delegate).toBe('CPU');
+    expect(mp.state.created.map((c) => c.delegate)).toEqual(['GPU', 'CPU']);
+    expect(mp.state.tasks[0].closed).toBe(true); // the broken GPU task is released
+    const after = det.detect(frame, 6);
+    expect(after.hands).toHaveLength(1);
+    // Only ONE fallback attempt: a CPU task that also throws is a real error, not another re-create.
+    expect(mp.state.created).toHaveLength(2);
+    det.close();
+  });
+
+  it('surfaces the error loudly when the CPU re-creation also fails', async () => {
+    mp.state.failGpuInference = true;
+    mp.state.failCpuCreate = true;
+    const det = await createDetector({ mode: 'leg' });
+    expect(det.detect(frame, 1).pose).toBeNull();
+    await flush();
+    expect(() => det.detect(frame, 2)).toThrow(/CPU create failed/);
+    expect(det.delegate).toBe('GPU');
+    det.close();
   });
 });

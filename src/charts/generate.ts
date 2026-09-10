@@ -1,4 +1,5 @@
 import { resolveDifficulty } from '../engine/difficulty.ts';
+import { validateTimingWindows } from '../engine/judge.ts';
 import type { Chart, Difficulty, DifficultyName, Note } from '../engine/types.ts';
 
 /** Subset of the song manifest needed to build a beat grid. */
@@ -24,6 +25,11 @@ export interface GenerateOptions {
   minLaneSpacingSec?: number;
   /** Override the minimum gap between any two notes regardless of lane (seconds). */
   minCrossLaneGapSec?: number;
+  /**
+   * Called once per diagnostic by `generateChart` (which otherwise has nowhere to put them).
+   * `generateChartDetailed` returns the same strings in `warnings` and ignores this.
+   */
+  onWarning?: (warning: string) => void;
 }
 
 /** Minimum time between two notes in the same lane (rehab pacing: a rep must return to rest). */
@@ -34,14 +40,33 @@ export const MIN_LANE_SPACING_SEC: Readonly<Record<DifficultyName, number>> = Ob
 });
 
 /**
- * Minimum time between two notes in *different* lanes (rehab pacing: on easy a patient should not
- * be asked to fire two limbs 250 ms apart). Hard is unconstrained beyond the half-beat grid.
+ * Preferred minimum time between two notes in *different* lanes (rehab pacing: on easy a patient
+ * should not be asked to fire two limbs 250 ms apart). Unlike `MIN_LANE_SPACING_SEC` this is not in
+ * the spec — it is a pacing preference, and it is capped at one beat by
+ * `defaultCrossLaneGapSec` (see there).
  */
 export const MIN_CROSS_LANE_GAP_SEC: Readonly<Record<DifficultyName, number>> = Object.freeze({
   easy: 0.45,
   medium: 0.25,
   hard: 0.15,
 });
+
+/**
+ * The cross-lane gap actually used by `generateChart`: the difficulty's preference, capped at ONE
+ * BEAT — the beat grid is the pacing unit, and a gap that is not expressible on it costs real reps
+ * on a rounding cliff. Without the cap, easy at 134–180 bpm asks for 0.45 s while two on-beat notes
+ * a bar apart are 0.448 s apart, so the whole 2-notes-per-bar family becomes infeasible and the
+ * chart falls to 0.333 notes/beat against a nominal 0.5 — a third fewer reps than the difficulty
+ * promises, from a 0.5 % rounding miss. The per-lane spacing (`MIN_LANE_SPACING_SEC`, the
+ * spec's return-to-rest constraint) is never relaxed; only this preference is.
+ *
+ * Pass `GenerateOptions.minCrossLaneGapSec` to override it exactly (no cap applied).
+ */
+export function defaultCrossLaneGapSec(difficulty: DifficultyName, bpm: number): number {
+  const pref = MIN_CROSS_LANE_GAP_SEC[difficulty] ?? 0;
+  const beatSec = Number.isFinite(bpm) && bpm > 0 ? 60 / bpm : 0.5;
+  return Math.min(pref, beatSec);
+}
 
 export const CHART_FORMAT_VERSION = 1;
 
@@ -92,13 +117,25 @@ export interface BarPattern {
 
 interface PatternTable {
   slotsPerBar: number;
-  /** Feasible patterns per note count, best first. */
+  /** Feasible patterns per note count, best first, at most `PATTERNS_PER_COUNT` of them. */
   byCount: BarPattern[][];
+  /** Same, restricted to patterns with every note on a beat (kept separately so truncation cannot hide them). */
+  onBeatByCount: BarPattern[][];
   /** Largest note count that has a feasible pattern. */
   maxCount: number;
   /** Largest note count that has a feasible pattern with every note on a beat. */
   maxOnBeatCount: number;
 }
+
+/**
+ * Patterns retained per note count (and per count for the on-beat-only list). The consumers pick
+ * the best pattern, or uniformly among the handful within `VARIATION_SCORE_SLACK` of it, so keeping
+ * every one of the (up to 65 536) feasible masks buys nothing and costs both the build time and
+ * ~6 MB per cached table. Truncation is a streaming top-K by the same (score, mask) order the
+ * consumers see, so the retained patterns — and therefore the generated chart — are exactly those
+ * the untruncated table would have offered.
+ */
+export const PATTERNS_PER_COUNT = 64;
 
 const EMPTY_PATTERN: BarPattern = Object.freeze({ mask: 0, slots: Object.freeze([]) as readonly number[], count: 0, score: 0, downbeat: false, offBeats: 0 });
 
@@ -107,6 +144,11 @@ const EMPTY_PATTERN: BarPattern = Object.freeze({ mask: 0, slots: Object.freeze(
  * half-beat grid: consecutive notes >= crossGapSlots apart and no window of laneGapSlots
  * consecutive slots holding more than `lanes` notes. The second condition is exactly what makes a
  * round-robin lane assignment valid: notes k and k+lanes are then always >= laneGapSlots apart.
+ *
+ * The window count is done with rotations + popcount instead of an O(slots x laneGap) walk: with
+ * laneGapSlots = q*slotsPerBar + r, a window of laneGapSlots consecutive ring positions covers
+ * every note q times plus the notes in the remaining r positions (the same counting-with-repetition
+ * the walk did).
  */
 function periodicFeasible(mask: number, slots: readonly number[], slotsPerBar: number, lanes: number, laneGapSlots: number, crossGapSlots: number): boolean {
   const n = slots.length;
@@ -115,12 +157,26 @@ function periodicFeasible(mask: number, slots: readonly number[], slotsPerBar: n
     const next = i + 1 < n ? slots[i + 1] : slots[0] + slotsPerBar;
     if (next - slots[i] < crossGapSlots) return false;
   }
+  if (laneGapSlots <= 1) return true; // a 1-slot window holds at most one note, and lanes >= 1
+  const q = Math.floor(laneGapSlots / slotsPerBar);
+  const r = laneGapSlots - q * slotsPerBar;
+  const base = n * q;
+  if (base > lanes) return false;
+  if (r === 0) return true;
+  const full = slotsPerBar >= 31 ? -1 >>> 0 : (1 << slotsPerBar) - 1;
+  const window = (1 << r) - 1;
   for (let s = 0; s < slotsPerBar; s++) {
-    let cnt = 0;
-    for (let k = 0; k < laneGapSlots; k++) if (mask & (1 << (s + k) % slotsPerBar)) cnt++;
-    if (cnt > lanes) return false;
+    const rot = ((mask >>> s) | (mask << (slotsPerBar - s))) & full;
+    if (base + popcount(rot & window) > lanes) return false;
   }
   return true;
+}
+
+function popcount(x: number): number {
+  let v = x - ((x >> 1) & 0x55555555);
+  v = (v & 0x33333333) + ((v >> 2) & 0x33333333);
+  v = (v + (v >> 4)) & 0x0f0f0f0f;
+  return (Math.imul(v, 0x01010101) >> 24) & 0x3f;
 }
 
 function beatStrength(beat: number, beatsPerBar: number): number {
@@ -156,36 +212,118 @@ function scorePattern(mask: number, slots: readonly number[], slotsPerBar: numbe
   return sc;
 }
 
+/**
+ * Memo for `buildPatternTableUncached`: the search is O(2^(2*beatsPerBar)) in the worst case and
+ * would otherwise be repeated on every generateChart call (tens of ms for an 8-beat bar — a visible
+ * stall at session setup). The table is a pure function of the key and is never mutated after
+ * construction.
+ */
+const patternTableCache = new Map<string, PatternTable>();
+const PATTERN_TABLE_CACHE_MAX = 64;
+
 function buildPatternTable(beatsPerBar: number, lanes: number, laneGapSlots: number, crossGapSlots: number, accents: boolean): PatternTable {
+  const key = `${beatsPerBar}|${lanes}|${laneGapSlots}|${crossGapSlots}|${accents ? 1 : 0}`;
+  const hit = patternTableCache.get(key);
+  if (hit) return hit;
+  const table = buildPatternTableUncached(beatsPerBar, lanes, laneGapSlots, crossGapSlots, accents);
+  if (patternTableCache.size >= PATTERN_TABLE_CACHE_MAX) patternTableCache.clear();
+  patternTableCache.set(key, table);
+  return table;
+}
+
+/**
+ * Enumerate every bar-periodic feasible pattern, best first per note count.
+ *
+ * Depth-first over slots in increasing order rather than a scan of all 2^(2*beatsPerBar) masks: the
+ * cross-lane gap and the lane window are enforced *while* building a candidate, so infeasible
+ * prefixes are never extended. The set of patterns produced is identical to the exhaustive scan's
+ * (both conditions are necessary, and the cyclic check still runs on every complete candidate), and
+ * only the top `PATTERNS_PER_COUNT` per note count are materialised — a candidate that cannot reach
+ * a full list is dropped before its slot array is allocated.
+ *
+ * Measured on the worst case an 8-beat bar can produce (60 bpm hard, 4 lanes: both gaps round down
+ * to one half-beat slot, so nothing prunes and all 2^16 masks are visited): 77.7 ms before, 29 ms
+ * cold / 9.4 ms warm now. A 7/8 song at 90 bpm went 19.4 -> 3.5 ms and 4/4 stays under 0.2 ms; a
+ * cached table is also ~6 MB smaller in the unconstrained case. The table is cached by key in
+ * `buildPatternTable`, so this runs once per configuration, not once per `generateChart`.
+ */
+function buildPatternTableUncached(beatsPerBar: number, lanes: number, laneGapSlots: number, crossGapSlots: number, accents: boolean): PatternTable {
   const S = beatsPerBar * SLOTS_PER_BEAT;
   const byCount: BarPattern[][] = [];
-  for (let c = 0; c <= S; c++) byCount.push([]);
+  const onBeatByCount: BarPattern[][] = [];
+  for (let c = 0; c <= S; c++) {
+    byCount.push([]);
+    onBeatByCount.push([]);
+  }
+  // Necessary conditions implied by periodicFeasible, used to bound the search depth.
+  const maxCountBound = Math.min(S, Math.floor(S / crossGapSlots), Math.floor((S * lanes) / laneGapSlots));
   const slots: number[] = [];
-  const total = 1 << S;
-  for (let mask = 0; mask < total; mask++) {
-    if (accents && mask !== 0 && (mask & 1) === 0) continue; // accents: every non-empty bar starts on the downbeat
-    slots.length = 0;
-    for (let s = 0; s < S; s++) if (mask & (1 << s)) slots.push(s);
-    if (!periodicFeasible(mask, slots, S, lanes, laneGapSlots, crossGapSlots)) continue;
+  const byScore = (a: BarPattern, b: BarPattern): number => b.score - a.score || a.mask - b.mask;
+  // Score below which a count's list is already full of strictly better patterns; a candidate under
+  // it cannot reach the final top-K, so it is dropped before anything is allocated for it.
+  const cutoff = new Array<number>(S + 1).fill(Number.NEGATIVE_INFINITY);
+  const onBeatCutoff = new Array<number>(S + 1).fill(Number.NEGATIVE_INFINITY);
+  /** Streaming top-K: only ever discards patterns that `PATTERNS_PER_COUNT` retained ones beat. */
+  const keep = (list: BarPattern[], p: BarPattern, cuts: number[], count: number): void => {
+    list.push(p);
+    if (list.length >= 4 * PATTERNS_PER_COUNT) {
+      list.sort(byScore);
+      list.length = PATTERNS_PER_COUNT;
+      cuts[count] = list[PATTERNS_PER_COUNT - 1].score;
+    }
+  };
+
+  const record = (mask: number): void => {
+    if (!periodicFeasible(mask, slots, S, lanes, laneGapSlots, crossGapSlots)) return;
+    const count = slots.length;
     let offBeats = 0;
     for (const x of slots) if (x % SLOTS_PER_BEAT !== 0) offBeats++;
-    byCount[slots.length].push({
-      mask,
-      slots: Object.freeze(slots.slice()),
-      count: slots.length,
-      score: scorePattern(mask, slots, S, beatsPerBar, accents),
-      downbeat: (mask & 1) !== 0,
-      offBeats,
-    });
+    const score = scorePattern(mask, slots, S, beatsPerBar, accents);
+    const wanted = score >= cutoff[count];
+    const wantedOnBeat = offBeats === 0 && score >= onBeatCutoff[count];
+    if (!wanted && !wantedOnBeat) return;
+    const pattern: BarPattern = { mask, slots: slots.slice(), count, score, downbeat: (mask & 1) !== 0, offBeats };
+    if (wanted) keep(byCount[count], pattern, cutoff, count);
+    if (wantedOnBeat) keep(onBeatByCount[count], pattern, onBeatCutoff, count);
+  };
+
+  /** Extend `slots` (strictly increasing, linear constraints already satisfied) with slots >= from. */
+  const extend = (from: number, mask: number): void => {
+    record(mask);
+    if (slots.length >= maxCountBound) return;
+    for (let s = from; s < S; s++) {
+      // lane window: at most `lanes` notes in any laneGapSlots consecutive slots (linear form —
+      // a relaxation of the cyclic test, so pruning here can never drop a feasible pattern)
+      let cnt = 1;
+      for (let j = slots.length - 1; j >= 0 && slots[j] > s - laneGapSlots; j--) cnt++;
+      if (cnt > lanes) continue;
+      slots.push(s);
+      extend(s + crossGapSlots, mask | (1 << s));
+      slots.pop();
+    }
+  };
+
+  if (accents) {
+    // every non-empty bar starts on the downbeat
+    record(0);
+    slots.push(0);
+    extend(crossGapSlots, 1);
+    slots.pop();
+  } else {
+    extend(0, 0);
   }
+
   let maxCount = 0;
   let maxOnBeatCount = 0;
   for (let c = 0; c <= S; c++) {
-    byCount[c].sort((a, b) => b.score - a.score || a.mask - b.mask);
+    byCount[c].sort(byScore);
+    if (byCount[c].length > PATTERNS_PER_COUNT) byCount[c].length = PATTERNS_PER_COUNT;
+    onBeatByCount[c].sort(byScore);
+    if (onBeatByCount[c].length > PATTERNS_PER_COUNT) onBeatByCount[c].length = PATTERNS_PER_COUNT;
     if (byCount[c].length > 0) maxCount = c;
-    if (byCount[c].some((p) => p.offBeats === 0)) maxOnBeatCount = c;
+    if (onBeatByCount[c].length > 0) maxOnBeatCount = c;
   }
-  return { slotsPerBar: S, byCount, maxCount, maxOnBeatCount };
+  return { slotsPerBar: S, byCount, onBeatByCount, maxCount, maxOnBeatCount };
 }
 
 /** Linear feasibility of `prev` followed by `cur` (only the bar boundary can fail when both are periodic-feasible). */
@@ -227,8 +365,20 @@ export interface DensityBudget {
   laneGapSlots: number;
   /** Minimum any-lane gap in half-beat slots. */
   crossGapSlots: number;
+  /** Same-lane spacing the budget was built for (seconds) — the spec's return-to-rest constraint. */
+  minLaneSpacingSec: number;
+  /** Cross-lane gap the budget was built for (seconds); see `defaultCrossLaneGapSec` for the cap. */
+  minCrossLaneGapSec: number;
   /** Beats per bar the patterns were built for (input clamped to [1, MAX_PATTERN_BEATS_PER_BAR]). */
   beatsPerBar: number;
+  /**
+   * 0 in the normal case (every bar carries a pattern). Otherwise the pacing constraints make even
+   * ONE note per bar infeasible when repeated (e.g. a 2/4 bar at 134 bpm is 0.896 s, just under the
+   * 0.9 s easy lane spacing) and the generator falls back to one note every `sparseBarStride` bar
+   * downbeats — which is perfectly playable, and far better than the empty chart a bar-pattern-only
+   * model produces.
+   */
+  sparseBarStride: number;
 }
 
 function computeBudget(
@@ -246,12 +396,37 @@ function computeBudget(
   const maxPerSlot = Math.min(1, lanes / laneGapSlots, 1 / crossGapSlots);
   const maxFeasibleDensity = maxPerSlot * SLOTS_PER_BEAT;
   const table = buildPatternTable(beatsPerBar, lanes, laneGapSlots, crossGapSlots, accents);
-  const maxBarDensity = table.maxCount / beatsPerBar;
-  const maxOnBeatDensity = table.maxOnBeatCount / beatsPerBar;
   const target = Math.max(0, targetDensity);
+  const S = beatsPerBar * SLOTS_PER_BEAT;
+  let maxBarDensity = table.maxCount / beatsPerBar;
+  let maxOnBeatDensity = table.maxOnBeatCount / beatsPerBar;
+  let sparseBarStride = 0;
+  if (table.maxCount === 0 && target > 0) {
+    // No single-bar pattern survives the pacing constraints when repeated. Space notes over several
+    // bars instead of giving up: one downbeat every `stride` bars, `stride` chosen so that
+    // consecutive notes are >= crossGapSlots apart and same-lane repeats (every `lanes` notes under
+    // round-robin) are >= laneGapSlots apart, and never denser than the difficulty asks for.
+    const minStride = Math.max(1, Math.ceil(crossGapSlots / S), Math.ceil(laneGapSlots / (lanes * S)));
+    const densityStride = Math.max(1, Math.ceil(1 / (target * beatsPerBar) - EPS));
+    sparseBarStride = Math.max(minStride, densityStride);
+    maxBarDensity = 1 / (sparseBarStride * beatsPerBar);
+    maxOnBeatDensity = maxBarDensity;
+  }
   const effectiveTargetDensity = Math.min(target, target <= 1 + EPS ? maxOnBeatDensity : maxBarDensity);
   return {
-    budget: { targetDensity, maxFeasibleDensity, maxBarDensity, maxOnBeatDensity, effectiveTargetDensity, laneGapSlots, crossGapSlots, beatsPerBar },
+    budget: {
+      targetDensity,
+      maxFeasibleDensity,
+      maxBarDensity,
+      maxOnBeatDensity,
+      effectiveTargetDensity,
+      laneGapSlots,
+      crossGapSlots,
+      minLaneSpacingSec,
+      minCrossLaneGapSec,
+      beatsPerBar,
+      sparseBarStride,
+    },
     table,
   };
 }
@@ -292,9 +467,29 @@ export interface GenerateResult extends DensityBudget {
   warnings: string[];
 }
 
+/** Thrown by `generateChart` when no playable chart could be produced. Carries the diagnostics. */
+export class ChartGenerationError extends Error {
+  readonly warnings: string[];
+  readonly result: GenerateResult;
+  constructor(result: GenerateResult) {
+    super(`generateChart: produced no notes — ${result.warnings.join('; ') || 'no diagnostics'}`);
+    this.name = 'ChartGenerationError';
+    this.warnings = result.warnings;
+    this.result = result;
+  }
+}
+
 /**
  * Generate a chart from a song's beat grid. Deterministic for (song, lanes, difficulty, seed).
- * See `generateChartDetailed` for the density budget actually used.
+ *
+ * Diagnostics are NOT silently dropped: every warning `generateChartDetailed` produces (density
+ * reduced to honour rehab pacing, beatsPerBar clamped, sparse fallback, lane imbalance, missing
+ * downbeat accents, a negative song offset) is passed to `opts.onWarning` when supplied, and an
+ * empty chart — a highway with nothing on it — throws `ChartGenerationError` instead of being
+ * returned as if it were playable. Use `generateChartDetailed` when you want to inspect the budget
+ * and decide for yourself; it never throws.
+ *
+ * @throws ChartGenerationError when the generated chart has no notes.
  */
 export function generateChart(
   song: SongGrid,
@@ -303,7 +498,24 @@ export function generateChart(
   seed: number,
   opts: GenerateOptions = {},
 ): Chart {
-  return generateChartDetailed(song, lanes, difficulty, seed, opts).chart;
+  const result = generateChartDetailed(song, lanes, difficulty, seed, opts);
+  if (opts.onWarning) for (const w of result.warnings) opts.onWarning(w);
+  if (result.chart.notes.length === 0) throw new ChartGenerationError(result);
+  return result.chart;
+}
+
+/**
+ * Validate the beat grid a chart is generated from. Throws RangeError — a bad manifest must fail at
+ * load, not produce an unplayable chart (or notes before the audio starts).
+ */
+export function validateSongGrid(song: SongGrid): void {
+  if (!song || typeof song !== 'object') throw new RangeError('generateChart: song missing');
+  if (!Number.isFinite(song.bpm) || song.bpm <= 0) throw new RangeError(`generateChart: bpm must be positive (got ${song.bpm})`);
+  if (!Number.isFinite(song.offset)) throw new RangeError(`generateChart: offset must be finite (got ${song.offset})`);
+  if (!Number.isFinite(song.durationSec) || song.durationSec <= 0) throw new RangeError(`generateChart: durationSec must be positive (got ${song.durationSec})`);
+  if (song.beatsPerBar !== undefined && (!Number.isFinite(song.beatsPerBar) || song.beatsPerBar < 1)) {
+    throw new RangeError(`generateChart: beatsPerBar must be >= 1 (got ${song.beatsPerBar})`);
+  }
 }
 
 /**
@@ -321,7 +533,16 @@ export function generateChart(
  *   a new section may swap the base pattern for an equally good one;
  * - lanes are assigned round-robin (0,1,2,…), which is provably spacing-safe for these patterns and
  *   gives every lane an equal share of reps (bilateral rehab: left/right get the same work);
- * - 2-beat lead-in silence, `tailSec` free at the end, accent notes on bar downbeats.
+ * - 2-beat lead-in silence measured from the AUDIO START (so a negative `song.offset` shifts the
+ *   first note later, never onto t = 0 where it would have no approach time), `tailSec` free at the
+ *   end, accent notes on bar downbeats.
+ *
+ * Lane count: the product sets up 2-4 movements (docs/ARCHITECTURE.md, Session flow) and the rehab
+ * density guarantees are stated for that range — across bpm 55-205 in 3/4 and 4/4, 2-4 lanes stay
+ * inside the spec's ±20 % density band. `lanes = 1` is accepted (tests, single-limb sessions) but
+ * the per-lane return-to-rest spacing is then the binding constraint and the achieved density can
+ * fall below the target: every such case emits a `density reduced` warning rather than quietly
+ * under-delivering reps, so treat a warning on a 1-lane chart as expected, not exceptional.
  */
 export function generateChartDetailed(
   song: SongGrid,
@@ -331,6 +552,7 @@ export function generateChartDetailed(
   opts: GenerateOptions = {},
 ): GenerateResult {
   const diff = resolveDifficulty(difficulty);
+  validateSongGrid(song);
   const laneCount = Math.max(1, Math.floor(lanes));
   const bpm = song.bpm > 0 && Number.isFinite(song.bpm) ? song.bpm : 120;
   const requestedBpb = Math.floor(song.beatsPerBar ?? 4);
@@ -342,7 +564,7 @@ export function generateChartDetailed(
   const tailSec = opts.tailSec ?? 1;
   const phraseBars = Math.max(1, Math.floor(opts.phraseBars ?? 4));
   const minSpacing = opts.minLaneSpacingSec ?? MIN_LANE_SPACING_SEC[diff.name] ?? 0.6;
-  const crossGap = opts.minCrossLaneGapSec ?? MIN_CROSS_LANE_GAP_SEC[diff.name] ?? 0;
+  const crossGap = opts.minCrossLaneGapSec ?? defaultCrossLaneGapSec(diff.name, bpm);
   const density = Math.max(0, diff.noteDensity);
   const { budget, table } = computeBudget(bpm, laneCount, density, minSpacing, crossGap, beatsPerBar, accents);
   const eff = budget.effectiveTargetDensity;
@@ -362,7 +584,18 @@ export function generateChartDetailed(
     );
   }
 
-  const mk = (chartNotes: Note[]): Chart => ({ songId: song.id, lanes: laneCount, notes: chartNotes, bpm, offset: song.offset, difficulty: diff, durationSec: song.durationSec });
+  // The chart owns its difficulty: a copy, never the deep-frozen DIFFICULTIES singleton. Aliasing it
+  // makes `chart.difficulty.windows.goodMs = x` (a therapist window scale applied downstream) throw
+  // a TypeError in strict mode instead of doing what the caller obviously meant.
+  const mk = (chartNotes: Note[]): Chart => ({
+    songId: song.id,
+    lanes: laneCount,
+    notes: chartNotes,
+    bpm,
+    offset: song.offset,
+    difficulty: { name: diff.name, thresholdFraction: diff.thresholdFraction, noteDensity: diff.noteDensity, windows: { perfectMs: diff.windows.perfectMs, goodMs: diff.windows.goodMs } },
+    durationSec: song.durationSec,
+  });
   const empty = (why: string): GenerateResult => ({
     chart: mk([]),
     ...budget,
@@ -375,7 +608,24 @@ export function generateChartDetailed(
   });
 
   // absolute half-beat slot j is at time offset + j * slotSec; bar b covers slots [b*S, (b+1)*S)
-  const firstSlot = Math.ceil(leadInBeats * SLOTS_PER_BEAT - EPS);
+  //
+  // The lead-in is measured from AUDIO START (song time 0), not from the beat grid's origin. With a
+  // negative song.offset (the first downbeat precedes the audio) the two differ: clamping only to
+  // "song time >= 0" let the first note land at exactly t = 0.000 — on the highway that is a note
+  // with no approach time at all, i.e. unhittable, and it used to happen with no warning (bpm 240 /
+  // offset -0.5, bpm 120 / offset -1.0). So the first usable slot is pushed past BOTH the grid
+  // lead-in and the audio start plus the same lead-in. For offset >= 0 this is exactly the old
+  // `leadInSlots` (firstPlayableSlot is then <= 0), so non-negative offsets are unaffected.
+  const leadInSlots = Math.ceil(leadInBeats * SLOTS_PER_BEAT - EPS);
+  const firstPlayableSlot = Math.ceil(-song.offset / slotSec - EPS);
+  const firstSlot = Math.max(leadInSlots, firstPlayableSlot + leadInSlots);
+  if (firstPlayableSlot > 0) {
+    const firstNoteTime = song.offset + firstSlot * slotSec;
+    warnings.push(
+      `song.offset ${song.offset}s is negative: the first ${firstPlayableSlot} half-beat slot(s) fall before the audio ` +
+        `and were skipped, plus ${leadInBeats} beat(s) of lead-in — the earliest note is at song time ${firstNoteTime.toFixed(3)}s`,
+    );
+  }
   const lastSlot = Math.floor((song.durationSec - tailSec - song.offset) / slotSec + EPS);
   if (!Number.isFinite(lastSlot) || lastSlot < firstSlot) return empty('song too short for any note');
   const usableBeats = (lastSlot - firstSlot + 1) / SLOTS_PER_BEAT;
@@ -383,7 +633,7 @@ export function generateChartDetailed(
   const lastBar = Math.floor(lastSlot / S);
 
   const rand = mulberry32(seed);
-  const startLane = Math.floor(rand() * laneCount);
+  rand(); // burn one draw: keeps chart output distinct per seed independently of the lane assignment
 
   const isCompatible = (prev: BarPattern | null, cur: BarPattern): boolean => compatible(prev, cur, S, laneCount, G, C);
   /** Cumulative note count after `bars` full bars (fractional per-bar counts alternate deterministically). */
@@ -391,10 +641,11 @@ export function generateChartDetailed(
   const countFor = (i: number): number => Math.min(table.maxCount, Math.max(0, cum(i + 1) - cum(i)));
   /** Candidate patterns for a count, best first; on-beat patterns only when the target prefers them and any exist. */
   const candidatesFor = (count: number): readonly BarPattern[] => {
-    const list = table.byCount[count] ?? [];
-    if (!preferOnBeat) return list;
-    const onBeat = list.filter((p) => p.offBeats === 0);
-    return onBeat.length > 0 ? onBeat : list;
+    if (preferOnBeat) {
+      const onBeat = table.onBeatByCount[count] ?? [];
+      if (onBeat.length > 0) return onBeat;
+    }
+    return table.byCount[count] ?? [];
   };
   const bestScore = (count: number): number => candidatesFor(count)[0]?.score ?? -Infinity;
 
@@ -418,6 +669,113 @@ export function generateChartDetailed(
     for (const p of list) if (isCompatible(prev, p)) return p;
     return list[0] ?? EMPTY_PATTERN;
   };
+
+  /**
+   * Lane assignment + metrics for a finished list of kept slots.
+   *
+   * Lanes are assigned greedily rather than by a fixed rotation: among the lanes that are still
+   * >= laneGapSlots away from their own previous note, the least-used one wins, ties broken from
+   * the seeded PRNG. The repair pass guarantees at most `laneCount - 1` notes inside any
+   * laneGapSlots window, so at least one lane is always free — the rehab spacing proof holds
+   * exactly as it did for the rotation, the per-lane rep counts stay balanced, and the highway is
+   * no longer a single predictable cycle the patient memorises within a bar.
+   */
+  const finish = (slots: readonly number[]): GenerateResult => {
+    const notes: Note[] = [];
+    const laneCounts = new Array<number>(laneCount).fill(0);
+    const lastSlotForLane = new Array<number>(laneCount).fill(Number.NEGATIVE_INFINITY);
+    let offBeats = 0;
+    for (let k = 0; k < slots.length; k++) {
+      const slot = slots[k];
+      let lane = -1;
+      let bestCount = Infinity;
+      let ties = 0;
+      for (let l = 0; l < laneCount; l++) {
+        if (slot - lastSlotForLane[l] < G) continue;
+        if (laneCounts[l] < bestCount) {
+          bestCount = laneCounts[l];
+          lane = l;
+          ties = 1;
+        } else if (laneCounts[l] === bestCount) {
+          ties++;
+          if (rand() < 1 / ties) lane = l; // seeded uniform choice among equally-used lanes
+        }
+      }
+      if (lane < 0) {
+        // Unreachable for slots produced by the repair pass (it caps a laneGapSlots window at
+        // laneCount - 1 notes); kept as a safety net: use the lane idle longest.
+        lane = 0;
+        for (let l = 1; l < laneCount; l++) if (lastSlotForLane[l] < lastSlotForLane[lane]) lane = l;
+      }
+      laneCounts[lane]++;
+      lastSlotForLane[lane] = slot;
+      if (slot % SLOTS_PER_BEAT !== 0) offBeats++;
+      notes.push({ id: k, lane, time: round6(song.offset + slot * slotSec) });
+    }
+
+    let downbeatsTotal = 0;
+    let downbeatsHit = 0;
+    const keptSet = new Set(slots);
+    for (let b = firstBar; b <= lastBar; b++) {
+      const d = b * S;
+      if (d < firstSlot || d > lastSlot) continue;
+      downbeatsTotal++;
+      if (keptSet.has(d)) downbeatsHit++;
+    }
+    const total = notes.length;
+    const laneShares = laneCounts.map((c) => (total > 0 ? c / total : 0));
+    const offBeatFraction = total > 0 ? offBeats / total : 0;
+    const expectedDownbeats = budget.sparseBarStride > 0 ? Math.ceil(downbeatsTotal / budget.sparseBarStride) : downbeatsTotal;
+    const downbeatCoverage = downbeatsTotal > 0 ? downbeatsHit / downbeatsTotal : 1;
+
+    if (total >= laneCount && laneCount > 1) {
+      const max = Math.max(...laneCounts);
+      const min = Math.min(...laneCounts);
+      if (min === 0) warnings.push(`lane balance: lane(s) ${laneCounts.map((c, l) => (c === 0 ? l : -1)).filter((l) => l >= 0).join(', ')} received no notes`);
+      else if (max / min > LANE_SHARE_WARN_RATIO && max - min > 1) {
+        warnings.push(`lane balance: reps per lane ${laneCounts.join('/')} (max/min ${(max / min).toFixed(2)} > ${LANE_SHARE_WARN_RATIO})`);
+      }
+    }
+    if (accents && downbeatsHit < expectedDownbeats) {
+      warnings.push(`accents: ${downbeatsHit} of ${downbeatsTotal} bar downbeats carry a note (pacing constraints)`);
+    }
+    if (diff.name === 'easy' && offBeatFraction > EASY_OFFBEAT_WARN_FRACTION) {
+      warnings.push(`easy: ${(offBeatFraction * 100).toFixed(0)}% of notes are off-beat`);
+    }
+    if (total === 0) warnings.push('chart is empty: no note survived the pacing constraints');
+
+    return {
+      chart: mk(notes),
+      ...budget,
+      achievedDensity: usableBeats > 0 ? total / usableBeats : 0,
+      usableBeats,
+      laneShares,
+      offBeatFraction,
+      downbeatCoverage,
+      warnings,
+    };
+  };
+
+  const kept: number[] = [];
+  const keptDown: boolean[] = [];
+  const isDownbeat = (slot: number): boolean => slot % S === 0;
+
+  if (budget.sparseBarStride > 0) {
+    // Sparse fallback: no bar pattern is feasible, so notes go on every `stride`-th bar downbeat.
+    const stride = budget.sparseBarStride;
+    warnings.push(
+      `pacing: at ${bpm} bpm with ${beatsPerBar} beat(s) per bar, ${laneCount} lane(s), lane spacing ${minSpacing}s and cross-lane gap ${crossGap}s ` +
+        `no bar pattern is playable; falling back to one note every ${stride} bar(s) ` +
+        `(${(stride * beatsPerBar * beatSec).toFixed(2)}s apart, ${eff.toFixed(3)} notes/beat)`,
+    );
+    for (let b = Math.max(firstBar, Math.ceil(firstSlot / S)); b <= lastBar; b += stride) {
+      const slot = b * S;
+      if (slot < firstSlot || slot > lastSlot) continue;
+      kept.push(slot);
+      keptDown.push(true);
+    }
+    return finish(kept);
+  }
 
   const chosen: BarPattern[] = [];
   let prev: BarPattern | null = null;
@@ -459,9 +817,6 @@ export function generateChartDetailed(
 
   // candidate slots in time order, then a repair pass that enforces both constraints linearly
   // (only bar transitions can conflict; downbeats win over the non-downbeat note before them)
-  const kept: number[] = [];
-  const keptDown: boolean[] = [];
-  const isDownbeat = (slot: number): boolean => slot % S === 0;
   const fits = (slot: number): boolean => {
     if (kept.length === 0) return true;
     if (slot - kept[kept.length - 1] < C) return false;
@@ -490,56 +845,7 @@ export function generateChartDetailed(
     }
   }
 
-  const notes: Note[] = [];
-  const laneCounts = new Array<number>(laneCount).fill(0);
-  let offBeats = 0;
-  for (let k = 0; k < kept.length; k++) {
-    const lane = (startLane + k) % laneCount;
-    laneCounts[lane]++;
-    if (kept[k] % SLOTS_PER_BEAT !== 0) offBeats++;
-    notes.push({ id: k, lane, time: round6(song.offset + kept[k] * slotSec) });
-  }
-
-  // metrics
-  let downbeatsTotal = 0;
-  let downbeatsHit = 0;
-  const keptSet = new Set(kept);
-  for (let b = firstBar; b <= lastBar; b++) {
-    const d = b * S;
-    if (d < firstSlot || d > lastSlot) continue;
-    downbeatsTotal++;
-    if (keptSet.has(d)) downbeatsHit++;
-  }
-  const total = notes.length;
-  const laneShares = laneCounts.map((c) => (total > 0 ? c / total : 0));
-  const offBeatFraction = total > 0 ? offBeats / total : 0;
-  const downbeatCoverage = downbeatsTotal > 0 ? downbeatsHit / downbeatsTotal : 1;
-
-  if (total >= laneCount && laneCount > 1) {
-    const max = Math.max(...laneCounts);
-    const min = Math.min(...laneCounts);
-    if (min === 0) warnings.push(`lane balance: lane(s) ${laneCounts.map((c, l) => (c === 0 ? l : -1)).filter((l) => l >= 0).join(', ')} received no notes`);
-    else if (max / min > LANE_SHARE_WARN_RATIO && max - min > 1) {
-      warnings.push(`lane balance: reps per lane ${laneCounts.join('/')} (max/min ${(max / min).toFixed(2)} > ${LANE_SHARE_WARN_RATIO})`);
-    }
-  }
-  if (accents && downbeatCoverage < 1 - EPS) {
-    warnings.push(`accents: ${downbeatsHit} of ${downbeatsTotal} bar downbeats carry a note (pacing constraints)`);
-  }
-  if (diff.name === 'easy' && offBeatFraction > EASY_OFFBEAT_WARN_FRACTION) {
-    warnings.push(`easy: ${(offBeatFraction * 100).toFixed(0)}% of notes are off-beat`);
-  }
-
-  return {
-    chart: mk(notes),
-    ...budget,
-    achievedDensity: usableBeats > 0 ? total / usableBeats : 0,
-    usableBeats,
-    laneShares,
-    offBeatFraction,
-    downbeatCoverage,
-    warnings,
-  };
+  return finish(kept);
 }
 
 function round6(x: number): number {
@@ -585,11 +891,34 @@ export function serializeChart(chart: Chart): string {
 
 const isNum = (x: unknown): x is number => typeof x === 'number' && Number.isFinite(x);
 
+/** `parseChart` plus what had to be assumed to make the input fit `Chart` (see `parseChartDetailed`). */
+export interface ParseChartResult {
+  chart: Chart;
+  /** Empty when nothing was assumed. Show these in dev tools / the chart editor, not to patients. */
+  warnings: string[];
+}
+
 /**
  * Parse a chart from a JSON string or already-parsed object (`ChartJson`, or object-form notes).
  * Throws on invalid input: unknown format version, out-of-range lanes, duplicate note ids.
+ *
+ * Anything that had to be assumed (currently only a missing `durationSec`) is reported by
+ * `parseChartDetailed`; this wrapper drops that. Prefer the detailed form wherever the result is
+ * shown or stored.
  */
 export function parseChart(input: string | unknown): Chart {
+  return parseChartDetailed(input).chart;
+}
+
+/**
+ * `parseChart` that also reports what it had to assume.
+ *
+ * The only such assumption today: `Chart.durationSec` is required by src/engine/types.ts but absent
+ * from the Chart block in docs/ARCHITECTURE.md, so a chart written to the documented shape has to be
+ * given one — the last note's time, which describes a song that ends on its final note. That number
+ * then drives end-of-song UI, so the caller is told rather than left to trust it.
+ */
+export function parseChartDetailed(input: string | unknown): ParseChartResult {
   const raw: unknown = typeof input === 'string' ? JSON.parse(input) : input;
   if (!raw || typeof raw !== 'object') throw new Error('chart: not an object');
   const o = raw as Record<string, unknown>;
@@ -600,7 +929,11 @@ export function parseChart(input: string | unknown): Chart {
   if (!isNum(o.lanes) || o.lanes < 1) throw new Error('chart: lanes invalid');
   if (!isNum(o.bpm) || o.bpm <= 0) throw new Error('chart: bpm invalid');
   if (!isNum(o.offset)) throw new Error('chart: offset invalid');
-  if (!isNum(o.durationSec) || o.durationSec < 0) throw new Error('chart: durationSec invalid');
+  // `durationSec` is required by src/engine/types.ts but absent from the Chart block in
+  // docs/ARCHITECTURE.md; accept charts written to the documented shape and fill it in from the
+  // last note so a hand-written or older chart still loads — and say so in `warnings`.
+  // (Contract divergence flagged to the orchestrator; the doc or the field needs amending.)
+  if (o.durationSec !== undefined && (!isNum(o.durationSec) || o.durationSec < 0)) throw new Error('chart: durationSec invalid');
   const d = o.difficulty as Record<string, unknown> | undefined;
   if (!d || typeof d !== 'object') throw new Error('chart: difficulty missing');
   const name = d.name;
@@ -609,6 +942,15 @@ export function parseChart(input: string | unknown): Chart {
   if (!isNum(d.thresholdFraction) || !isNum(d.noteDensity) || !w || !isNum(w.perfectMs) || !isNum(w.goodMs)) {
     throw new Error('chart: difficulty fields invalid');
   }
+  // These numbers are handed straight to the vision threshold detector and the Judge. A
+  // thresholdFraction above 1 makes every note unhittable (the patient can never cross the ROM
+  // threshold) and non-positive windows blow up inside the Judge at Play time; charts come from
+  // localStorage, so both are reachable. Fail here, at load, with a message that names the field.
+  if (d.thresholdFraction < 0 || d.thresholdFraction > 1) {
+    throw new Error(`chart: difficulty.thresholdFraction ${d.thresholdFraction} out of range [0, 1]`);
+  }
+  if (d.noteDensity < 0) throw new Error(`chart: difficulty.noteDensity ${d.noteDensity} must be >= 0`);
+  validateTimingWindows({ perfectMs: w.perfectMs, goodMs: w.goodMs }, 'chart: difficulty.windows');
   if (!Array.isArray(o.notes)) throw new Error('chart: notes missing');
   const lanes = Math.floor(o.lanes);
   const ids = new Set<number>();
@@ -623,13 +965,22 @@ export function parseChart(input: string | unknown): Chart {
     return { id, lane, time };
   });
   notes.sort((a, b) => a.time - b.time || a.id - b.id);
-  return {
+  const warnings: string[] = [];
+  let durationSec: number;
+  if (isNum(o.durationSec)) {
+    durationSec = o.durationSec;
+  } else {
+    durationSec = notes.length > 0 ? notes[notes.length - 1].time : 0;
+    warnings.push(`chart: durationSec missing; assumed ${durationSec.toFixed(2)}s from the last note (the song is treated as ending on its final note)`);
+  }
+  const chart: Chart = {
     songId: o.songId,
     lanes,
     bpm: o.bpm,
     offset: o.offset,
-    durationSec: o.durationSec,
+    durationSec,
     difficulty: { name, thresholdFraction: d.thresholdFraction, noteDensity: d.noteDensity, windows: { perfectMs: w.perfectMs, goodMs: w.goodMs } },
     notes,
   };
+  return { chart, warnings };
 }

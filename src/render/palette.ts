@@ -11,6 +11,11 @@ export interface LaneColor {
   dark: string;
   /** Halo / bloom color (used at low alpha). */
   glow: string;
+  /**
+   * Matte finish: no specular highlight, no lit centre. Used for missed gems so they read as
+   * switched-off rather than as a shiny special note.
+   */
+  matte?: boolean;
 }
 
 export interface LanePalette {
@@ -30,7 +35,8 @@ export const GH_PALETTE: LanePalette = {
     { name: 'blue', base: '#3b8cff', bright: '#c5dcff', dark: '#153f8f', glow: '#6fb0ff' },
     { name: 'orange', base: '#ff8c1a', bright: '#ffd9b0', dark: '#8f4a05', glow: '#ffb060' },
   ],
-  miss: { name: 'grey', base: '#6e6e74', bright: '#b8b8be', dark: '#33333a', glow: '#8a8a90' },
+  // Deliberately dead: a missed gem must read as switched-off, not as a shiny special note.
+  miss: { name: 'grey', base: '#55565e', bright: '#7e808a', dark: '#26262c', glow: '#6b6c75', matte: true },
 };
 
 /**
@@ -46,7 +52,7 @@ export const HIGH_CONTRAST_PALETTE: LanePalette = {
     { name: 'lime', base: '#c8ff2a', bright: '#f8ffd0', dark: '#5f8300', glow: '#e0ff7a' },
     { name: 'white', base: '#f4f4f4', bright: '#ffffff', dark: '#888888', glow: '#ffffff' },
   ],
-  miss: { name: 'grey', base: '#7a7a80', bright: '#c4c4c8', dark: '#3a3a40', glow: '#9a9aa0' },
+  miss: { name: 'grey', base: '#5f6067', bright: '#8b8d96', dark: '#2b2b31', glow: '#75767f', matte: true },
 };
 
 export function getPalette(highContrast: boolean): LanePalette {
@@ -77,10 +83,22 @@ export const MULTIPLIER_TIERS: Record<number, { color: string; glow: string; lab
   4: { color: '#ffcf3a', glow: '#d08a00', label: 'x4' },
 };
 
+/**
+ * Derived tiers above x4, memoized: `multiplierTier` is called a few times per frame, so building
+ * a fresh object per call was ~180 allocations/second in any game mode with an x5+ tier.
+ */
+const DERIVED_TIERS: Array<{ color: string; glow: string; label: string } | undefined> = [];
+
 export function multiplierTier(multiplier: number): { color: string; glow: string; label: string } {
-  const m = Math.max(1, Math.min(4, Math.floor(multiplier)));
-  const tier = MULTIPLIER_TIERS[m];
-  return multiplier > 4 ? { ...tier, label: `x${Math.floor(multiplier)}` } : tier;
+  const raw = Math.floor(multiplier);
+  const m = Number.isFinite(raw) ? Math.max(1, Math.min(99, raw)) : 1;
+  if (m <= 4) return MULTIPLIER_TIERS[m];
+  const hit = DERIVED_TIERS[m];
+  if (hit) return hit;
+  const top = MULTIPLIER_TIERS[4];
+  const tier = { color: top.color, glow: top.glow, label: `x${m}` };
+  DERIVED_TIERS[m] = tier;
+  return tier;
 }
 
 /** Rock meter colors low → high. */

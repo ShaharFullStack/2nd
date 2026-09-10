@@ -3,6 +3,7 @@ import {
   DEFAULT_GEOMETRY_OPTIONS,
   beatLineTimes,
   bucketRadius,
+  clamp,
   depthAtY,
   depthOf,
   fillBeatLines,
@@ -24,6 +25,20 @@ import {
 const W = 1920;
 const H = 1080;
 
+describe('clamp', () => {
+  it('clamps and is NaN-safe (a degenerate frame must not poison downstream state)', () => {
+    expect(clamp(5, 0, 1)).toBe(1);
+    expect(clamp(-5, 0, 1)).toBe(0);
+    expect(clamp(0.4, 0, 1)).toBe(0.4);
+    // NaN used to fall through both comparisons and come back out as NaN, which then flowed into
+    // dt → every smoothed accumulator in the renderer, permanently.
+    expect(clamp(Number.NaN, 0, 1)).toBe(0);
+    expect(clamp(Number.NaN, 0.25, 1)).toBe(0.25);
+    expect(clamp(Number.POSITIVE_INFINITY, 0, 1)).toBe(1);
+    expect(clamp(Number.NEGATIVE_INFINITY, 0, 1)).toBe(0);
+  });
+});
+
 describe('makeGeometry', () => {
   it('places the strike line and horizon at the requested fractions', () => {
     const g = makeGeometry(W, H, 4);
@@ -44,14 +59,42 @@ describe('makeGeometry', () => {
     expect(scaleAt(g, 1)).toBeCloseTo(0.1);
   });
 
-  it('adapts road width to lane count (fewer lanes → narrower road, gems stay sane)', () => {
+  it('adapts road width to lane count (fewer lanes → narrower road, lane width barely moves)', () => {
     const g2 = makeGeometry(W, H, 2);
     const g4 = makeGeometry(W, H, 4);
     expect(g2.nearHalfWidth).toBeLessThan(g4.nearHalfWidth);
     expect(roadWidthFactor(2)).toBeLessThan(roadWidthFactor(4));
-    expect(g2.laneWidthNear).toBeGreaterThan(g4.laneWidthNear);
-    expect(g2.gemRadiusNear).toBeLessThanOrEqual(H * 0.05);
     expect(g2.gemRadiusNear).toBeGreaterThan(0);
+    // Dropping lanes removes road, it does not stretch the remaining lanes into a wide empty ramp:
+    // a 2-lane lane is at most 20% wider than a 4-lane lane (targets grow a little for the rehab
+    // audience, the fret-board proportions stay).
+    expect(g2.laneWidthNear).toBeGreaterThan(g4.laneWidthNear);
+    expect(g2.laneWidthNear / g4.laneWidthNear).toBeLessThan(1.2);
+  });
+
+  it('proportions gems like a fret board: gem diameter is a large fraction of lane width', () => {
+    // Clone Hero / GH frets fill ~70-85% of their lane. This is the single strongest cue that the
+    // road is an instrument rather than a ramp, so it is pinned at every realistic aspect ratio.
+    for (const [w, h] of [
+      [1280, 720],
+      [1920, 1080],
+      [1366, 768],
+      [1024, 768],
+      [720, 1280],
+      [800, 600],
+    ]) {
+      for (const lanes of [2, 3, 4]) {
+        const g = makeGeometry(w, h, lanes);
+        const fill = (g.gemRadiusNear * 2) / g.laneWidthNear;
+        expect(fill, `${w}x${h} lanes=${lanes} gem/lane`).toBeGreaterThanOrEqual(0.7);
+        expect(fill, `${w}x${h} lanes=${lanes} gem/lane`).toBeLessThanOrEqual(0.9);
+        // Receptor ring sits just outside the gem but still inside its lane.
+        expect(g.receptorRadius).toBeGreaterThan(g.gemRadiusNear);
+        expect(g.receptorRadius * 2).toBeLessThanOrEqual(g.laneWidthNear);
+        // The road stays on screen with room for the side panels.
+        expect(g.nearHalfWidth * 2).toBeLessThan(w * 0.8);
+      }
+    }
   });
 });
 
@@ -140,18 +183,45 @@ describe('lane x', () => {
 });
 
 describe('tail below the strike line', () => {
-  it('is continuous at the line and linear (constant screen speed) below it', () => {
+  it('is position- and speed-continuous at the line (a crossing gem never visibly brakes)', () => {
     const g = makeGeometry(W, H, 4);
     expect(scaleAt(g, 0)).toBe(1);
     expect(scaleAt(g, -1e-9)).toBeCloseTo(1, 6);
-    const v1 = yAt(g, -0.05) - yAt(g, 0);
-    const v2 = yAt(g, -0.1) - yAt(g, -0.05);
-    const v3 = yAt(g, -0.2) - yAt(g, -0.15);
+    // Screen-space speed (px of y per unit of depth) either side of the line, by finite difference.
+    const speed = (d: number): number => (yAt(g, d - 1e-6) - yAt(g, d + 1e-6)) / 2e-6;
+    const above = speed(1e-5);
+    const below = speed(-1e-5);
+    // The old hard switch made this ratio pastLineSpeed (0.42) — a 58 % step change at the receptor.
+    expect(below / above).toBeGreaterThan(0.995);
+    expect(below / above).toBeLessThan(1.005);
+    // ...and it stays smooth all the way through the blend: no step anywhere below the line.
+    let prev = above;
+    for (let d = 0; d > -0.4; d -= 0.005) {
+      const v = speed(d);
+      expect(Math.abs(v - prev) / above, `step at d=${d.toFixed(3)}`).toBeLessThan(0.05);
+      prev = v;
+    }
+  });
+
+  it('settles to exactly pastLineSpeed once the blend is over', () => {
+    const g = makeGeometry(W, H, 4);
+    const speed = (d: number): number => (yAt(g, d - 1e-6) - yAt(g, d + 1e-6)) / 2e-6;
+    const above = speed(1e-5);
+    expect(speed(-g.tailBlend - 0.05) / above).toBeCloseTo(g.pastLineSpeed, 4);
+    expect(speed(-0.4) / above).toBeCloseTo(g.pastLineSpeed, 4);
+    // Still exactly linear (constant speed) beyond the blend.
+    const v1 = yAt(g, -0.25) - yAt(g, -0.2);
+    const v2 = yAt(g, -0.35) - yAt(g, -0.3);
     expect(v1).toBeCloseTo(v2, 6);
-    expect(v2).toBeCloseTo(v3, 6);
-    // Slower than the approach speed at the line by pastLineSpeed.
-    const above = yAt(g, 0) - yAt(g, 0.001);
-    expect(v1 / 50).toBeCloseTo(above * g.pastLineSpeed, 2);
+  });
+
+  it('depthAtY inverts yAt exactly through the eased tail', () => {
+    for (const opts of [{}, { pastLineSpeed: 1 }, { pastLineSpeed: 0.2 }]) {
+      const g = makeGeometry(W, H, 4, opts);
+      for (let d = 1; d > -0.5; d -= 0.01) {
+        expect(depthAtY(g, yAt(g, d)), `d=${d.toFixed(2)} p=${g.pastLineSpeed}`).toBeCloseTo(d, 6);
+      }
+    }
   });
 
   it('road edges stay straight through the line (x offset proportional to y - vpY)', () => {

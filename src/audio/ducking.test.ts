@@ -180,21 +180,51 @@ describe('DuckController', () => {
     expect(d.valueAt(2.5)).toBe(1);
   });
 
-  it('rebind restores the old param and controls the new one', () => {
+  it('reset(now, rampSec) ramps back from the ducked value instead of stepping (click-free seek/stop)', () => {
+    const p = new FakeAudioParam(1);
+    const d = new DuckController(p);
+    d.miss(1);
+    p.now = 1.06; // the miss ramp has landed
+    p.calls = [];
+    d.reset(1.06, 0.008); // transport fade length: the stem is still audible for 8 ms
+    expect(d.ducked).toBe(false);
+    expect(p.calls).toEqual([['cancel', 1.06], ['set', 0.05, 1.06], ['exp', 1, 1.068]]);
+    expect(d.valueAt(1.06)).toBeCloseTo(0.05, 12); // continuous: no step at the anchor
+    expect(d.valueAt(1.064)).toBeCloseTo(Math.sqrt(0.05), 12);
+    expect(d.valueAt(1.068)).toBe(1);
+    // mid-ramp interruption anchors on the analytic value, exactly like hit()/miss()
+    const q = new FakeAudioParam(1);
+    const e = new DuckController(q);
+    e.miss(0);
+    q.calls = [];
+    e.reset(0.02, 0.008); // half way down the 40 ms miss ramp
+    expect(q.calls[1]).toEqual(['set', Math.pow(0.05, 0.5), 0.02]);
+    // already at the nominal level: nothing to ramp, the hard write stays (and is a no-op)
+    const r = new FakeAudioParam(1);
+    const f = new DuckController(r);
+    r.calls = [];
+    f.reset(3, 0.008);
+    expect(r.calls).toEqual([['cancel', 3], ['set', 1, 3]]);
+  });
+
+  it('rebind ramps the old param back (no click) and controls the new one', () => {
     const a = new FakeAudioParam(1);
     const b = new FakeAudioParam(1);
     const d = new DuckController(a);
-    d.miss(1);
+    d.miss(1); // a is ducked to 0.05 by t = 1.04
     a.now = b.now = 2;
     d.rebind(b, 2);
-    expect(a.value).toBe(1);
-    expect(a.calls.slice(-2)).toEqual([['cancel', 2], ['set', 1, 2]]);
+    // the outgoing stem must be RAMPED back over the hit ramp, not hard-written: a
+    // setValueAtTime(1) here would jump 0.05 → 1.0 in one sample.
+    expect(a.calls.slice(-3)).toEqual([['cancel', 2], ['set', 0.05, 2], ['exp', 1, 2.06]]);
+    expect(a.value).toBe(0.05); // anchored at where the miss ramp actually left it
     b.now = 3;
     d.miss(3);
     expect(b.lastRamp()[1]).toBe(0.05);
     expect(b.calls.slice(0, 2)).toEqual([['cancel', 2], ['set', 1, 2]]); // rebind pins the new stem at the nominal level
     expect(b.calls[3]).toEqual(['set', 1, 3]); // the miss ramp anchors on that level
-    expect(a.calls.filter((c) => c[0] === 'exp')).toHaveLength(1); // no new automation on a
+    // exactly two ramps on a: the miss duck and the rebind restore — nothing after the handover
+    expect(a.calls.filter((c) => c[0] === 'exp')).toHaveLength(2);
   });
 });
 

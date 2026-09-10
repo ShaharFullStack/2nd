@@ -24,6 +24,10 @@ export class SongClock {
   private startCtx = 0;
   private pausedAtCtx = 0;
   private pausedTotal = 0;
+  /** ctx time of the most recent `resume()`; stamps inside (pausedAtCtx, resumedAtCtx) are rejected. */
+  private resumedAtCtx = -Infinity;
+  /** Duration of the most recent completed pause, so stamps from before it map correctly after it. */
+  private lastPauseSec = 0;
   private state: SongClockState = 'idle';
 
   constructor(ctx: ClockSource, opts: { avOffsetSec?: number } = {}) {
@@ -56,18 +60,23 @@ export class SongClock {
     this.startCtx = ctxTime - songTimeAtStart;
     this.pausedTotal = 0;
     this.pausedAtCtx = 0;
+    this.resumedAtCtx = -Infinity;
+    this.lastPauseSec = 0;
     this.state = 'running';
   }
 
   pause(ctxTime: number = this.ctx.currentTime): void {
     if (this.state !== 'running') return;
     this.pausedAtCtx = ctxTime;
+    this.resumedAtCtx = -Infinity;
     this.state = 'paused';
   }
 
   resume(ctxTime: number = this.ctx.currentTime): void {
     if (this.state !== 'paused') return;
-    this.pausedTotal += Math.max(0, ctxTime - this.pausedAtCtx);
+    this.lastPauseSec = Math.max(0, ctxTime - this.pausedAtCtx);
+    this.pausedTotal += this.lastPauseSec;
+    this.resumedAtCtx = Math.max(ctxTime, this.pausedAtCtx);
     this.state = 'running';
   }
 
@@ -85,12 +94,25 @@ export class SongClock {
   /**
    * Song time at which the event stamped `ctxTime` occurred, for events delivered late (e.g. a camera
    * crossing stamped before `pause()` but delivered after it). Unlike `songTime`, a paused clock still
-   * maps stamps up to the pause point; returns null while idle or for stamps after the pause point.
+   * maps stamps up to the pause point.
+   *
+   * Returns null while idle, for stamps after the pause point while paused, and — after `resume()` —
+   * for stamps that fall inside the pause interval just ended: a movement made while the song was
+   * stopped must not be able to claim a note sitting near the pause boundary.
+   *
+   * A stamp from *before* the most recent pause is still mapped correctly after the resume (the
+   * pause that had not yet happened when it was taken is not subtracted). Only the most recent
+   * pause is remembered; anything older than that is far beyond any input-delivery delay (~100 ms).
    */
   songTimeOf(ctxTime: number): number | null {
     if (this.state === 'idle') return null;
     if (this.state === 'paused' && ctxTime > this.pausedAtCtx) return null;
-    return ctxTime - this.startCtx - this.pausedTotal + this.avOffsetSec;
+    let paused = this.pausedTotal;
+    if (this.state === 'running' && this.resumedAtCtx > -Infinity) {
+      if (ctxTime > this.pausedAtCtx && ctxTime < this.resumedAtCtx) return null;
+      if (ctxTime <= this.pausedAtCtx) paused -= this.lastPauseSec;
+    }
+    return ctxTime - this.startCtx - paused + this.avOffsetSec;
   }
 
   /** AudioContext time at which song time `songTime` will occur (valid while running or paused). */
@@ -131,9 +153,16 @@ export interface NoteRange {
   end: number;
 }
 
+/** How long a note stays "visible" after its time by default (hit/miss animations). */
+export const DEFAULT_TAIL_SEC = 0.5;
+
 /**
  * Moving cursor over the (time-sorted) chart notes for per-frame rendering queries.
  * Amortized O(1) per frame: the head only advances as notes scroll out of view.
+ *
+ * One cursor per consumer: it holds a playback position, so two consumers polling one cursor at
+ * different song times make it seek back and forth. `RhythmEngine` owns one; the chart form of
+ * `visibleNotes` is stateless and safe to share instead.
  */
 export class NoteCursor {
   /** Chart notes sorted by time (a copy; the chart itself is not mutated). */
@@ -149,7 +178,7 @@ export class NoteCursor {
    * @param tailSec how long (seconds) a note stays "visible" after its time has passed
    *                (so hit/miss animations can draw it); default 0.5 s.
    */
-  constructor(chart: Chart, tailSec = 0.5) {
+  constructor(chart: Chart, tailSec = DEFAULT_TAIL_SEC) {
     this.chart = chart;
     this.sourceNotes = chart.notes;
     this.notes = chart.notes.slice().sort((a, b) => a.time - b.time || a.id - b.id);
@@ -208,33 +237,112 @@ export class NoteCursor {
   }
 }
 
-const cursorByChart = new WeakMap<Chart, NoteCursor>();
+/**
+ * Time-sorted view of a chart's notes, memoised per notes array.
+ *
+ * This is a *pure* memo — a cached derivation of an immutable input, keyed on the exact array
+ * object — not a hidden cursor. Two consumers polling the same chart at different song times share
+ * the sorted copy and nothing else, so neither can perturb the other (the earlier WeakMap held a
+ * mutable playback position, which they could).
+ */
+interface SortedMemo {
+  len: number;
+  /** endpoint identity + times: an O(1) staleness signature, see `sortedNotesOf` */
+  first: Note | undefined;
+  last: Note | undefined;
+  firstTime: number;
+  lastTime: number;
+  sorted: readonly Note[];
+}
+
+const sortedByNotes = new WeakMap<readonly Note[], SortedMemo>();
+
+/**
+ * Drop the memoised sorted view of a notes array — call it after editing note *times in place*
+ * (a chart editor / dev tools), which the O(1) staleness signature cannot always detect.
+ * Building a new chart object with a new notes array needs no invalidation.
+ */
+export function invalidateSortedNotes(source: Chart | readonly Note[]): void {
+  sortedByNotes.delete(Array.isArray(source) ? (source as readonly Note[]) : (source as Chart).notes);
+}
+
+function sortedNotesOf(chart: Chart): readonly Note[] {
+  const src = chart.notes;
+  const n = src.length;
+  const cached = sortedByNotes.get(src);
+  // Staleness signature, all O(1): length, the identity of the endpoint note objects, and their
+  // times. It catches a replaced array, a grown/shrunk one, a replaced or retimed first/last note
+  // — the common editor edits. It cannot catch a time edit on a note strictly inside the array;
+  // for that the editor must call `invalidateSortedNotes` (or rebuild the chart).
+  if (
+    cached !== undefined &&
+    cached.len === n &&
+    cached.first === src[0] &&
+    cached.last === src[n - 1] &&
+    cached.firstTime === (src[0]?.time ?? 0) &&
+    cached.lastTime === (src[n - 1]?.time ?? 0)
+  ) {
+    return cached.sorted;
+  }
+  let ordered = true;
+  for (let i = 1; i < n; i++) {
+    if (src[i].time < src[i - 1].time) {
+      ordered = false;
+      break;
+    }
+  }
+  const sorted = ordered ? src.slice() : src.slice().sort((a, b) => a.time - b.time || a.id - b.id);
+  sortedByNotes.set(src, {
+    len: n,
+    first: src[0],
+    last: src[n - 1],
+    firstTime: src[0]?.time ?? 0,
+    lastTime: src[n - 1]?.time ?? 0,
+    sorted,
+  });
+  return sorted;
+}
+
+/** First index with notes[i].time >= t (binary search over a time-sorted array). */
+function lowerBoundByTime(notes: readonly Note[], t: number): number {
+  let lo = 0;
+  let hi = notes.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (notes[mid].time < t) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
 
 /**
  * Visible notes for a frame — the spec signature `visibleNotes(chart, songTime, lookaheadSec)`.
  *
- * Convenience form: when given a Chart, ONE cursor per chart object is kept in a WeakMap, so this
- * is amortized O(1) only for a single consumer that advances monotonically. Two consumers (e.g. the
- * highway and a preview strip) polling the same chart at different song times make the shared
- * cursor seek back and forth every frame — give each its own `NoteCursor` (or use
- * `RhythmEngine.cursor`, the intended per-consumer path) and pass it here instead. The cached
- * cursor snapshots `chart.notes` at first use; if the notes array is later replaced or its length
- * changes the cursor is rebuilt, but in-place edits of note times are not detected — build a new
- * NoteCursor after editing a chart.
+ * Given a Chart this is stateless: O(log n) binary search over a memoised time-sorted view of
+ * `chart.notes`, so any number of consumers (highway, preview strip, a React StrictMode double
+ * render) may call it at any song times, in any order, and each gets the same answer at the same
+ * cost. There is no shared playback position. The memo is keyed on the `chart.notes` array object
+ * and validated in O(1) against its length and its endpoint notes' identity and times, so
+ * replacing the array, changing its length, or retiming/replacing the first or last note all
+ * invalidate it. A time edit on a note strictly INSIDE the array cannot be detected that cheaply —
+ * after such an edit call `invalidateSortedNotes(chart)` (or build a new chart object / a fresh
+ * `NoteCursor`).
  *
- * Notes within `tailSec` (default 0.5 s) after their time are included so hit/miss animations can
- * draw them. Pass `out` to avoid per-frame allocation.
+ * Given a `NoteCursor` it uses that cursor's amortized-O(1) advance instead. For a hot per-frame
+ * loop over a long chart prefer the cursor (`RhythmEngine.cursor` is one per engine).
+ *
+ * Notes within `tailSec` (default 0.5 s for the cursor form) after their time are included so
+ * hit/miss animations can draw them. Pass `out` to avoid per-frame allocation.
  */
 export function visibleNotes(source: Chart | NoteCursor, songTime: number, lookaheadSec: number, out?: Note[]): Note[] {
-  let cursor: NoteCursor;
-  if (source instanceof NoteCursor) cursor = source;
-  else {
-    let c = cursorByChart.get(source);
-    if (!c || c.sourceNotes !== source.notes || c.notes.length !== source.notes.length) {
-      c = new NoteCursor(source);
-      cursorByChart.set(source, c);
-    }
-    cursor = c;
+  if (source instanceof NoteCursor) return source.collect(songTime, lookaheadSec, out);
+  const notes = sortedNotesOf(source);
+  const result = out ?? [];
+  result.length = 0;
+  const limit = songTime + lookaheadSec;
+  for (let i = lowerBoundByTime(notes, songTime - DEFAULT_TAIL_SEC); i < notes.length; i++) {
+    if (notes[i].time > limit) break;
+    result.push(notes[i]);
   }
-  return cursor.collect(songTime, lookaheadSec, out);
+  return result;
 }

@@ -11,10 +11,19 @@
  * - unpaired beats count as rejected samples, so "no data" is diagnosed, not reported as 0 ms;
  * - the spread threshold (MAD) is ~1.5 camera frames and confidence is graded (0..1) so the
  *   calibration screen can show a meter instead of a bare boolean;
- * - the *estimate itself* is checked for plausibility: the pipeline is 80–200 ms, so a median
- *   offset beyond `LATENCY_MAX_OFFSET_SEC` (0.4 s) means the patient reacted to the click rather
- *   than anticipating it — using it would shift judgment by a beat or more. It is flagged
- *   (`implausibleOffset`), never confident, and its confidence is downgraded.
+ * - the *magnitude* of the estimate is reported separately from its quality: the pipeline is
+ *   80–200 ms, so a median offset beyond `LATENCY_MAX_OFFSET_SEC` (0.4 s) is mostly the patient's
+ *   reaction time rather than pipeline latency. That is an advisory flag (`implausibleOffset`,
+ *   graded by `offsetPlausibility`), NOT a rejection — see the note on `confident` below.
+ *
+ * `confident` vs `implausibleOffset` (one shared semantic with `src/audio/latencyProbe.ts`):
+ * `confident` answers "is this measurement trustworthy?" — enough samples, tight spread, few
+ * rejects. It deliberately does NOT include the offset magnitude: a slow rehab patient who answers
+ * every click 600 ms late *has* been measured accurately, and subtracting 600 ms is exactly what
+ * makes the session judge their movements fairly. The calibration screen should accept such a run
+ * and surface `implausibleOffset` as a warning ("you are moving well after the click — the game
+ * will compensate"), so the therapist can decide between accepting it and re-running at a slower
+ * tempo. `LatencyProbe.accepted` is `confident` for this reason.
  */
 
 /** One calibration observation: the beat the patient was asked to hit and when the input arrived. */
@@ -40,18 +49,27 @@ export interface LatencyEstimate {
   /** Beats that never received an input (subset of `rejected`). */
   unpaired: number;
   /**
-   * Graded confidence 0..1 (min of sample-count, spread, rejection and offset-plausibility scores;
-   * 0.5 = every threshold just met).
+   * Graded measurement confidence 0..1 (min of the sample-count, spread and rejection scores;
+   * 0.5 = every threshold just met). Independent of the offset's magnitude — see
+   * `offsetPlausibility` / `implausibleOffset`.
    */
   confidence: number;
   /** Convenience label for the UI: good (>= 0.75), fair (>= 0.5), poor (> 0), none (no accepted samples). */
   quality: LatencyQuality;
-  /** True when every threshold is met (equivalent to confidence >= 0.5). */
+  /** True when every measurement threshold is met (equivalent to confidence >= 0.5). */
   confident: boolean;
   /**
-   * True when |offsetSec| exceeds `maxOffsetSec` (default 0.4 s): the patient moved consistently
-   * late/early rather than the pipeline being slow. Never confident; do not feed such an offset to
-   * the engine — ask the patient to move exactly on the click and repeat.
+   * Graded plausibility 0..1 of the offset *magnitude* as pipeline latency: 1 up to
+   * `plausibleOffsetSec` (0.3 s), 0.5 at `maxOffsetSec` (0.4 s), 0 at 0.5 s. 0 when there are no
+   * samples. A separate axis from `confidence`: it says how much of the measured offset is likely
+   * the patient's own reaction time rather than the camera pipeline.
+   */
+  offsetPlausibility: number;
+  /**
+   * True when |offsetSec| exceeds `maxOffsetSec` (default 0.4 s): the measured lag is larger than
+   * the documented 80–200 ms pipeline, so it is mostly the patient's reaction time. ADVISORY, not a
+   * rejection — the run can still be `confident` and the offset is still the right value to feed
+   * the engine. Show it as a warning and offer a slower tempo / a repeat.
    */
   implausibleOffset: boolean;
 }
@@ -69,9 +87,9 @@ export interface LatencyOptions {
   maxRejectedFraction?: number;
   /** Beats that received no input; counted as rejected (default 0; `calibrateLatency` fills it in). */
   unpaired?: number;
-  /** |offset| fully plausible up to this (default 0.3 s); the offset score declines above it. */
+  /** |offset| fully plausible up to this (default 0.3 s); `offsetPlausibility` declines above it. */
   plausibleOffsetSec?: number;
-  /** |offset| above this is flagged implausible and never confident (default 0.4 s). */
+  /** |offset| above this is flagged `implausibleOffset` (default 0.4 s). Advisory; see `confident`. */
   maxOffsetSec?: number;
 }
 
@@ -93,8 +111,8 @@ export const LATENCY_MAX_REJECTED_FRACTION = 1 / 3;
 /** Offsets up to this magnitude are fully plausible pipeline latency (+ a little anticipation error). */
 export const LATENCY_PLAUSIBLE_OFFSET_SEC = 0.3;
 /**
- * Offsets beyond this magnitude are implausible as pipeline latency (80–200 ms documented): the
- * patient is reacting to the click instead of moving on it. At 120 bpm 0.4 s is most of a beat.
+ * Offsets beyond this magnitude are implausible as *pipeline* latency (80–200 ms documented): the
+ * patient is reacting to the click instead of moving on it. Advisory only — see `confident`.
  */
 export const LATENCY_MAX_OFFSET_SEC = 0.4;
 /** Recommended metronome tempo for the calibration screen (beat interval 1 s ≫ pipeline latency). */
@@ -166,14 +184,16 @@ export function estimateLatency(pairs: readonly LatencySample[], opts: LatencyOp
   const sampleScore = samples === 0 ? 0 : clamp01(samples / (2 * minSamples));
   const spreadScore = samples === 0 ? 0 : clamp01(1 - madSec / (2 * maxMad));
   const rejectScore = samples === 0 ? 0 : clamp01(1 - rejectedFraction / (2 * maxRejected));
-  // plausibility of the estimate itself: 1 up to plausibleOffset, 0.5 at maxOffset, 0 at 2*maxOffset - plausibleOffset
+  // Measurement quality only. The offset magnitude is a separate axis (offsetPlausibility) so that a
+  // well-measured but slow patient is accepted rather than told their calibration failed.
+  const confidence = Math.min(sampleScore, spreadScore, rejectScore);
+  const confident = samples >= minSamples && madSec <= maxMad && rejectedFraction <= maxRejected;
+  const quality: LatencyQuality = qualityForConfidence(confidence, samples);
+  // plausibility of the magnitude: 1 up to plausibleOffset, 0.5 at maxOffset, 0 at 2*maxOffset - plausibleOffset
   const absOffset = Math.abs(offsetSec);
   const implausibleOffset = samples > 0 && absOffset > maxOffset + 1e-9;
   const ramp = Math.max(1e-9, maxOffset - plausibleOffset);
-  const offsetScore = samples === 0 ? 0 : clamp01(1 - 0.5 * Math.max(0, absOffset - plausibleOffset) / ramp);
-  const confidence = Math.min(sampleScore, spreadScore, rejectScore, offsetScore);
-  const confident = samples >= minSamples && madSec <= maxMad && rejectedFraction <= maxRejected && !implausibleOffset;
-  const quality: LatencyQuality = implausibleOffset ? 'poor' : qualityForConfidence(confidence, samples);
+  const offsetPlausibility = samples === 0 ? 0 : clamp01(1 - (0.5 * Math.max(0, absOffset - plausibleOffset)) / ramp);
 
   return {
     offsetSec,
@@ -185,8 +205,21 @@ export function estimateLatency(pairs: readonly LatencySample[], opts: LatencyOp
     confidence,
     quality,
     confident,
+    offsetPlausibility,
     implausibleOffset,
   };
+}
+
+/**
+ * Re-estimate the latency offset from signed input-to-nearest-note distances (seconds, positive =
+ * late), e.g. `Scoring.getNearestDeltaSamplesMs()` during or after a session. The result's
+ * `offsetSec` is the *additional* shift to apply on top of the offset already in force — see
+ * `RhythmEngine.suggestedInputLatency()`.
+ */
+export function estimateLatencyFromDeltas(deltasSec: readonly number[], opts: LatencyOptions = {}): LatencyEstimate {
+  const pairs: LatencySample[] = [];
+  for (let i = 0; i < deltasSec.length; i++) pairs.push({ expected: 0, observed: deltasSec[i] });
+  return estimateLatency(pairs, opts);
 }
 
 export interface PairingWindow {

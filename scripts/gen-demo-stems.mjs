@@ -238,7 +238,16 @@ export const SONGS = {
     key: 'D major',
     progression: [Dmaj7, Aadd9, Bm7, Gmaj7],
     style: 'laidback',
-    mix: { bass: 0.7, keys: 1.3, lead: 0.9 },
+    // Triplet shuffle: the odd 16ths land a third of a 16th late, i.e. long:short = 2:1 — the
+    // classic swing feel, and 50 ms at 100 BPM. (It used to be 0.55 → 3.4:1, a lurching
+    // dotted feel AND 82 ms off the straight grid.) The value is published in song.json as
+    // `swing` so the chart generator can place odd-16th notes on the audio: see
+    // `stepTimeSec` in src/audio/manifest.ts.
+    swing: 1 / 3,
+    // trims are loudness offsets on STEM_MIX.rmsDb (1.3 → +2.3 dB); the bass/lead trims that used
+    // to sit here only existed to undo peak normalisation and are unnecessary now that `master`
+    // matches RMS.
+    mix: { keys: 1.3 },
     description: 'Laid-back 100 BPM groove with swung hats, rimshot backbeat, warm round bass, electric-piano chords and a gentle pentatonic lead.',
     previewStart: 19,
   },
@@ -406,16 +415,89 @@ function renderLead(song, ctx) {
 // mastering + WAV
 // ---------------------------------------------------------------------------
 
-function master(buf, targetPeak, drive) {
-  let peak = 1e-9;
-  for (let i = 0; i < buf.length; i++) peak = Math.max(peak, Math.abs(buf[i]));
-  const g = targetPeak / peak;
+export function rmsOf(buf, stride = 1) {
+  let s = 0;
+  let n = 0;
+  for (let i = 0; i < buf.length; i += stride) { s += buf[i] * buf[i]; n++; }
+  return n === 0 ? 0 : Math.sqrt(s / n);
+}
+export function peakOf(buf) {
+  let p = 0;
+  for (let i = 0; i < buf.length; i++) { const a = Math.abs(buf[i]); if (a > p) p = a; }
+  return p;
+}
+export const dbToLin = (db) => Math.pow(10, db / 20);
+export const linToDb = (x) => 20 * Math.log10(Math.max(x, 1e-12));
+
+/** Largest saturation pre-gain the search may use (beyond this the tanh stops sounding musical). */
+const MAX_PRE_GAIN = 8;
+
+/**
+ * Loudness-matched mastering.
+ *
+ * Peak normalisation alone leaves transient-dominated stems quiet: the drums have a ~17 dB crest
+ * factor against the bass's ~10 dB, so peak-matching them puts the drums 3.5 dB DOWN in RMS. The
+ * drums are the player stem, and the whole mechanic is that ducking them makes the patient's
+ * instrument audibly vanish, so that cue must not be the quietest thing in the mix.
+ *
+ * So each stem is matched on RMS (`rmsDb`), and `peak` is a CEILING rather than a target: the
+ * output gain is whatever hits the loudness target, and saturation is used only when that gain
+ * would push the peak through the ceiling. Concretely the stem is peak-normalised, driven into
+ * the tanh soft clipper by a pre-gain, then scaled to the RMS target; the finished peak is then
+ * `targetRms × crest(pre)`, so the search is for the SMALLEST pre-gain whose crest ratio fits
+ * under the ceiling — the least distortion that buys the required loudness. Because the input
+ * peak is exactly 1 after normalisation, the post-clip peak is exactly tanh(pre·drive)/tanh(drive),
+ * so the search and the final render agree and the result stays deterministic. RMS during the
+ * search is measured on a decimated pass (the target is a mix decision, not a contract;
+ * `masteringReport` verifies the achieved value).
+ */
+function master(buf, { rmsDb, peak: peakCeiling, drive }) {
+  const inv = 1 / Math.max(peakOf(buf), 1e-9);
+  const stride = Math.max(1, Math.floor(buf.length / 200000));
+  const target = dbToLin(rmsDb);
+  const rmsClipped = (pre) => {
+    let s = 0;
+    let n = 0;
+    for (let i = 0; i < buf.length; i += stride) {
+      const y = softClip(buf[i] * inv * pre, drive);
+      s += y * y; n++;
+    }
+    return Math.sqrt(s / Math.max(n, 1));
+  };
+  // crest ratio (peak / RMS) of the soft-clipped signal; monotonically decreasing in `pre`.
+  // The input peak is exactly 1 after normalisation, so the clipped peak is softClip(pre, drive).
+  const crest = (pre) => softClip(pre, drive) / Math.max(rmsClipped(pre), 1e-12);
+  const maxCrest = peakCeiling / target;
+  let lo = 0.05;
+  let hi = MAX_PRE_GAIN;
+  let pre;
+  if (crest(lo) <= maxCrest) pre = lo;            // target fits with (almost) no saturation
+  else if (crest(hi) > maxCrest) pre = hi;        // even full saturation cannot fit it
+  else {
+    for (let it = 0; it < 40; it++) {
+      pre = 0.5 * (lo + hi);
+      if (crest(pre) > maxCrest) lo = pre; else hi = pre;
+    }
+    pre = hi;                                     // the side that satisfies the ceiling
+  }
+  // gain for the RMS target, then clamp so the peak never exceeds the ceiling
+  const scale = Math.min(target / Math.max(rmsClipped(pre), 1e-12), peakCeiling / softClip(pre, drive));
   const fadeN = Math.floor(0.1 * SR);
   for (let i = 0; i < buf.length; i++) {
-    let x = softClip(buf[i] * g * 1.15, drive) * targetPeak;
+    let x = softClip(buf[i] * inv * pre, drive) * scale;
     if (i > buf.length - fadeN) x *= (buf.length - i) / fadeN;
     buf[i] = x;
   }
+  return pre;
+}
+
+/** Measured loudness of a rendered song's stems (used by the generator log and by the tests). */
+export function masteringReport(stems) {
+  const out = {};
+  for (const [id, buf] of Object.entries(stems)) {
+    out[id] = { peak: peakOf(buf), rmsDb: linToDb(rmsOf(buf)), crestDb: linToDb(peakOf(buf)) - linToDb(rmsOf(buf)) };
+  }
+  return out;
 }
 
 export function encodeWav16(samples, sampleRate = SR) {
@@ -445,11 +527,17 @@ export function encodeWav16(samples, sampleRate = SR) {
 // driver
 // ---------------------------------------------------------------------------
 
+/**
+ * Per-stem mix targets. `rmsDb` is the loudness each stem is mastered to (see `master`), `peak`
+ * its ceiling, `drive` the soft-clipper knee. The player stem (drums) sits at the TOP of the
+ * loudness order on purpose: ducking it to 0.05 is the game's main feedback channel, so it has to
+ * be the most audible element, not the quietest.
+ */
 const STEM_MIX = {
-  drums: { label: 'Drums', peak: 0.92, drive: 1.6 },
-  bass: { label: 'Bass', peak: 0.7, drive: 1.5 },
-  keys: { label: 'Keys', peak: 0.5, drive: 1.2 },
-  lead: { label: 'Lead', peak: 0.6, drive: 1.3 },
+  drums: { label: 'Drums', rmsDb: -13, peak: 0.95, drive: 1.6 },
+  bass: { label: 'Bass', rmsDb: -15, peak: 0.7, drive: 1.5 },
+  keys: { label: 'Keys', rmsDb: -19.5, peak: 0.5, drive: 1.2 },
+  lead: { label: 'Lead', rmsDb: -16.5, peak: 0.6, drive: 1.3 },
 };
 const RENDERERS = { drums: renderDrums, bass: renderBass, keys: renderKeys, lead: renderLead };
 
@@ -462,13 +550,15 @@ export function renderSong(songId, { bars: barsOverride } = {}) {
   const stepSec = beatSec / 4;
   const durationSec = bars * barSec + TAIL_SEC;
   const totalSamples = Math.round(durationSec * SR);
-  const swing = song.style === 'laidback' ? 0.55 : 0; // fraction of a 16th the off-16ths are pushed late
+  const swing = song.swing ?? 0; // fraction of a 16th the odd 16ths are pushed late (0 = straight)
   const stems = {};
   for (const stemId of Object.keys(STEM_MIX)) {
     const buf = new Float32Array(totalSamples);
     const rnd = mulberry32(stemSeed(song.seed, stemId));
     RENDERERS[stemId](song, { buf, rnd, stepSec, bars, barSec, swing, progression: song.progression });
-    master(buf, STEM_MIX[stemId].peak * (song.mix?.[stemId] ?? 1), STEM_MIX[stemId].drive);
+    const mix = STEM_MIX[stemId];
+    // per-song trim, applied as a loudness offset (mix 1.25 → +1.9 dB)
+    master(buf, { ...mix, rmsDb: mix.rmsDb + linToDb(song.mix?.[stemId] ?? 1) });
     stems[stemId] = buf;
   }
   const manifest = {
@@ -486,6 +576,9 @@ export function renderSong(songId, { bars: barsOverride } = {}) {
     offset: 0,
     durationSec: Number(durationSec.toFixed(4)),
     previewStart: Math.min(song.previewStart, Math.max(0, durationSec - 8)),
+    // Published so a chart can put odd-16th notes where the audio actually is (src/audio/manifest.ts
+    // `stepTimeSec`). 0 = straight grid.
+    swing,
     bars,
     key: song.key,
     stems: Object.keys(STEM_MIX).map((id) => ({ id, file: `stems/${id}.wav`, label: STEM_MIX[id].label })),
@@ -496,31 +589,69 @@ export function renderSong(songId, { bars: barsOverride } = {}) {
   return { manifest, stems, sampleRate: SR };
 }
 
+/**
+ * Anti-aliased downsample (linear interpolation behind a 4-pole lowpass at 0.42×`toRate`).
+ * Bandwidth reduction is the only size lever available here: the repo may not add dependencies,
+ * and Node ships no Vorbis/Opus/MP3 encoder, so a compressed variant cannot be produced in-repo
+ * (see public/songs/ccmixter-README.md for the ffmpeg one-liner).
+ */
+export function resample(buf, fromRate, toRate) {
+  if (toRate === fromRate) return buf;
+  if (!(toRate > 0) || !Number.isFinite(toRate)) throw new Error(`invalid rate ${toRate}`);
+  let src = buf;
+  if (toRate < fromRate) {
+    const fc = 0.42 * toRate;
+    const a = new SVF();
+    const b = new SVF();
+    src = new Float32Array(buf.length);
+    for (let i = 0; i < buf.length; i++) src[i] = b.run(a.run(buf[i], fc, 1.2), fc, 1.2);
+  }
+  const n = Math.max(1, Math.round((buf.length * toRate) / fromRate));
+  const out = new Float32Array(n);
+  const step = fromRate / toRate;
+  for (let i = 0; i < n; i++) {
+    const x = i * step;
+    const i0 = Math.min(src.length - 1, Math.floor(x));
+    const i1 = Math.min(src.length - 1, i0 + 1);
+    const f = x - i0;
+    out[i] = src[i0] * (1 - f) + src[i1] * f;
+  }
+  return out;
+}
+
 export function writeSong(outRoot, songId, opts = {}) {
+  const rate = opts.rate ?? SR;
   const { manifest, stems } = renderSong(songId, opts);
   const dir = path.join(outRoot, songId);
   fs.mkdirSync(path.join(dir, 'stems'), { recursive: true });
   const written = [];
   for (const [id, buf] of Object.entries(stems)) {
     const file = path.join(dir, 'stems', `${id}.wav`);
-    fs.writeFileSync(file, encodeWav16(buf));
+    fs.writeFileSync(file, encodeWav16(resample(buf, SR, rate), rate));
     written.push(file);
   }
+  manifest.generated.sampleRate = rate;
   const manifestPath = path.join(dir, 'song.json');
   fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
   written.push(manifestPath);
-  return { manifest, written };
+  return { manifest, written, mastering: masteringReport(stems) };
 }
 
 function parseArgs(argv) {
-  const args = { out: 'public/songs', song: 'all', bars: undefined };
+  const args = { out: 'public/songs', song: 'all', bars: undefined, rate: SR };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--out') args.out = argv[++i];
     else if (a === '--song') args.song = argv[++i];
     else if (a === '--bars') args.bars = Number(argv[++i]);
-    else if (a === '--help' || a === '-h') { console.log('usage: gen-demo-stems.mjs [--out dir] [--song id|all] [--bars N]'); process.exit(0); }
-    else throw new Error(`unknown argument ${a}`);
+    else if (a === '--rate') {
+      args.rate = Number(argv[++i]);
+      if (!Number.isFinite(args.rate) || args.rate < 8000 || args.rate > SR) throw new Error('--rate expects 8000..44100 Hz');
+    } else if (a === '--help' || a === '-h') {
+      console.log('usage: gen-demo-stems.mjs [--out dir] [--song id|all] [--bars N] [--rate hz]');
+      console.log('  --rate 22050  low-bandwidth build (half the bytes) for slow clinic Wi-Fi; default 44100');
+      process.exit(0);
+    } else throw new Error(`unknown argument ${a}`);
   }
   return args;
 }
@@ -533,9 +664,12 @@ if (isMain) {
   const ids = args.song === 'all' ? Object.keys(SONGS) : [args.song];
   for (const id of ids) {
     const t0 = Date.now();
-    const { manifest, written } = writeSong(args.out, id, { bars: args.bars });
+    const { manifest, written, mastering } = writeSong(args.out, id, { bars: args.bars, rate: args.rate });
     const bytes = written.reduce((n, f) => n + fs.statSync(f).size, 0);
-    console.log(`${id}: ${manifest.bpm} BPM, ${manifest.bars} bars, ${manifest.durationSec}s, ${(bytes / 1e6).toFixed(1)} MB in ${Date.now() - t0} ms`);
+    console.log(`${id}: ${manifest.bpm} BPM, ${manifest.bars} bars, ${manifest.durationSec}s, ${args.rate} Hz, ${(bytes / 1e6).toFixed(1)} MB in ${Date.now() - t0} ms`);
+    for (const [stem, m] of Object.entries(mastering)) {
+      console.log(`  ${stem.padEnd(6)} ${m.rmsDb.toFixed(1)} dBRMS  peak ${m.peak.toFixed(3)}  crest ${m.crestDb.toFixed(1)} dB${stem === manifest.playerStem ? '  <- player stem' : ''}`);
+    }
     for (const f of written) console.log('  ' + path.relative(process.cwd(), f));
   }
 }

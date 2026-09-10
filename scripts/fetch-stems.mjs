@@ -46,7 +46,18 @@ export function parseArgs(argv) {
     } else throw new Error(`unknown argument ${a}`);
   }
   if (!args.root) throw new Error('--root expects a directory');
+  // a song id is a directory name under --root, never a path
+  if (args.song !== null) assertSafeSongId(args.song);
   return args;
+}
+
+/** A song id must be a single directory name (no separators, no "..", not absolute). */
+export function assertSafeSongId(id) {
+  if (typeof id !== 'string' || id.length === 0) throw new Error('--song expects a song id');
+  if (id === '.' || id === '..' || /[\\/]/.test(id) || id.includes('\0') || path.isAbsolute(id)) {
+    throw new Error(`--song ${JSON.stringify(id)}: expects a song id (a directory name under --root), not a path`);
+  }
+  return id;
 }
 
 export function isPlaceholderUrl(url) {
@@ -69,13 +80,29 @@ export function discoverSongIds(root) {
   return [...ids];
 }
 
+/**
+ * Reject anything that would write outside the song's own directory. song.json is data the README
+ * invites users to paste in from a third party, so `"file": "../../../.ssh/authorized_keys"` (or a
+ * Windows drive/UNC path) must not be honoured.
+ */
+export function assertSafeRelativePath(rel, what = 'path') {
+  if (typeof rel !== 'string' || rel.length === 0) throw new Error(`${what}: must be a non-empty string`);
+  if (rel.includes('\0')) throw new Error(`${what} ${JSON.stringify(rel)}: contains a NUL byte`);
+  if (path.isAbsolute(rel) || /^[a-zA-Z]:/.test(rel) || rel.startsWith('\\\\') || rel.startsWith('/')) {
+    throw new Error(`${what} ${JSON.stringify(rel)}: must be relative to the song directory`);
+  }
+  const segments = rel.split(/[\\/]+/);
+  if (segments.some((s) => s === '..')) throw new Error(`${what} ${JSON.stringify(rel)}: must not contain ".." segments`);
+  return rel;
+}
+
 /** Resolve where a remote stem should be written, using the manifest's "stems" entry with the same id. */
 export function targetPathFor(manifest, remote) {
   const local = (manifest.stems ?? []).find((s) => s.id === remote.id);
-  if (local?.file) return local.file;
+  if (local?.file) return assertSafeRelativePath(local.file, `stem "${remote.id}" file`);
   let ext = '.wav';
   try { ext = path.extname(new URL(remote.url).pathname) || ext; } catch { /* keep default */ }
-  return `stems/${remote.id}${ext}`;
+  return `stems/${assertSafeRelativePath(String(remote.id), 'stem id')}${ext}`;
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -134,6 +161,7 @@ export async function download(url, dest, { retries = DEFAULT_RETRIES, timeoutMs
 }
 
 export async function fetchSong(root, id, { force = false, retries = DEFAULT_RETRIES, timeoutSec = DEFAULT_TIMEOUT_SEC, log = console.log } = {}) {
+  assertSafeSongId(id);
   const dir = path.join(root, id);
   const manifestPath = path.join(dir, 'song.json');
   if (!fs.existsSync(manifestPath)) { log(`- ${id}: no song.json, skipping`); return { id, fetched: 0, skipped: 0, failed: 0 }; }
@@ -144,7 +172,14 @@ export async function fetchSong(root, id, { force = false, retries = DEFAULT_RET
   if (manifest.attribution) log(`    attribution: ${manifest.attribution}`);
   if (remotes.length === 0) { log('    no remoteStems (stems are local); nothing to fetch'); return summary; }
   for (const remote of remotes) {
-    const rel = targetPathFor(manifest, remote);
+    let rel;
+    try {
+      rel = targetPathFor(manifest, remote);
+    } catch (err) {
+      log(`    ${remote.id}: REFUSED unsafe target in song.json: ${err.message}`);
+      summary.failed++;
+      continue;
+    }
     const dest = path.join(dir, rel);
     if (isPlaceholderUrl(remote.url)) { log(`    ${remote.id}: placeholder URL (${remote.url || 'empty'}) — edit song.json first, see public/songs/ccmixter-README.md`); summary.skipped++; continue; }
     if (!force && fs.existsSync(dest) && fs.statSync(dest).size > 0) { log(`    ${remote.id}: exists (${rel}), skipping`); summary.skipped++; continue; }

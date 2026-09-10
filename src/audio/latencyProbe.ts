@@ -10,10 +10,25 @@
  * the calibration screen share one definition of `inputLatencySec`. This file only owns the
  * click scheduling, the recording, and a UI-facing diagnosis of *why* a run was not confident.
  *
- * Tempo: the engine recommends 60 BPM (`CALIBRATION_BPM_RECOMMENDED`). A slow, seated movement
- * measured through a 30 fps camera can lag the click by 300–700 ms; with a 1 s beat and the
- * engine's asymmetric pairing window (−25 % / +75 % of the beat) such inputs still pair with the
- * beat they answer instead of being counted as early hits of the next one.
+ * Tempo (DELIBERATE DEVIATION from the original spec's "100 BPM grid" — see the handoff notes):
+ * the probe defaults to the engine's `CALIBRATION_BPM_RECOMMENDED` = 60 BPM, overridable with
+ * `options.bpm`. A slow, seated movement measured through a 30 fps camera can lag the click by
+ * 300–700 ms. At 100 BPM the beat is 0.6 s and the engine's asymmetric pairing window is only
+ * +0.45 s, so a 600 ms patient pairs with the *next* click and is measured at −0.15 s — a
+ * confident, silently wrong calibration. At 60 BPM the window is +0.75 s and the same patient is
+ * measured correctly. 100 BPM still works for anyone inside ~400 ms; pass `{ bpm: 100 }` for it.
+ *
+ * Slow patients (the target population) are the reason for three behaviours here:
+ *  - a well-measured large lag is ACCEPTED (`accepted`) and flagged (`warning`,
+ *    diagnosis 'reacting-not-anticipating'): the engine's `confident` deliberately ignores the
+ *    offset magnitude, because subtracting 600 ms is exactly what makes the session fair. The
+ *    alternative — refusing the run — leaves `inputLatencySec` at 0, every note is missed, and
+ *    the player stem stays ducked to 0.05 for the whole song.
+ *  - a lag so large that inputs pair with the FOLLOWING click ("aliasing") produces a confident
+ *    but negative offset. That is detected (diagnosis 'reacting-previous-beat'), rejected, and
+ *    the true lag is reported as `apparentLagSec`.
+ *  - every non-'ok' diagnosis carries a concrete remedy; when the remedy is a slower metronome,
+ *    `suggestedBpm` is the tempo to re-run at, so the screen can offer one button.
  *
  * Usage: `await mixer.resumeContext()` (user gesture) → `probe.start()` → feed every input via
  * `probe.recordInput(e.ctxTime)` → when `probe.isComplete()` call `probe.finish()`.
@@ -25,6 +40,7 @@ import {
   LATENCY_MAX_MAD_SEC,
   LATENCY_MAX_REJECTED_FRACTION,
   LATENCY_MIN_SAMPLES,
+  beatIntervalOf,
   calibrateLatency,
   defaultPairingWindow,
   type CalibrationResult,
@@ -56,7 +72,7 @@ export interface LatencyProbeOptions {
   latency?: LatencyOptions;
 }
 
-/** Why a calibration run was not confident (for the calibration screen's remedy text). */
+/** Why a calibration run was / was not usable (for the calibration screen's remedy text). */
 export type ProbeDiagnosis =
   | 'ok'
   /** No input at all was recorded — camera/lane not triggering. */
@@ -68,19 +84,85 @@ export type ProbeDiagnosis =
   /** Enough samples but the spread (MAD) is above the threshold — inconsistent timing. */
   | 'too-jittery'
   /** Enough paired samples but too many were rejected as outliers. */
-  | 'too-many-outliers';
+  | 'too-many-outliers'
+  /**
+   * ACCEPTED with a warning: the run is well measured but the lag is bigger than the camera
+   * pipeline can explain (`implausibleOffset`) — the patient is *reacting* to each click instead
+   * of moving with it. The offset is still the right value to feed the engine; a slower tempo
+   * (`suggestedBpm`) shrinks the reaction component if the therapist wants a tighter number.
+   */
+  | 'reacting-not-anticipating'
+  /**
+   * REJECTED: the lag is so long that each movement pairs with the *following* click, which
+   * yields a confident but negative (physically impossible) offset. `apparentLagSec` holds the
+   * true lag; re-run at `suggestedBpm`.
+   */
+  | 'reacting-previous-beat';
 
 export interface LatencyProbeResult extends CalibrationResult {
-  /** Same as `confident` (kept as the probe's verdict name). */
+  /**
+   * The probe's verdict: `confident` AND not beat-aliased. `true` for a well-measured slow
+   * patient (see `warning`) — refusing those is what locks them out of the game.
+   */
   accepted: boolean;
+  /** Accepted, but the therapist should see `message` (currently: 'reacting-not-anticipating'). */
+  warning: boolean;
   totalClicks: number;
+  /** Beat interval of the recording (seconds). */
+  beatSec: number;
+  /**
+   * The lag the patient actually has, in seconds: `offsetSec`, except on a beat-aliased run
+   * where it is `offsetSec + beatSec` (what the negative measurement really means).
+   */
+  apparentLagSec: number;
+  /** A slower metronome tempo to re-run at, or null when the tempo is not the problem. */
+  suggestedBpm: number | null;
   /** Inputs recorded during the measured part of the run. */
   inputs: number;
   /** observed − expected for every paired beat, in ms and in beat order (for plotting). */
   samplesMs: number[];
   diagnosis: ProbeDiagnosis;
-  /** Short, patient-facing explanation of `diagnosis`. */
+  /** Short, patient-facing explanation of `diagnosis`, with the concrete numbers filled in. */
   message: string;
+}
+
+/**
+ * A measured offset below −this is read as beat aliasing rather than anticipation: sensorimotor
+ * synchronisation research puts the negative mean asynchrony of healthy tappers at 20–80 ms and
+ * of impaired populations nearer zero, so −120 ms "early" through a camera pipeline that adds
+ * 80–200 ms of positive latency is not a real measurement.
+ */
+export const PROBE_ALIAS_OFFSET_SEC = 0.12;
+/** …and anticipation also scales with the beat, so at fast tempi the bound is a fraction of it. */
+export const PROBE_ALIAS_BEAT_FRACTION = 0.15;
+
+/**
+ * How negative an offset must be at this beat interval before it is read as aliasing.
+ * NOTE the hard limit of the method: a lag of exactly one beat measures as 0 and is invisible to
+ * any single-tempo probe. That is why the default tempo is slow (60 BPM, beat 1 s ≫ any plausible
+ * lag) rather than the spec's 100 BPM.
+ */
+export function aliasLimitSec(beatSec: number): number {
+  return Math.min(PROBE_ALIAS_OFFSET_SEC, PROBE_ALIAS_BEAT_FRACTION * beatSec);
+}
+
+/** Tempi the calibration screen offers, slowest last. */
+export const CALIBRATION_BPM_STEPS: readonly number[] = [60, 50, 40, 30];
+
+/**
+ * Slowest-but-one tempo at which a lag of `lagSec` fits inside HALF a beat, so it can never be
+ * confused with the next click. Returns null when `currentBpm` already has that much room (or the
+ * lag is not positive), i.e. when a slower tempo is not the remedy.
+ */
+export function suggestedCalibrationBpm(lagSec: number, currentBpm: number): number | null {
+  if (!Number.isFinite(lagSec) || !Number.isFinite(currentBpm) || currentBpm <= 0) return null;
+  const needBeat = Math.max(0, lagSec) * 2;
+  if (needBeat <= 0 || needBeat <= 60 / currentBpm + 1e-9) return null;
+  const maxBpm = 60 / needBeat;
+  // 1e-9 slack: 60 / (0.6 × 2) is 49.999999999999993 in binary floating point, and the 50 BPM step
+  // must not be skipped because of it
+  const pick = CALIBRATION_BPM_STEPS.find((b) => b <= maxBpm * (1 + 1e-9)) ?? CALIBRATION_BPM_STEPS[CALIBRATION_BPM_STEPS.length - 1];
+  return pick < currentBpm ? pick : null;
 }
 
 /** ctx times of `count` clicks starting at `startCtxTime`. */
@@ -91,6 +173,7 @@ export function clickSchedule(startCtxTime: number, bpm: number, count: number):
   return out;
 }
 
+/** Generic (number-free) text for a diagnosis; `probeMessage` fills in the measured values. */
 export function diagnosisMessage(d: ProbeDiagnosis): string {
   switch (d) {
     case 'ok': return 'Calibration succeeded.';
@@ -99,21 +182,61 @@ export function diagnosisMessage(d: ProbeDiagnosis): string {
     case 'too-few': return 'Not enough clicks were answered. Try to move on every click.';
     case 'too-jittery': return 'Your timing varied a lot between clicks. Try again, moving as steadily as you can.';
     case 'too-many-outliers': return 'Several movements were far from the beat. Try again, moving on every click.';
+    case 'reacting-not-anticipating': return 'Your timing was very steady, but you move well after each click rather than with it. That is fine — the game will allow for it. A slower tempo makes it easier to move with the click.';
+    case 'reacting-previous-beat': return 'You move almost a full beat after each click, so the clicks could not be told apart. Please run the calibration again at a slower tempo.';
   }
+}
+
+/** `diagnosisMessage` with the run's own numbers (lag in ms, the tempo to retry at) filled in. */
+export function probeMessage(d: ProbeDiagnosis, detail: { apparentLagSec?: number; suggestedBpm?: number | null } = {}): string {
+  const base = diagnosisMessage(d);
+  const lagMs = Math.round((detail.apparentLagSec ?? 0) * 1000);
+  const retry = detail.suggestedBpm ? ` Try ${detail.suggestedBpm} BPM.` : '';
+  switch (d) {
+    case 'reacting-not-anticipating':
+      return `You move about ${lagMs} ms after each click — very steadily, so the game can compensate exactly. Calibration accepted.${retry}`;
+    case 'reacting-previous-beat':
+      return `You move about ${lagMs} ms after each click, almost a full beat, so the clicks could not be told apart.${retry || ' Please run the calibration again at a slower tempo.'}`;
+    case 'out-of-window':
+      return `${base}${retry}`;
+    default:
+      return base;
+  }
+}
+
+export interface DiagnoseOptions extends LatencyOptions {
+  /** Beat interval of the recording (seconds); enables the beat-aliasing check. */
+  beatSec?: number;
+}
+
+/**
+ * True when a confident-looking result is really the patient answering the *previous* click:
+ * a negative offset is physically impossible for a camera pipeline, and the leftover unpaired
+ * beat / spurious input at the ends of the recording corroborate the one-beat shift.
+ */
+export function isBeatAliased(r: CalibrationResult, beatSec: number | undefined, minSamples: number): boolean {
+  if (!beatSec || !Number.isFinite(beatSec) || beatSec <= 0) return false;
+  if (r.samples < minSamples) return false;
+  if (r.offsetSec >= -aliasLimitSec(beatSec)) return false;
+  return r.pairing.unpairedBeats >= 1 || r.pairing.spuriousInputs >= 1;
 }
 
 /** Classify a calibration run; pure so the calibration screen can be unit-tested against it. */
 export function diagnoseCalibration(
   r: CalibrationResult,
   totalBeats: number,
-  opts: LatencyOptions = {},
+  opts: DiagnoseOptions = {},
 ): ProbeDiagnosis {
   const minSamples = opts.minSamples ?? LATENCY_MIN_SAMPLES;
   const maxMad = opts.maxMadSec ?? LATENCY_MAX_MAD_SEC;
   const maxRejected = opts.maxRejectedFraction ?? LATENCY_MAX_REJECTED_FRACTION;
   const { pairing } = r;
   if (pairing.pairs.length === 0 && pairing.spuriousInputs === 0) return 'no-input';
-  if (r.confident) return 'ok';
+  // Checked before `confident`: an aliased run looks perfectly measured but its sign is wrong.
+  if (isBeatAliased(r, opts.beatSec, minSamples)) return 'reacting-previous-beat';
+  // The engine's `confident` deliberately ignores the offset *magnitude* (see engine/latency.ts):
+  // a steady 600 ms lag is a good measurement of a slow patient, not a failed calibration.
+  if (r.confident) return r.implausibleOffset ? 'reacting-not-anticipating' : 'ok';
   const unpairedFraction = totalBeats > 0 ? pairing.unpairedBeats / totalBeats : 1;
   // inputs exist but do not pair: the patient is answering the clicks outside the window
   if (unpairedFraction > maxRejected && pairing.spuriousInputs >= Math.ceil(pairing.unpairedBeats / 2)) return 'out-of-window';
@@ -124,24 +247,62 @@ export function diagnoseCalibration(
 
 /**
  * Pure part of the probe: measured click times + recorded input times → result.
- * Delegates all statistics to the engine (`calibrateLatency`).
+ * Delegates all statistics to the engine (`calibrateLatency`); adds the probe-level verdict
+ * (`accepted` / `warning`), the beat-aliasing check and the remedy (`suggestedBpm`).
  */
 export function computeProbeResult(
   clickTimes: readonly number[],
   inputTimes: readonly number[],
-  opts: { window?: number | PairingWindow; latency?: LatencyOptions } = {},
+  opts: { window?: number | PairingWindow; latency?: LatencyOptions; beatSec?: number } = {},
 ): LatencyProbeResult {
   const cal = calibrateLatency(clickTimes, inputTimes, { ...opts.latency, window: opts.window });
-  const diagnosis = diagnoseCalibration(cal, clickTimes.length, opts.latency);
+  const beatSec = opts.beatSec ?? beatIntervalOf(clickTimes);
+  const diagnosis = diagnoseCalibration(cal, clickTimes.length, { ...opts.latency, beatSec });
+  const aliased = diagnosis === 'reacting-previous-beat';
+  const apparentLagSec = aliased ? cal.offsetSec + beatSec : cal.offsetSec;
+  // For 'out-of-window' the pairs are empty, so the recording itself is the only evidence of how
+  // late the patient is: use the median input-to-nearest-click distance to size the retry tempo.
+  const lagForRemedy = diagnosis === 'out-of-window' ? medianLagFromPrecedingClick(clickTimes, inputTimes) : apparentLagSec;
+  const bpm = beatSec > 0 ? 60 / beatSec : 0;
+  const needsSlower = diagnosis === 'reacting-previous-beat' || diagnosis === 'reacting-not-anticipating' || diagnosis === 'out-of-window';
+  const suggestedBpm = needsSlower ? suggestedCalibrationBpm(lagForRemedy, bpm) : null;
   return {
     ...cal,
-    accepted: cal.confident,
+    accepted: cal.confident && !aliased,
+    warning: diagnosis === 'reacting-not-anticipating',
     totalClicks: clickTimes.length,
+    beatSec,
+    apparentLagSec,
+    suggestedBpm,
     inputs: inputTimes.length,
     samplesMs: cal.pairing.pairs.map((p) => (p.observed - p.expected) * 1000),
     diagnosis,
-    message: diagnosisMessage(diagnosis),
+    message: probeMessage(diagnosis, { apparentLagSec, suggestedBpm }),
   };
+}
+
+/**
+ * Median lag from each input back to the click *preceding* it (seconds). Used only to size the
+ * retry tempo when nothing paired: "nearest click" would read a 500 ms lag at a 600 ms beat as
+ * −100 ms early, which is the very confusion the slower tempo is meant to remove, so the
+ * physically correct assumption (latency is positive) is used instead.
+ */
+function medianLagFromPrecedingClick(clickTimes: readonly number[], inputTimes: readonly number[]): number {
+  if (clickTimes.length === 0 || inputTimes.length === 0) return 0;
+  const clicks = clickTimes.slice().sort((a, b) => a - b);
+  const lags: number[] = [];
+  for (const t of inputTimes) {
+    let best = Number.NaN;
+    for (const c of clicks) {
+      if (c > t) break;
+      best = t - c;
+    }
+    if (Number.isFinite(best)) lags.push(best);
+  }
+  lags.sort((a, b) => a - b);
+  if (lags.length === 0) return 0;
+  const mid = lags.length >> 1;
+  return lags.length % 2 === 1 ? lags[mid] : (lags[mid - 1] + lags[mid]) / 2;
 }
 
 interface ResolvedOptions {
@@ -166,7 +327,8 @@ export class LatencyProbe {
   private countInClicks: number[] = [];
   private inputs: number[] = [];
   private ignoredEarlyInputs = 0;
-  private nodes: OscillatorNode[] = [];
+  /** Scheduled clicks, oscillator AND its envelope gain: both must be disconnected on cancel. */
+  private nodes: { osc: OscillatorNode; env: GainNode }[] = [];
   private running = false;
   private endsAtCtx = 0;
 
@@ -256,7 +418,11 @@ export class LatencyProbe {
   finish(): LatencyProbeResult {
     this.silence();
     this.running = false;
-    return computeProbeResult(this.clicks, this.inputs, { window: this.opts.window, latency: this.opts.latency });
+    return computeProbeResult(this.clicks, this.inputs, {
+      window: this.opts.window,
+      latency: this.opts.latency,
+      beatSec: this.beatSec,
+    });
   }
 
   cancel(): void {
@@ -283,14 +449,24 @@ export class LatencyProbe {
     env.gain.exponentialRampToValueAtTime(1e-4, at + 0.04);
     osc.connect(env);
     env.connect(this.out);
-    osc.onended = () => { osc.disconnect(); env.disconnect(); this.nodes = this.nodes.filter((n) => n !== osc); };
+    osc.onended = () => { osc.disconnect(); env.disconnect(); this.nodes = this.nodes.filter((n) => n.osc !== osc); };
     osc.start(at);
     osc.stop(at + 0.05);
-    this.nodes.push(osc);
+    this.nodes.push({ osc, env });
   }
 
+  /**
+   * Stop and fully disconnect every pending click. The `env` gain has to go too: it is what is
+   * connected to `this.out`, so leaving it behind strands one node per unplayed click on the bus
+   * and they accumulate across cancel()/start() cycles (a 16-beat probe cancelled early = 20).
+   */
   private silence(): void {
-    for (const osc of this.nodes) { osc.onended = null; try { osc.stop(); } catch { /* already stopped */ } osc.disconnect(); }
+    for (const { osc, env } of this.nodes) {
+      osc.onended = null;
+      try { osc.stop(); } catch { /* already stopped */ }
+      osc.disconnect();
+      env.disconnect();
+    }
     this.nodes = [];
   }
 }

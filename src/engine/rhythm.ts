@@ -1,8 +1,11 @@
 import { DEFAULT_MISS_GRACE_MS, Judge } from './judge.ts';
+import type { InputResult } from './judge.ts';
+import { estimateLatencyFromDeltas } from './latency.ts';
+import type { LatencyEstimate } from './latency.ts';
 import { NoteCursor, SongClock } from './scheduler.ts';
 import type { ClockSource } from './scheduler.ts';
 import { Scoring } from './scoring.ts';
-import type { ScoreDelta, ScoreState } from './scoring.ts';
+import type { ScoreDelta, ScoreResults, ScoreState, TimingBias } from './scoring.ts';
 import type { Chart, HitEvent, Note, TimingWindows } from './types.ts';
 import type { LaneInputEvent } from '../input/types.ts';
 
@@ -16,7 +19,17 @@ export interface RhythmEngineOptions {
   ctx: ClockSource;
   /** Calibrated input pipeline latency (seconds, `CalibrationResult.offsetSec`). Applied exactly once. */
   inputLatencySec?: number;
-  /** Miss grace (ms) covering the input pipeline's capture→delivery delay. Default `DEFAULT_MISS_GRACE_MS`. */
+  /**
+   * Miss grace (ms) covering the input pipeline's capture→delivery delay. Default
+   * `DEFAULT_MISS_GRACE_MS` (100), NOT the spec-exact 0 that a bare `Judge` uses: camera inputs are
+   * timestamped at capture and delivered after inference, so a note whose good window closed at the
+   * audible deadline must stay hittable for one delivery delay longer.
+   *
+   * Consequence for the renderer: note states (`Judge.getNoteState`), `TickResult.misses` and
+   * `isComplete()` lag the audible deadline by this much. Read it back with `getMissGraceMs()` and
+   * either delay the "miss" animation by the same amount or accept a `missGraceMs`-late flash; pass
+   * 0 here for a keyboard/replay input source, which has no delivery delay.
+   */
   missGraceMs?: number;
   /** Audio/visual alignment offset for the SongClock (seconds). Default 0. Not the calibration value. */
   avOffsetSec?: number;
@@ -60,16 +73,49 @@ export class RhythmEngine {
       missGraceMs: opts.missGraceMs ?? DEFAULT_MISS_GRACE_MS,
     });
     this.scoring = new Scoring(opts.chart.lanes, opts.chart.notes.length);
+    this.scoring.setLatencyOffsetMs(this.judge.getLatencyOffset() * 1000);
     this.cursor = new NoteCursor(opts.chart, opts.tailSec ?? 0.5);
   }
 
-  /** The single input-latency knob. */
+  /**
+   * The single input-latency knob. Applying a mid-session calibration also rebases the timing-bias
+   * samples collected so far (they are stored offset-free), so the Results screen reports one
+   * honest bias instead of a bimodal mixture of "before" and "after" the correction, and
+   * `suggestedInputLatency()` keeps converging. Judgments already made are not revisited.
+   */
   setInputLatency(sec: number): void {
     this.judge.setLatencyOffset(sec);
+    this.scoring.setLatencyOffsetMs(sec * 1000);
   }
 
   getInputLatency(): number {
     return this.judge.getLatencyOffset();
+  }
+
+  /**
+   * Miss grace (ms): how far behind the audible deadline (`note.time + goodMs`) note states and
+   * `TickResult.misses` run. Default `DEFAULT_MISS_GRACE_MS`; see `RhythmEngineOptions.missGraceMs`.
+   */
+  getMissGraceMs(): number {
+    return this.judge.getMissGrace();
+  }
+
+  setMissGraceMs(ms: number): void {
+    this.judge.setMissGrace(ms);
+  }
+
+  /**
+   * Apply a new therapist window scale mid-session without losing the run: pass fresh windows
+   * (`windowsForLanes(lanes, difficulty, scale)`), keeping every judgment, the score and the cursor.
+   * Judgments already made are not revisited; see `Judge.setWindows`.
+   */
+  setWindows(windows: TimingWindows | TimingWindows[]): void {
+    this.judge.setWindows(windows);
+  }
+
+  /** Windows currently in force for a lane. @throws RangeError for a lane outside the chart. */
+  getWindows(lane: number): TimingWindows {
+    return this.judge.getWindows(lane);
   }
 
   start(ctxTime?: number, songTimeAtStart = 0): void {
@@ -107,13 +153,55 @@ export class RhythmEngine {
    * null when it matched no note. Ignored while the clock is idle; while paused, events stamped
    * before the pause point are still judged (a camera crossing captured just before `pause()` and
    * delivered ~100 ms later must not lose its rep), later stamps are ignored.
+   *
+   * An input that matches no note is never penalised, but it is recorded: the rep is counted and
+   * its distance to the nearest unjudged note feeds the uncensored timing bias
+   * (`ScoreState.reps` / `timingBiasMs`, `suggestedInputLatency()`). An input on a lane the chart
+   * does not have does not throw here either — it is counted in `ScoreState.outOfRange`.
    */
   handleInput(e: LaneInputEvent): HitEvent | null {
+    return this.handleInputDetailed(e)?.hit ?? null;
+  }
+
+  /**
+   * `handleInput` with the diagnostics: the nearest unjudged note's distance even when nothing was
+   * hit. Returns null when the clock is idle or the stamp falls inside a pause (nothing recorded).
+   */
+  handleInputDetailed(e: LaneInputEvent): InputResult | null {
     const songTime = this.clock.songTimeOf(e.ctxTime);
     if (songTime === null) return null;
-    const hit = this.judge.onInput(e.lane, songTime);
-    if (hit) this.lastHit = this.scoring.apply(hit);
-    return hit;
+    // The InputSource is the untrusted boundary: a mis-wired keyboard map or an off-by-one
+    // LaneSpec.index delivers a lane this chart does not have. `Judge.onInputDetailed` throws for
+    // that (like every other lane-indexed API), but throwing out of the input callback would kill a
+    // patient's session over a wiring bug. Count it instead — a rep performed is never lost, and
+    // `ScoreState.outOfRange` above 0 names the bug for dev tools and the Results screen.
+    if (!Number.isInteger(e.lane) || e.lane < 0 || e.lane >= this.chart.lanes) {
+      this.scoring.recordOutOfRangeInput(e.lane);
+      return { hit: null, lane: e.lane, time: songTime - this.judge.getLatencyOffset(), nearestDeltaMs: null, nearestNoteId: null };
+    }
+    const r = this.judge.onInputDetailed(e.lane, songTime);
+    if (r.hit) this.lastHit = this.scoring.apply(r.hit);
+    else this.scoring.recordUnmatchedInput(e.lane, r.nearestDeltaMs);
+    return r;
+  }
+
+  /**
+   * Re-estimate the input latency from what has been played so far: the current offset plus the
+   * robust centre of every input's distance to the note it was aiming at (hits *and* inputs the
+   * good window rejected). Returns null when too little data has accumulated, or when the estimate
+   * is not a consistent bias (`estimate.confident === false`).
+   *
+   * Use it to tell the therapist mid-session "the camera offset looks ~180 ms out" — apply it with
+   * `setInputLatency(suggested)`. Judgments already made are not revisited.
+   *
+   * @param lane restrict to one lane (default: all lanes pooled).
+   */
+  suggestedInputLatency(lane?: number): { sec: number; adjustmentSec: number; estimate: LatencyEstimate } | null {
+    const samples = this.scoring.getNearestDeltaSamplesMs(lane);
+    if (samples.length === 0) return null;
+    const estimate = estimateLatencyFromDeltas(samples.map((ms) => ms / 1000));
+    if (!estimate.confident) return null;
+    return { sec: this.getInputLatency() + estimate.offsetSec, adjustmentSec: estimate.offsetSec, estimate };
   }
 
   /** Per-frame: advance misses (applied to scoring). */
@@ -135,8 +223,23 @@ export class RhythmEngine {
     return this.lastHit;
   }
 
+  /**
+   * Per-frame HUD snapshot: cached and frozen, so binding to it every frame costs nothing and the
+   * same object comes back until the score actually changes. Robust timing bias is not in it (it
+   * costs two sorts of the sample pool) — the Results screen calls `getScoreResults()` once.
+   */
   getScoreState(): ScoreState {
     return this.scoring.getState();
+  }
+
+  /** `getScoreState()` plus the robust timing bias, overall and per lane. Results screen; not per frame. */
+  getScoreResults(): ScoreResults {
+    return this.scoring.getResults();
+  }
+
+  /** Robust timing bias for a lane (or all lanes pooled) on the current latency timeline. */
+  getTimingBias(lane?: number): TimingBias {
+    return this.scoring.getTimingBias(lane);
   }
 
   isComplete(): boolean {

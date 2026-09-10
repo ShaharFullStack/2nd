@@ -251,10 +251,24 @@ describe('StemMixer', () => {
     const { ctx, mixer } = setup();
     await mixer.loadSong(manifest, '/songs');
     const clock = new SongClock(ctx);
+    /**
+     * The song↔ctx mapping must be identical to the engine's and invertible in EVERY transport
+     * state — `ReplayInput`/`AutoplayInput` stamp events with `ctxTimeForSongTime()` and may well
+     * tick while the therapist has the session paused; a mapping that is only right while playing
+     * hands the engine stamps seconds in the past, which `songTimeOf()` nulls out or, worse,
+     * pins on the wrong note.
+     */
+    const mappingAgrees = () => {
+      for (const s of [0, 0.75, 1.97, 5, 12.5]) {
+        expect(mixer.ctxTimeForSongTime(s)).toBeCloseTo(clock.ctxTimeForSongTime(s), 12);
+        expect(mixer.ctxTimeToSongTime(mixer.ctxTimeForSongTime(s))).toBeCloseTo(s, 12); // invertible
+      }
+    };
     const agree = (t: number) => {
       expect(mixer.songTime(t)).toBeCloseTo(clock.songTime(t), 12);
       expect(mixer.ctxTimeForSongTime(mixer.songTime(t))).toBeCloseTo(t, 12);
       expect(clock.ctxTimeForSongTime(clock.songTime(t))).toBeCloseTo(t, 12);
+      mappingAgrees();
     };
     ctx.currentTime = 1;
     const start = mixer.play();
@@ -269,6 +283,13 @@ describe('StemMixer', () => {
     ctx.currentTime = 4;
     expect(mixer.songTime()).toBeCloseTo(1.97, 9);
     expect(clock.songTime()).toBeCloseTo(1.97, 9);
+    // …and the mapping survives the pause: the pause point still maps to the ctx time of the
+    // pause, both here and in the engine clock (this is where the mixer used to be off by the
+    // whole elapsed playback time, 1.97 s, because it derived song-0 from the moved offset).
+    mappingAgrees();
+    expect(mixer.ctxTimeForSongTime(1.97)).toBeCloseTo(3, 12);
+    expect(mixer.ctxTimeForSongTime(mixer.songTime())).toBeCloseTo(3, 12);
+    expect(mixer.ctxTimeForSongTime(1)).toBeCloseTo(2.03, 12); // a stamp from before the pause
 
     // resume: ctx.resume() takes 200 ms; the restart is scheduled only afterwards, and the
     // resolved time is exactly when the sources start
@@ -402,6 +423,57 @@ describe('StemMixer', () => {
     expect((idle.mixer.master as unknown as FakeGain).connections).toHaveLength(0);
   });
 
+  it('dispose() leaves no pending retire timers behind', async () => {
+    vi.useFakeTimers();
+    const { ctx, mixer } = setup();
+    await mixer.loadSong(manifest, '/songs');
+    mixer.play();
+    mixer.seek(2); // a seek while playing queues one retire timer per source
+    mixer.pause();
+    expect(vi.getTimerCount()).toBeGreaterThan(0);
+    mixer.dispose();
+    // dispose while paused runs the teardown immediately AND flushes everything still queued:
+    // those timers would otherwise fire after teardown and keep the mixer + buffers reachable
+    expect(vi.getTimerCount()).toBe(0);
+    expect((mixer.master as unknown as FakeGain).connections).toHaveLength(0);
+    expect((mixer.sfxBus as unknown as FakeGain).connections).toHaveLength(0);
+    expect(ctx.sources.every((s) => s.connections.length === 0)).toBe(true);
+    vi.advanceTimersByTime(1000); // nothing left to fire
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('createSfx() routes the cues through the master chain, not straight to the destination', () => {
+    const { ctx, mixer } = setup();
+    const sfx = mixer.createSfx(0.4);
+    expect(sfx.volume).toBe(0.4);
+    // the Sfx output bus is the newest gain node; it must land on sfxBus → master, never destination
+    const out = ctx.gains[ctx.gains.length - 1];
+    expect(out.connections).toEqual([mixer.sfxBus]);
+    expect((mixer.sfxBus as unknown as FakeGain).connections).toEqual([mixer.master]);
+    expect(ctx.destination.connections).toHaveLength(0);
+    sfx.dispose();
+    mixer.dispose();
+  });
+
+  it('exposes the output latency so a renderer can draw what is being heard, not what is queued', async () => {
+    const { ctx, mixer } = setup();
+    await mixer.loadSong(manifest, '/songs');
+    const withLatency = ctx as unknown as { outputLatency?: number; baseLatency?: number };
+    expect(mixer.outputLatencySec).toBe(0); // absent in this fake, as in older browsers
+    withLatency.baseLatency = 0.01;
+    expect(mixer.outputLatencySec).toBeCloseTo(0.01, 9); // falls back to baseLatency
+    withLatency.outputLatency = 0.14; // e.g. Bluetooth headphones
+    expect(mixer.outputLatencySec).toBeCloseTo(0.14, 9);
+    withLatency.outputLatency = Number.NaN;
+    expect(mixer.outputLatencySec).toBeCloseTo(0.01, 9); // ignores a garbage value
+    withLatency.outputLatency = 0.14;
+    ctx.currentTime = 5;
+    const startAt = mixer.play(5.5, 2);
+    expect(mixer.songTime(startAt + 1)).toBeCloseTo(3, 9); // what the graph produces (judgment uses this)
+    expect(mixer.displaySongTime(startAt + 1)).toBeCloseTo(2.86, 9); // what the listener hears (draw this)
+    mixer.dispose();
+  });
+
   it('reports ended via the longest stem and clamps song time to the duration', async () => {
     const { ctx, mixer } = setup();
     await mixer.loadSong(manifest, '/songs');
@@ -455,6 +527,63 @@ describe('StemMixer', () => {
     expect(() => mixer.setPlayerStem('nope')).toThrow(/unknown stem/);
   });
 
+  it('seek/stop/replay while ducked restore the player stem with a ramp, never a step (click-free)', async () => {
+    const { ctx, mixer } = setup();
+    await mixer.loadSong(manifest, '/songs');
+    ctx.currentTime = 1;
+    mixer.play();
+    const drumDuck = ctx.sources[0].connections[0] as FakeGain;
+    ctx.currentTime = 2;
+    mixer.onMiss();
+    ctx.currentTime = 2.1; // the miss ramp has landed: the stem is at 0.05 and audible
+    drumDuck.gain.log = [];
+
+    mixer.seek(4); // sources fade out over STOP_FADE_SEC — restoring in one sample would click here
+    expect(drumDuck.gain.log).toEqual(['cancel@2.1', 'set 0.05@2.1', `exp 1@${2.1 + STOP_FADE_SEC}`]);
+    expect(mixer.getPlayerStemGain()).toBeCloseTo(0.05, 12); // anchored on the ducked value
+    ctx.currentTime = 2.1 + STOP_FADE_SEC;
+    expect(mixer.getPlayerStemGain()).toBe(1);
+
+    // same on stop() and on a re-play() while ducked
+    ctx.currentTime = 3;
+    mixer.onMiss();
+    ctx.currentTime = 3.05;
+    drumDuck.gain.log = [];
+    mixer.stop();
+    expect(drumDuck.gain.log.slice(-1)[0]).toBe(`exp 1@${3.05 + STOP_FADE_SEC}`);
+    expect(drumDuck.gain.log.some((e) => e === 'set 1@3.05')).toBe(false); // no step to 1
+
+    // nothing audible (stopped): the hard write is fine and stays
+    ctx.currentTime = 4;
+    drumDuck.gain.log = [];
+    mixer.play();
+    expect(drumDuck.gain.log).toEqual(['cancel@4', 'set 1@4']);
+  });
+
+  it('the song↔ctx mapping stays exact and invertible after stop and after a seek while paused', async () => {
+    const { ctx, mixer } = setup();
+    await mixer.loadSong(manifest, '/songs');
+    ctx.currentTime = 1;
+    mixer.play();
+    ctx.currentTime = 3;
+    mixer.pause();
+    ctx.currentTime = 4;
+    mixer.seek(6); // seek while paused: the new position is "now"
+    expect(mixer.songTime()).toBe(6);
+    expect(mixer.ctxTimeForSongTime(6)).toBeCloseTo(4, 12);
+    expect(mixer.ctxTimeToSongTime(4)).toBeCloseTo(6, 12);
+    ctx.currentTime = 5;
+    mixer.stop();
+    expect(mixer.songTime()).toBe(0);
+    expect(mixer.ctxTimeForSongTime(0)).toBeCloseTo(5, 12);
+    expect(mixer.ctxTimeToSongTime(5.5)).toBeCloseTo(0.5, 12);
+    // and after the restart the mapping is the new segment's
+    ctx.currentTime = 6;
+    const start = mixer.play();
+    expect(mixer.ctxTimeForSongTime(0)).toBeCloseTo(start, 12);
+    expect(mixer.ctxTimeForSongTime(mixer.songTime(7))).toBeCloseTo(7, 12);
+  });
+
   it('per-stem and master gains ramp linearly and anchor on the analytic value, not param.value', async () => {
     const { ctx, mixer } = setup();
     await mixer.loadSong(manifest, '/songs');
@@ -492,7 +621,7 @@ describe('StemMixer', () => {
     expect(() => mixer.play()).toThrow(/no song loaded/);
   });
 
-  it('master stage: limiter settings when on; 0.45 headroom and direct wiring when off', async () => {
+  it('master stage: limiter settings when on; 0.32 headroom and direct wiring when off', async () => {
     const on = setup();
     const c = on.mixer.compressor as unknown as FakeCompressor;
     expect(on.mixer.getMasterGain()).toBe(DEFAULT_MASTER_GAIN.limiter);
@@ -503,7 +632,8 @@ describe('StemMixer', () => {
 
     const off = setup({ compressor: false });
     expect(off.mixer.getMasterGain()).toBe(DEFAULT_MASTER_GAIN.none);
-    expect(DEFAULT_MASTER_GAIN.none).toBe(0.45);
+    // headroom for stems (2.28 with the streak boost) + the loudest SFX cue at full slider (0.62)
+    expect(DEFAULT_MASTER_GAIN.none).toBe(0.32);
     expect(off.mixer.output).toBe(off.mixer.master);
     await off.mixer.loadSong(manifest, '/songs');
     off.mixer.play();
@@ -517,6 +647,9 @@ describe('StemMixer', () => {
       expect(volume.connections).toEqual([off.mixer.transport]);
     }
     expect((off.mixer.transport as unknown as FakeGain).connections).toEqual([off.mixer.master]);
+    // the SFX bus joins the master AFTER the transport (cues are not faded by pause/seek) and
+    // BEFORE the master gain/limiter (so they share the song's headroom instead of clipping past it)
+    expect((off.mixer.sfxBus as unknown as FakeGain).connections).toEqual([off.mixer.master]);
     expect((off.mixer.master as unknown as FakeGain).connections).toEqual([off.ctx.destination]);
     expect(new StemMixer({ ctx: off.ctx as unknown as AudioContext, compressor: false, masterGain: 0.9 }).getMasterGain()).toBe(0.9);
   });
@@ -570,6 +703,67 @@ describe('StemMixer', () => {
     await expect(p).rejects.toMatchObject({ name: 'AbortError' });
   });
 
+  it('readBodyWithProgress fills one preallocated buffer, and still copes when Content-Length lies', async () => {
+    const chunksOf = (n: number, cut: number[]) => {
+      const body = new Uint8Array(n);
+      for (let i = 0; i < n; i++) body[i] = i % 251;
+      return [0, ...cut].map((s, i) => body.subarray(s, cut[i] ?? n));
+    };
+    const stream = (cs: Uint8Array[]) => new ReadableStream<Uint8Array>({
+      start(c) { for (const x of cs) c.enqueue(x); c.close(); },
+    });
+    const check = (data: ArrayBuffer, n: number) => {
+      const v = new Uint8Array(data);
+      expect(v.byteLength).toBe(n);
+      for (let i = 0; i < n; i++) expect(v[i]).toBe(i % 251);
+    };
+    // exact Content-Length: the common case, written straight into the final buffer
+    check(await readBodyWithProgress(new Response(stream(chunksOf(1000, [300, 650])), { headers: { 'content-length': '1000' } }), () => {}), 1000);
+    // body SHORTER than announced (truncated response): the result is trimmed to what arrived
+    check(await readBodyWithProgress(new Response(stream(chunksOf(400, [150])), { headers: { 'content-length': '1000' } }), () => {}), 400);
+    // body LONGER than announced (e.g. a proxy rewriting the header): falls back to joining chunks
+    check(await readBodyWithProgress(new Response(stream(chunksOf(1500, [300, 900])), { headers: { 'content-length': '1000' } }), () => {}), 1500);
+    // no Content-Length at all: chunk list, as before
+    check(await readBodyWithProgress(new Response(stream(chunksOf(700, [200]))), () => {}), 700);
+  });
+
+  it('readBodyWithProgress releases the stream on abort and on a mid-stream failure', async () => {
+    // The reader holds the socket; loadSong aborts its SIBLING downloads on a failure but nothing
+    // else releases the stream that threw, so it must cancel itself.
+    const mkBody = (fail: boolean) => {
+      let cancelled = 0;
+      const body = {
+        getReader() {
+          let n = 0;
+          return {
+            async read() {
+              if (fail && n === 2) throw new Error('network reset');
+              return n++ < 4 ? { done: false, value: new Uint8Array(100) } : { done: true, value: undefined };
+            },
+            async cancel() { cancelled++; },
+          };
+        },
+      };
+      const res = { body, headers: new Headers({ 'content-length': '400' }) } as unknown as Response;
+      return { res, cancelled: () => cancelled };
+    };
+
+    const failing = mkBody(true);
+    await expect(readBodyWithProgress(failing.res, () => {})).rejects.toThrow(/network reset/);
+    expect(failing.cancelled()).toBe(1);
+
+    const aborting = mkBody(false);
+    const ac = new AbortController();
+    await expect(readBodyWithProgress(aborting.res, (r) => { if (r >= 200) ac.abort(); }, ac.signal))
+      .rejects.toMatchObject({ name: 'AbortError' });
+    expect(aborting.cancelled()).toBeGreaterThanOrEqual(1);
+
+    // a body that completes normally is NOT cancelled (that would be a spurious stream error)
+    const ok = mkBody(false);
+    expect((await readBodyWithProgress(ok.res, () => {})).byteLength).toBe(400);
+    expect(ok.cancelled()).toBe(0);
+  });
+
   it('aggregateProgress weights download 0.85 and decode 0.15 per stem and tracks byte totals', () => {
     const p = aggregateProgress([
       { received: 500, total: 1000, fetched: false, decoded: false },
@@ -583,28 +777,53 @@ describe('StemMixer', () => {
     expect(aggregateProgress([{ received: 5000, total: 1000, fetched: false, decoded: false }], 'x', 'downloading').fraction).toBeCloseTo(0.85, 9);
   });
 
-  it('play() at or past the end of every stem ends immediately instead of playing forever', async () => {
+  it('play() never starts a silent song: the end is reached by seek(), and an explicit past-the-end offset throws', async () => {
     const { ctx, mixer } = setup();
     await mixer.loadSong(manifest, '/songs');
     let ended = 0;
     mixer.onEnded(() => ended++);
     ctx.currentTime = 1;
     mixer.play(1.5);
-    mixer.seek(mixer.getDuration()); // seek to the very end while playing
+    expect(mixer.seek(mixer.getDuration())).toBeNull(); // seek to the very end while playing: no restart
     expect(mixer.state).toBe('ended');
     expect(ended).toBe(1);
     expect(mixer.getSongTime()).toBe(10);
     ctx.currentTime = 50;
     expect(mixer.getSongTime()).toBe(10); // does not run past the duration
     expect(ctx.sources.filter((s) => s.started && !s.stopped)).toHaveLength(0);
-    // explicit offset beyond the end behaves the same
-    mixer.play(undefined, 999);
-    expect(mixer.state).toBe('ended');
-    expect(ended).toBe(2);
-    // and playing again after 'ended' restarts from 0
+
+    // An explicit offset past the end is a programming error, NOT a silent start: the engine
+    // clock must never be started on a song that never sounds (`engine.start(mixer.play())`).
+    expect(() => mixer.play(undefined, 999)).toThrow(/at\/after the end/);
+    expect(() => mixer.play(undefined, Number.NaN)).toThrow(/finite/);
+    expect(ended).toBe(1);
+    expect(mixer.state).toBe('ended'); // the failed call changed nothing
+
+    // playing again after 'ended' restarts from 0 (and so does a position parked at the end)
     mixer.play();
     expect(mixer.state).toBe('playing');
     expect(ctx.sources[ctx.sources.length - 1].started?.offset).toBe(0);
+    mixer.stop();
+    mixer.seek(999); // clamped to the duration while stopped
+    expect(mixer.getSongTime()).toBe(10);
+    mixer.play();
+    expect(mixer.state).toBe('playing');
+    expect(ctx.sources[ctx.sources.length - 1].started?.offset).toBe(0);
+  });
+
+  it('loadSong rejects a manifest whose playerStem is not a stem before touching the mixer', async () => {
+    const { mixer } = setup();
+    await mixer.loadSong(manifest, '/songs');
+    await expect(mixer.loadSong({ ...manifest, playerStem: 'vocals' }, '/songs')).rejects.toThrow(/playerStem "vocals" is not one of the stems/);
+    // the previously loaded song is untouched: no half-loaded 'ready' mixer with a dead
+    // duck controller (onHit/onMiss silently doing nothing for the rest of the session)
+    expect(mixer.state).toBe('ready');
+    expect(mixer.playerStem).toBe('drums');
+    expect(mixer.stemIds).toEqual(['drums', 'bass', 'keys']);
+    mixer.onMiss();
+    expect(mixer.isDucked).toBe(true);
+    await expect(mixer.loadSong({ ...manifest, stems: [] }, '/songs')).rejects.toThrow(/no stems/);
+    await expect(mixer.loadSong({ ...manifest, stems: [manifest.stems[0], manifest.stems[0]] }, '/songs')).rejects.toThrow(/unique/);
   });
 
   it('pause() before the scheduled start clamps song time to 0', async () => {

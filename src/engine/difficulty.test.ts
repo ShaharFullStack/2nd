@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it } from 'vitest';
-import { DIFFICULTIES, FINE_MOTOR_WINDOW_MULTIPLIER, clampWindowScale, windowsFor, windowsForLanes } from './difficulty.ts';
+import { DIFFICULTIES, FINE_MOTOR_WINDOW_MULTIPLIER, checkWindowScale, clampWindowScale, windowsFor, windowsForLanes } from './difficulty.ts';
 import type { LaneSpec } from './types.ts';
 
 describe('DIFFICULTIES', () => {
@@ -32,6 +32,19 @@ describe('windowsFor', () => {
   it('honours multiplier override', () => {
     expect(windowsFor('finger_spread', 'easy', 1)).toEqual({ perfectMs: 90, goodMs: 180 });
     expect(windowsFor('seated_march', 'easy', 2)).toEqual({ perfectMs: 180, goodMs: 360 });
+  });
+  it('clamps the multiplier override like the scale, instead of handing the Judge a zero window', () => {
+    // a therapist control that reaches 0 or a negative number must be caught here, not at Play time
+    expect(windowsFor('seated_march', 'medium', 0)).toEqual({ perfectMs: 70 * 0.25, goodMs: 140 * 0.25 });
+    expect(windowsFor('seated_march', 'medium', -1)).toEqual({ perfectMs: 70 * 0.25, goodMs: 140 * 0.25 });
+    expect(windowsFor('seated_march', 'medium', 1000)).toEqual({ perfectMs: 280, goodMs: 560 });
+    expect(windowsFor('seated_march', 'medium', Number.NaN)).toEqual({ perfectMs: 70, goodMs: 140 });
+    for (const m of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, 1e9]) {
+      const w = windowsFor('finger_opposition', 'hard', m, m);
+      expect(w.perfectMs).toBeGreaterThan(0);
+      expect(w.goodMs).toBeGreaterThanOrEqual(w.perfectMs);
+      expect(Number.isFinite(w.goodMs)).toBe(true);
+    }
   });
   it('applies an explicit therapist scale and clamps it (no global state)', () => {
     expect(windowsFor('knee_extension', 'medium', undefined, 1.5)).toEqual({ perfectMs: 105, goodMs: 210 });
@@ -65,5 +78,31 @@ describe('windowsFor', () => {
       ),
     ).toThrow(/duplicate lane index 0/);
     expect(() => windowsForLanes([], 'easy')).toThrow(/no lanes/);
+  });
+});
+
+describe('checkWindowScale (a clinical control must not silently apply a different number)', () => {
+  it('reports the clamp instead of hiding it', () => {
+    expect(checkWindowScale(1)).toEqual({ value: 1, clamped: false, reason: 'ok', message: null });
+    expect(checkWindowScale(0.25)).toMatchObject({ value: 0.25, clamped: false, reason: 'ok' });
+    expect(checkWindowScale(4)).toMatchObject({ value: 4, clamped: false, reason: 'ok' });
+
+    // the probed cases: a therapist typing 0.1 was getting 0.25 — 2.5x what they asked for
+    const low = checkWindowScale(0.1);
+    expect(low).toMatchObject({ value: 0.25, clamped: true, reason: 'below_min' });
+    expect(low.message).toMatch(/0\.1/);
+    expect(checkWindowScale(0)).toMatchObject({ value: 0.25, clamped: true, reason: 'below_min' });
+    expect(checkWindowScale(-2)).toMatchObject({ value: 0.25, clamped: true, reason: 'below_min' });
+    expect(checkWindowScale(100)).toMatchObject({ value: 4, clamped: true, reason: 'above_max' });
+    expect(checkWindowScale(Number.NaN)).toMatchObject({ value: 1, clamped: true, reason: 'non_finite' });
+    expect(checkWindowScale(Number.POSITIVE_INFINITY)).toMatchObject({ value: 1, clamped: true, reason: 'non_finite' });
+    for (const bad of [0, 0.1, 100, Number.NaN]) expect(checkWindowScale(bad).message).toBeTruthy();
+  });
+  it('agrees exactly with the silent clamp windowsFor applies', () => {
+    for (const s of [-5, 0, 0.1, 0.25, 0.5, 1, 2, 4, 9, Number.NaN]) {
+      expect(clampWindowScale(s)).toBe(checkWindowScale(s).value);
+      const w = windowsFor('seated_march', 'easy', undefined, s);
+      expect(w.goodMs).toBeCloseTo(180 * checkWindowScale(s).value, 9);
+    }
   });
 });

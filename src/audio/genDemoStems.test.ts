@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parseManifest } from './manifest';
+import { parseManifest, stepTimeSec } from './manifest';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const script = path.join(repoRoot, 'scripts', 'gen-demo-stems.mjs');
@@ -32,6 +32,27 @@ function readWav(file: string): WavInfo {
   const samples = new Int16Array(dataBytes / 2);
   for (let i = 0; i < samples.length; i++) samples[i] = b.readInt16LE(44 + i * 2);
   return { format, channels, sampleRate, bits, dataBytes, samples };
+}
+
+/**
+ * Onset times (seconds) of a percussive mono stem: peaks of the short-time energy envelope that
+ * rise sharply over the previous frame. Crude but ample for "is this transient on the grid?".
+ */
+function onsetTimes(s: Int16Array, sampleRate: number, hop = 128, win = 512): number[] {
+  const env: number[] = [];
+  for (let i = 0; i + win < s.length; i += hop) {
+    let e = 0;
+    for (let j = 0; j < win; j++) { const v = s[i + j] / 32768; e += v * v; }
+    env.push(Math.sqrt(e / win));
+  }
+  const out: number[] = [];
+  for (let i = 1; i < env.length - 1; i++) {
+    if (env[i] - env[i - 1] > 0.02 && env[i] >= env[i + 1] && env[i] > 0.05) {
+      const t = (i * hop) / sampleRate;
+      if (out.length === 0 || t - out[out.length - 1] > 0.05) out.push(t); // one onset per 50 ms
+    }
+  }
+  return out;
 }
 
 const rms = (s: Int16Array, from = 0, to = s.length) => {
@@ -108,6 +129,44 @@ describe('scripts/gen-demo-stems.mjs', () => {
     const b = fs.readFileSync(path.join(out2, 'demo-groove/stems/lead.wav'));
     expect(a.equals(b)).toBe(true);
   });
+
+  it('masters stems to matched loudness with the player stem on top, under each peak ceiling', () => {
+    // Peak normalisation alone left the transient-heavy drums ~3.5 dB below the bass in RMS —
+    // and the drums are the stem whose ducking is the game's main feedback cue.
+    const loud = manifest.stems.map((s) => {
+      const w = readWav(path.join(dir, s.file));
+      let peak = 0;
+      for (const v of w.samples) peak = Math.max(peak, Math.abs(v) / 32768);
+      return { id: s.id, db: 20 * Math.log10(rms(w.samples)), peak };
+    });
+    const player = loud.find((l) => l.id === manifest.playerStem)!;
+    expect(player.db).toBeCloseTo(-13, 0);
+    for (const l of loud) {
+      expect(l.peak, l.id).toBeLessThanOrEqual(0.951); // never clips the 16-bit container
+      if (l.id !== manifest.playerStem) expect(player.db, l.id).toBeGreaterThan(l.db + 1);
+    }
+  });
+
+  it('--rate writes a smaller low-bandwidth build at the requested sample rate', () => {
+    const out3 = fs.mkdtempSync(path.join(os.tmpdir(), 'beat-rehab-stems3-'));
+    execFileSync(process.execPath, [script, '--out', out3, '--song', 'demo-groove', '--bars', String(bars), '--rate', '22050'], { timeout: 120_000 });
+    const w = readWav(path.join(out3, 'demo-groove/stems/drums.wav'));
+    expect(w.sampleRate).toBe(22050);
+    expect(w.channels).toBe(1);
+    expect(w.bits).toBe(16);
+    expect(w.samples.length).toBe(Math.round(expectedSec * 22050));
+    // half the bytes, same music: the only size lever available without an encoder dependency
+    expect(w.dataBytes).toBeLessThan(readWav(path.join(dir, 'stems/drums.wav')).dataBytes * 0.55);
+    expect(rms(w.samples)).toBeGreaterThan(0.02);
+    const m3 = parseManifest(JSON.parse(fs.readFileSync(path.join(out3, 'demo-groove/song.json'), 'utf8')));
+    expect(m3.durationSec).toBeCloseTo(expectedSec, 3);
+  });
+
+  it('rejects a --rate outside the supported range', () => {
+    for (const rate of ['0', '48000', 'abc']) {
+      expect(() => execFileSync(process.execPath, [script, '--out', out, '--rate', rate], { timeout: 30_000, stdio: 'pipe' })).toThrow();
+    }
+  });
 });
 
 describe('committed demo songs', () => {
@@ -130,6 +189,41 @@ describe('committed demo songs', () => {
     const b = parseManifest(JSON.parse(fs.readFileSync(path.join(songsDir, 'demo-sunrise/song.json'), 'utf8')));
     expect(a.bpm).not.toBe(b.bpm);
     expect(a.title).not.toBe(b.title);
+  });
+
+  it('the published `swing` describes the audio: drum onsets sit on the manifest grid, not near it', () => {
+    // A chart generator places notes with `stepTimeSec(manifest, step)`. If the manifest did not
+    // publish the feel (or published the wrong one) every odd-16th note of a swung song would ask
+    // the patient to move `swing × a 16th` away from the drum they can hear — 50 ms here, which is
+    // most of a 'perfect' window on hard.
+    const songsDir = path.join(repoRoot, 'public', 'songs');
+    const expected: Record<string, number> = { 'demo-groove': 0, 'demo-sunrise': 1 / 3 };
+    for (const [id, swing] of Object.entries(expected)) {
+      const m = parseManifest(JSON.parse(fs.readFileSync(path.join(songsDir, id, 'song.json'), 'utf8')));
+      expect(m.swing ?? 0, id).toBeCloseTo(swing, 6);
+      const drums = readWav(path.join(songsDir, id, 'stems/drums.wav'));
+      const onsets = onsetTimes(drums.samples, drums.sampleRate);
+      expect(onsets.length, id).toBeGreaterThan(50);
+      const stepSec = 60 / m.bpm / 4;
+      const errs: number[] = [];
+      const oddErrs: number[] = [];
+      for (const t of onsets) {
+        const k = Math.round((t - m.offset) / stepSec);
+        const e = (t - stepTimeSec(m, k)) * 1000;
+        if (Math.abs(e) > 60) continue; // fill hits sit on 32nds; the detector also has jitter
+        errs.push(Math.abs(e));
+        if (Math.abs(k % 2) === 1) oddErrs.push(e);
+      }
+      errs.sort((a, b) => a - b);
+      expect(errs.length, id).toBeGreaterThan(40);
+      expect(errs[Math.floor(errs.length / 2)], `${id} median |onset − grid|`).toBeLessThan(6);
+      if (swing > 0) {
+        // and the swung steps are genuinely late against the STRAIGHT grid (the feel is real)
+        expect(oddErrs.length, id).toBeGreaterThan(5);
+        const straight = oddErrs.map((e) => e + swing * stepSec * 1000).sort((a, b) => a - b);
+        expect(straight[Math.floor(straight.length / 2)]).toBeCloseTo(swing * stepSec * 1000, 0);
+      }
+    }
   });
 
   it('the template manifest parses and uses placeholder remote URLs', () => {

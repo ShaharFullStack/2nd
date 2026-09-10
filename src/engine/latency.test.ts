@@ -10,6 +10,7 @@ import {
   calibrateLatency,
   defaultPairingWindow,
   estimateLatency,
+  estimateLatencyFromDeltas,
   mad,
   median,
   pairInputsToBeats,
@@ -74,36 +75,42 @@ describe('estimateLatency', () => {
     expect(e4.samples).toBe(7);
     expect(e4.rejected).toBe(2);
   });
-  it('flags an implausible offset: a patient reacting 700 ms late is not a 0.7 s pipeline latency', () => {
+  it('flags a large offset as advisory without failing the measurement (shared semantic with LatencyProbe)', () => {
     const late = estimateLatency([0.7, 0.71, 0.69, 0.7, 0.72, 0.68, 0.7, 0.7].map((d, i) => ({ expected: i, observed: i + d })));
     expect(late.offsetSec).toBeCloseTo(0.7, 9);
     expect(late.samples).toBe(8); // the samples themselves are consistent and kept
     expect(late.implausibleOffset).toBe(true);
-    expect(late.confident).toBe(false);
-    expect(late.confidence).toBeLessThan(0.5);
-    expect(late.quality).toBe('poor');
-    // early is just as implausible
+    expect(late.offsetPlausibility).toBe(0);
+    // the measurement is sound: a patient who consistently answers 700 ms late HAS been measured,
+    // and 0.7 s is the right offset to compensate with. `confident` must not depend on magnitude —
+    // src/audio/latencyProbe.ts maps it to `accepted`.
+    expect(late.confident).toBe(true);
+    expect(late.confidence).toBeGreaterThanOrEqual(0.5);
+    expect(late.quality).not.toBe('none');
+    // early is just as flagged
     const early = estimateLatency([-0.5, -0.5, -0.49, -0.51, -0.5, -0.5, -0.5, -0.5].map((d, i) => ({ expected: i, observed: i + d })));
     expect(early.implausibleOffset).toBe(true);
-    expect(early.confident).toBe(false);
-    // plausible band: 0.3 s is fully trusted, 0.35 s is graded down but still confident, 0.4 s is the edge
+    expect(early.confident).toBe(true);
+    // plausibility band: 0.3 s fully trusted, 0.35 s graded down, 0.4 s the flag edge
     const at = (d: number) => estimateLatency(Array.from({ length: 16 }, (_, i) => ({ expected: i, observed: i + d })));
+    expect(at(0.3).offsetPlausibility).toBeCloseTo(1, 9);
     expect(at(0.3).confidence).toBeCloseTo(1, 9);
     expect(at(0.3).quality).toBe('good');
-    expect(at(0.35).confidence).toBeCloseTo(0.75, 9);
-    expect(at(0.35).confident).toBe(true);
+    expect(at(0.35).offsetPlausibility).toBeCloseTo(0.75, 9);
     expect(at(0.35).implausibleOffset).toBe(false);
-    expect(at(LATENCY_MAX_OFFSET_SEC).confident).toBe(true);
-    expect(at(LATENCY_MAX_OFFSET_SEC).confidence).toBeCloseTo(0.5, 9);
-    expect(at(0.401).confident).toBe(false);
+    expect(at(LATENCY_MAX_OFFSET_SEC).offsetPlausibility).toBeCloseTo(0.5, 9);
+    expect(at(LATENCY_MAX_OFFSET_SEC).implausibleOffset).toBe(false);
     expect(at(0.401).implausibleOffset).toBe(true);
+    // measurement quality is untouched by the magnitude at every point of the band
+    for (const d of [0.3, 0.35, LATENCY_MAX_OFFSET_SEC, 0.401, 0.9]) expect(at(d).confident).toBe(true);
     expect(LATENCY_PLAUSIBLE_OFFSET_SEC).toBeLessThan(LATENCY_MAX_OFFSET_SEC);
-    // therapist override for slow pipelines
+    // therapist override for slow pipelines silences the flag
     expect(at(0.5).implausibleOffset).toBe(true);
     const tolerant = estimateLatency(Array.from({ length: 16 }, (_, i) => ({ expected: i, observed: i + 0.5 })), { maxOffsetSec: 0.6, plausibleOffsetSec: 0.5 });
     expect(tolerant.implausibleOffset).toBe(false);
     expect(tolerant.confident).toBe(true);
     expect(estimateLatency([]).implausibleOffset).toBe(false);
+    expect(estimateLatency([]).offsetPlausibility).toBe(0);
   });
   it('is not confident with too few samples, high spread, or mostly outliers', () => {
     expect(estimateLatency([{ expected: 0, observed: 0.1 }]).confident).toBe(false);
@@ -228,13 +235,17 @@ describe('calibrateLatency (30 fps camera model)', () => {
     expect(r.quality).toBe('good');
     expect(r.implausibleOffset).toBe(false);
   });
-  it('a patient who reacts 600 ms late pairs fine (0.75 s late window) but is flagged, not calibrated', () => {
+  it('a slow patient answering 600 ms after each click pairs, is accepted, and is flagged for review', () => {
     const r = calibrateLatency(beats, beats.map((b) => b + 0.6));
     expect(r.samples).toBe(16);
+    expect(r.pairing.unpairedBeats).toBe(0);
     expect(r.offsetSec).toBeCloseTo(0.6, 9);
+    // accepted (this is exactly what src/audio/latencyProbe.test.ts asserts for the same recording)
+    expect(r.confident).toBe(true);
+    expect(r.quality).toBe('good');
+    // ...but the magnitude is well beyond the documented 80-200 ms pipeline, so the screen warns
     expect(r.implausibleOffset).toBe(true);
-    expect(r.confident).toBe(false);
-    expect(r.quality).toBe('poor');
+    expect(r.offsetPlausibility).toBe(0);
   });
   it('unpaired beats are counted as rejected, so a patient who mostly did not move is diagnosed', () => {
     const r = calibrateLatency(beats, [beats[0] + 0.2, beats[3] + 0.2, beats[8] + 0.2]);
@@ -283,5 +294,32 @@ describe('calibrateLatency (30 fps camera model)', () => {
     expect(r.pairing.spuriousInputs).toBe(16);
     expect(r.offsetSec).toBeCloseTo(0.15 + FRAME / 2, 1);
     expect(r.confident).toBe(true);
+  });
+});
+
+describe('estimateLatencyFromDeltas (mid-session re-estimation)', () => {
+  it('turns signed nearest-note distances into the same estimate as beat pairs', () => {
+    const deltas = [0.18, 0.182, 0.179, 0.181, 0.18, 0.178, 0.183, 0.18];
+    const a = estimateLatencyFromDeltas(deltas);
+    const b = estimateLatency(deltas.map((d, i) => ({ expected: i, observed: i + d })));
+    expect(a.offsetSec).toBeCloseTo(b.offsetSec, 12);
+    expect(a.madSec).toBeCloseTo(b.madSec, 12);
+    expect(a.samples).toBe(b.samples);
+    expect(a.confident).toBe(true);
+    expect(a.offsetSec).toBeCloseTo(0.18, 9);
+    expect(a.implausibleOffset).toBe(false);
+  });
+  it('rejects outliers, is not confident on noise, and handles an empty pool', () => {
+    const withOutliers = [0.18, 0.18, 0.19, 0.17, 0.18, 0.18, 0.9, -0.8];
+    const r = estimateLatencyFromDeltas(withOutliers);
+    expect(r.samples).toBe(6);
+    expect(r.rejected).toBe(2);
+    expect(r.offsetSec).toBeCloseTo(0.18, 6);
+    const noisy = estimateLatencyFromDeltas([0.02, 0.2, -0.1, 0.15, -0.05, 0.18, 0.01, 0.22]);
+    expect(noisy.confident).toBe(false);
+    const empty = estimateLatencyFromDeltas([]);
+    expect(empty.samples).toBe(0);
+    expect(empty.confident).toBe(false);
+    expect(empty.offsetSec).toBe(0);
   });
 });

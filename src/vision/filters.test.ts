@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { DEFAULT_LANE_FILTER, EmaFilter, LowPassFilter, OneEuroFilter, createFilter, filterGroupDelaySec } from './filters.ts';
+import { DEFAULT_LANE_FILTER, Ema2Filter, EmaFilter, LowPassFilter, OneEuroFilter, createFilter, filterGroupDelaySec, matchedEma2Alpha } from './filters.ts';
 
 describe('filters', () => {
   it('EMA converges toward a constant input and starts at the first sample', () => {
@@ -94,5 +94,65 @@ describe('lane filters (unit-free)', () => {
     s30.reset();
     expect(s30.filter(4, 9)).toBe(4);
     expect(createFilter({ kind: 'lowpass', cutoffHz: 2 })).toBeInstanceOf(LowPassFilter);
+  });
+});
+
+describe('Ema2Filter (fine-motor lanes)', () => {
+  const FPS = 30;
+  const EMA = { kind: 'ema', alpha: 0.5 } as const;
+  const EMA2 = { kind: 'ema2', alpha: 2 / 3 } as const;
+
+  it('matches a single EMA delay exactly while rejecting twice as much high-frequency noise', () => {
+    expect(matchedEma2Alpha(0.5)).toBeCloseTo(2 / 3, 12);
+    expect(filterGroupDelaySec(EMA2, FPS)).toBeCloseTo(filterGroupDelaySec(EMA, FPS), 12);
+    expect(filterGroupDelaySec(EMA2, FPS)).toBeCloseTo(1 / FPS, 12);
+
+    // Nyquist-rate jitter (alternating +/-1), the band landmark noise lives in.
+    const ema = createFilter(EMA);
+    const ema2 = createFilter(EMA2);
+    let emaAmp = 0;
+    let ema2Amp = 0;
+    for (let i = 0; i < 200; i++) {
+      const t = i / FPS;
+      const v = i % 2 === 0 ? 1 : -1;
+      const a = ema.filter(v, t);
+      const b = ema2.filter(v, t);
+      if (i > 100) {
+        emaAmp = Math.max(emaAmp, Math.abs(a));
+        ema2Amp = Math.max(ema2Amp, Math.abs(b));
+      }
+    }
+    expect(emaAmp).toBeCloseTo(1 / 3, 6);
+    expect(ema2Amp).toBeCloseTo(1 / 4, 6);
+    expect(ema2Amp).toBeLessThan(emaAmp);
+  });
+
+  it('tracks a 2 Hz rep at least as well as the EMA it replaces (no extra lag on real movement)', () => {
+    const ema = createFilter(EMA);
+    const ema2 = createFilter(EMA2);
+    let emaPeak = 0;
+    let ema2Peak = 0;
+    for (let i = 0; i < 300; i++) {
+      const t = i / FPS;
+      const v = 0.5 * (1 - Math.cos(2 * Math.PI * 2 * t));
+      const a = ema.filter(v, t);
+      const b = ema2.filter(v, t);
+      if (t > 1) {
+        emaPeak = Math.max(emaPeak, a);
+        ema2Peak = Math.max(ema2Peak, b);
+      }
+    }
+    expect(ema2Peak).toBeGreaterThanOrEqual(emaPeak - 1e-9);
+  });
+
+  it('starts at the first sample, converges and resets', () => {
+    const f = new Ema2Filter(2 / 3);
+    expect(f.filter(10, 0)).toBe(10);
+    for (let i = 1; i < 60; i++) f.filter(0, i / FPS);
+    expect(Math.abs(f.value)).toBeLessThan(1e-6);
+    f.reset();
+    expect(Number.isNaN(f.value)).toBe(true);
+    expect(f.filter(3, 0)).toBe(3);
+    expect(createFilter(EMA2)).toBeInstanceOf(Ema2Filter);
   });
 });

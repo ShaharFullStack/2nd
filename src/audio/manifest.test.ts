@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   attributionText, attributionParts, loadManifest, loadSongCatalog, loadSongEntry, loadSongIndex,
-  manifestUrl, parseManifest, stemUrl, type SongManifest, type FetchLike,
+  manifestUrl, parseManifest, stemExists, stemUrl, stepTimeSec, type SongManifest, type FetchLike,
 } from './manifest';
 
 const valid = {
@@ -48,6 +48,37 @@ describe('parseManifest', () => {
   it('validates remoteStems entries', () => {
     expect(() => parseManifest({ ...valid, remoteStems: [{ id: 'drums' }] })).toThrow(/remoteStems\[0\]/);
     expect(parseManifest({ ...valid, remoteStems: [{ id: 'drums', url: 'https://x/y.wav' }] }).remoteStems).toHaveLength(1);
+  });
+});
+
+describe('swing / grid', () => {
+  it('parses swing, drops 0/absent and clamps out-of-range values', () => {
+    expect(parseManifest(valid).swing).toBeUndefined();
+    expect(parseManifest({ ...valid, swing: 0 }).swing).toBeUndefined();
+    expect(parseManifest({ ...valid, swing: 1 / 3 }).swing).toBeCloseTo(1 / 3, 12);
+    expect(parseManifest({ ...valid, swing: 5 }).swing).toBe(0.9);
+    expect(parseManifest({ ...valid, swing: -1 }).swing).toBe(0);
+    expect(parseManifest({ ...valid, swing: 'a lot' }).swing).toBeUndefined();
+  });
+
+  it('stepTimeSec places notes on the audio grid, swinging odd 16ths only', () => {
+    const straight = parseManifest({ ...valid, bpm: 120, offset: 0.25 });
+    expect(stepTimeSec(straight, 0)).toBe(0.25);
+    expect(stepTimeSec(straight, 3)).toBeCloseTo(0.25 + 3 * 0.125, 12); // 16ths at 120 BPM
+    expect(stepTimeSec(straight, 2, 2)).toBeCloseTo(0.25 + 0.5, 12); // 8ths: step 2 = one beat
+
+    // demo-sunrise's feel: 100 BPM, triplet shuffle (odd 16ths a third of a 16th = 50 ms late)
+    const swung = parseManifest({ ...valid, bpm: 100, offset: 0, swing: 1 / 3 });
+    const sixteenth = 60 / 100 / 4;
+    expect(stepTimeSec(swung, 0)).toBe(0);
+    expect(stepTimeSec(swung, 2)).toBeCloseTo(2 * sixteenth, 12); // straight 8th: untouched
+    expect(stepTimeSec(swung, 1)).toBeCloseTo(sixteenth + sixteenth / 3, 12);
+    expect(stepTimeSec(swung, 1) - stepTimeSec(swung, 0)).toBeCloseTo(0.2, 12); // long
+    expect(stepTimeSec(swung, 2) - stepTimeSec(swung, 1)).toBeCloseTo(0.1, 12); // short → 2:1
+    // straight-8th charts (stepsPerBeat 2) never hit an odd 16th, so swing cannot affect them
+    for (const s of [0, 1, 2, 3]) expect(stepTimeSec(swung, s, 2)).toBeCloseTo((s * 60) / 100 / 2, 12);
+    // a step that is not on a 16th boundary (triplets) is left alone
+    expect(stepTimeSec(swung, 1, 3)).toBeCloseTo(60 / 100 / 3, 12);
   });
 });
 
@@ -119,6 +150,31 @@ describe('loaders', () => {
     });
     const e = await loadSongEntry('demo-groove', '/songs', { fetch: f });
     expect(e.missingStems).toEqual(['drums']);
+  });
+
+  it('stemExists retries a HEAD rejection with a ranged GET (CDNs and object stores answer 403/404 to HEAD)', async () => {
+    // A present file behind a host that refuses HEAD must never be reported "needs fetch".
+    const calls: { url: string; method: string; range?: string }[] = [];
+    const hostile = (headStatus: number, getStatus: number, getType = 'audio/wav'): FetchLike => async (url, init) => {
+      const method = init?.method ?? 'GET';
+      calls.push({ url, method, range: (init?.headers as Record<string, string> | undefined)?.Range });
+      if (method === 'HEAD') return new Response('', { status: headStatus });
+      return new Response(getStatus === 206 ? 'R' : '<html>nope</html>', { status: getStatus, headers: { 'content-type': getType } });
+    };
+    for (const status of [403, 404, 405, 500]) {
+      calls.length = 0;
+      expect(await stemExists('/songs/s/stems/d.wav', { fetch: hostile(status, 206) })).toBe(true);
+      expect(calls.map((c) => c.method)).toEqual(['HEAD', 'GET']);
+      expect(calls[1].range).toBe('bytes=0-0');
+    }
+    // both refuse → genuinely absent; an HTML fallback page on the GET is absent too
+    expect(await stemExists('/x.wav', { fetch: hostile(404, 404) })).toBe(false);
+    expect(await stemExists('/x.wav', { fetch: hostile(404, 200, 'text/html') })).toBe(false);
+    // a HEAD that answers 2xx costs exactly one request
+    calls.length = 0;
+    expect(await stemExists('/x.wav', { fetch: hostile(200, 500) })).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(await stemExists('/x.wav', { fetch: () => Promise.reject(new Error('offline')) })).toBe(false);
   });
 
   it('loadSongCatalog never throws per song: ready / needs-fetch / error side by side', async () => {

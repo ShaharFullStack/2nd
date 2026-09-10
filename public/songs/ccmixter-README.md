@@ -37,6 +37,7 @@ Edit `song.json`:
 | `license`, `licenseUrl` | copy **exactly** from the song page, e.g. `CC BY 4.0` + `https://creativecommons.org/licenses/by/4.0/` |
 | `attribution` | `"Title" by Artist (ccmixter.org) is licensed under CC BY 4.0` — this string is shown in song select and on the results screen, which is what CC BY requires |
 | `bpm`, `offset` | tempo, and the time (seconds) of the first downbeat in the stems |
+| `swing` | rhythmic feel: the fraction of a 16th by which the **odd** 16ths are played late. `0` (or absent) for a straight track; `0.333` for a triplet shuffle (long:short = 2:1); measure it if the drummer swings, otherwise every off-16th note in the chart lands `swing × 15/bpm` seconds off the audio. `stepTimeSec()` in `src/audio/manifest.ts` applies it. |
 | `durationSec`, `previewStart` | length of the stems; where the preview snippet starts |
 | `stems` | one entry per file, `file` is relative to the song folder |
 | `playerStem` | id of the stem the patient controls |
@@ -64,13 +65,29 @@ stems are committed.
 ## Tips
 
 * If stems come as MP3, keep them: `AudioContext.decodeAudioData` handles MP3/OGG/WAV.
-* Bandwidth: the committed demo stems are 16-bit/44.1 kHz WAV (≈34 MB per song before the
-  first note). For a deployment on a slow clinic Wi-Fi, transcode them once with ffmpeg and
-  point `stems[].file` at the `.ogg` files (decoding is identical, sample-accurate start is
-  unaffected — the mixer schedules decoded buffers, not files):
-  `for s in drums bass keys lead; do ffmpeg -i stems/$s.wav -c:a libvorbis -q:a 5 stems/$s.ogg; done`
-  (≈1.5 MB per stem). The repo keeps WAV so the generator output stays byte-reproducible
-  and dependency-free.
+* Bandwidth: the committed demo stems are 16-bit/44.1 kHz WAV (≈34 MB for demo-groove,
+  ≈27 MB for demo-sunrise, downloaded before the first note). Two ways to cut that for a
+  deployment on slow clinic Wi-Fi — decoding is identical either way and the
+  sample-accurate start is unaffected, because the mixer schedules decoded buffers, not files:
+  1. **No new tools.** Re-run the generator at half the sample rate:
+     `node scripts/gen-demo-stems.mjs --rate 22050` — same music, half the bytes, still
+     16-bit mono WAV. (Lower rates down to 8000 Hz work too; the generator lowpass-filters
+     before decimating.)
+  2. **With ffmpeg** (smallest, ≈1.5 MB per stem): transcode once and point `stems[].file`
+     at the `.ogg` files:
+     `for s in drums bass keys lead; do ffmpeg -i stems/$s.wav -c:a libvorbis -q:a 5 stems/$s.ogg; done`
+
+  The repo ships 44.1 kHz WAV because that is what the spec mandates and because the
+  generator output has to stay byte-reproducible and dependency-free: Node has no built-in
+  Vorbis/Opus/MP3 encoder, and this repo may not add one, so no compressed variant can be
+  produced in-repo.
+* Safety: `song.json` is data, and this file invites you to paste manifests from third
+  parties. `fetch-stems` refuses any `stems[].file` that is absolute or contains a `..`
+  segment (it prints `REFUSED unsafe target` and counts it as a failure), and `--song`
+  must be a plain song id, not a path.
 * Stems must all start at the same time (sample 0 = same moment). Most ccMixter packs do;
   if one stem is shorter it simply ends early.
 * Set `offset` carefully: notes are generated on the beat grid starting at `offset`.
+* Set `swing` carefully too, for the same reason: `demo-sunrise` shuffles (`swing: 0.333`,
+  a 50 ms push at 100 BPM), `demo-groove` is straight. A chart that ignores it asks the
+  patient to move where the drum is not.

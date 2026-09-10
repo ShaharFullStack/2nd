@@ -1,10 +1,10 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { HitEvent, LaneSpec } from '../engine/types';
-import { Highway, makeFrame } from './Highway';
+import { Highway, POPUP_MAX_RISE_FRAC, makeFrame } from './Highway';
 import { createMockCanvas, mockCanvasFactory, type MockCanvas } from './canvasMock';
 import { runDemo } from './demo';
 import { laneX, roadEdgeX, visibleTailSec } from './geometry';
-import { TextCache } from './text';
+import { TextCache, type Ctx2D } from './text';
 import type { RenderFrame, RenderNote } from './types';
 
 const LANES: LaneSpec[] = [
@@ -127,7 +127,9 @@ describe('Highway.draw', () => {
     expect(() => hw.draw(frame)).not.toThrow();
     const names = canvas.ctx.names();
     // DPR transform, background blit, road fill, beat lines, strike line, gauge arcs, receptor sprites.
-    for (const n of ['setTransform', 'drawImage', 'fill', 'stroke', 'beginPath', 'moveTo', 'lineTo', 'arc', 'createLinearGradient', 'clip']) {
+    // (No `clip` here on purpose: an idle frame has no receptor meter fill and a settled score is
+    // drawn unclipped, so clipping is asserted where it is actually used — see the meter test.)
+    for (const n of ['setTransform', 'drawImage', 'fill', 'stroke', 'beginPath', 'moveTo', 'lineTo', 'arc', 'createLinearGradient']) {
       expect(names.has(n), `expected ${n} to be called`).toBe(true);
     }
     const stats = hw.getStats();
@@ -254,6 +256,48 @@ describe('Highway.draw', () => {
     }
   });
 
+  it('draws the lane tint on the very frame a judgment arrives, at every song time', () => {
+    // Regression: storing the flash start time in a Float32Array rounded it *up* for about half of
+    // all song times (fround(6.28) = 6.28000020980835), so `songTime - t0` came out negative on the
+    // frame the flash was created and the "age < 0" branch cleared it before it ever drew — the
+    // hit / miss lane tint silently vanished for those notes. The lane trapezoid is the one extra
+    // closed path in the frame, so compare an identical frame with and without the event.
+    const closedPaths = (songTime: number, hits: HitEvent[]): number => {
+      const { canvas, hw } = setup(1280, 720);
+      hw.resize(1280, 720, 1);
+      hw.draw(makeFrame({ lanes: LANES, songTime: songTime - 0.1 }));
+      canvas.ctx.reset();
+      hw.draw(makeFrame({ lanes: LANES, songTime, recentHits: hits }));
+      return canvas.ctx.count('closePath');
+    };
+    // 6.28 / 10.02 / 44.05 round up under Float32; 1.28 / 3.5 round down or are exact.
+    for (const st of [6.28, 10.02, 44.05, 1.28, 3.5, 17.31]) {
+      const miss: HitEvent[] = [{ noteId: 1, lane: 1, judgment: 'miss', deltaMs: 180, time: st - 0.1 }];
+      const hit: HitEvent[] = [{ noteId: 2, lane: 2, judgment: 'perfect', deltaMs: 4, time: st }];
+      expect(closedPaths(st, miss) - closedPaths(st, []), `miss lane tint at songTime ${st}`).toBe(1);
+      expect(closedPaths(st, hit) - closedPaths(st, []), `hit lane flash at songTime ${st}`).toBe(1);
+    }
+    // ...and it keeps drawing on following frames until it expires (miss tint lasts ~0.45 s).
+    const { canvas, hw } = setup(1280, 720);
+    hw.resize(1280, 720, 1);
+    hw.draw(makeFrame({ lanes: LANES, songTime: 6.18 }));
+    const base = (() => {
+      canvas.ctx.reset();
+      hw.draw(makeFrame({ lanes: LANES, songTime: 6.2 }));
+      return canvas.ctx.count('closePath');
+    })();
+    const miss: HitEvent[] = [{ noteId: 9, lane: 0, judgment: 'miss', deltaMs: 180, time: 6.18 }];
+    for (const st of [6.28, 6.4, 6.6]) {
+      canvas.ctx.reset();
+      hw.draw(makeFrame({ lanes: LANES, songTime: st, recentHits: miss }));
+      expect(canvas.ctx.count('closePath') - base, `miss tint still up at ${st}`).toBe(1);
+    }
+    // Expired (> 0.45 s after the verdict).
+    canvas.ctx.reset();
+    hw.draw(makeFrame({ lanes: LANES, songTime: 6.8, recentHits: miss }));
+    expect(canvas.ctx.count('closePath') - base).toBe(0);
+  });
+
   it('fizzles a miss note from the time the renderer first sees it even without a HitEvent', () => {
     const { hw } = setup();
     hw.resize(1280, 720, 1);
@@ -286,13 +330,18 @@ describe('Highway.draw', () => {
     hw.draw(makeFrame({ lanes: LANES, songTime: 3, combo: 12 }));
     canvas.ctx.reset();
     hw.draw(makeFrame({ lanes: LANES, songTime: 3.02, combo: 12 }));
-    const comboSprite = scratch.find((c) => c.ctx.calls.some((k) => k.name === 'fillText' && k.args[0] === '12'));
-    expect(comboSprite).toBeDefined();
-    const blit = canvas.ctx.calls.find((c) => c.name === 'drawImage' && c.args[0] === comboSprite);
-    expect(blit).toBeDefined();
-    const [, dx, , dw] = blit!.args as [unknown, number, number, number];
-    const cx = dx + dw / 2;
-    expect(cx).toBeGreaterThan(roadEdgeX(hw.geometry, 1, 0));
+    // The combo is drawn as one sprite per digit; they are the only sprites in the combo font.
+    const comboFont = /italic 900 \d+px/;
+    const digitSprites = scratch.filter(
+      (c) => comboFont.test(String(c.ctx.props.font)) && c.ctx.calls.some((k) => k.name === 'fillText' && (k.args[0] === '1' || k.args[0] === '2')),
+    );
+    expect(digitSprites.length).toBe(2);
+    const blits = canvas.ctx.calls.filter((c) => c.name === 'drawImage' && digitSprites.includes(c.args[0] as MockCanvas));
+    expect(blits.length).toBe(2);
+    for (const b of blits) {
+      const [, dx, , dw] = b.args as [unknown, number, number, number];
+      expect(dx + dw / 2).toBeGreaterThan(roadEdgeX(hw.geometry, 1, 0));
+    }
   });
 
   it('replays hit effects after a restart (auto-detected backward songTime jump) and after reset()', () => {
@@ -443,7 +492,7 @@ describe('Highway.draw', () => {
     const active = makeFrame({ lanes: LANES, songTime: 1.04, laneStates: LANES.map(() => ({ value: 0.8, armed: true, tracking: true })), thresholdFraction: 0.6 });
     canvas.ctx.reset();
     hw.draw(active);
-    // One clip per lane for the meter fill (score digits also clip once).
+    // One clip per lane for the meter fill.
     expect(canvas.ctx.count('clip')).toBeGreaterThanOrEqual(clipsIdle + 4);
   });
 
@@ -467,6 +516,281 @@ describe('Highway.draw', () => {
   });
 });
 
+describe('judgment feedback is never dropped', () => {
+  // The renderer supports two integration shapes: HitEvents in `recentHits`, and the integrator
+  // flipping `RenderNote.state` (+ `judgment`). In practice both happen, a frame apart, in either
+  // order. Feedback must fire exactly once, whichever arrives first.
+  const missEvent = (id: number, lane: number, noteTime: number): HitEvent[] => [
+    { noteId: id, lane, judgment: 'miss', deltaMs: 180, time: noteTime + 0.18 },
+  ];
+
+  /** closePath count for the *last* frame drawn; the lane flash trapezoid is the one extra closed path. */
+  function closedPaths(build: (hw: Highway) => void, final: (hw: Highway) => void): number {
+    const { canvas, hw } = setup(1280, 720);
+    hw.resize(1280, 720, 1);
+    hw.draw(makeFrame({ lanes: LANES, songTime: 9.9 }));
+    build(hw);
+    canvas.ctx.reset();
+    final(hw);
+    return canvas.ctx.count('closePath');
+  }
+
+  it('fires the miss puff and lane tint when the state flip lands a frame BEFORE the event', () => {
+    // Regression: the state-flip path used to write the note id into the same map processHits
+    // de-dupes on, so the real miss event arriving one frame later was treated as already seen —
+    // the red lane tint and the grey puff (the two loudest miss cues) never fired at all.
+    const { hw } = setup();
+    hw.resize(1280, 720, 1);
+    const missed: RenderNote = { id: 5, lane: 1, time: 10, state: 'miss', judgment: 'miss' };
+    hw.draw(makeFrame({ lanes: LANES, songTime: 9.9 }));
+    // Frame 1: state already 'miss', recentHits still empty.
+    hw.draw(makeFrame({ lanes: LANES, songTime: 10.28, notes: [missed] }));
+    const afterFlip = hw.getStats().particles;
+    expect(afterFlip, 'grey puff on the state-flip frame').toBeGreaterThan(0);
+    // Frame 2: the engine's miss event finally shows up — no second puff, no silent frame.
+    hw.draw(makeFrame({ lanes: LANES, songTime: 10.3, notes: [missed], recentHits: missEvent(5, 1, 10) }));
+    expect(hw.getStats().particles, 'event must be de-duped, not replayed').toBeLessThanOrEqual(afterFlip);
+
+    // The red lane tint is up on the state-flip frame and stays up when the event arrives.
+    const noop = (): void => undefined;
+    const base = closedPaths(noop, (hw2) => hw2.draw(makeFrame({ lanes: LANES, songTime: 10.28 })));
+    const flip = closedPaths(noop, (hw2) => hw2.draw(makeFrame({ lanes: LANES, songTime: 10.28, notes: [missed] })));
+    expect(flip - base, 'miss lane tint on the state-flip frame').toBe(1);
+    const both = closedPaths(
+      (hw2) => hw2.draw(makeFrame({ lanes: LANES, songTime: 10.28, notes: [missed] })),
+      (hw2) => hw2.draw(makeFrame({ lanes: LANES, songTime: 10.3, notes: [missed], recentHits: missEvent(5, 1, 10) })),
+    );
+    const baseTwo = closedPaths(
+      (hw2) => hw2.draw(makeFrame({ lanes: LANES, songTime: 10.28 })),
+      (hw2) => hw2.draw(makeFrame({ lanes: LANES, songTime: 10.3 })),
+    );
+    expect(both - baseTwo, 'miss lane tint still up on the event frame').toBe(1);
+  });
+
+  it('fires miss feedback exactly once when the event lands BEFORE the state flip (either order)', () => {
+    const { hw } = setup();
+    hw.resize(1280, 720, 1);
+    hw.draw(makeFrame({ lanes: LANES, songTime: 9.9 }));
+    hw.draw(makeFrame({ lanes: LANES, songTime: 10.28, recentHits: missEvent(6, 2, 10) }));
+    const afterEvent = hw.getStats().particles;
+    expect(afterEvent).toBeGreaterThan(0);
+    const missed: RenderNote = { id: 6, lane: 2, time: 10, state: 'miss', judgment: 'miss' };
+    hw.draw(makeFrame({ lanes: LANES, songTime: 10.3, notes: [missed] }));
+    expect(hw.getStats().particles).toBeLessThanOrEqual(afterEvent);
+  });
+
+  it('fires the hit burst from a state flip alone (no HitEvent ever) and reads RenderNote.judgment', () => {
+    const burstFor = (judgment: 'perfect' | 'good'): number => {
+      const { hw } = setup();
+      hw.resize(1280, 720, 1);
+      hw.draw(makeFrame({ lanes: LANES, songTime: 9.9 }));
+      hw.draw(makeFrame({ lanes: LANES, songTime: 10.02, notes: [{ id: 8, lane: 0, time: 10, state: 'hit', judgment }] }));
+      return hw.getStats().particles;
+    };
+    const good = burstFor('good');
+    const perfect = burstFor('perfect');
+    expect(good).toBeGreaterThan(15);
+    // `judgment` has a visual consequence: a perfect throws more debris (plus the white core flash).
+    expect(perfect).toBeGreaterThan(good);
+  });
+
+  it('never re-fires effects for a stale judged note left in the frame', () => {
+    const { hw } = setup();
+    hw.resize(1280, 720, 1);
+    const stale: RenderNote = { id: 9, lane: 0, time: 10, state: 'hit', judgment: 'perfect' };
+    hw.draw(makeFrame({ lanes: LANES, songTime: 9.9 }));
+    // Handed to us 2 s after its note time: far outside the judgment window, so no burst.
+    hw.draw(makeFrame({ lanes: LANES, songTime: 12, notes: [stale] }));
+    expect(hw.getStats().particles).toBe(0);
+    // ...and it keeps not firing frame after frame, including after the de-dupe map is pruned.
+    for (let t = 12.02; t < 20; t += 0.05) hw.draw(makeFrame({ lanes: LANES, songTime: t, notes: [stale] }));
+    expect(hw.getStats().particles).toBe(0);
+  });
+
+  it('keeps every popup on screen when the same lane is hit twice inside a popup lifetime', () => {
+    // 8th notes at 120 BPM are 250 ms apart and the popup lives 750 ms: with one slot per lane the
+    // first PERFECT! was cancelled mid-flight.
+    const { canvas, hw, scratch } = setup();
+    hw.resize(1280, 720, 1);
+    hw.draw(makeFrame({ lanes: LANES, songTime: 1 }));
+    hw.draw(makeFrame({ lanes: LANES, songTime: 1.02, recentHits: [{ noteId: 1, lane: 2, judgment: 'perfect', deltaMs: 3, time: 1.02 }] }));
+    canvas.ctx.reset();
+    hw.draw(makeFrame({ lanes: LANES, songTime: 1.27, recentHits: [{ noteId: 2, lane: 2, judgment: 'perfect', deltaMs: 3, time: 1.27 }] }));
+    const popupSprites = scratch.filter((c) => c.ctx.calls.some((k) => k.name === 'fillText' && k.args[0] === 'PERFECT!'));
+    expect(popupSprites.length).toBeGreaterThan(0);
+    const blits = canvas.ctx.calls.filter((c) => c.name === 'drawImage' && popupSprites.includes(c.args[0] as MockCanvas));
+    expect(blits.length, 'both popups drawn').toBe(2);
+    // The second popup is stacked above the first rather than drawn on top of it. Compare text
+    // anchors (blit y + half the blit height) — the blit's own top edge moves with the pop scale.
+    const ys = blits.map((b) => {
+      const a = b.args as [unknown, number, number, number, number];
+      return a[2] + a[4] / 2;
+    });
+    expect(Math.abs(ys[0] - ys[1])).toBeGreaterThan(10);
+  });
+});
+
+describe('runtime options actually take effect', () => {
+  it('setOptions({maxParticles}) resizes the pool instead of silently doing nothing', () => {
+    const { hw } = setup();
+    hw.resize(1280, 720, 1);
+    const hits: HitEvent[] = LANES.map((l, i) => ({ noteId: i + 1, lane: l.index, judgment: 'perfect' as const, deltaMs: 2, time: 1 }));
+    hw.draw(makeFrame({ lanes: LANES, songTime: 1 }));
+    hw.draw(makeFrame({ lanes: LANES, songTime: 1.02, recentHits: hits }));
+    expect(hw.getStats().particles).toBeGreaterThan(50);
+    hw.setOptions({ maxParticles: 10 });
+    expect(hw.options.maxParticles).toBe(10);
+    hw.reset();
+    hw.draw(makeFrame({ lanes: LANES, songTime: 2 }));
+    hw.draw(makeFrame({ lanes: LANES, songTime: 2.02, recentHits: hits.map((h) => ({ ...h, noteId: h.noteId + 100 })) }));
+    expect(hw.getStats().particles).toBeLessThanOrEqual(10);
+    expect(hw.getStats().particles).toBeGreaterThan(0);
+  });
+
+  it('setOptions re-bakes the pre-rendered background at the new horizon', () => {
+    const { hw, scratch } = setup();
+    hw.resize(1280, 720, 1);
+    const hazeCentres = (from: number): number[] =>
+      scratch
+        .slice(from)
+        .flatMap((c) => c.ctx.calls.filter((k) => k.name === 'createRadialGradient' && (k.args as number[])[3] === 640))
+        .map((k) => (k.args as number[])[4]);
+    expect(hazeCentres(0)).toContain(0.35 * 720);
+    const before = scratch.length;
+    hw.setOptions({ horizonY: 0.15 });
+    expect(hw.geometry.horizonY).toBeCloseTo(0.15 * 720);
+    // A fresh background layer was rasterized, with the haze at the new horizon (a stale layer left
+    // a glow blob floating in the middle of the sky).
+    expect(scratch.length).toBeGreaterThanOrEqual(before + 3);
+    expect(hazeCentres(before)).toContain(0.15 * 720);
+  });
+
+  it('resize() with unchanged size/DPR is a no-op (no background re-bake, no cache wipe)', () => {
+    const { hw, scratch } = setup(1920, 1080);
+    hw.resize(1920, 1080, 1);
+    hw.draw(makeFrame({ lanes: LANES, songTime: 1, songTitle: 'Song', score: 1234 }));
+    const before = scratch.length;
+    const spritesBefore = hw.getStats().sprites;
+    for (let i = 0; i < 60; i++) hw.resize();
+    for (let i = 0; i < 60; i++) hw.resize(1920, 1080, 1);
+    expect(scratch.length, 'no scratch canvases allocated by redundant resizes').toBe(before);
+    hw.draw(makeFrame({ lanes: LANES, songTime: 1.02, songTitle: 'Song', score: 1234 }));
+    expect(hw.getStats().sprites).toBe(spritesBefore);
+    // A real change still resizes.
+    hw.resize(1600, 900, 1);
+    expect(hw.geometry.width).toBe(1600);
+    expect(scratch.length).toBeGreaterThan(before);
+  });
+
+  it('effectIntensity 0 keeps judgment feedback (ring, lane flash, popup) but stops the fireworks', () => {
+    const run = (effectIntensity: number): { particles: number; popup: boolean; tint: number } => {
+      const { canvas, hw, scratch } = setup(1280, 720, { effectIntensity });
+      hw.resize(1280, 720, 1);
+      hw.draw(makeFrame({ lanes: LANES, songTime: 1 }));
+      canvas.ctx.reset();
+      hw.draw(makeFrame({ lanes: LANES, songTime: 1.02, recentHits: [{ noteId: 1, lane: 0, judgment: 'perfect', deltaMs: 2, time: 1.02 }] }));
+      const sprites = scratch.filter((c) => c.ctx.calls.some((k) => k.name === 'fillText' && k.args[0] === 'PERFECT!'));
+      const blits = canvas.ctx.calls.filter((c) => c.name === 'drawImage' && sprites.includes(c.args[0] as MockCanvas));
+      return { particles: hw.getStats().particles, popup: blits.length > 0, tint: canvas.ctx.count('closePath') };
+    };
+    const loud = run(1);
+    const calm = run(0);
+    expect(loud.particles).toBeGreaterThan(20);
+    expect(calm.particles).toBeGreaterThan(0); // the shockwave ring survives
+    expect(calm.particles).toBeLessThan(5);
+    expect(calm.popup).toBe(true);
+    expect(calm.tint).toBeGreaterThanOrEqual(loud.tint - 1); // lane flash trapezoid still drawn
+  });
+
+  it('reducedMotion freezes the parallax layers and the beat pulse', () => {
+    const offsets = (reducedMotion: boolean): number[] => {
+      const { canvas, hw } = setup(1280, 720, { reducedMotion });
+      hw.resize(1280, 720, 1);
+      const out: number[] = [];
+      for (const t of [0, 0.5, 1.25]) {
+        canvas.ctx.reset();
+        hw.draw(makeFrame({ lanes: LANES, songTime: t, beatPhase: (t * 2) % 1 }));
+        const tiles = canvas.ctx.calls.filter((c) => c.name === 'drawImage' && c.args.length === 5 && c.args[3] === 1280 && c.args[4] === 360);
+        out.push(tiles[0].args[1] as number);
+      }
+      return out;
+    };
+    const moving = offsets(false);
+    const still = offsets(true);
+    expect(new Set(still).size).toBe(1);
+    expect(new Set(moving).size).toBeGreaterThan(1);
+  });
+});
+
+describe('strike line', () => {
+  it('draws the glow as a band spanning the whole board, not a stretched radial sprite', () => {
+    // A single radial glow sprite stretched across the road is an ellipse: brightest at road
+    // centre, dimmest at the outermost receptors. It must be a fill across the full road width.
+    const { canvas, hw } = setup();
+    hw.resize(1280, 720, 1);
+    canvas.ctx.reset();
+    hw.draw(makeFrame({ lanes: LANES, songTime: 2 }));
+    const g = hw.geometry;
+    const x0 = roadEdgeX(g, -1, 0);
+    const x1 = roadEdgeX(g, 1, 0);
+    const band = canvas.ctx.calls.filter((c) => {
+      if (c.name !== 'fillRect') return false;
+      const [x, y, w, h] = c.args as [number, number, number, number];
+      return Math.abs(x - x0) < 1 && Math.abs(w - (x1 - x0)) < 1 && y < g.strikeY && y + h > g.strikeY;
+    });
+    expect(band.length).toBe(1);
+    // ...drawn additively, and centred on the strike line.
+    const i = canvas.ctx.calls.indexOf(band[0]);
+    expect(canvas.ctx.propBefore(i, 'globalCompositeOperation')).toBe('lighter');
+    const [, y, , h] = band[0].args as [number, number, number, number];
+    expect(y + h / 2).toBeCloseTo(g.strikeY, 5);
+  });
+});
+
+describe('particle rendering', () => {
+  /**
+   * Alphas applied to streak strokes in one frame. Streaks are stroked between the spark blits and
+   * the ring shockwave's `ellipse`, so that window isolates them from the road/rail strokes.
+   */
+  function streakAlphas(calls: Array<{ name: string; args: unknown[] }>, propBefore: (i: number, p: string) => unknown): number[] {
+    let ring = -1;
+    for (let i = 0; i < calls.length; i++) {
+      if (calls[i].name !== 'ellipse') continue;
+      const next = calls.slice(i + 1).find((c) => !c.name.startsWith('set:'));
+      if (next && next.name === 'stroke') {
+        ring = i;
+        break;
+      }
+    }
+    if (ring < 0) return [];
+    let lastBlit = -1;
+    for (let i = 0; i < ring; i++) if (calls[i].name === 'drawImage') lastBlit = i;
+    const out: number[] = [];
+    for (let i = lastBlit + 1; i < ring; i++) if (calls[i].name === 'stroke') out.push(propBefore(i, 'globalAlpha') as number);
+    return out;
+  }
+
+  it('fades streak particles over their life instead of burning at a constant alpha', () => {
+    const { canvas, hw } = setup();
+    hw.resize(1280, 720, 1);
+    hw.draw(makeFrame({ lanes: LANES, songTime: 1 }));
+    hw.draw(makeFrame({ lanes: LANES, songTime: 1.01, recentHits: [{ noteId: 1, lane: 0, judgment: 'perfect', deltaMs: 2, time: 1.01 }] }));
+    const seen = new Set<number>();
+    for (let t = 1.03; t < 1.5; t += 0.02) {
+      canvas.ctx.reset();
+      hw.draw(makeFrame({ lanes: LANES, songTime: t }));
+      for (const a of streakAlphas(canvas.ctx.calls, canvas.ctx.propBefore)) {
+        expect(a).toBeGreaterThan(0);
+        expect(a).toBeLessThanOrEqual(0.85);
+        seen.add(Number(a.toFixed(4)));
+      }
+    }
+    // More than one alpha level over the burst's life, including a faded one near the end.
+    expect(seen.size).toBeGreaterThan(1);
+    expect(Math.min(...seen)).toBeLessThan(0.5);
+  });
+});
+
 describe('TextCache allocation', () => {
   it('allocates one scratch canvas per new string after the shared probe exists', () => {
     const created: MockCanvas[] = [];
@@ -478,6 +802,29 @@ describe('TextCache allocation', () => {
     cache.get('2', style);
     cache.get('3', style);
     expect(created.length).toBe(afterFirst + 2);
+  });
+
+  it('drawChars costs one sprite per distinct character, not per distinct string', () => {
+    const created: MockCanvas[] = [];
+    const cache = new TextCache(mockCanvasFactory(created));
+    const target = createMockCanvas(200, 100);
+    const style = { font: '700 20px sans-serif', color: '#fff' };
+    for (let v = 0; v < 200; v++) cache.drawChars(target.ctx as unknown as Ctx2D, String(v), 100, 50, style);
+    // probe + at most the 10 digit glyphs.
+    expect(created.length).toBeLessThanOrEqual(11);
+    expect(cache.size).toBeLessThanOrEqual(10);
+    // Each character is blitted.
+    expect(target.ctx.count('drawImage')).toBeGreaterThan(200);
+  });
+
+  it('a combo that changes every frame does not allocate a canvas per value', () => {
+    const { hw, scratch } = setup();
+    hw.resize(1280, 720, 1);
+    hw.draw(makeFrame({ lanes: LANES, songTime: 1, combo: 2 }));
+    const before = scratch.length;
+    for (let c = 3; c < 160; c++) hw.draw(makeFrame({ lanes: LANES, songTime: 1 + c * 0.02, combo: c }));
+    // 10 digit glyphs (plus a little slack), not ~157 large glowing string sprites.
+    expect(scratch.length - before).toBeLessThan(16);
   });
 });
 
@@ -516,5 +863,217 @@ describe('demo', () => {
     t = 1;
     scheduled[0]();
     handle.stop();
+  });
+});
+
+describe('degenerate input degrades gracefully', () => {
+  const healthyStates = LANES.map(() => ({ value: 0.9, armed: true, tracking: true }));
+  const healthy = (t: number): RenderFrame =>
+    makeFrame({ lanes: LANES, songTime: t, health: 0.8, score: 4200, combo: 7, multiplier: 2, laneStates: healthyStates, thresholdFraction: 0.6 });
+
+  it('a single NaN frame does not permanently switch off the receptor glow, rock meter or score', () => {
+    // The receptor halo is the primary biofeedback cue ("you are approaching threshold"). It used
+    // to disappear for the rest of the session after one non-finite songTime, because clamp()
+    // passed NaN through into dt and from there into every smoothed accumulator.
+    const control = setup();
+    const poisoned = setup();
+    control.hw.resize(1280, 720, 1);
+    poisoned.hw.resize(1280, 720, 1);
+    control.hw.draw(healthy(1));
+    poisoned.hw.draw(healthy(1));
+    poisoned.hw.draw({
+      ...healthy(1.1),
+      songTime: Number.NaN,
+      health: Number.NaN,
+      score: Number.NaN,
+      combo: Number.NaN,
+      multiplier: Number.NaN,
+      beatPhase: Number.NaN,
+      energy: Number.NaN,
+      bpm: Number.NaN,
+    });
+    for (let i = 1; i <= 40; i++) {
+      control.hw.draw(healthy(1 + i * 0.1));
+      poisoned.hw.draw(healthy(1 + i * 0.1));
+    }
+    control.canvas.ctx.reset();
+    poisoned.canvas.ctx.reset();
+    control.hw.draw(healthy(5.2));
+    poisoned.hw.draw(healthy(5.2));
+    // Identical frames: the halo blits, the gauge arcs and the score digits are all back.
+    expect(poisoned.canvas.ctx.count('drawImage')).toBe(control.canvas.ctx.count('drawImage'));
+    expect(poisoned.canvas.ctx.count('arc')).toBe(control.canvas.ctx.count('arc'));
+    expect(poisoned.canvas.ctx.count('fillRect')).toBe(control.canvas.ctx.count('fillRect'));
+  });
+
+  it('never issues a non-finite coordinate, even on the poisoned frame itself', () => {
+    const { canvas, hw } = setup();
+    hw.resize(1280, 720, 1);
+    hw.draw(healthy(1));
+    canvas.ctx.reset();
+    expect(() =>
+      hw.draw({
+        ...healthy(1.1),
+        songTime: Number.NaN,
+        health: Number.NaN,
+        score: Number.NaN,
+        combo: Number.NaN,
+        multiplier: Number.NaN,
+        beatPhase: Number.NaN,
+        energy: Number.NaN,
+        notes: [{ id: 1, lane: 0, time: 1.4, state: 'pending' }],
+      }),
+    ).not.toThrow();
+    for (const call of canvas.ctx.calls) {
+      for (const a of call.args) {
+        if (typeof a === 'number') expect(Number.isFinite(a), `${call.name}(${String(a)})`).toBe(true);
+      }
+    }
+  });
+
+  it('warns exactly once when thresholdFraction is missing (the meter would lie about the trigger point)', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      const { hw } = setup();
+      hw.resize(1280, 720, 1);
+      for (let i = 0; i < 5; i++) hw.draw(makeFrame({ lanes: LANES, songTime: i * 0.1 }));
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0][0])).toContain('thresholdFraction');
+      // A frame that supplies it does not warn at all.
+      const other = setup();
+      other.hw.resize(1280, 720, 1);
+      other.hw.draw(makeFrame({ lanes: LANES, songTime: 0, thresholdFraction: 0.55 }));
+      expect(warn).toHaveBeenCalledTimes(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
+describe('judgment popups stay out of the note approach path', () => {
+  /** Popup sprites are the scratch canvases that rasterized the judgment word. */
+  function popupBlits(canvas: MockCanvas, scratch: MockCanvas[], word: string): Array<{ x: number; y: number; w: number; h: number }> {
+    const sprites = scratch.filter((c) => c.ctx.calls.some((k) => k.name === 'fillText' && k.args[0] === word));
+    return canvas.ctx.calls
+      .filter((c) => c.name === 'drawImage' && sprites.includes(c.args[0] as MockCanvas))
+      .map((c) => {
+        const a = c.args as [unknown, number, number, number, number];
+        return { x: a[1], y: a[2], w: a[3], h: a[4] };
+      });
+  }
+
+  it('never rises more than POPUP_MAX_RISE_FRAC of the board above the strike line', () => {
+    for (const [w, h] of [
+      [1280, 720],
+      [1920, 1080],
+      [720, 1280],
+    ]) {
+      const { canvas, hw, scratch } = setup(w, h);
+      hw.resize(w, h, 1);
+      const g = hw.geometry;
+      const cap = (g.strikeY - g.horizonY) * POPUP_MAX_RISE_FRAC;
+      let highest = g.strikeY;
+      // Four hits in a row on one lane: the popups stack, so this is the worst case.
+      hw.draw(makeFrame({ lanes: LANES, songTime: 1 }));
+      for (let i = 0; i < 4; i++) {
+        const t = 1.02 + i * 0.12;
+        hw.draw(makeFrame({ lanes: LANES, songTime: t, recentHits: [{ noteId: i, lane: 1, judgment: 'perfect', deltaMs: 2, time: t }] }));
+      }
+      for (let t = 1.02; t < 2.3; t += 0.02) {
+        canvas.ctx.reset();
+        hw.draw(makeFrame({ lanes: LANES, songTime: t }));
+        // Text anchor, not the blit's top edge: the sprite carries transparent glow padding.
+        for (const b of popupBlits(canvas, scratch, 'PERFECT!')) highest = Math.min(highest, b.y + b.h / 2);
+      }
+      expect(g.strikeY - highest, `${w}x${h}`).toBeLessThanOrEqual(cap + 1);
+      // ...and the *ink* still occupies only a small slice of the board: the popup lives near the
+      // fret (Clone Hero style) instead of flying up through the note approach path.
+      const u = Math.min(Math.max(Math.min(w / 1280, h / 720), 0.35), 2.5);
+      const inkTop = g.strikeY - highest + Math.round(22 * u) * 0.7;
+      expect(inkTop / (g.strikeY - g.horizonY), `${w}x${h}`).toBeLessThan(0.42);
+    }
+  });
+
+  it('draws popups under the gems so a judgment can never hide the next target', () => {
+    const { canvas, hw, scratch } = setup();
+    hw.resize(1280, 720, 1);
+    hw.draw(makeFrame({ lanes: LANES, songTime: 1 }));
+    canvas.ctx.reset();
+    const notes: RenderNote[] = [{ id: 5, lane: 1, time: 1.35, state: 'pending' }];
+    hw.draw(makeFrame({ lanes: LANES, songTime: 1.02, notes, recentHits: [{ noteId: 1, lane: 1, judgment: 'perfect', deltaMs: 2, time: 1.02 }] }));
+    const popupSprites = scratch.filter((c) => c.ctx.calls.some((k) => k.name === 'fillText' && k.args[0] === 'PERFECT!'));
+    const gemSprites = scratch.filter((c) => c.ctx.calls.some((k) => k.name === 'ellipse') && !popupSprites.includes(c));
+    const idx = (pred: (c: { name: string; args: unknown[] }) => boolean): number => canvas.ctx.calls.findIndex(pred);
+    const popupAt = idx((c) => c.name === 'drawImage' && popupSprites.includes(c.args[0] as MockCanvas));
+    const gemAt = canvas.ctx.calls.map((c, i) => ({ c, i })).filter(({ c }) => c.name === 'drawImage' && gemSprites.includes(c.args[0] as MockCanvas));
+    expect(popupAt).toBeGreaterThan(-1);
+    expect(gemAt.length).toBeGreaterThan(0);
+    expect(gemAt[gemAt.length - 1].i).toBeGreaterThan(popupAt);
+  });
+});
+
+describe('lane labels fit their lanes', () => {
+  /** Text extents (not sprite extents — sprites carry transparent padding) of every lane label. */
+  function labelSpans(canvas: MockCanvas, scratch: MockCanvas[]): Array<{ x0: number; x1: number; y: number; text: string }> {
+    const out: Array<{ x0: number; x1: number; y: number; text: string }> = [];
+    for (const c of canvas.ctx.calls) {
+      if (c.name !== 'drawImage') continue;
+      const src = c.args[0] as MockCanvas;
+      if (!scratch.includes(src)) continue;
+      const drawn = src.ctx.calls.find((k) => k.name === 'fillText');
+      const text = drawn ? String(drawn.args[0]) : '';
+      if (!/^[LR] /.test(text)) continue;
+      const a = c.args as [unknown, number, number, number, number];
+      const cx = a[1] + a[3] / 2;
+      const tw = text.length * 8; // canvasMock measureText
+      out.push({ x0: cx - tw / 2, x1: cx + tw / 2, y: a[2], text });
+    }
+    return out;
+  }
+
+  it('leaves roomy labels alone on a desktop canvas, on one row', () => {
+    const { canvas, hw, scratch } = setup(1280, 720);
+    hw.resize(1280, 720, 1);
+    canvas.ctx.reset();
+    hw.draw(makeFrame({ lanes: LANES, songTime: 1 }));
+    const spans = labelSpans(canvas, scratch);
+    expect(spans.length).toBe(4);
+    expect(spans.map((s) => s.text)).toEqual(['L knee lift', 'R knee lift', 'L knee ext', 'R knee ext']);
+    expect(new Set(spans.map((s) => s.y)).size).toBe(1);
+  });
+
+  it('never overlaps a neighbour on a narrow portrait canvas (staggered rows + ellipsis)', () => {
+    for (const [w, h] of [
+      [400, 800],
+      [360, 640],
+      [720, 1280],
+    ]) {
+      const { canvas, hw, scratch } = setup(w, h);
+      hw.resize(w, h, 1);
+      canvas.ctx.reset();
+      hw.draw(makeFrame({ lanes: LANES, songTime: 1 }));
+      const spans = labelSpans(canvas, scratch);
+      expect(spans.length, `${w}x${h}`).toBe(4);
+      for (const s of spans) expect(s.text.length, `${w}x${h} "${s.text}"`).toBeGreaterThan(1);
+      // Group by row: labels on the same row must not overlap.
+      const rows = new Map<number, typeof spans>();
+      for (const s of spans) {
+        const row = rows.get(s.y) ?? [];
+        row.push(s);
+        rows.set(s.y, row);
+      }
+      for (const row of rows.values()) {
+        row.sort((a, b) => a.x0 - b.x0);
+        for (let i = 1; i < row.length; i++) {
+          expect(row[i].x0, `${w}x${h} "${row[i - 1].text}" / "${row[i].text}"`).toBeGreaterThanOrEqual(row[i - 1].x1 - 0.001);
+        }
+      }
+      // Labels stay inside the canvas.
+      for (const s of spans) {
+        expect(s.x0, `${w}x${h}`).toBeGreaterThan(-1);
+        expect(s.x1, `${w}x${h}`).toBeLessThan(w + 1);
+        expect(s.y, `${w}x${h}`).toBeLessThan(h);
+      }
+    }
   });
 });

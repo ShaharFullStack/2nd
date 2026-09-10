@@ -30,6 +30,41 @@ export interface JudgeOptions {
 /** Miss grace used by `RhythmEngine`: covers 30 fps capture + inference delivery delay. */
 export const DEFAULT_MISS_GRACE_MS = 100;
 
+/**
+ * The full outcome of one input, including the inputs the rehab rule tells us to ignore.
+ *
+ * `onInput` returns `null` for an input that matched no note, which is the right *scoring*
+ * behaviour (extra/involuntary movements must never be punished) but throws away the one number a
+ * therapist needs: how far the movement was from the note it was clearly aiming at. A patient whose
+ * latency calibration is 180 ms out performs every rep correctly and scores zero; with
+ * `nearestDeltaMs` recorded the session can still report the reps performed and re-estimate the
+ * offset (`estimateLatencyFromDeltas`). Use `onInputDetailed` wherever the result is measured
+ * rather than merely rendered.
+ */
+export interface InputResult {
+  /** The judged hit (already applied to the note's state), or null when no note matched. */
+  hit: HitEvent | null;
+  lane: number;
+  /** Latency-shifted song time of the input (the timeline judgment happens on). */
+  time: number;
+  /**
+   * Signed distance in ms (positive = input late) to the nearest note of this lane — measured
+   * against the note grid itself, without the good window and without regard to what has already
+   * been judged, so it is censored by neither scoring nor miss detection. Null only when the lane
+   * holds no notes at all (a lane outside the chart throws instead of reading back as empty).
+   *
+   * NOT always equal to `hit.deltaMs`: `hit` matches the nearest *unjudged* note, this measures the
+   * nearest note of any state. They differ exactly when the true nearest note has already been hit
+   * or missed — notes at 1.00 (already hit) and 1.10, input at 1.04, gives `hit.deltaMs = -60` and
+   * `nearestDeltaMs = +40`. Attribute a matched input's timing with `hit.deltaMs`, and use
+   * `nearestDeltaMs` only for the inputs that matched nothing (which is exactly how `Scoring`
+   * consumes it: `apply(hit)` samples `hit.deltaMs`, `recordUnmatchedInput` samples this).
+   */
+  nearestDeltaMs: number | null;
+  /** Id of the note `nearestDeltaMs` refers to, or null. */
+  nearestNoteId: number | null;
+}
+
 /** Validate a timing window: finite, positive, perfectMs <= goodMs. Throws RangeError. */
 export function validateTimingWindows(w: TimingWindows, label = 'windows'): void {
   if (!w || typeof w !== 'object') throw new RangeError(`Judge: ${label} missing`);
@@ -66,7 +101,9 @@ export function validateChartForJudge(chart: Chart): void {
  * times). Inputs delivered later than `missGraceMs` after their own timestamp may lose to a miss;
  * choose the grace to cover the input pipeline's delivery delay.
  *
- * Rehab rules: an input with no candidate note is ignored (no penalty for extra movements).
+ * Rehab rules: an input with no candidate note is ignored (no penalty for extra movements) — but it
+ * is not *forgotten*: `onInputDetailed` reports the distance to the nearest unjudged note so reps
+ * performed and the true timing bias survive the scoring window (see `InputResult`).
  * Allocation: `onInput` allocates only the returned event; `update` returns a shared frozen empty
  * array when nothing was missed.
  */
@@ -87,20 +124,30 @@ export class Judge {
   private readonly missScratch: HitEvent[] = [];
 
   /**
-   * @param windows one TimingWindows for every lane, or an array indexed by lane (the last entry
-   *                is reused for lanes beyond the array).
+   * @param windows one TimingWindows for every lane, or an array with EXACTLY `chart.lanes`
+   *                entries indexed by lane (from `windowsForLanes`).
    * @param options `JudgeOptions`, or a bare number for `latencyOffsetSec` (legacy form).
-   * @throws RangeError when the chart has duplicate note ids or lanes outside [0, chart.lanes), or a
-   *         window is non-finite, non-positive or has perfectMs > goodMs.
+   * @throws RangeError when the chart has duplicate note ids or lanes outside [0, chart.lanes), the
+   *         window array's length does not match `chart.lanes`, or a window is non-finite,
+   *         non-positive or has perfectMs > goodMs.
    */
   constructor(chart: Chart, windows: TimingWindows | TimingWindows[], options: number | JudgeOptions = {}) {
     validateChartForJudge(chart);
     const opts: JudgeOptions = typeof options === 'number' ? { latencyOffsetSec: options } : options;
     this.chart = chart;
     const lanes = chart.lanes;
+    if (Array.isArray(windows)) {
+      // A short array used to silently reuse its last entry for every lane past the end, which is
+      // how a 4-lane chart got the gross-motor windows on its two fine-motor lanes. `windowsForLanes`
+      // throws for a missing index; so does this.
+      if (windows.length === 0) throw new RangeError('Judge: no timing windows supplied');
+      if (windows.length !== lanes) {
+        throw new RangeError(`Judge: ${windows.length} timing window(s) supplied for a ${lanes}-lane chart (pass one per lane, or a single TimingWindows for all)`);
+      }
+    }
     this.windows = [];
     for (let l = 0; l < lanes; l++) {
-      const w = Array.isArray(windows) ? (windows[l] ?? windows[windows.length - 1]) : windows;
+      const w = Array.isArray(windows) ? windows[l] : windows;
       if (!w) throw new RangeError('Judge: no timing windows supplied');
       validateTimingWindows(w, `lane ${l} windows`);
       this.windows.push({ perfectMs: w.perfectMs, goodMs: w.goodMs });
@@ -139,8 +186,56 @@ export class Judge {
     return this.missGraceSec * 1000;
   }
 
+  /** Windows of a lane. @throws RangeError for a lane outside [0, chart.lanes). */
   getWindows(lane: number): TimingWindows {
-    return this.windows[lane] ?? this.windows[this.windows.length - 1];
+    const w = this.windows[lane];
+    if (w === undefined) throw new RangeError(`Judge: lane ${lane} out of range [0, ${this.windows.length})`);
+    return w;
+  }
+
+  /**
+   * Replace the timing windows mid-session, keeping every judgment made so far, the lane cursors
+   * and the score. The spec calls the therapist window scale tunable, so it must be adjustable
+   * during Play without rebuilding the Judge (which would reset all note states).
+   *
+   * Takes the same argument as the constructor: one `TimingWindows` for every lane, or exactly
+   * `chart.lanes` of them indexed by lane (from `windowsForLanes`). Validated identically.
+   *
+   * Already-judged notes are NOT revisited — widening the windows does not un-miss a note, and
+   * narrowing them does not take a hit back. What changes is every judgment from here on, plus the
+   * miss deadline of notes still pending: widening `goodMs` gives pending notes more time,
+   * narrowing it can make a note that is already past its new deadline miss on the next `update`.
+   *
+   * @throws RangeError on the same conditions as the constructor (wrong count, non-finite,
+   *         non-positive, perfectMs > goodMs) — and then nothing is changed.
+   */
+  setWindows(windows: TimingWindows | TimingWindows[]): void {
+    const lanes = this.windows.length;
+    if (Array.isArray(windows)) {
+      if (windows.length === 0) throw new RangeError('Judge: no timing windows supplied');
+      if (windows.length !== lanes) {
+        throw new RangeError(`Judge: ${windows.length} timing window(s) supplied for a ${lanes}-lane chart (pass one per lane, or a single TimingWindows for all)`);
+      }
+    }
+    // validate everything BEFORE mutating, so a bad set leaves the session on its old windows
+    const next: TimingWindows[] = [];
+    for (let l = 0; l < lanes; l++) {
+      const w = Array.isArray(windows) ? windows[l] : windows;
+      if (!w) throw new RangeError('Judge: no timing windows supplied');
+      validateTimingWindows(w, `lane ${l} windows`);
+      next.push({ perfectMs: w.perfectMs, goodMs: w.goodMs });
+    }
+    for (let l = 0; l < lanes; l++) this.windows[l] = next[l];
+  }
+
+  /**
+   * Replace one lane's windows (see `setWindows`). @throws RangeError for a lane outside
+   * [0, chart.lanes) or an invalid window; nothing is changed in either case.
+   */
+  setLaneWindows(lane: number, w: TimingWindows): void {
+    if (this.windows[lane] === undefined) throw new RangeError(`Judge: lane ${lane} out of range [0, ${this.windows.length})`);
+    validateTimingWindows(w, `lane ${lane} windows`);
+    this.windows[lane] = { perfectMs: w.perfectMs, goodMs: w.goodMs };
   }
 
   /** Number of notes not yet judged (0 = every note has been hit or missed). */
@@ -148,9 +243,18 @@ export class Judge {
     return this.pendingCount;
   }
 
-  getNoteState(noteId: number): NoteState {
+  /** True when `noteId` belongs to this chart. */
+  hasNote(noteId: number): boolean {
+    return this.indexById.has(noteId);
+  }
+
+  /**
+   * State of a note of this chart, or `undefined` for an id the chart does not contain — a stale or
+   * wrong id must not read back as a plausible 'pending' note the renderer keeps drawing.
+   */
+  getNoteState(noteId: number): NoteState | undefined {
     const idx = this.indexById.get(noteId);
-    if (idx === undefined) return 'pending';
+    if (idx === undefined) return undefined;
     return STATE_NAMES[this.states[idx]];
   }
 
@@ -165,10 +269,19 @@ export class Judge {
    * Judge an input on `lane` observed at `songTimeSec`.
    * Returns the HitEvent for the nearest pending note within ±goodMs, or null (input ignored).
    * deltaMs is positive when the input is late. `time` is the latency-shifted input time.
+   *
+   * @throws RangeError when `lane` is outside [0, chart.lanes) — as `getWindows`, `Scoring.apply`
+   *         and `Scoring.recordUnmatchedInput` already did. Returning null there made a mis-wired
+   *         lane index (a keyboard map or an off-by-one `LaneSpec.index`) indistinguishable from
+   *         "the patient moved and no note was near", so every rep on that lane vanished from the
+   *         score AND from the rep count with no signal at all — the one path in this module that
+   *         silently loses a rep. Callers that take lane indices from an untrusted InputSource
+   *         should range-check first and count the rejects; `RhythmEngine.handleInputDetailed`
+   *         does exactly that (`ScoreState.outOfRange`) rather than crashing the session.
    */
   onInput(lane: number, songTimeSec: number): HitEvent | null {
     const notes = this.laneNotes[lane];
-    if (!notes) return null;
+    if (notes === undefined) throw new RangeError(`Judge: lane ${lane} out of range [0, ${this.laneNotes.length})`);
     const w = this.windows[lane];
     const t = songTimeSec - this.latencyOffsetSec;
     const goodSec = w.goodMs / 1000;
@@ -194,6 +307,67 @@ export class Judge {
     const judgment: Judgment = Math.abs(deltaMs) <= w.perfectMs + 1e-9 ? 'perfect' : 'good';
     this.mark(best, judgment === 'perfect' ? STATE_PERFECT : STATE_GOOD, lane);
     return { noteId: best.id, lane, judgment, deltaMs, time: t };
+  }
+
+  /**
+   * Nearest note of `lane` to the (already latency-shifted) song time `t`, ties to the earlier one.
+   * O(log n) binary search, allocation-free, and — deliberately — independent of judgment state.
+   *
+   * Judgment state must not enter here: a patient whose offset is 180 ms out arrives *after* their
+   * note has already been declared a miss, so "nearest still-pending note" would measure against
+   * the following note and report the bias as −820 ms instead of +180 ms. Restricting the search
+   * would reintroduce exactly the censoring this method exists to remove. The distance to the note
+   * grid is a pure function of (chart, lane, time), which also makes it deterministic and
+   * order-independent.
+   *
+   * Returns null when the lane exists but holds no notes.
+   * @throws RangeError when `lane` is outside [0, chart.lanes) — see `onInput`.
+   */
+  nearestNote(lane: number, songTimeSec: number): Note | null {
+    const notes = this.laneNotes[lane];
+    if (notes === undefined) throw new RangeError(`Judge: lane ${lane} out of range [0, ${this.laneNotes.length})`);
+    if (notes.length === 0) return null;
+    const t = songTimeSec - this.latencyOffsetSec;
+    let lo = 0;
+    let hi = notes.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (notes[mid].time < t) lo = mid + 1;
+      else hi = mid;
+    }
+    const after = lo < notes.length ? notes[lo] : null;
+    let before: Note | null = null;
+    if (lo > 0) {
+      // among notes sharing a time, always return the lowest id, so the answer never depends on
+      // which duplicate the search happened to land on
+      let k = lo - 1;
+      while (k > 0 && notes[k - 1].time === notes[k].time) k--;
+      before = notes[k];
+    }
+    if (after === null) return before;
+    if (before === null) return after;
+    return t - before.time <= after.time - t ? before : after;
+  }
+
+  /**
+   * `onInput` plus the diagnostics the rehab metrics need: the distance to the nearest unjudged
+   * note in the lane even when the input matched nothing. Judgment and note states are byte-for-byte
+   * what `onInput` would produce — this only adds observation. Allocates one result object per call
+   * (inputs are a few per second, not per frame).
+   *
+   * @throws RangeError when `lane` is outside [0, chart.lanes) — see `onInput`.
+   */
+  onInputDetailed(lane: number, songTimeSec: number): InputResult {
+    const t = songTimeSec - this.latencyOffsetSec;
+    const nearest = this.nearestNote(lane, songTimeSec);
+    const hit = this.onInput(lane, songTimeSec);
+    return {
+      hit,
+      lane,
+      time: t,
+      nearestDeltaMs: nearest === null ? null : (t - nearest.time) * 1000,
+      nearestNoteId: nearest === null ? null : nearest.id,
+    };
   }
 
   /**

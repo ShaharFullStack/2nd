@@ -11,6 +11,7 @@
   "offset": 0.0,
   "durationSec": 180,
   "previewStart": 30,
+  "swing": 0,
   "stems": [
     { "id": "drums", "file": "stems/drums.wav", "label": "Drums" },
     { "id": "bass", "file": "stems/bass.wav", "label": "Bass" },

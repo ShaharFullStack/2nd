@@ -10,7 +10,12 @@ export interface RenderNote {
   /** Song time (seconds) the note should be struck. */
   time: number;
   state: NoteVisualState;
-  /** Set once the note is judged (hit or miss). */
+  /**
+   * Set once the note is judged (hit or miss). Read by the renderer's no-event fallback: if a note
+   * is flipped to `hit`/`miss` and no matching `HitEvent` has been seen (yet, or ever), the renderer
+   * fires that judgment's feedback itself — `perfect` gets the brighter burst + gold popup, anything
+   * else `good`. When the `HitEvent` does arrive it is de-duped, so feedback plays exactly once.
+   */
   judgment?: Judgment;
 }
 
@@ -58,7 +63,14 @@ export interface RenderFrame {
   attribution?: string;
   /** Optional audio-reactive energy 0..1 (e.g. RMS of the mix); boosts glow intensity. */
   energy?: number;
-  /** Fraction of ROM that counts as a hit (Difficulty.thresholdFraction). Default 0.5. Receptors glow as value approaches it. */
+  /**
+   * Fraction of ROM that counts as a hit — pass `Difficulty.thresholdFraction` for the session,
+   * every frame. The receptor meter fills against it and reads "full" exactly when the lane would
+   * trigger, which is the renderer's core biofeedback claim. It is optional only so the type stays
+   * compatible with partial frames: when it is absent the renderer falls back to 0.5 *and warns
+   * once on the console*, because a meter filled against the wrong threshold is a lie (a full ring
+   * with no note firing, or a note firing at a half-full ring).
+   */
   thresholdFraction?: number;
 }
 
@@ -77,7 +89,7 @@ export interface HighwayOptions {
   /**
    * Screen-space scroll speed below the strike line relative to the speed at the line (0.2..1).
    * Lower keeps gems visible longer past the line so the engine's late miss verdict
-   * (note time + goodMs + grace, up to ~280 ms) still lands on a visible gem. Default 0.45 ≈ ≥500 ms at 720p/1080p, ≥480 ms portrait.
+   * (note time + goodMs + grace, up to ~280 ms) still lands on a visible gem. Default 0.42 ≈ ≥600 ms at 720p/1080p, ≥420 ms portrait. The speed eases into the tail over ~0.13 s so a gem crossing the receptor never visibly brakes.
    */
   pastLineSpeed: number;
   /** Use the rehab-friendly high-contrast palette instead of Guitar Hero colors. */
@@ -92,8 +104,26 @@ export interface HighwayOptions {
   showMissPopup: boolean;
   /** Overlay draw-time stats (for the demo / profiling). */
   showStats: boolean;
-  /** Particle pool capacity. */
+  /**
+   * Particle pool capacity. Applied immediately by `setOptions()` (the pool is reallocated), so a
+   * therapist-facing "calmer effects" control can lower it mid-song.
+   */
   maxParticles: number;
+  /**
+   * Decorative effect intensity 0..1 (default 1). Scales the things that are *not* judgment
+   * feedback — particle burst size, stage-light beams, parallax stars, rail/edge glow — and softens
+   * (never removes) the hit flash and miss tint. At 0 a hit still gets a shockwave ring, a lane
+   * flash and a popup, and a miss still gets a grey fizzle and a red tint: feedback is never
+   * silent, it just stops being a fireworks display. Runtime-adjustable via `setOptions()`.
+   */
+  effectIntensity: number;
+  /**
+   * Reduced motion (vestibular / clinical safety, default false). Freezes the parallax star layers
+   * and the sweeping stage lights, stops the combo bounce/shake and the beat-driven size pulsing,
+   * and keeps judgment popups from flying up the screen. Notes still scroll (that is the game) and
+   * all judgment feedback still fires. Runtime-adjustable via `setOptions()`.
+   */
+  reducedMotion: boolean;
   /**
    * Factory for offscreen scratch canvases (sprites, cached text). Defaults to OffscreenCanvas
    * when available, else document.createElement('canvas'). Tests inject a stub.

@@ -188,11 +188,15 @@ export class DuckController {
   /** Analytic gain of the player stem at ctx time `now` (for UI meters / anchoring). */
   valueAt(now: number): number { return rampValueAt(this.ramp, now); }
 
-  /** Point the controller at another stem's gain (e.g. setPlayerStem). Restores the old one instantly. */
+  /**
+   * Point the controller at another stem's gain (e.g. setPlayerStem mid-song). The outgoing stem
+   * is RAMPED back to the nominal level over the hit ramp, anchored on the value its current ramp
+   * has actually reached: hard-writing it would jump 0.05 → 1.0 in one sample (an audible click)
+   * whenever the player stem is swapped while ducked.
+   */
   rebind(param: GainParamLike, now: number): void {
     if (param === this.param) return;
-    this.param.cancelScheduledValues(now);
-    this.param.setValueAtTime(Math.max(this.opts.hitGain, MIN_GAIN), now);
+    scheduleRamp(this.param, this.valueAt(now), now, this.opts.hitGain, this.opts.hitRampMs / 1000);
     this.param = param;
     this.reset(now);
   }
@@ -209,10 +213,23 @@ export class DuckController {
     return this.ramp.to;
   }
 
-  /** Instantly restore the nominal level (song start / stop / seek). */
-  reset(now: number): void {
+  /**
+   * Restore the nominal level (song start / stop / seek / stem swap).
+   *
+   * `rampSec` > 0 ramps there from the value the current ramp has actually reached, exactly like
+   * `hit()`; pass the transport's fade length whenever the stem may still be audible (a seek or
+   * stop while ducked otherwise steps 0.05 → 1.0 in one sample — a 26× discontinuity inside the
+   * ~8 ms fade-out, i.e. an audible click). The default 0 is the hard write, correct only when
+   * nothing is sounding (a fresh load, or after the fade has completed).
+   */
+  reset(now: number, rampSec: number = 0): void {
     this.isDucked = false;
     const v = Math.max(this.opts.hitGain, MIN_GAIN);
+    const from = this.valueAt(now);
+    if (rampSec > 0 && Math.abs(from - v) > 1e-9) {
+      this.ramp = scheduleRamp(this.param, from, now, v, rampSec);
+      return;
+    }
     this.ramp = { from: v, to: v, t0: now, t1: now };
     this.param.cancelScheduledValues(now);
     this.param.setValueAtTime(v, now);

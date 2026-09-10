@@ -34,10 +34,17 @@ describe('Judge.onInput', () => {
     expect(j.onInput(0, 5.1401)).toBeNull();
     expect(j.onInput(0, 4.86)!.judgment).toBe('good');
   });
-  it('ignores inputs on lanes without candidates and unknown lanes', () => {
+  it('ignores inputs on lanes without candidates, but THROWS for a lane the chart does not have', () => {
     const j = new Judge(chart([{ id: 0, lane: 0, time: 1 }]), W);
-    expect(j.onInput(1, 1)).toBeNull();
-    expect(j.onInput(7, 1)).toBeNull();
+    expect(j.onInput(1, 1)).toBeNull(); // lane exists, no note near: ignored, no penalty (rehab rule)
+    // a lane outside the chart is a wiring bug (keyboard map / LaneSpec.index off by one). Returning
+    // null made every rep on that lane vanish from the score AND the rep count with no signal —
+    // the one path that silently lost a rep. It now fails like every other lane-indexed API.
+    expect(() => j.onInput(7, 1)).toThrow(/lane 7 out of range \[0, 2\)/);
+    expect(() => j.onInput(-1, 1)).toThrow(RangeError);
+    expect(() => j.onInputDetailed(7, 1)).toThrow(RangeError);
+    expect(() => j.nearestNote(7, 1)).toThrow(RangeError);
+    expect(j.getPendingCount()).toBe(1); // nothing was judged by any of that
     expect(j.onInput(0, 1)!.judgment).toBe('perfect');
   });
   it('picks the nearest pending note when two are in range', () => {
@@ -67,6 +74,82 @@ describe('Judge.onInput', () => {
   });
 });
 
+describe('Judge.onInputDetailed (rejected inputs are ignored for scoring, never lost for metrics)', () => {
+  it('reports the distance to the nearest note even when nothing matched', () => {
+    const j = new Judge(chart([{ id: 0, lane: 0, time: 1 }, { id: 1, lane: 0, time: 3 }]), W);
+    // 300 ms late: no hit (goodMs 140), but the distance to note 0 is still known
+    const r = j.onInputDetailed(0, 1.3);
+    expect(r.hit).toBeNull();
+    expect(r.nearestNoteId).toBe(0);
+    expect(r.nearestDeltaMs).toBeCloseTo(300, 6);
+    expect(r.time).toBeCloseTo(1.3, 9);
+    expect(j.getNoteState(0)).toBe('pending'); // no penalty: the note is untouched
+    expect(j.getPendingCount()).toBe(2);
+    // early inputs give a negative delta, and the nearest note may be ahead of the input
+    const e = j.onInputDetailed(0, 2.4);
+    expect(e.hit).toBeNull();
+    expect(e.nearestNoteId).toBe(1);
+    expect(e.nearestDeltaMs).toBeCloseTo(-600, 6);
+  });
+  it('measures against the note grid, not against what is still pending', () => {
+    // the whole point: a patient 300 ms late arrives after their note was declared a miss.
+    // "nearest still-pending note" would report -700 ms (the NEXT note) and hide the calibration error.
+    const j = new Judge(chart([{ id: 0, lane: 0, time: 1 }, { id: 1, lane: 0, time: 2 }]), W);
+    expect(j.update(1.5).map((e) => e.noteId)).toEqual([0]);
+    expect(j.getNoteState(0)).toBe('miss');
+    const r = j.onInputDetailed(0, 1.3);
+    expect(r.hit).toBeNull();
+    expect(r.nearestNoteId).toBe(0);
+    expect(r.nearestDeltaMs).toBeCloseTo(300, 6);
+    // a hit note is equally valid as a reference point
+    expect(j.onInputDetailed(0, 2)!.hit!.noteId).toBe(1);
+    expect(j.onInputDetailed(0, 2.3).nearestDeltaMs).toBeCloseTo(300, 6);
+  });
+  it('matches onInput exactly when a note is in range, and reports the same delta', () => {
+    const j = new Judge(chart([{ id: 0, lane: 0, time: 1 }]), W);
+    const r = j.onInputDetailed(0, 1.05);
+    expect(r.hit).toEqual({ noteId: 0, lane: 0, judgment: 'perfect', deltaMs: expect.closeTo(50, 6), time: 1.05 });
+    expect(r.nearestNoteId).toBe(0);
+    expect(r.nearestDeltaMs).toBeCloseTo(r.hit!.deltaMs, 9);
+  });
+  it('nearestDeltaMs is NOT the hit delta when the true nearest note is already judged', () => {
+    // documented explicitly because the two numbers must not be conflated: `hit` matches the nearest
+    // UNJUDGED note, `nearestDeltaMs` measures the note grid. Attribute a matched input with
+    // hit.deltaMs (which is exactly what Scoring does).
+    const j = new Judge(chart([{ id: 0, lane: 0, time: 1.0 }, { id: 1, lane: 0, time: 1.1 }]), W);
+    expect(j.onInput(0, 1.0)!.noteId).toBe(0);
+    const r = j.onInputDetailed(0, 1.04);
+    expect(r.hit!.noteId).toBe(1);
+    expect(r.hit!.deltaMs).toBeCloseTo(-60, 6);
+    expect(r.nearestNoteId).toBe(0);
+    expect(r.nearestDeltaMs).toBeCloseTo(40, 6);
+  });
+  it('reports null distances only for a lane with no notes at all', () => {
+    const j = new Judge(chart([{ id: 0, lane: 0, time: 1 }]), W);
+    expect(j.onInputDetailed(1, 1).nearestDeltaMs).toBeNull(); // empty lane: exists, holds no notes
+    expect(() => j.onInputDetailed(9, 1)).toThrow(RangeError); // lane not in the chart: a bug, not "empty"
+    expect(j.nearestNote(1, 1)).toBeNull();
+    j.update(100);
+    expect(j.onInputDetailed(0, 1).nearestDeltaMs).toBeCloseTo(0, 9); // judged, but still a reference
+  });
+  it('honours the latency offset', () => {
+    const j = new Judge(chart([{ id: 0, lane: 0, time: 1 }, { id: 1, lane: 0, time: 2 }]), W, 0.2);
+    expect(j.onInputDetailed(0, 1.2).hit!.judgment).toBe('perfect');
+    const r = j.onInputDetailed(0, 1.9); // shifted to 1.7
+    expect(r.nearestNoteId).toBe(1);
+    expect(r.nearestDeltaMs).toBeCloseTo(-300, 6);
+    expect(j.nearestNote(0, 1.9)!.id).toBe(1);
+  });
+  it('picks the nearest note on either side, ties to the earlier one, and clamps at the ends', () => {
+    const j = new Judge(chart([{ id: 0, lane: 0, time: 1 }, { id: 1, lane: 0, time: 3 }]), W);
+    expect(j.onInputDetailed(0, 2).nearestNoteId).toBe(0);
+    expect(j.onInputDetailed(0, 2.001).nearestNoteId).toBe(1);
+    expect(j.onInputDetailed(0, 1.9).nearestNoteId).toBe(0);
+    expect(j.nearestNote(0, -50)!.id).toBe(0);
+    expect(j.nearestNote(0, 1e6)!.id).toBe(1);
+  });
+});
+
 describe('Judge validation', () => {
   it('throws on duplicate note ids', () => {
     expect(() => new Judge(chart([{ id: 0, lane: 0, time: 1 }, { id: 0, lane: 1, time: 2 }]), W)).toThrow(/duplicate note id 0/);
@@ -88,6 +171,19 @@ describe('Judge validation', () => {
     expect(() => new Judge(c, { perfectMs: 50, goodMs: Number.POSITIVE_INFINITY })).toThrow(/finite/);
     expect(() => new Judge(c, [W, { perfectMs: 200, goodMs: 100 }])).toThrow(/lane 1 windows/);
     expect(() => new Judge(c, [])).toThrow(/no timing windows/);
+    // a short array used to reuse its last entry for the remaining lanes: a 4-lane chart with two
+    // entries silently gave lanes 2-3 the wrong (gross-motor) windows. windowsForLanes throws for a
+    // missing index; so must this, or the two contracts disagree.
+    const c4 = chart([{ id: 0, lane: 3, time: 1 }], 4);
+    expect(() => new Judge(c4, [W, W])).toThrow(/2 timing window\(s\) supplied for a 4-lane chart/);
+    expect(() => new Judge(c4, [W, W, W, W, W])).toThrow(/5 timing window\(s\)/);
+    expect(() => new Judge(c4, [W, W, W, W])).not.toThrow();
+    expect(() => new Judge(c4, W)).not.toThrow(); // one object still means "the same for every lane"
+    // and a lane outside the chart has no windows to report
+    const j4 = new Judge(c4, [W, W, W, { perfectMs: 112, goodMs: 224 }]);
+    expect(j4.getWindows(3).goodMs).toBe(224);
+    expect(() => j4.getWindows(4)).toThrow(/lane 4 out of range/);
+    expect(() => j4.getWindows(-1)).toThrow(/out of range/);
     expect(() => validateTimingWindows({ perfectMs: 70, goodMs: 70 })).not.toThrow();
     expect(() => validateTimingWindows(undefined as unknown as TimingWindows)).toThrow(/missing/);
     expect(new Judge(c, { perfectMs: 70, goodMs: 70 }).onInput(0, 1.07)!.judgment).toBe('perfect');
@@ -175,7 +271,10 @@ describe('Judge.update', () => {
     const j = new Judge(chart([{ id: 42, lane: 0, time: 3 }, { id: 7, lane: 0, time: 1 }]), W);
     expect(j.onInput(0, 1)!.noteId).toBe(7);
     expect(j.update(5).map((e) => e.noteId)).toEqual([42]);
-    expect(j.getNoteState(999)).toBe('pending');
+    // an id that is not in the chart reads back as undefined, never as a plausible 'pending' note
+    expect(j.getNoteState(999)).toBeUndefined();
+    expect(j.hasNote(999)).toBe(false);
+    expect(j.hasNote(42)).toBe(true);
   });
 });
 
@@ -273,8 +372,41 @@ describe('Judge matches a brute-force reference under random interleavings', () 
           const near = notes[Math.floor(rand() * n)];
           const t = rand() < 0.5 ? frame - rand() * 0.15 : near.time + (rand() - 0.5) * 0.5 + latency;
           const lane = rand() < 0.9 ? Math.floor(rand() * lanes) : lanes + 1;
+          if (lane >= lanes) {
+            // a lane the chart does not have is a wiring bug, not an input: it throws, and nothing
+            // may be judged as a side effect
+            const pendingBefore = judge.getPendingCount();
+            expect(() => judge.onInput(lane, t)).toThrow(RangeError);
+            expect(() => judge.onInputDetailed(lane, t)).toThrow(RangeError);
+            expect(judge.getPendingCount()).toBe(pendingBefore);
+            continue;
+          }
           inputs++;
-          const a = judge.onInput(lane, t);
+          // half the inputs go through onInputDetailed: it must judge identically and, when it
+          // rejects, still report the true nearest-unjudged-note distance (brute-forced here)
+          let a: HitEvent | null;
+          if (rand() < 0.5) {
+            let nearest: Note | null = null;
+            const shifted = t - latency;
+            for (const nt of notes) {
+              if (nt.lane !== lane) continue;
+              if (nearest === null) {
+                nearest = nt;
+                continue;
+              }
+              const d = Math.abs(nt.time - shifted);
+              const best = Math.abs(nearest.time - shifted);
+              // ties go to the earlier note (then the lower id), matching laneNotes' sort order
+              if (d < best - 1e-12 || (Math.abs(d - best) <= 1e-12 && (nt.time < nearest.time || (nt.time === nearest.time && nt.id < nearest.id)))) nearest = nt;
+            }
+            const det = judge.onInputDetailed(lane, t);
+            a = det.hit;
+            expect(det.nearestNoteId).toBe(nearest === null ? null : nearest.id);
+            expect(det.nearestDeltaMs === null).toBe(nearest === null);
+            if (nearest !== null) expect(det.nearestDeltaMs!).toBeCloseTo((shifted - nearest.time) * 1000, 9);
+          } else {
+            a = judge.onInput(lane, t);
+          }
           const b = ref.onInput(lane, t);
           if (a === null || b === null) expect(a).toBe(b);
           else {
@@ -290,5 +422,57 @@ describe('Judge matches a brute-force reference under random interleavings', () 
       expect(judge.getPendingCount()).toBe(0);
     }
     expect(inputs).toBeGreaterThan(10000);
+  });
+});
+
+describe('Judge.setWindows (the therapist window scale is tunable mid-session)', () => {
+  it('re-applies windows without discarding note states, the cursor or the score', () => {
+    const j = new Judge(chart([{ id: 0, lane: 0, time: 1 }, { id: 1, lane: 0, time: 3 }, { id: 2, lane: 1, time: 3 }]), { perfectMs: 20, goodMs: 40 });
+    expect(j.onInput(0, 1.01)!.judgment).toBe('perfect');
+    expect(j.onInput(0, 3.08)).toBeNull(); // 80 ms out: outside goodMs 40
+    j.setWindows({ perfectMs: 60, goodMs: 120 });
+    expect(j.getWindows(0)).toEqual({ perfectMs: 60, goodMs: 120 });
+    expect(j.getWindows(1)).toEqual({ perfectMs: 60, goodMs: 120 });
+    expect(j.getNoteState(0)).toBe('perfect'); // judged before the change, untouched
+    expect(j.getPendingCount()).toBe(2);
+    expect(j.onInput(0, 3.08)!.judgment).toBe('good'); // now inside the wider window
+  });
+  it('takes per-lane windows and one lane at a time', () => {
+    const j = new Judge(chart([{ id: 0, lane: 0, time: 1 }, { id: 1, lane: 1, time: 1 }]), W);
+    j.setWindows([{ perfectMs: 10, goodMs: 20 }, { perfectMs: 100, goodMs: 200 }]);
+    expect(j.getWindows(0).goodMs).toBe(20);
+    expect(j.getWindows(1).goodMs).toBe(200);
+    j.setLaneWindows(0, { perfectMs: 50, goodMs: 150 });
+    expect(j.getWindows(0)).toEqual({ perfectMs: 50, goodMs: 150 });
+    expect(j.getWindows(1).goodMs).toBe(200); // untouched
+  });
+  it('validates the whole set before changing anything', () => {
+    const j = new Judge(chart([{ id: 0, lane: 0, time: 1 }]), W);
+    expect(() => j.setWindows([W])).toThrow(/1 timing window\(s\) supplied for a 2-lane chart/);
+    expect(() => j.setWindows([])).toThrow(/no timing windows/);
+    expect(() => j.setWindows([{ perfectMs: 10, goodMs: 20 }, { perfectMs: 300, goodMs: 20 }])).toThrow(/exceeds goodMs/);
+    expect(() => j.setWindows({ perfectMs: 0, goodMs: 20 })).toThrow(/positive/);
+    expect(() => j.setWindows({ perfectMs: Number.NaN, goodMs: 20 })).toThrow(/finite/);
+    expect(() => j.setLaneWindows(4, W)).toThrow(/lane 4 out of range/);
+    expect(() => j.setLaneWindows(0, { perfectMs: 30, goodMs: 10 })).toThrow(/exceeds goodMs/);
+    // every rejection left the original windows in force (lane 1 would have taken the bad set first)
+    expect(j.getWindows(0)).toEqual(W);
+    expect(j.getWindows(1)).toEqual(W);
+  });
+  it('does not alias the caller\'s window objects', () => {
+    const mutable = { perfectMs: 60, goodMs: 120 };
+    const j = new Judge(chart([{ id: 0, lane: 0, time: 1 }]), W);
+    j.setWindows(mutable);
+    mutable.goodMs = 9999;
+    expect(j.getWindows(0).goodMs).toBe(120);
+  });
+  it('narrowing the windows can retire a note that is already past its new deadline', () => {
+    const j = new Judge(chart([{ id: 0, lane: 0, time: 1 }]), { perfectMs: 200, goodMs: 400 });
+    j.update(1.3); // still inside the 400 ms window
+    expect(j.getNoteState(0)).toBe('pending');
+    j.setWindows({ perfectMs: 20, goodMs: 40 });
+    const missed = j.update(1.3);
+    expect(missed.map((e) => e.noteId)).toEqual([0]);
+    expect(missed[0].deltaMs).toBe(40); // the deadline reported is the one now in force
   });
 });

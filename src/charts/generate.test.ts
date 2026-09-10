@@ -5,29 +5,35 @@ import { Judge } from '../engine/judge.ts';
 import type { Chart, DifficultyName } from '../engine/types.ts';
 import {
   CHART_FORMAT_VERSION,
+  ChartGenerationError,
   EASY_OFFBEAT_WARN_FRACTION,
   LANE_SHARE_WARN_RATIO,
   MIN_CROSS_LANE_GAP_SEC,
   MIN_LANE_SPACING_SEC,
   chartToJson,
+  defaultCrossLaneGapSec,
   densityBudget,
   generateChart,
   generateChartDetailed,
   mulberry32,
   parseChart,
+  parseChartDetailed,
   serializeChart,
 } from './generate.ts';
 import type { ChartJson, GenerateResult } from './generate.ts';
 
 const song = { id: 'demo', bpm: 120, offset: 0.25, durationSec: 60 };
 
+/** Note times are quantised to 1 µs (`round6`), so a gap may fall that far short of its nominal value. */
+const GRID_EPS = 1e-6;
+
 function spacingViolations(chart: Chart, laneMin: number, crossMin: number): string[] {
   const out: string[] = [];
   const last: number[] = [];
   let anyLast = -Infinity;
   for (const n of chart.notes) {
-    if (last[n.lane] !== undefined && n.time - last[n.lane] < laneMin - 1e-9) out.push(`lane ${n.lane} gap ${(n.time - last[n.lane]).toFixed(3)} at ${n.time}`);
-    if (n.time - anyLast < crossMin - 1e-9) out.push(`cross gap ${(n.time - anyLast).toFixed(3)} at ${n.time}`);
+    if (last[n.lane] !== undefined && n.time - last[n.lane] < laneMin - GRID_EPS) out.push(`lane ${n.lane} gap ${(n.time - last[n.lane]).toFixed(6)} at ${n.time}`);
+    if (n.time - anyLast < crossMin - GRID_EPS) out.push(`cross gap ${(n.time - anyLast).toFixed(6)} at ${n.time}`);
     last[n.lane] = n.time;
     anyLast = n.time;
   }
@@ -76,6 +82,14 @@ describe('generateChart', () => {
     expect(a.notes.length).toBeGreaterThan(10);
     expect(a.notes.map((n) => `${n.lane}@${n.time}`)).not.toEqual(c.notes.map((n) => `${n.lane}@${n.time}`));
     expect(a.difficulty).toEqual(DIFFICULTIES.medium);
+    // ...but the chart OWNS its difficulty: aliasing the deep-frozen preset makes a downstream
+    // therapist window scale (chart.difficulty.windows.goodMs = x) throw in strict mode
+    expect(a.difficulty).not.toBe(DIFFICULTIES.medium);
+    expect(a.difficulty.windows).not.toBe(DIFFICULTIES.medium.windows);
+    expect(Object.isFrozen(a.difficulty)).toBe(false);
+    a.difficulty.windows.goodMs = 999;
+    expect(a.difficulty.windows.goodMs).toBe(999);
+    expect(DIFFICULTIES.medium.windows.goodMs).toBe(140);
     expect(a.lanes).toBe(3);
     expect(a.songId).toBe('demo');
     expect(a.durationSec).toBe(60);
@@ -128,7 +142,9 @@ describe('generateChart', () => {
           const offset = 0.1;
           const res = generateChartDetailed({ id: 'x', bpm, offset, durationSec: dur, beatsPerBar: bpb }, lanes, name, seed);
           const tag = `${name} bpm=${bpm} lanes=${lanes} dur=${dur} bpb=${bpb} seed=${seed}`;
-          expect(spacingViolations(res.chart, MIN_LANE_SPACING_SEC[name], MIN_CROSS_LANE_GAP_SEC[name]), tag).toEqual([]);
+          expect(spacingViolations(res.chart, MIN_LANE_SPACING_SEC[name], defaultCrossLaneGapSec(name, bpm)), tag).toEqual([]);
+          expect(res.minLaneSpacingSec, tag).toBe(MIN_LANE_SPACING_SEC[name]);
+          expect(res.minCrossLaneGapSec, tag).toBe(defaultCrossLaneGapSec(name, bpm));
           expect(res.targetDensity).toBe(target);
           expect(res.effectiveTargetDensity).toBeLessThanOrEqual(res.maxBarDensity + 1e-9);
           expect(res.maxBarDensity).toBeLessThanOrEqual(res.maxFeasibleDensity + 1e-9);
@@ -143,10 +159,18 @@ describe('generateChart', () => {
             expect(res.achievedDensity / target, tag).toBeGreaterThanOrEqual(0.8);
             expect(res.achievedDensity / target, tag).toBeLessThanOrEqual(1.2);
           }
-          // realistic sessions (2-4 lanes): 4/4 easy/medium is always feasible at full density; hard is at least 80 %
-          if (lanes >= 2 && bpb === 4) {
+          // realistic sessions (2-4 lanes): easy/medium are feasible at full density in 3/4 AND 4/4
+          // (they were not while the cross-lane gap was a fixed 0.45 s), hard is at least 80 %
+          if (lanes >= 2) {
             if (name !== 'hard') expect(reduced, tag).toBe(false);
             expect(res.achievedDensity / target, tag).toBeGreaterThanOrEqual(0.8);
+          }
+          // the only configs that miss the nominal ±20 % band are single-lane ones, where the spec's
+          // own per-lane spacing is the binding constraint (0.9 s apart is 1.5 notes/beat only above
+          // 90 bpm) — and every one of them says so in a warning rather than quietly under-delivering
+          if (res.achievedDensity / target < 0.8) {
+            expect(lanes, tag).toBe(1);
+            expect(densityWarnings.length + res.warnings.filter((w) => /no bar pattern is playable/.test(w)).length, tag).toBeGreaterThan(0);
           }
           // no warnings other than the density reduction: balance, accents and off-beats are all in order
           expect(res.warnings.filter((w) => !/density reduced/.test(w)), tag).toEqual([]);
@@ -204,30 +228,60 @@ describe('generateChart', () => {
     const easy = densityBudget(120, 3, 0.5, 0.9, 0.45);
     expect(easy.effectiveTargetDensity).toBe(0.5);
     expect(generateChartDetailed(song, 3, 'easy', 1).warnings).toEqual([]);
-    // targets of at most one note per beat never trade on-beat notes for syncopation: fast 3/4 easy caps at one note per bar
+    // targets of at most one note per beat never trade on-beat notes for syncopation: with an
+    // explicit 0.45 s cross-lane gap, fast 3/4 easy caps at one note per bar...
     const waltz = densityBudget(150, 2, 0.5, 0.9, 0.45, 3);
     expect(waltz.maxBarDensity).toBeCloseTo(2 / 3);
     expect(waltz.maxOnBeatDensity).toBeCloseTo(1 / 3);
     expect(waltz.effectiveTargetDensity).toBeCloseTo(1 / 3);
+    const forced = generateChartDetailed({ id: 'w', bpm: 150, offset: 0, durationSec: 60, beatsPerBar: 3 }, 2, 'easy', 1, { minCrossLaneGapSec: 0.45 });
+    expect(forced.offBeatFraction).toBe(0);
+    expect(forced.warnings[0]).toMatch(/on-beat bar pattern/);
+    // ...but the default gap is derived from the beat grid (0.4 s at 150 bpm), so the same waltz
+    // reaches the full easy density instead of losing a third of the patient's reps to a 0.002 s
+    // rounding miss (0.4478 s between two on-beat notes vs a 0.45 s gate)
     const w = generateChartDetailed({ id: 'w', bpm: 150, offset: 0, durationSec: 60, beatsPerBar: 3 }, 2, 'easy', 1);
+    expect(w.minCrossLaneGapSec).toBeCloseTo(0.4, 9);
+    expect(w.effectiveTargetDensity).toBe(0.5);
+    expect(w.achievedDensity).toBeGreaterThan(0.45);
     expect(w.offBeatFraction).toBe(0);
-    expect(w.warnings[0]).toMatch(/on-beat bar pattern/);
+    expect(w.warnings).toEqual([]);
   });
 
-  it('easy never asks for two movements closer than the cross-lane gap', () => {
+  it('reaches the difficulty density in 3/4 at the tempos the fixed 0.45 s gate used to cut by a third', () => {
+    for (const bpm of [134, 140, 150, 160, 170, 180]) {
+      for (const lanes of [2, 3, 4]) {
+        for (const name of ['easy', 'medium'] as const) {
+          const tag = `${name} ${bpm} bpm 3/4 x${lanes}`;
+          const r = generateChartDetailed({ id: 'x', bpm, offset: 0, durationSec: 120, beatsPerBar: 3 }, lanes, name, 2);
+          expect(r.effectiveTargetDensity, tag).toBe(DIFFICULTIES[name].noteDensity);
+          expect(r.achievedDensity / DIFFICULTIES[name].noteDensity, tag).toBeGreaterThanOrEqual(0.8);
+          expect(r.achievedDensity / DIFFICULTIES[name].noteDensity, tag).toBeLessThanOrEqual(1.2);
+          expect(spacingViolations(r.chart, MIN_LANE_SPACING_SEC[name], defaultCrossLaneGapSec(name, bpm)), tag).toEqual([]);
+          expect(r.warnings, tag).toEqual([]);
+        }
+      }
+    }
+  });
+
+  it('easy never asks for two movements closer than the cross-lane gap (capped at one beat)', () => {
     for (const bpm of [100, 120, 140]) {
       for (const lanes of [2, 4]) {
         const ch = generateChart({ id: 'e', bpm, offset: 0, durationSec: 60 }, lanes, 'easy', 11);
         let minGap = Infinity;
         for (let i = 1; i < ch.notes.length; i++) minGap = Math.min(minGap, ch.notes[i].time - ch.notes[i - 1].time);
-        expect(minGap).toBeGreaterThanOrEqual(MIN_CROSS_LANE_GAP_SEC.easy - 1e-9);
+        expect(minGap).toBeGreaterThanOrEqual(defaultCrossLaneGapSec('easy', bpm) - GRID_EPS);
       }
     }
+    // the cap is the beat, and it only ever binds above 133 bpm on easy
+    expect(defaultCrossLaneGapSec('easy', 120)).toBe(MIN_CROSS_LANE_GAP_SEC.easy);
+    expect(defaultCrossLaneGapSec('easy', 180)).toBeCloseTo(1 / 3, 9);
+    expect(defaultCrossLaneGapSec('hard', 200)).toBe(MIN_CROSS_LANE_GAP_SEC.hard);
     const custom = generateChart(song, 4, 'easy', 11, { minCrossLaneGapSec: 0.1, minLaneSpacingSec: 0.5 });
     expect(spacingViolations(custom, 0.5, 0.1)).toEqual([]);
   });
 
-  it('uses all lanes equally (round-robin)', () => {
+  it('gives every lane an equal share of reps without being one predictable rotation', () => {
     const ch = generateChart(song, 4, 'easy', 11);
     const counts = laneCounts(ch);
     expect(counts.every((c) => c > 0)).toBe(true);
@@ -235,8 +289,16 @@ describe('generateChart', () => {
     const dense = generateChart({ id: 'l', bpm: 180, offset: 0, durationSec: 60 }, 3, 'medium', 1);
     const dc = laneCounts(dense);
     expect(Math.max(...dc) - Math.min(...dc)).toBeLessThanOrEqual(1);
-    // consecutive notes cycle through the lanes
-    for (let i = 1; i < dense.notes.length; i++) expect(dense.notes[i].lane).toBe((dense.notes[i - 1].lane + 1) % 3);
+    // spacing is still guaranteed note by note (this is what the rotation used to prove)
+    expect(spacingViolations(dense, MIN_LANE_SPACING_SEC.medium, MIN_CROSS_LANE_GAP_SEC.medium)).toEqual([]);
+    // ...but the lane order is not a single fixed cycle a patient memorises within a bar
+    let cyclic = 0;
+    for (let i = 1; i < dense.notes.length; i++) if (dense.notes[i].lane === (dense.notes[i - 1].lane + 1) % 3) cyclic++;
+    expect(cyclic).toBeLessThan(dense.notes.length - 1);
+    // a different seed gives a different lane sequence, and the same seed reproduces it exactly
+    const other = generateChart({ id: 'l', bpm: 180, offset: 0, durationSec: 60 }, 3, 'medium', 2);
+    expect(other.notes.map((n) => n.lane)).not.toEqual(dense.notes.map((n) => n.lane));
+    expect(generateChart({ id: 'l', bpm: 180, offset: 0, durationSec: 60 }, 3, 'medium', 1).notes).toEqual(dense.notes);
   });
 
   it('places accent notes on every bar downbeat (bar grid anchored at the song offset)', () => {
@@ -284,7 +346,10 @@ describe('generateChart', () => {
     // easy bilateral: strictly on the beat, alternating legs
     const easy = generateChartDetailed({ id: 'e', bpm: 120, offset: 0, durationSec: 80 }, 2, 'easy', 21);
     expect(easy.offBeatFraction).toBe(0);
-    for (let i = 1; i < easy.chart.notes.length; i++) expect(easy.chart.notes[i].lane).toBe(1 - easy.chart.notes[i - 1].lane);
+    // bilateral: both legs get the same number of reps, never closer than the easy lane spacing
+    const ec = laneCounts(easy.chart);
+    expect(Math.abs(ec[0] - ec[1])).toBeLessThanOrEqual(1);
+    expect(spacingViolations(easy.chart, MIN_LANE_SPACING_SEC.easy, MIN_CROSS_LANE_GAP_SEC.easy)).toEqual([]);
     expect(phraseRepetition(easy, 0, 4).mean).toBeGreaterThan(0.6);
   });
 
@@ -293,7 +358,13 @@ describe('generateChart', () => {
     expect(short.chart.notes).toEqual([]);
     expect(short.warnings.join()).toMatch(/too short/);
     expect(short.laneShares).toEqual([0, 0]);
-    expect(generateChart({ id: 'z', bpm: 0, offset: 0, durationSec: 10 }, 1, 'easy', 1).bpm).toBe(120);
+    // generateChart refuses to hand back an empty highway as if it were playable
+    expect(() => generateChart({ id: 'short', bpm: 120, offset: 0, durationSec: 1 }, 2, 'easy', 1)).toThrow(ChartGenerationError);
+    expect(() => generateChart({ id: 'short', bpm: 120, offset: 0, durationSec: 1 }, 2, 'easy', 1)).toThrow(/too short/);
+    // a bad beat grid fails at generation, not silently as 120 bpm
+    expect(() => generateChart({ id: 'z', bpm: 0, offset: 0, durationSec: 10 }, 1, 'easy', 1)).toThrow(/bpm must be positive/);
+    expect(() => generateChart({ id: 'z', bpm: 120, offset: Number.NaN, durationSec: 10 }, 1, 'easy', 1)).toThrow(/offset must be finite/);
+    expect(() => generateChart({ id: 'z', bpm: 120, offset: 0, durationSec: 0 }, 1, 'easy', 1)).toThrow(/durationSec must be positive/);
     const one = generateChart(song, 1, 'hard', 2);
     expect(spacingViolations(one, MIN_LANE_SPACING_SEC.hard, MIN_CROSS_LANE_GAP_SEC.hard)).toEqual([]);
     expect(generateChart(song, 2, 'easy', 1, { phraseBars: 1 }).notes.length).toBeGreaterThan(10);
@@ -346,5 +417,140 @@ describe('serialize / parse', () => {
     expect(() => parseChart({ ...base, v: 'x' })).toThrow(/format version/);
     const { v: _v, ...noVersion } = base;
     expect(parseChart(noVersion).notes.length).toBe(base.notes.length); // v missing = v1
+  });
+});
+
+describe('generateChart: configurations that used to produce a silent empty highway', () => {
+  it('falls back to multi-bar spacing instead of an empty chart (fast waltzes and marches)', () => {
+    const empties: string[] = [];
+    let sparse = 0;
+    for (let bpm = 120; bpm <= 260; bpm += 2) {
+      for (const beatsPerBar of [2, 3, 4]) {
+        for (const d of DIFFICULTY_NAMES) {
+          for (const lanes of [1, 2]) {
+            const r = generateChartDetailed({ id: 'f', bpm, offset: 0, durationSec: 180, beatsPerBar }, lanes, d, 1);
+            if (r.chart.notes.length === 0) empties.push(`${bpm}/${beatsPerBar}/${d}/${lanes}`);
+            if (r.sparseBarStride > 0) sparse++;
+            expect(spacingViolations(r.chart, MIN_LANE_SPACING_SEC[d], defaultCrossLaneGapSec(d, bpm))).toEqual([]);
+          }
+        }
+      }
+    }
+    expect(empties).toEqual([]);
+    expect(sparse).toBeGreaterThan(0); // the fallback really is exercised by this range
+  });
+
+  it('the reported 2/4-at-134-bpm easy case is playable, spaced and warned about', () => {
+    const r = generateChartDetailed({ id: 'm', bpm: 134, offset: 0, durationSec: 180, beatsPerBar: 2 }, 1, 'easy', 1);
+    expect(r.sparseBarStride).toBe(2);
+    expect(r.chart.notes.length).toBeGreaterThan(50);
+    const gaps: number[] = [];
+    for (let i = 1; i < r.chart.notes.length; i++) gaps.push(r.chart.notes[i].time - r.chart.notes[i - 1].time);
+    expect(Math.min(...gaps)).toBeGreaterThan(MIN_LANE_SPACING_SEC.easy);
+    expect(Math.min(...gaps)).toBeCloseTo((4 * 60) / 134, 5); // two 2/4 bars apart
+    expect(r.warnings.join()).toMatch(/no bar pattern is playable/);
+    expect(r.achievedDensity).toBeCloseTo(r.effectiveTargetDensity, 1);
+    // every note is on a bar downbeat, and the chart is still deterministic
+    expect(generateChart({ id: 'm', bpm: 134, offset: 0, durationSec: 180, beatsPerBar: 2 }, 1, 'easy', 1).notes).toEqual(r.chart.notes);
+  });
+
+  it('generateChart surfaces the warnings its detailed form computes', () => {
+    const seen: string[] = [];
+    const song2 = { id: 'w', bpm: 160, offset: 0, durationSec: 90 };
+    const detailed = generateChartDetailed(song2, 2, 'hard', 1);
+    generateChart(song2, 2, 'hard', 1, { onWarning: (x) => seen.push(x) });
+    expect(seen).toEqual(detailed.warnings);
+    expect(seen.length).toBeGreaterThan(0);
+  });
+
+  it('never places a note before the audio starts, even with a negative song offset', () => {
+    for (const offset of [-0.4, -1.7, -0.05]) {
+      for (const leadInBeats of [0, 2]) {
+        for (const d of DIFFICULTY_NAMES) {
+          const r = generateChartDetailed({ id: 'n', bpm: 120, offset, durationSec: 60 }, 2, d, 3, { leadInBeats });
+          expect(r.chart.notes.length).toBeGreaterThan(0);
+          expect(Math.min(...r.chart.notes.map((n) => n.time))).toBeGreaterThanOrEqual(0);
+        }
+      }
+    }
+    const warned = generateChartDetailed({ id: 'n', bpm: 120, offset: -0.4, durationSec: 60 }, 2, 'easy', 3, { leadInBeats: 0 });
+    expect(warned.warnings.join()).toMatch(/negative/);
+  });
+});
+
+describe('parseChart validates the difficulty numbers it hands to vision and the Judge', () => {
+  const base = () => chartToJson(generateChart(song, 2, 'medium', 1));
+
+  it('rejects a thresholdFraction outside [0, 1] (an unwinnable session, silently)', () => {
+    const j = base();
+    expect(() => parseChart({ ...j, difficulty: { ...j.difficulty, thresholdFraction: 5 } })).toThrow(/thresholdFraction 5 out of range/);
+    expect(() => parseChart({ ...j, difficulty: { ...j.difficulty, thresholdFraction: -0.1 } })).toThrow(/out of range/);
+    expect(parseChart({ ...j, difficulty: { ...j.difficulty, thresholdFraction: 1 } }).difficulty.thresholdFraction).toBe(1);
+    expect(parseChart({ ...j, difficulty: { ...j.difficulty, thresholdFraction: 0 } }).difficulty.thresholdFraction).toBe(0);
+  });
+  it('rejects a negative noteDensity and non-positive or inverted windows', () => {
+    const j = base();
+    expect(() => parseChart({ ...j, difficulty: { ...j.difficulty, noteDensity: -3 } })).toThrow(/noteDensity -3/);
+    expect(() => parseChart({ ...j, difficulty: { ...j.difficulty, windows: { perfectMs: -10, goodMs: 0 } } })).toThrow(/positive/);
+    expect(() => parseChart({ ...j, difficulty: { ...j.difficulty, windows: { perfectMs: 200, goodMs: 100 } } })).toThrow(/exceeds goodMs/);
+    // and the error names the field, at load, instead of throwing later inside the Judge
+    expect(() => parseChart({ ...j, difficulty: { ...j.difficulty, windows: { perfectMs: -10, goodMs: 0 } } })).toThrow(/difficulty.windows/);
+  });
+  it('accepts a chart written to the documented shape (no durationSec) and fills it in', () => {
+    const j = { ...base() } as unknown as Record<string, unknown>;
+    delete j.durationSec;
+    const c = parseChart(j);
+    expect(c.durationSec).toBeCloseTo(c.notes[c.notes.length - 1].time, 9);
+    expect(c.notes.length).toBeGreaterThan(0);
+  });
+  it('says so when it had to invent durationSec, instead of passing off an assumption as data', () => {
+    const j = { ...base() } as unknown as Record<string, unknown>;
+    delete j.durationSec;
+    const r = parseChartDetailed(j);
+    expect(r.chart.durationSec).toBeCloseTo(r.chart.notes[r.chart.notes.length - 1].time, 9);
+    expect(r.warnings.join()).toMatch(/durationSec missing/);
+    // nothing is assumed for a complete chart
+    expect(parseChartDetailed(base()).warnings).toEqual([]);
+    expect(parseChartDetailed(base()).chart).toEqual(parseChart(base()));
+  });
+});
+
+describe('generateChart: the lead-in is measured from the audio start, not from the beat grid', () => {
+  // Regression: the clamp guaranteed notes >= 0 but not >= the lead-in measured from t = 0, so a
+  // negative offset could put the first note at exactly 0.000 with no approach time on the highway
+  // (unhittable) and NO warning — the warning only fired when the skipped slots exceeded the lead-in.
+  it('never places the first note inside the lead-in, and warns whenever the clamp binds', () => {
+    const probes = [
+      { bpm: 240, offset: -0.5 },
+      { bpm: 120, offset: -1.0 },
+      { bpm: 174, offset: -2 },
+      { bpm: 90, offset: -0.13 },
+      { bpm: 60, offset: -3.25 },
+    ];
+    for (const { bpm, offset } of probes) {
+      for (const d of DIFFICULTY_NAMES) {
+        const leadInBeats = 2;
+        const r = generateChartDetailed({ id: 'lead', bpm, offset, durationSec: 90 }, 2, d, 5, { leadInBeats });
+        const tag = `bpm=${bpm} offset=${offset} ${d}`;
+        expect(r.chart.notes.length, tag).toBeGreaterThan(0);
+        const first = Math.min(...r.chart.notes.map((n) => n.time));
+        expect(first, tag).toBeGreaterThanOrEqual((leadInBeats * 60) / bpm - 1e-9);
+        expect(r.warnings.filter((w) => /negative/.test(w)).length, tag).toBe(1);
+      }
+    }
+  });
+  it('leaves non-negative offsets exactly as they were', () => {
+    for (const offset of [0, 0.1, 1.7]) {
+      for (const d of DIFFICULTY_NAMES) {
+        const r = generateChartDetailed({ id: 'p', bpm: 128, offset, durationSec: 90 }, 3, d, 7);
+        expect(r.warnings.filter((w) => /negative/.test(w))).toEqual([]);
+        expect(Math.min(...r.chart.notes.map((n) => n.time))).toBeGreaterThanOrEqual(offset + (2 * 60) / 128 - 1e-9);
+      }
+    }
+  });
+  it('a zero lead-in still keeps every note at or after the audio start', () => {
+    const r = generateChartDetailed({ id: 'z', bpm: 240, offset: -0.5, durationSec: 60 }, 2, 'easy', 1, { leadInBeats: 0 });
+    expect(Math.min(...r.chart.notes.map((n) => n.time))).toBeGreaterThanOrEqual(0);
+    expect(r.warnings.join()).toMatch(/negative/);
   });
 });

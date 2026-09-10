@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import type { Movement, Side } from '../engine/types.ts';
-import { EXTRACTORS, MOVEMENT_INFO, baselineFromSamples, captureCompensationBaseline, checkCompensation, evaluateCompensation, extractFeature, measureCompensation, trunkTiltDeg } from './features.ts';
-import { handPose, seatedPose, seatedPoseWorld, seatedRest, handOpen, handFist, seatedKneeLifted, handWristExtended, handWristRaised } from './fixtures.ts';
+import { EXTRACTORS, MOVEMENT_INFO, POSTURE_INFO, abductionSign, baselineFromSamples, captureCompensationBaseline, checkCompensation, evaluateCompensation, extractFeature, handPlausible, hasBlockingLaneConflict, laneConflicts, measureCompensation, requiredPostures, trunkTiltDeg } from './features.ts';
+import { handCollapsed, handPose, seatedPose, seatedPoseWorld, seatedRest, handOpen, handFist, seatedKneeAbducted, seatedKneeAdducted, seatedKneeLifted, handWristExtended, handWristRaised } from './fixtures.ts';
+import { normalizeFeature } from './calibration.ts';
+import type { LaneSpec } from '../engine/types.ts';
 import { POSE, HAND_LANDMARK_COUNT, POSE_LANDMARK_COUNT } from './landmarks.ts';
 import type { Landmark } from './landmarks.ts';
 
@@ -74,6 +76,35 @@ describe('leg extractors (Pose fixtures)', () => {
     expect(extractFeature('seated_march', seatedRest().slice(0, 20), 'left')).toBeNull();
   });
 
+  it('hip_abduction is DIRECTION-SPECIFIC: adduction must not score like abduction', () => {
+    for (const side of SIDES) {
+      const rest = extractFeature('hip_abduction', seatedPose({ side }), side) as number;
+      const abducted = extractFeature('hip_abduction', seatedKneeAbducted(1, side), side) as number;
+      const adducted = extractFeature('hip_abduction', seatedKneeAdducted(1, side), side) as number;
+      expect(abducted).toBeGreaterThan(rest);
+      // Pulling the knee INWARD across the midline (the compensatory pattern this exercise corrects)
+      // reads BELOW rest, so ROM normalization pins it at 0 instead of awarding full credit.
+      expect(adducted).toBeLessThan(rest);
+      expect(adducted).not.toBeCloseTo(abducted, 6);
+      const cal = { min: rest, max: abducted };
+      expect(normalizeFeature(cal, abducted)).toBe(1);
+      expect(normalizeFeature(cal, adducted)).toBe(0);
+      // Half-way adduction also scores nothing.
+      expect(normalizeFeature(cal, extractFeature('hip_abduction', seatedKneeAdducted(0.5, side), side) as number)).toBe(0);
+    }
+  });
+
+  it('hip_abduction respects the mirror convention', () => {
+    expect(abductionSign('left', false)).toBe(1);
+    expect(abductionSign('right', false)).toBe(-1);
+    expect(abductionSign('left', true)).toBe(-1);
+    // Mirroring the frames flips which image-x direction is outward, so the sign of the feature flips.
+    const pose = seatedKneeAbducted(1, 'left');
+    const raw = extractFeature('hip_abduction', pose, 'left') as number;
+    const mirrored = extractFeature('hip_abduction', pose, 'left', { mirrored: true }) as number;
+    expect(mirrored).toBeCloseTo(-raw, 9);
+  });
+
   it('accepts a custom minVisibility', () => {
     const pose = seatedPose({ visibility: 0.4 });
     expect(extractFeature('hip_abduction', pose, 'left')).toBeNull();
@@ -126,6 +157,22 @@ describe('hand extractors (Hand fixtures)', () => {
     const idx = extractFeature('finger_opposition', hand, 'left', { fingertip: 'index' }) as number;
     const pinky = extractFeature('finger_opposition', hand, 'left', { fingertip: 'pinky' }) as number;
     expect(idx).toBeGreaterThan(pinky);
+  });
+
+  it('rejects an implausible (collapsed) hand even though all 21 landmarks are present', () => {
+    // The real HandLandmarker ALWAYS returns 21 landmarks — it infers occluded ones — so "missing
+    // landmarks" never arrives from the detector; confident garbage does.
+    const collapsed = handCollapsed();
+    expect(collapsed).toHaveLength(HAND_LANDMARK_COUNT);
+    expect(collapsed.every((l) => Number.isFinite(l.x) && Number.isFinite(l.y))).toBe(true);
+    expect(handPlausible(collapsed)).toBe(false);
+    for (const m of ['hand_open_close', 'wrist_extension', 'finger_opposition', 'finger_spread'] as Movement[]) {
+      expect(extractFeature(m, collapsed, 'left'), m).toBeNull();
+    }
+    // Every legitimate hand pose (including the fingers-at-the-camera wrist_extension rest) is plausible.
+    for (const p of [handOpen(), handFist(), handWristExtended(0), handWristExtended(1), handPose({ pinch: 1 }), handPose({ spread: 1 }), handPose({ scale: 0.4 })]) {
+      expect(handPlausible(p)).toBe(true);
+    }
   });
 
   it('returns null for incomplete hands', () => {
@@ -200,8 +247,84 @@ describe('MOVEMENT_INFO', () => {
       expect(info.calibrationInstruction.length).toBeGreaterThan(10);
       expect(info.mode).toBe(m.startsWith('hand') || m.startsWith('wrist') || m.startsWith('finger') ? 'hand' : 'leg');
       // Lane smoothing must be unit-free so every lane has the same filter delay.
-      expect(['ema', 'lowpass', 'none']).toContain(info.smoothing.kind);
+      expect(['ema', 'ema2', 'lowpass', 'none']).toContain(info.smoothing.kind);
+      // Every movement declares the setup it is measured in, and the patient-facing rest instruction
+      // must describe THAT setup (the instructions are what the therapist reads out loud).
+      expect(POSTURE_INFO[info.posture], m).toBeDefined();
+      expect(info.posture === 'seated_leg', m).toBe(info.mode === 'leg');
+      if (info.posture === 'palm_to_camera') expect(info.restInstruction, m).toMatch(/palm to the camera/);
+      if (info.posture === 'hand_over_edge') expect(info.restInstruction, m).toMatch(/over the edge/);
     }
+  });
+
+  it('laneConflicts warns about physically coupled lanes on the same limb', () => {
+    const lanes = (...specs: Array<[number, Movement, Side]>): LaneSpec[] => specs.map(([index, movement, side]) => ({ index, movement, side }));
+    // Same limb, coupled movements: a knee lift almost always carries lateral drift.
+    const coupled = laneConflicts(lanes([0, 'seated_march', 'left'], [1, 'hip_abduction', 'left']));
+    expect(coupled).toHaveLength(1);
+    expect(coupled[0].severity).toBe('warning');
+    expect(coupled[0].lanes).toEqual([0, 1]);
+    expect(coupled[0].message).toMatch(/left/);
+    // Opposite limbs are independent.
+    expect(laneConflicts(lanes([0, 'seated_march', 'left'], [1, 'hip_abduction', 'right']))).toHaveLength(0);
+    // A 3D knee angle is unaffected by hip flexion, so this common pairing is NOT flagged.
+    expect(laneConflicts(lanes([0, 'seated_march', 'left'], [1, 'knee_extension', 'left']))).toHaveLength(0);
+    expect(laneConflicts(lanes([0, 'knee_extension', 'right'], [1, 'ankle_dorsiflexion', 'right']))).toHaveLength(1);
+    // The same movement twice on the same limb is an error, not a warning.
+    const dup = laneConflicts(lanes([0, 'hand_open_close', 'left'], [1, 'hand_open_close', 'left']));
+    expect(dup[0].severity).toBe('error');
+    expect(laneConflicts(lanes([0, 'hand_open_close', 'left'], [1, 'finger_spread', 'left']))).toHaveLength(1);
+    expect(laneConflicts([])).toEqual([]);
+  });
+
+  it('a same-hand posture mismatch is an ERROR (wrist_extension vs the palm-to-camera movements)', () => {
+    const lanes = (...specs: Array<[number, Movement, Side]>): LaneSpec[] => specs.map(([index, movement, side]) => ({ index, movement, side }));
+    for (const other of ['hand_open_close', 'finger_opposition', 'finger_spread'] as Movement[]) {
+      const c = laneConflicts(lanes([0, 'wrist_extension', 'left'], [1, other, 'left']));
+      expect(c, other).toHaveLength(1);
+      expect(c[0].severity, other).toBe('error');
+      expect(c[0].kind, other).toBe('posture');
+      expect(c[0].side).toBe('left');
+      expect(c[0].message).toMatch(/different setups/);
+      expect(hasBlockingLaneConflict(lanes([0, 'wrist_extension', 'left'], [1, other, 'left'])), other).toBe(true);
+      // Opposite hands are physically possible but need two different setups at once: a warning.
+      const bilateral = laneConflicts(lanes([0, 'wrist_extension', 'left'], [1, other, 'right']));
+      expect(bilateral, other).toHaveLength(1);
+      expect(bilateral[0].severity, other).toBe('warning');
+      expect(bilateral[0].side).toBeNull();
+      expect(hasBlockingLaneConflict(lanes([0, 'wrist_extension', 'left'], [1, other, 'right']))).toBe(false);
+    }
+    // Movements sharing a posture are unaffected (still only the coupling warning), and leg lanes never
+    // collide on posture.
+    const coupled = laneConflicts(lanes([0, 'hand_open_close', 'left'], [1, 'finger_spread', 'left']));
+    expect(coupled[0].kind).toBe('coupled');
+    expect(coupled[0].severity).toBe('warning');
+    expect(laneConflicts(lanes([0, 'knee_extension', 'left'], [1, 'hip_abduction', 'left']))).toHaveLength(0);
+    expect(hasBlockingLaneConflict(lanes([0, 'seated_march', 'left'], [1, 'knee_extension', 'right']))).toBe(false);
+    expect(requiredPostures(lanes([0, 'wrist_extension', 'left'], [1, 'hand_open_close', 'left'], [2, 'finger_spread', 'right'])))
+      .toEqual(['hand_over_edge', 'palm_to_camera']);
+    expect(requiredPostures(lanes([0, 'hand_open_close', 'left'], [1, 'finger_spread', 'right']))).toEqual(['palm_to_camera']);
+  });
+
+  it('MEASURED: the posture mismatch is real geometry — a rigid wrist rotation sweeps the other features', () => {
+    // Openness and spread are held CONSTANT while only the wrist angle changes. Both palm-to-camera
+    // features move by more than their whole minimum ROM, i.e. across a calibrated range — which is why
+    // laneConflicts must refuse the pairing rather than warn about it.
+    const oc = STEPS.map((a) => extractFeature('hand_open_close', handPose({ openness: 0.6, spread: 0.5, wristExtension: a }), 'left') as number);
+    const fs = STEPS.map((a) => extractFeature('finger_spread', handPose({ openness: 0.6, spread: 0.5, wristExtension: a }), 'left') as number);
+    expect(Math.max(...oc) - Math.min(...oc)).toBeGreaterThan(MOVEMENT_INFO.hand_open_close.minRom);
+    expect(Math.max(...fs) - Math.min(...fs)).toBeGreaterThan(MOVEMENT_INFO.finger_spread.minRom);
+    // Converse: in the palm-to-camera posture wrist_extension is pinned near its maximum whatever the
+    // hand does, so that lane could never re-arm.
+    const wrist = [0, 0.5, 1].map((o) => extractFeature('wrist_extension', handPose({ openness: o }), 'left') as number);
+    const full = extractFeature('wrist_extension', handWristExtended(1), 'left') as number;
+    for (const w of wrist) expect(w).toBeGreaterThanOrEqual(full - 1e-9);
+  });
+
+  it('fine-motor lanes get a steeper filter with the SAME group delay as the coarse lanes', () => {
+    expect(MOVEMENT_INFO.finger_opposition.smoothing).toEqual({ kind: 'ema2', alpha: 2 / 3 });
+    expect(MOVEMENT_INFO.finger_spread.smoothing).toEqual({ kind: 'ema2', alpha: 2 / 3 });
+    expect(MOVEMENT_INFO.seated_march.smoothing).toEqual({ kind: 'ema', alpha: 0.5 });
   });
 
   it('fixtures have the right landmark counts', () => {

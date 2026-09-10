@@ -47,6 +47,13 @@ export interface LandmarkDetector {
   readonly mode: Mode;
   /** Backend actually in use. */
   readonly delegate: 'GPU' | 'CPU';
+  /**
+   * True while the detector is swapping backends (GPU inference failed, the CPU task is being built).
+   * detect() returns EMPTY results for these frames, which downstream would otherwise report to the
+   * patient as "no person detected — sit facing the camera": honest about the landmarks, a lie about
+   * the cause, and it asks them to move when moving cannot help. Consumers surface this as 'recovering'.
+   */
+  readonly recovering?: boolean;
   /** Run inference for one video frame. `timestampMs` must increase monotonically. */
   detect(frame: FrameSource, timestampMs: number): DetectionResult;
   close(): void;
@@ -109,11 +116,39 @@ async function withDelegateFallback<T>(
   }
 }
 
-/** Create a real MediaPipe-backed detector for the given mode using LOCAL assets. */
-export async function createDetector(opts: DetectorOptions): Promise<LandmarkDetector> {
-  const mp = await loadTasksVision();
-  const fileset = await loadFileset(opts.wasmPath ?? DEFAULT_WASM_PATH);
-  const preferred = opts.delegate ?? 'auto';
+/** The minimum a MediaPipe task instance has to look like for `buildDetector`. */
+interface VideoTask<R> {
+  detectForVideo(frame: never, timestampMs: number): R;
+  close(): void;
+}
+
+/**
+ * Wrap a created task instance as a LandmarkDetector, with a ONE-SHOT GPU -> CPU recovery.
+ *
+ * WHY THE SECOND FALLBACK: `withDelegateFallback` only covers creation. MediaPipe on a clinic laptop with
+ * a broken/blocklisted WebGL stack routinely CREATES a GPU landmarker successfully and then throws on the
+ * first `detectForVideo`. Without this, that path surfaces as a permanent 'error' status (DetectLoop
+ * reports every frame's throw) and the session is dead. Here the first GPU inference failure re-creates
+ * the task on CPU in the background; frames during the swap return "nothing detected" (the lanes read
+ * 'not tracking' — honest, and no unearned hits), and `delegate` flips to 'CPU' once it is live. If the
+ * CPU re-creation ALSO fails, the failure is rethrown from every subsequent detect: loudly dead, never a
+ * frozen meter under a green OK.
+ */
+function buildDetector<R>(cfg: {
+  mode: Mode;
+  instance: VideoTask<R>;
+  delegate: 'GPU' | 'CPU';
+  /** null when no CPU retry is allowed (delegate was pinned to 'GPU'). */
+  createCpu: (() => Promise<VideoTask<R>>) | null;
+  map: (res: R, ts: number) => DetectionResult;
+  empty: (ts: number) => DetectionResult;
+}): LandmarkDetector {
+  let instance = cfg.instance;
+  let delegate = cfg.delegate;
+  let closed = false;
+  let recovering = false;
+  let fallbackUsed = delegate === 'CPU' || cfg.createCpu === null;
+  let fatal: unknown = null;
   let lastTs = -1;
   const nextTs = (t: number) => {
     // MediaPipe requires strictly increasing timestamps.
@@ -121,54 +156,111 @@ export async function createDetector(opts: DetectorOptions): Promise<LandmarkDet
     lastTs = ts;
     return ts;
   };
+  return {
+    mode: cfg.mode,
+    get delegate() {
+      return delegate;
+    },
+    get recovering() {
+      return recovering;
+    },
+    detect(frame, timestampMs) {
+      if (fatal) throw fatal;
+      const ts = nextTs(timestampMs);
+      if (recovering) return cfg.empty(ts);
+      try {
+        return cfg.map(instance.detectForVideo(frame as never, ts), ts);
+      } catch (err) {
+        if (fallbackUsed || closed || !cfg.createCpu) throw err;
+        fallbackUsed = true;
+        recovering = true;
+        console.warn('[vision] GPU inference failed, re-creating the detector on CPU', err);
+        const dying = instance;
+        void cfg.createCpu().then(
+          (inst) => {
+            try {
+              dying.close();
+            } catch {
+              /* the GPU task is already broken; its close() may throw too */
+            }
+            if (closed) {
+              inst.close();
+              return;
+            }
+            instance = inst;
+            delegate = 'CPU';
+            recovering = false;
+          },
+          (e) => {
+            fatal = e;
+            recovering = false;
+          },
+        );
+        return cfg.empty(ts);
+      }
+    },
+    close() {
+      closed = true;
+      instance.close();
+    },
+  };
+}
+
+/** Create a real MediaPipe-backed detector for the given mode using LOCAL assets. */
+export async function createDetector(opts: DetectorOptions): Promise<LandmarkDetector> {
+  const mp = await loadTasksVision();
+  const fileset = await loadFileset(opts.wasmPath ?? DEFAULT_WASM_PATH);
+  const preferred = opts.delegate ?? 'auto';
 
   if (opts.mode === 'leg') {
-    const { instance, delegate } = await withDelegateFallback(preferred, (d) =>
+    const createPose = (d: 'GPU' | 'CPU') =>
       mp.PoseLandmarker.createFromOptions(fileset, {
         baseOptions: { modelAssetPath: opts.poseModelPath ?? DEFAULT_POSE_MODEL, delegate: d },
         runningMode: 'VIDEO',
         numPoses: 1,
         minPoseDetectionConfidence: opts.minDetectionConfidence ?? 0.5,
         minTrackingConfidence: opts.minTrackingConfidence ?? 0.5,
-      }),
-    );
-    return {
+      });
+    const { instance, delegate } = await withDelegateFallback(preferred, createPose);
+    type PoseResult = ReturnType<typeof instance.detectForVideo>;
+    return buildDetector<PoseResult>({
       mode: 'leg',
+      instance: instance as unknown as VideoTask<PoseResult>,
       delegate,
-      detect(frame, timestampMs) {
-        const ts = nextTs(timestampMs);
-        const res = instance.detectForVideo(frame as Parameters<typeof instance.detectForVideo>[0], ts);
+      createCpu: preferred === 'GPU' ? null : () => createPose('CPU') as unknown as Promise<VideoTask<PoseResult>>,
+      map: (res, ts) => {
         const pose = res.landmarks.length > 0 ? res.landmarks[0].map(toLandmark) : null;
         const poseWorld = pose && res.worldLandmarks.length > 0 ? res.worldLandmarks[0].map(toLandmark) : null;
         return { tMs: ts, pose, poseWorld, hands: [] };
       },
-      close: () => instance.close(),
-    };
+      empty: (ts) => ({ tMs: ts, pose: null, poseWorld: null, hands: [] }),
+    });
   }
 
-  const { instance, delegate } = await withDelegateFallback(preferred, (d) =>
+  const createHand = (d: 'GPU' | 'CPU') =>
     mp.HandLandmarker.createFromOptions(fileset, {
       baseOptions: { modelAssetPath: opts.handModelPath ?? DEFAULT_HAND_MODEL, delegate: d },
       runningMode: 'VIDEO',
       numHands: opts.numHands ?? 2,
       minHandDetectionConfidence: opts.minDetectionConfidence ?? 0.5,
       minTrackingConfidence: opts.minTrackingConfidence ?? 0.5,
-    }),
-  );
-  return {
+    });
+  const { instance, delegate } = await withDelegateFallback(preferred, createHand);
+  type HandResult = ReturnType<typeof instance.detectForVideo>;
+  return buildDetector<HandResult>({
     mode: 'hand',
+    instance: instance as unknown as VideoTask<HandResult>,
     delegate,
-    detect(frame, timestampMs) {
-      const ts = nextTs(timestampMs);
-      const res = instance.detectForVideo(frame as Parameters<typeof instance.detectForVideo>[0], ts);
+    createCpu: preferred === 'GPU' ? null : () => createHand('CPU') as unknown as Promise<VideoTask<HandResult>>,
+    map: (res, ts) => {
       const hands: HandDetection[] = res.landmarks.map((lms, i) => {
         const cat = res.handedness[i]?.[0];
         return { landmarks: lms.map(toLandmark), label: cat?.categoryName ?? '', score: cat?.score ?? 0 };
       });
       return { tMs: ts, pose: null, hands };
     },
-    close: () => instance.close(),
-  };
+    empty: (ts) => ({ tMs: ts, pose: null, hands: [] }),
+  });
 }
 
 function toLandmark(l: { x: number; y: number; z: number; visibility?: number }): Landmark {
@@ -186,6 +278,23 @@ export function labelToPatientSide(label: string, mirrored: boolean): Side | nul
   return asLabel === 'left' ? 'right' : 'left';
 }
 
+export interface PickHandOptions {
+  /** Handedness score at which a MediaPipe label is trusted (default 0.6). */
+  minLabelScore?: number;
+  /**
+   * Accept the ONLY hand in frame even without a confident label. Default false.
+   *
+   * The lone-hand safety rule below exists for BILATERAL sessions. In a UNILATERAL session (every lane
+   * on one side — the standard stroke prescription) there is no second lane to steal from and no
+   * ambiguity to protect against, so refusing the lone hand only locks the patient out of their own
+   * session. Handedness confidence is exactly what degrades in the fingers-at-the-camera posture that
+   * wrist_extension requires, which makes that lockout likely rather than hypothetical. VisionInput
+   * turns this on automatically when all its lanes share one side.
+   * It never applies with two hands in frame: there the position rule is meaningful and is used instead.
+   */
+  acceptLoneHand?: boolean;
+}
+
 /**
  * Pick the detected hand belonging to the patient's `side`.
  *  1. Exactly one hand carries a confident, mirror-corrected label of `side`: that hand.
@@ -196,11 +305,20 @@ export function labelToPatientSide(label: string, mirrored: boolean): Side | nul
  *     has the smaller wrist x (the larger x when `mirrored`).
  * With two hands the left and right lanes therefore always resolve to DIFFERENT hands, even when the
  * labels are identical or missing.
+ *
+ * A SINGLE hand with no usable label (score below `minLabelScore`) is returned for NEITHER side: image
+ * position cannot tell which hand it is when there is nothing to compare it against, and in a bilateral
+ * session (affected + unaffected side, a very common prescription) handing it to both lanes would let
+ * the good hand score the affected hand's lane. Returning null surfaces as 'hand_missing' instead.
+ * `opts.acceptLoneHand` is the documented escape hatch for a unilateral session.
  */
-export function pickHand(hands: readonly HandDetection[], side: Side, mirrored = false, minLabelScore = 0.6): HandDetection | null {
+export function pickHand(hands: readonly HandDetection[], side: Side, mirrored = false, opts: PickHandOptions = {}): HandDetection | null {
   if (hands.length === 0) return null;
+  const minLabelScore = opts.minLabelScore ?? 0.6;
   const other: Side = side === 'left' ? 'right' : 'left';
   const labelOf = (h: HandDetection) => (h.score >= minLabelScore ? labelToPatientSide(h.label, mirrored) : null);
+  // Unilateral escape hatch: one hand in frame, no lane on the other side to protect.
+  if (hands.length === 1 && opts.acceptLoneHand) return labelOf(hands[0]) === other ? null : hands[0];
   const mine = hands.filter((h) => labelOf(h) === side);
   if (mine.length === 1) return mine[0];
   let candidates = mine.length > 1 ? mine : hands.filter((h) => labelOf(h) !== other);
@@ -208,6 +326,8 @@ export function pickHand(hands: readonly HandDetection[], side: Side, mirrored =
   // gives both the same label) => assign by position; a single hand of the other side is not ours.
   if (candidates.length === 0 && hands.length >= 2) candidates = hands.slice();
   if (candidates.length === 0) return null;
+  // Only one hand in the frame and no confident label: unassignable (see above).
+  if (hands.length === 1) return labelOf(hands[0]) === side ? hands[0] : null;
   if (candidates.length === 1) return candidates[0];
   // Positional assignment.
   const byX = candidates.slice().sort((a, b) => a.landmarks[0].x - b.landmarks[0].x);
@@ -234,6 +354,14 @@ export interface CameraSession {
   stream: MediaStream;
   width: number;
   height: number;
+  /**
+   * True once a video track of the stream fired 'ended' (device unplugged, permission revoked, another
+   * app grabbed the camera, OS sleep). Frames stop arriving without any error being thrown, so the
+   * runtime must watch this instead of assuming the last frame's verdict still holds.
+   */
+  ended?: boolean;
+  /** Set by the consumer: called when a video track ends (see `ended`). */
+  onEnded?: (() => void) | null;
   stop(): void;
 }
 
@@ -242,14 +370,23 @@ export async function openCamera(opts: CameraOptions = {}): Promise<CameraSessio
   if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
     throw new Error('Camera not available: getUserMedia unsupported');
   }
+  const wantW = opts.width ?? 640;
+  const wantH = opts.height ?? 480;
   const constraints: MediaStreamConstraints = {
     audio: false,
     video: {
-      width: { ideal: opts.width ?? 640 },
-      height: { ideal: opts.height ?? 480 },
+      width: { ideal: wantW },
+      height: { ideal: wantH },
+      // Only an IDEAL: most laptop sensors are natively 16:9 and would be letterboxed or refused by an
+      // exact 4:3. Whatever the browser actually hands back, the session reports the true videoWidth /
+      // videoHeight below and the features correct for it (FeatureOptions.xScale) — the aspect ratio
+      // must never silently rescale the movement measurements.
+      aspectRatio: { ideal: wantW / wantH },
       facingMode: opts.deviceId ? undefined : (opts.facingMode ?? 'user'),
       deviceId: opts.deviceId ? { exact: opts.deviceId } : undefined,
-      frameRate: { ideal: 30 },
+      // Cap as well as prefer: a 60 fps sensor doubles the main-thread inference cost for no extra
+      // timing resolution (DetectLoop also enforces its own cap, since `max` is only a request).
+      frameRate: { ideal: 30, max: 60 },
     },
   };
   const stream = await navigator.mediaDevices.getUserMedia(constraints);
@@ -274,13 +411,25 @@ export async function openCamera(opts: CameraOptions = {}): Promise<CameraSessio
     release();
     throw err;
   }
-  return {
+  const session: CameraSession = {
     video,
     stream,
     width: video.videoWidth || (opts.width ?? 640),
     height: video.videoHeight || (opts.height ?? 480),
+    ended: false,
+    onEnded: null,
     stop: release,
   };
+  // A track that ends (unplug / revoked permission / stolen device) simply stops delivering frames.
+  // Surface it so the runtime can show "not tracking" instead of a frozen meter under a green OK.
+  const tracks = typeof stream.getVideoTracks === 'function' ? stream.getVideoTracks() : stream.getTracks();
+  for (const t of tracks) {
+    t.addEventListener?.('ended', () => {
+      session.ended = true;
+      session.onEnded?.();
+    });
+  }
+  return session;
 }
 
 /** Resolve once the video has metadata (readyState >= 2), reject on error or after `timeoutMs`. */
@@ -321,9 +470,47 @@ export interface LoopStats {
   /** performance.now() of the last processed frame; 0 if none. */
   lastFrameAt: number;
   running: boolean;
+  /** Video frames deliberately skipped by the rate cap / adaptive budget (see DetectLoopOptions). */
+  skipped?: number;
 }
 
 export type DetectionCallback = (result: DetectionResult, frameTimeMs: number) => void;
+
+/**
+ * Detection rate below which the engine's ±50 ms "perfect" window stops being reachable: at N fps a
+ * crossing is localized to a frame interval of 1/N s, and even with the trigger's sub-frame
+ * interpolation the residual error is a good fraction of that. At 15 fps (67 ms between frames) the
+ * hardest difficulty's perfect window is already gone. Reported, not enforced — a patient must be told
+ * their laptop cannot keep up, rather than silently missing every note.
+ */
+export const MIN_USABLE_DETECT_FPS = 15;
+
+/** Default inference rate cap: just above the 30 fps the camera is asked for (see DetectLoopOptions). */
+export const DEFAULT_MAX_DETECT_HZ = 32;
+
+export interface DetectLoopOptions {
+  /**
+   * Hard cap on inferences per second (default 32 — just above the 30 fps the camera is asked for, so
+   * ordinary frame jitter is not clipped). Video frames arriving faster are dropped without running
+   * inference: the camera is only asked for `ideal: 30`, and a 60 fps webcam that ignores that would
+   * otherwise double the main-thread cost of the whole session for no extra timing resolution.
+   * The cap is measured on the frames' own capture/presentation clock, not on wall time.
+   */
+  maxDetectHz?: number;
+  /**
+   * Adaptive skip (default true). MediaPipe's detectForVideo runs SYNCHRONOUSLY on the main thread —
+   * the same thread that draws the note highway — so a 30-60 ms pose inference on the CPU delegate (the
+   * documented clinic-laptop path) stalls the highway for that long every single frame. When an
+   * inference overruns `budgetMs`, the loop waits out the overrun before the next one, so inference
+   * duty-cycles down to roughly the budget and the renderer keeps its slice. Bounded by `minDetectHz`
+   * so the input never degrades below a usable rate.
+   */
+  adaptiveSkip?: boolean;
+  /** Main-thread time per frame inference may take before the adaptive skip kicks in (default: half the cap's period). */
+  budgetMs?: number;
+  /** Floor for the adaptive skip (default 12 Hz): inference is never throttled below this. */
+  minDetectHz?: number;
+}
 
 /**
  * Runs detector.detect on every new video frame, using requestVideoFrameCallback when available
@@ -341,23 +528,41 @@ export class DetectLoop {
   private usingRvfc = false;
   private running = false;
   private lastMediaTime = -1;
-  private stats: LoopStats = { fps: 0, inferenceMs: 0, frames: 0, lastFrameAt: 0, running: false };
+  private stats: LoopStats = { fps: 0, inferenceMs: 0, frames: 0, lastFrameAt: 0, running: false, skipped: 0 };
   private lastTick = 0;
+  /** Rate cap / adaptive budget: no inference before this frame time. */
+  private nextDetectAtMs = -Infinity;
+  private readonly minPeriodMs: number;
+  private readonly maxPeriodMs: number;
+  private readonly budgetMs: number;
+  private readonly adaptive: boolean;
   onError: ((err: unknown) => void) | null = null;
 
-  constructor(video: HTMLVideoElement, detector: LandmarkDetector, onResult: DetectionCallback) {
+  constructor(video: HTMLVideoElement, detector: LandmarkDetector, onResult: DetectionCallback, opts: DetectLoopOptions = {}) {
     this.video = video;
     this.detector = detector;
     this.onResult = onResult;
+    const maxHz = opts.maxDetectHz && opts.maxDetectHz > 0 ? opts.maxDetectHz : DEFAULT_MAX_DETECT_HZ;
+    const minHz = opts.minDetectHz && opts.minDetectHz > 0 ? Math.min(opts.minDetectHz, maxHz) : Math.min(12, maxHz);
+    this.minPeriodMs = 1000 / maxHz;
+    this.maxPeriodMs = 1000 / minHz;
+    this.budgetMs = opts.budgetMs !== undefined && opts.budgetMs > 0 ? opts.budgetMs : this.minPeriodMs / 2;
+    this.adaptive = opts.adaptiveSkip !== false;
   }
 
   getStats(): LoopStats {
     return { ...this.stats, running: this.running };
   }
 
+  /** True when the last inference blew the main-thread budget and the loop is duty-cycling it down. */
+  isThrottled(): boolean {
+    return this.adaptive && this.stats.inferenceMs > this.budgetMs;
+  }
+
   start(): void {
     if (this.running) return;
     this.running = true;
+    this.nextDetectAtMs = -Infinity;
     this.usingRvfc = typeof this.video.requestVideoFrameCallback === 'function';
     this.schedule();
   }
@@ -373,9 +578,14 @@ export class DetectLoop {
     if (!this.running) return;
     if (this.usingRvfc) {
       this.handle = this.video.requestVideoFrameCallback((now, meta) => {
+        // A callback dispatched BEFORE stop() still fires after it. Without this guard it would call
+        // detector.detect() on a MediaPipe task VisionInput.stop() has already close()d, and calling
+        // into a deleted wasm task can abort the runtime outright rather than throw — taking the whole
+        // page's vision stack with it.
+        if (!this.running) return;
         const frameTime = meta.captureTime ?? meta.presentationTime ?? now;
         try {
-          this.step(frameTime, now);
+          this.maybeStep(frameTime);
         } finally {
           this.schedule();
         }
@@ -383,12 +593,13 @@ export class DetectLoop {
     } else {
       const raf = typeof requestAnimationFrame === 'function' ? requestAnimationFrame : (cb: FrameRequestCallback) => setTimeout(() => cb(performance.now()), 16) as unknown as number;
       this.handle = raf((now) => {
+        if (!this.running) return; // same post-stop() guard as above
         try {
           const mt = this.video.currentTime;
           // Only run inference when the video advanced to a new frame (rAF can outpace the camera).
           if (mt !== this.lastMediaTime && this.video.readyState >= 2) {
             this.lastMediaTime = mt;
-            this.step(now, now);
+            this.maybeStep(now);
           }
         } finally {
           this.schedule();
@@ -397,17 +608,34 @@ export class DetectLoop {
     }
   }
 
-  private step(frameTimeMs: number, nowMs: number): void {
+  /** Rate cap + adaptive main-thread budget (see DetectLoopOptions); skipped frames are counted. */
+  private maybeStep(frameTimeMs: number): void {
+    if (frameTimeMs < this.nextDetectAtMs) {
+      this.stats.skipped = (this.stats.skipped ?? 0) + 1;
+      return;
+    }
+    this.step(frameTimeMs);
+  }
+
+  private step(frameTimeMs: number): void {
     const t0 = performance.now();
     let result: DetectionResult;
     try {
-      result = this.detector.detect(this.video, Math.max(0, Math.round(nowMs)));
+      // The MediaPipe timestamp is the frame's CAPTURE time, the same clock the engine is judged
+      // against — not the callback's wall time, which leads capture by a variable 10-30 ms under load
+      // and would desync the tracker's internal temporal filtering from our timing. (createDetector
+      // still enforces strict monotonicity.)
+      result = this.detector.detect(this.video, Math.max(0, Math.round(frameTimeMs)));
     } catch (err) {
+      // Still charge the rate cap: a detector that throws in 40 ms would otherwise be retried on every
+      // single video frame, which is the same main-thread stall with none of the benefit.
+      this.chargeBudget(frameTimeMs, performance.now() - t0);
       this.onError?.(err);
       return;
     }
     const t1 = performance.now();
     const inf = t1 - t0;
+    this.chargeBudget(frameTimeMs, inf);
     const s = this.stats;
     s.frames++;
     s.inferenceMs = s.frames === 1 ? inf : s.inferenceMs * 0.9 + inf * 0.1;
@@ -426,5 +654,17 @@ export class DetectLoop {
       // A throwing listener must not kill the loop (the frame callback re-schedules in `finally`).
       this.onError?.(err);
     }
+  }
+
+  /**
+   * Set the earliest frame time of the next inference: at least the rate cap's period, plus (when
+   * adaptive) the amount by which this inference overran the main-thread budget, so a slow CPU-delegate
+   * inference yields the thread back to the renderer instead of monopolising every frame. Capped at
+   * `maxPeriodMs` so the detection rate never collapses.
+   */
+  private chargeBudget(frameTimeMs: number, inferenceMs: number): void {
+    let period = this.minPeriodMs;
+    if (this.adaptive && inferenceMs > this.budgetMs) period = Math.min(this.maxPeriodMs, period + (inferenceMs - this.budgetMs));
+    this.nextDetectAtMs = frameTimeMs + period;
   }
 }
