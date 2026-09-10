@@ -1,32 +1,114 @@
-# React + TypeScript + Vite
+# Beat Rehab
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+A rhythm game you play with your body, built for physiotherapy. The patient performs
+therapist-prescribed exercises in time with real music; each exercise is a lane on a
+Guitar-Hero-style note highway, and a camera — not a controller — reads the movement.
 
-Currently, two official plugins are available:
+The music is multitrack. One stem belongs to the patient: hit your notes and your
+instrument plays in the mix, miss them and it drops out while the rest of the band keeps
+going. The body plays the music.
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
-
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the Oxlint configuration
-
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
-
-```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
-}
+```bash
+npm install
+npm run dev            # http://localhost:5173
 ```
 
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+No camera to hand? `?input=keyboard` maps lanes to `1`–`4` / `D F J K`, `?input=autoplay`
+runs a bot, `?demo=highway` mounts the renderer on its own.
+
+## How a session goes
+
+1. **Mode** — legs or hands. One per session, never both.
+2. **Prescription** — the therapist picks 2–4 movements (with side), a difficulty, and a song.
+3. **Camera check** — live preview with landmark overlay, frame rate, mirror toggle.
+4. **Range-of-motion calibration** — per lane: rest for two seconds, then three comfortable
+   reps. The hit threshold is a fraction of *that patient's* range, and the fraction is the
+   difficulty knob (easy 0.5, medium 0.65, hard 0.8).
+5. **Latency calibration** — a metronome, eight beats, move on each click. Camera pipelines
+   run 80–200 ms behind reality; this measures it rather than guessing.
+6. **Play.**
+7. **Results** — score and stars, but also reps performed, accuracy and timing bias per
+   movement, range achieved against the calibrated range, and compensation flags.
+
+Sessions are stored locally, so the History screen shows progress across visits.
+
+## The movements
+
+Each movement is one lane.
+
+**Leg mode** (MediaPipe Pose, patient seated)
+
+| Movement | What the patient does | What the camera measures |
+| --- | --- | --- |
+| Seated march | Lifts the knee | Hip flexion: knee height above hip, over torso length |
+| Knee extension | Straightens the leg | Hip–knee–ankle angle |
+| Ankle dorsiflexion | Lifts the toes, heel down | Shin-to-foot angle, with a heel-lift compensation check |
+| Hip abduction | Swings the knee outward | Lateral knee displacement from the hip, over torso length |
+
+**Hand mode** (MediaPipe Hands, forearm resting on a table)
+
+| Movement | What the patient does | What the camera measures |
+| --- | --- | --- |
+| Hand open / close | Opens and closes the fist | Mean fingertip-to-wrist distance over palm size |
+| Wrist extension | Lifts the wrist | Wrist rise against the calibrated rest baseline |
+| Finger opposition | Taps a fingertip to the thumb | Fingertip-to-thumb distance over palm size |
+| Finger spread | Spreads the fingers | Index-to-pinky angle |
+
+Fine-motor movements get timing windows 1.6× wider than gross ones, because they are
+smaller signals in a noisier part of the image.
+
+## Music and attribution
+
+Songs live in `public/songs/<id>/` as a `song.json` manifest plus a `stems/` folder. Two
+demo multitracks are synthesized in-repo (`npm run gen-demo-stems`, CC0) so the game is
+playable immediately.
+
+For real music, `public/songs/ccmixter-README.md` walks through taking a Creative Commons
+multitrack from [dig.ccMixter](https://dig.ccmixter.org/) (the free-for-commercial-use
+section) or [stems.ccMixter](https://stems.ccmixter.org/), writing its licence and artist
+into the manifest, and pulling the audio down with `npm run fetch-stems`. Per-song
+attribution is required data, and the game displays it — on the song list, as a lower-third
+card when the song starts, and on the results screen.
+
+Songs whose stems have not been fetched are shown as "needs fetch" rather than crashing the
+catalogue.
+
+## Layout
+
+```
+src/engine/    timing, judgment, scoring, latency maths — pure TS, no DOM
+src/charts/    chart generation from a song's beat grid
+src/audio/     Web Audio stem mixer (sample-synced stems, per-stem ducking), SFX, latency probe
+src/vision/    MediaPipe wrappers, per-movement feature extraction, ROM calibration, triggers
+src/input/     InputSource: vision, keyboard, replay, autoplay
+src/render/    Canvas note highway and HUD
+src/session/   game loop, session config, results
+src/ui/        React screens
+src/state/     zustand store + local persistence
+critic/        Playwright harnesses the build is judged with, plus reference material
+docs/          ARCHITECTURE.md — the contract every module follows
+```
+
+`docs/ARCHITECTURE.md` is the source of truth for module boundaries, the time base, and the
+input and audio contracts.
+
+## Checks
+
+```bash
+npm test               # vitest
+npm run typecheck
+npm run build
+node critic/smoke.mjs  # boots the app in headless Chromium and plays a session end to end
+node critic/frames.mjs # captures 1080p gameplay frames for visual review
+```
+
+`critic/smoke.mjs` starts and stops its own dev server, drives the whole flow, and asserts
+the engine actually scored, the clock froze on pause, and the session was saved.
+
+## A note on safety and scope
+
+This is a movement game, not a medical device. Nothing here diagnoses, and the numbers on
+the results screen are session telemetry for a clinician to interpret, not clinical
+measurements. The engine deliberately never penalises extra movement — a patient with
+tremor or spasticity should not lose points for their symptoms — and a song can never be
+failed out of.
