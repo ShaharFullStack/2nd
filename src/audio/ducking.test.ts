@@ -219,7 +219,7 @@ class FakeHoldParam implements GainParamLike, LinearParamLike {
 describe('scheduleRamp with cancelAndHoldAtTime', () => {
   it('feature-detects the method', () => {
     expect(supportsCancelAndHold(new FakeHoldParam())).toBe(true);
-    expect(supportsCancelAndHold(new FakeAudioParam())).toBe(false);
+    expect(supportsCancelAndHold(new FakeAudioParam() as unknown as { cancelAndHoldAtTime?: unknown })).toBe(false);
     expect(supportsCancelAndHold({})).toBe(false);
   });
 

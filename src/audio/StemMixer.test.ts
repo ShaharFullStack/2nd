@@ -39,7 +39,8 @@ class FakeSource extends FakeNode {
   stopped = false;
   stopAt: number | null = null;
   onended: (() => void) | null = null;
-  constructor(private readonly ctx: FakeContext) { super(); }
+  readonly ctx: FakeContext;
+  constructor(ctx: FakeContext) { super(); this.ctx = ctx; }
   start(when: number, offset: number) {
     this.started = { when, offset };
     // simulate a main thread that stalls (MediaPipe inference) right after posting the first start
@@ -93,7 +94,7 @@ function setup(opts: { durations?: Record<string, number>; compressor?: boolean;
     if (id === 'slow') {
       // resolves only when the test says so; rejects like a real fetch when its signal aborts
       return new Promise<Response>((resolve, reject) => {
-        pending.push({ url, signal: init?.signal, resolve });
+        pending.push({ url, signal: init?.signal ?? undefined, resolve });
         init?.signal?.addEventListener('abort', () => { const e = new Error('aborted'); e.name = 'AbortError'; reject(e); });
       });
     }
