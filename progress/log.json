@@ -1,25 +1,25 @@
 {
- "updated": "2026-09-09T19:41Z",
+ "updated": "2026-09-10T05:02Z",
  "pieces": {
   "engine": {
-   "round": 1,
+   "round": 2,
    "status": "fixing",
-   "note": "Critic round 1 (score 6.5): latency-calibration confidence unusable at 30 fps camera quantisation; pairing radius = outlier cutoff so consis"
+   "note": "Round 2 (6.5): chart lattice gives unbalanced lanes (62/38 at 2 lanes) — bilateral rehab would shortchange one side."
   },
   "audio": {
-   "round": 1,
+   "round": 2,
    "status": "fixing",
-   "note": "Critic round 1 (score 7): latencyProbe duplicated engine latency math with different defaults; must delegate to engine estimateLatency."
+   "note": "Round 2 (7.5): StemMixer must implement the SongTimeSource contract and return resume start time; pause/resume drifts judgments."
   },
   "vision": {
-   "round": 1,
+   "round": 2,
    "status": "fixing",
-   "note": "Critic round 1 (score 6): OneEuro smoothing on raw units gives 13–95 ms lane-dependent lag; filter normalized 0..1 value and route calibrati"
+   "note": "Round 2 (7): VisionInput start/stop not race-safe — StrictMode double-mount leaks two cameras."
   },
   "render": {
-   "round": 1,
+   "round": 2,
    "status": "fixing",
-   "note": "Critic round 1 (score 6.5): miss visual can never be seen — gem leaves screen 134 ms after note time but engine declares miss at 210–280 ms."
+   "note": "Round 2: miss gem culled before the engine ever declares the miss."
   }
  },
  "entries": [
@@ -58,6 +58,30 @@
    "piece": "orchestrator",
    "kind": "info",
    "text": "Subagent spend limit hit mid-loop; resumed workflow after reset (fix rounds + critic rounds 2+ + integration)."
+  },
+  {
+   "time": "2026-09-10T05:02Z",
+   "piece": "engine",
+   "kind": "fail",
+   "text": "Round 2 (6.5): chart lattice gives unbalanced lanes (62/38 at 2 lanes) — bilateral rehab would shortchange one side."
+  },
+  {
+   "time": "2026-09-10T05:02Z",
+   "piece": "audio",
+   "kind": "fail",
+   "text": "Round 2 (7.5): StemMixer must implement the SongTimeSource contract and return resume start time; pause/resume drifts judgments."
+  },
+  {
+   "time": "2026-09-10T05:02Z",
+   "piece": "vision",
+   "kind": "fail",
+   "text": "Round 2 (7): VisionInput start/stop not race-safe — StrictMode double-mount leaks two cameras."
+  },
+  {
+   "time": "2026-09-10T05:02Z",
+   "piece": "render",
+   "kind": "fail",
+   "text": "Round 2: miss gem culled before the engine ever declares the miss."
   }
  ]
 }
