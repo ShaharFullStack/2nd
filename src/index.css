@@ -3,7 +3,8 @@
  *
  * Two constraints drive everything here: the therapist drives it on a tablet (touch targets never
  * below 56 px, no hover-only affordances) and the patient reads it from ~2 m away in a chair
- * (body text 18 px, primary numbers 40 px+, contrast >= 7:1 on the dark ground).
+ * (body text 18 px and never under 16 px effective, primary numbers 40 px+, every text colour at
+ * least 7:1 on the page ground and never under WCAG AA 4.5:1 on a panel).
  */
 
 :root {
@@ -19,7 +20,14 @@
   --line: #2a3550;
   --text: #eef1f8;
   --muted: #9aa6c2;
-  --dim: #6b7796;
+  /*
+   * The quiet text colour. It was #6b7796 — 3.8:1 on --panel, below WCAG AA, while the header six
+   * lines up claimed >= 7:1. Most of the app's load-bearing prose is `.dim` (the ROM denominator
+   * disclosure, the "this session did not measure range" note, the camera-failure explanation, the
+   * preview captions), which is exactly the text a low-vision patient at 2 m cannot afford to lose.
+   * #9fabc7 is 8.6:1 on --bg, 7.4:1 on --panel and 6.7:1 on --panel-2.
+   */
+  --dim: #9fabc7;
 
   --accent: #ff3d7f;
   --accent-2: #35d6ff;
@@ -107,7 +115,8 @@ h2 { margin: 0; font-size: 1.6rem; font-weight: 800; letter-spacing: -0.01em; }
 h3 { margin: 0; font-size: 1.1rem; font-weight: 700; }
 p { margin: 0; }
 .muted { color: var(--muted); }
-.dim { color: var(--dim); font-size: 0.85rem; }
+ /* 0.92rem = 16.6 px at the 18 px root: the floor for body text read from a chair 2 m away. */
+.dim { color: var(--dim); font-size: 0.92rem; }
 .mono { font-variant-numeric: tabular-nums; font-feature-settings: 'tnum'; }
 .big-number { font-size: clamp(2.4rem, 6vw, 3.6rem); font-weight: 900; line-height: 1; }
 
@@ -339,7 +348,7 @@ table.table tr:hover td { background: rgba(255, 255, 255, 0.03); }
 .pip video { width: 100%; display: block; transform: scaleX(-1); background: #000; }
 .pip-video { display: block; line-height: 0; }
 .pip-meters { display: flex; gap: 8px; height: 54px; padding: 8px; align-items: stretch; }
-.pip-note { padding: 6px 10px 10px; font-size: 0.72rem; color: var(--dim); }
+.pip-note { padding: 6px 10px 10px; font-size: 0.82rem; color: var(--dim); }
 
 .lower-third {
   position: absolute;

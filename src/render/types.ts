@@ -44,17 +44,65 @@ export interface RenderLaneState {
    * them the same way.
    *
    * This is NOT a brightness modifier. The receptor renders it as a categorically different set of
-   * MARKS: the dead grey miss ring shrunk 12 %, a grey liquid column capped short of the target
-   * height (it can never reach the height that means "at the trigger point", however hard the
-   * patient pushes), and — uniquely to this state — a violet drain cap riding the top of that
-   * column, a dashed re-arm line at the level to come back down to, a "lower to reset" chevron that
-   * settles onto that line, and an arc outside the ring that grows as the value drains and
-   * completes exactly when the lane re-arms. Just as important is what is *removed*: no level line,
-   * no target line or ticks, no hot fill, no halo, no additive rim or corona. A lane with
-   * `armed === false` must never wear any part of the "will fire" costume: the input layer will
-   * emit nothing for it however hard the patient pushes.
+   * MARKS: the ring shrunk 12 % and pulled most of the way toward the dead miss grey — desaturated,
+   * but still carrying the lane's own hue, so the lane keeps its identity at the instant its note is
+   * struck — a dulled liquid column, and — uniquely to this state — a violet drain cap riding the
+   * top of that column, a dashed re-arm line at the level to come back down to, a "lower to reset"
+   * chevron in the gap between the two, and an arc outside the ring that grows with the fraction of
+   * the return journey travelled and completes exactly when the lane re-arms. Just as important is
+   * what is *removed*: no level line, no target line or ticks, no hot fill, no halo, no additive rim
+   * or corona. A lane with `armed === false` must never wear any part of the "this counts" costume:
+   * the input layer will emit nothing for it however hard the patient pushes.
+   *
+   * THE COLUMN IS NOT ONE OF THOSE MARKS. It is a position gauge on the same scale in every state,
+   * so a locked lane's column stands at the patient's true height — above the target height if that
+   * is where they are — and travels down through it as they lower. It was once clamped short of the
+   * target height to keep it from "looking ready", and the cost was the opposite of biofeedback:
+   * combined with a fill that saturates at the threshold, the column and every mark hanging off it
+   * (drain cap, chevron, arc) sat frozen for the whole span from the patient's real peak down to
+   * the threshold — 71 % of the return journey on the default 'easy' difficulty. All four of the
+   * return-to-rest marks now move from the first millimetre of the descent; the eccentric phase is
+   * a therapeutic target in its own right, not dead time.
+   *
+   * ONE EXCEPTION, AND IT IS THE POINT: the ~0.45 s immediately after the THRESHOLD CROSSING. The
+   * trigger disarms on the sample that crosses (src/vision/trigger.ts) and `VisionInput` pushes it
+   * before it publishes `armed` (src/input/VisionInput.ts), so the crossing frame arrives here as
+   * `{ value >= threshold, armed: false }` — the frame the lane really did fire on is an
+   * `armed: false` frame, and no frame from any input source in this repo is ever
+   * `armed && value >= threshold`. The renderer therefore latches that EDGE (a lane that was armed
+   * on the previous tracked frame and is now not armed at or past threshold) and shows the
+   * goal-attainment look for it; see `ReceptorHistory` in src/render/receptor.ts. Without the latch
+   * the patient gets no gauge-level acknowledgement of reaching their target range at all, and the
+   * column visibly steps DOWN at the moment they reach it.
+   *
+   * AND THE EDGE IS NOT ENOUGH ON ITS OWN. A lane is disarmed by three different things, only one
+   * of which is a rep: the crossing; `LaneTrigger.breakContinuity`, i.e. the sample stream going
+   * silent for longer than `maxGapSec` (VisionInput pushes a null sample for every untracked frame,
+   * so half a second of a lost landmark does it) which sends the lane to 'unconfirmed' AT ITS
+   * CURRENT VALUE; and `LaneTrigger.setThreshold`, which re-checks the arming when a therapist
+   * retunes the difficulty mid-song. Cases 2 and 3 publish exactly the same
+   * `{ value >= threshold, armed: false }` frame as a crossing while emitting no `LaneInputEvent`
+   * and — case 2 — no `LaneRepEvent` either. So `ReceptorHistory` also expires its evidence the way
+   * the trigger expires its own: an arming older than `RenderFrame.maxGapSec` of unobserved stream,
+   * or gathered under a different `thresholdFraction` / `rearmFraction`, cannot produce a crossing.
+   * See `RenderLaneState.triggerState` for the way to stop guessing altogether, and the RESIDUAL
+   * paragraph in src/render/receptor.ts for what is left.
    */
   armed: boolean;
+  /**
+   * OPTIONAL, AND PREFERRED: the input layer's own three-way trigger state
+   * (`LaneTrigger.state`, already exposed on `VisionInput.getLaneDebug()` /
+   * `getLaneActivity()`). `armed` collapses 'unconfirmed' and 'triggered' into one flag, and the
+   * difference between them is the difference between "this rep just fired" and "this lane has
+   * never been confirmed" — the exact thing the crossing latch has to reconstruct from timing
+   * otherwise. When this is present the receptor reads it instead: only 'armed' → 'triggered' is a
+   * crossing, an 'unconfirmed' lane never is one however full its meter, and `armed` is derived
+   * from it so the two cannot disagree.
+   *
+   * `VisionInput.getLaneStates()` does not publish it yet. Wiring it there (one field, already on
+   * the lane's trigger) removes the last inference in the receptor's "this counts" cue.
+   */
+  triggerState?: 'unconfirmed' | 'armed' | 'triggered';
   /**
    * False when the tracker lost the limb / hand (`VisionInput.getLaneStates()` sets it, and reports
    * `value: 0` with it when the whole stream is dead — a lane-level dropout instead leaves the last
@@ -68,6 +116,18 @@ export interface RenderLaneState {
    * grey "lower to reset" ring, because the remedy is different (get back in frame, not move
    * differently). It outranks `armed === false`: a patient who is out of frame cannot act on
    * "lower to reset".
+   *
+   * DEBOUNCED BY THE RENDERER. This flag is a per-frame hard visibility gate
+   * (src/vision/landmarks.ts `MIN_VISIBILITY`, via src/vision/pipeline.ts) passed straight through
+   * by `VisionInput`, and nothing upstream smooths it: a landmark chattering across that gate —
+   * marginal framing, or motion blur at peak rep velocity — would strobe the whole receptor row
+   * between a full gauge and "?" at frame rate, and during Play the receptor is the patient's only
+   * out-of-frame signal. So the renderer holds the last tracked look for `LOST_HOLD_SEC` (0.2 s)
+   * before it will show this state; a lane that has never been tracked shows it immediately.
+   *
+   * A lane with NO `RenderLaneState` at all is treated as this state, not as an idle armed lane:
+   * an absent measurement is "I cannot see you", and `GameRunner`'s first frame really does ship
+   * `laneStates: []`.
    */
   tracking?: boolean;
 }
@@ -88,7 +148,11 @@ export interface RenderFrame {
    * (and an out-of-range / duplicated `index` warns once).
    */
   lanes: LaneSpec[];
-  /** Live movement meters, one per lane — matched by `RenderLaneState.lane` when present. */
+  /**
+   * Live movement meters, one per lane — matched by `RenderLaneState.lane` when present. A lane
+   * with no entry has no measurement and is drawn as tracking-lost (see `RenderLaneState.tracking`),
+   * never as an idle at-rest gauge.
+   */
   laneStates: RenderLaneState[];
   combo: number;
   /** Score multiplier tier (1..4+). */
@@ -110,25 +174,45 @@ export interface RenderFrame {
   /**
    * Fraction of ROM that counts as a hit — pass `Difficulty.thresholdFraction` for the session,
    * every frame. It is drawn as a fixed TARGET LINE across the receptor's meter well (and as two
-   * ticks on the ring's outline at the same height, where the liquid can never cover it), at 76 %
-   * of the well's height with overshoot headroom above it. So the meter answers "how much further"
-   * during the rise, and a lane that would really fire is the only one that paints liquid at or
-   * above the target-line height: a locked-out lane's column is capped ~10 % of the target height
-   * short of that line, so the band around it stays empty in every state that cannot score.
+   * marks on the ring's outline at the same height, where the liquid can never cover them), at 76 %
+   * of the well's height; the band above it spans the rest of the patient's calibrated ROM, so the
+   * meter answers "how much further" during the rise and can never saturate before full ROM. The
+   * column is a POSITION on one scale in all four states — including the locked one, whose whole
+   * job is to be lowered and which therefore has to be able to show itself coming down from above
+   * the line. Only during the ~0.45 s after a real threshold crossing is a height above that line
+   * ALSO a claim: "this rep cleared the target by this much", the ROM-achieved reading a therapist
+   * is looking for. In every other state the height says where the patient is and nothing more.
    *
-   * A level at or above the target line is necessary but NOT sufficient for the "this will fire"
-   * look: that one (hot fill, split white-hot cap, inner rim, corona, halo) is drawn only when the
-   * lane would really trigger — at/over threshold *and* `armed` *and* `tracking` (see
-   * `RenderLaneState`). That conjunction is the renderer's core biofeedback claim. A locked-out
-   * lane loses the target line and ticks altogether: its target is the re-arm line below, not the
-   * threshold above.
+   * A level at or above the target line is necessary but NOT sufficient for the "you reached it"
+   * look. That one (hot fill into the headroom, split white-hot cap, two solid arrowheads in place
+   * of the ticks, inner rim, corona, full halo) is drawn only for the CROSSING — latched by the
+   * renderer from the armed → not-armed edge at or past threshold, because the crossing frame is
+   * published with `armed: false` and the level test `armed && value >= threshold` matches no frame
+   * any input source in this repo emits (see `RenderLaneState.armed`). A lane that is merely held
+   * at end range gets none of it; a lane that has just fired gets all of it, once, for as long as a
+   * patient mid-rep can actually catch it. After the latch the receptor becomes the locked-out look
+   * and loses the target line and ticks altogether: its target is now the re-arm line below, not
+   * the threshold above.
    *
-   * KNOWN LIMIT, stated because the rest of this doc is a promise: the renderer can only be as
-   * truthful as `LaneState` is. `src/vision/trigger.ts` also swallows a crossing that lands within
-   * `minIntervalSec` (0.3 s) of the previous one, and that refractory window is not exposed in
-   * `LaneState`, so a rise that re-arms and re-crosses inside 300 ms can wear the "will fire" look
-   * for the frame before it is dropped. Closing it needs the input layer to fold the min-interval
-   * into `armed` (or to publish it per lane); the renderer must not guess at it.
+   * The latch is guarded, because an armed → not-armed edge is not always a crossing: see
+   * `RenderLaneState.armed`. An arming that predates more than `maxGapSec` of unobserved stream, or
+   * that was gathered under a different threshold, is thrown away rather than celebrated — the same
+   * rule `LaneTrigger` applies to its own arming.
+   *
+   * KNOWN LIMITS, stated because the rest of this doc is a promise: the renderer can only be as
+   * truthful as `LaneState` is, and two paths to the cue survive the guards.
+   *   - REFRACTORY. `src/vision/trigger.ts` swallows a crossing that lands within `minIntervalSec`
+   *     (0.3 s) of the previous one, and that window is not exposed in `LaneState`. Such a crossing
+   *     still enters 'triggered', so the latch still fires and the gauge still says "you reached
+   *     your target" — true of the patient's movement (the rep IS reported, with
+   *     `LaneRepEvent.emitted: false`) but not of the score.
+   *   - AN UNREPORTED STALL. The gap guard can only measure silence the renderer is TOLD about.
+   *     `VisionInput` republishes its last sample with `tracking: true` until its own stall
+   *     watchdog fires, so up to `maxGapSec` of the trigger's silence can be invisible here, and a
+   *     lane whose stream died in that window and recovers at end range can still be latched.
+   * Both close the same way, upstream and cheaply: publish `RenderLaneState.triggerState` (or the
+   * sample's observation time) from `VisionInput.getLaneStates()`. The renderer must not guess at
+   * either number.
    *
    * The threshold is optional only so the type stays compatible with partial frames: when it is
    * absent the renderer falls back to 0.5 *and warns once on the console*, because a meter filled
@@ -145,6 +229,22 @@ export interface RenderFrame {
    * drawn at the wrong height tells the patient to stop lowering while the lane is still dead.
    */
   rearmFraction?: number;
+  /**
+   * The input layer's break-in-the-stream window: a sample arriving more than this long after the
+   * previous OBSERVED one makes `LaneTrigger` throw the lane's arming away ('unconfirmed'), because
+   * a whole rep could have started and finished unwatched. Defaults to `DEFAULT_MAX_GAP_SEC`
+   * (0.5 s) — `LaneTrigger`'s default and the value `VisionInput` actually passes its triggers
+   * (`VisionInput.staleFrameSec`).
+   *
+   * The receptor needs it because the disarming it causes is published as *exactly* the frame a
+   * threshold crossing is (`{ value >= threshold, armed: false }`), with no `LaneInputEvent` and no
+   * `LaneRepEvent` behind it. `ReceptorHistory` therefore expires its own crossing evidence on the
+   * same clock: a patient whose limb left frame for half a second mid-rep is told to lower and
+   * reset, not congratulated for a rep that scored nothing. Pass the session's real value if
+   * `staleFrameSec` is ever tuned — too large re-opens the false "you reached it", too small only
+   * costs a real crossing its acknowledgement.
+   */
+  maxGapSec?: number;
 }
 
 /** Tunables for the highway renderer. All optional; see DEFAULT_HIGHWAY_OPTIONS. */

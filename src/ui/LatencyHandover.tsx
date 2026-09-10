@@ -49,10 +49,22 @@ export default function LatencyHandover({ result }: { result: SessionResult }) {
 
   const source = `${result.songTitle}, ${formatDate(result.startedAt)}`;
   const apply = () => setApplied(applySuggestedLatency(advice.applicableMs, source));
-  /** Put back exactly what was in force before the click, and say where it came from. */
+  /**
+   * Put back exactly what was in force before the click — INCLUDING its provenance.
+   *
+   * `latencyMeasured` and `latencyNote` are clinical facts about the offset — they are what the
+   * latency screen prints beside the number in force, so a therapist can tell "280 ms measured from
+   * last Tuesday's run" from "280 ms of unknown origin". Restoring the number while writing
+   * `measured: false` would make undoing a misclick cost the previous value's provenance. The note is
+   * restored too, and only replaced when there was none.
+   */
   const revert = () => {
     if (!applied) return;
-    setLatency(applied.previousMs / 1000, false, `${applied.previousMs} ms restored after undoing the ${source} suggestion`);
+    setLatency(
+      applied.previousMs / 1000,
+      applied.previousMeasured,
+      applied.previousNote || `${applied.previousMs} ms restored after undoing the ${source} suggestion`,
+    );
     setApplied(null);
   };
 
@@ -117,24 +129,38 @@ export default function LatencyHandover({ result }: { result: SessionResult }) {
           <p className="muted" style={{ margin: 0 }}>
             A good window in this session is ±{Math.round(advice.goodWindowMs)} ms, so a steady{' '}
             {Math.abs(advice.deltaMs)} ms of bias pushed honest movements outside it — the camera pipeline is{' '}
-            {advice.deltaMs > 0 ? 'slower' : 'faster'} than the {advice.currentMs} ms this session assumed. That is the
-            equipment, not the patient: the accuracy and hit counts below are an under-estimate of what they did.
+            {advice.deltaMs > 0 ? 'slower' : 'faster'} than the {advice.currentMs} ms{' '}
+            <b>this session was judged at</b>. That is the equipment, not the patient: the accuracy and hit counts
+            below are an under-estimate of what they did.
+          </p>
+        )}
+        {/* TWO DIFFERENT NUMBERS, NAMED. The sentence above quotes the offset THIS RUN was judged at
+            (it is a property of the stored record); the swap below quotes what is on the device right
+            now. They are the same unless the latency screen has been re-run since the session, and a
+            therapist deciding whether the suggestion is plausible must not have to guess which is
+            which when they differ. */}
+        {!done && advice.currentMs !== currentMs && (
+          <p className="muted" style={{ margin: 0 }} data-testid="latency-drift">
+            This device has been set to <b>{currentMs} ms</b> since that run — most likely the latency screen was
+            re-run. {currentMs} ms is the value the swap below replaces; {advice.currentMs} ms is what the figures on
+            this page were judged against.
           </p>
         )}
       </div>
 
       <div className="latency-swap">
         <div className="val now">
-          <span className="eyebrow">{done ? 'Was' : 'In force now'}</span>
+          <span className="eyebrow">{done ? 'Was (on this device)' : 'In force now (this device)'}</span>
           {/* The STORE's value, not the run's: this pair is what will change on this device. They are
-              the same number unless the latency screen has been re-run since the session. */}
+              the same number unless the latency screen has been re-run since the session, and when
+              they are not, the note above says so. */}
           <b className="mono">{applied ? applied.previousMs : currentMs} ms</b>
         </div>
         <span className="arrow" aria-hidden="true">
           →
         </span>
         <div className="val next">
-          <span className="eyebrow">{done ? 'Now' : 'Measured this run'}</span>
+          <span className="eyebrow">{done ? 'Now (on this device)' : 'Measured this run'}</span>
           <b className="mono">{applied ? applied.appliedMs : buttonMs} ms</b>
         </div>
         <div className="grow" />

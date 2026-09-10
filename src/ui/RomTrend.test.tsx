@@ -44,7 +44,10 @@ describe('RomTrend', () => {
   it('draws one card per movement, headed by the latest number and the direction', () => {
     render(<RomTrend history={IMPROVING} />);
     const card = screen.getByTestId('trend-knee_extension:left');
-    expect(card.textContent).toContain('L knee extension');
+    // The title is DERIVED from movement/side/fingertip, not read back from the stored `label` (which
+    // says "L knee extension" in this fixture, and says "L pinch" for every digit in records written
+    // before the fingertip reached the label).
+    expect(card.textContent).toContain('L knee ext');
     expect(card.textContent).toContain('72%'); // latest ROM
     expect(card.textContent).toContain('+20 pts'); // 0.52 → 0.72
     expect(card.textContent).toContain('3 camera sessions');
@@ -97,8 +100,12 @@ describe('RomTrend', () => {
   it('labels every chart for a screen reader', () => {
     render(<RomTrend history={IMPROVING} />);
     const svgs = screen.getByTestId('trend-knee_extension:left').querySelectorAll('svg');
-    expect(svgs.length).toBe(2);
-    for (const svg of svgs) expect(svg.getAttribute('aria-label')).toMatch(/L knee extension/);
+    // ROM percentage, the same reps in degrees, and accuracy.
+    expect(svgs.length).toBe(3);
+    for (const svg of svgs) expect(svg.getAttribute('aria-label')).toMatch(/L knee ext/);
+    // No two charts in one card may carry the same accessible name: they are different quantities.
+    const names = [...svgs].map((svg) => svg.getAttribute('aria-label'));
+    expect(new Set(names).size).toBe(names.length);
   });
 
   it('never shows a bot or keyboard run as the patient improving', () => {
@@ -112,8 +119,13 @@ describe('RomTrend', () => {
     render(<RomTrend history={history} />);
     const card = screen.getByTestId('trend-knee_extension:left');
     expect(card.textContent).toContain('2 camera sessions');
-    expect(card.textContent).toContain('70%'); // the patient's accuracy, not the bot's 100 %
-    expect(card.textContent).not.toContain('100%');
+    // The FIGURES, not the whole card: "100%" is also the ceiling label on the accuracy axis, which is
+    // a property of the chart and not a number claimed about anyone.
+    const figures = [...card.querySelectorAll('.trend-figure .v')].map((e) => e.textContent);
+    expect(figures).toContain('70%'); // the patient's accuracy, not the bot's 100 %
+    expect(figures).not.toContain('100%');
+    // ... and the bot's session is not a row in the per-session list either.
+    expect(card.querySelectorAll('.trend-points tbody tr').length).toBe(2);
     expect(card.textContent).toContain('20 movements performed'); // 10 + 10, not 27
     // ... and the exclusion is stated, not silent.
     expect(screen.getByTestId('trend-excluded-knee_extension:left').textContent).toMatch(/1 autoplay session/i);
@@ -178,6 +190,121 @@ describe('RomTrend', () => {
     const recentPair = xs(2); // last two sessions two days apart
     const spreadOut = xs(50); // ... versus fifty
     expect(recentPair[1] - recentPair[0]).toBeGreaterThan(spreadOut[1] - spreadOut[0]);
+  });
+
+  it('puts session i at the SAME x in every chart in the card, however bunched the dates are', () => {
+    // The failure this guards: the ROM line positioned points by real timestamp while the accuracy
+    // columns positioned them by even index slot. Four sessions in one week, a fourteen-week gap and
+    // two more, and the accuracy column above a ROM point belonged to a different session — inside one
+    // card, under one pair of dates, with a caption claiming each point sits at its real date.
+    const day = 86_400_000;
+    const base = 400 * day;
+    const days = [0, 2, 4, 6, 104, 106]; // bunched week, long gap, bunched pair
+    const history = days
+      .map((d, i) => session(`s${i}`, base + d * day, [lane({ romMean: 0.4 + i * 0.05, accuracy: 0.5 + i * 0.05 })]))
+      .reverse(); // newest first, as the store keeps it
+    render(<RomTrend history={history} />);
+    const card = screen.getByTestId('trend-knee_extension:left');
+
+    const line = card.querySelector('svg[aria-label*="range of motion"]')!;
+    const pointXs = (line.querySelector('polyline')!.getAttribute('points') ?? '')
+      .split(' ')
+      .map((p) => Number(p.split(',')[0]));
+    const bars = card.querySelector('svg[aria-label*="accuracy"]')!;
+    const barXs = [...bars.querySelectorAll('rect')].map(
+      (r) => Number(r.getAttribute('x')) + Number(r.getAttribute('width')) / 2,
+    );
+
+    expect(barXs.length).toBe(pointXs.length);
+    barXs.forEach((bx, i) => expect(bx).toBeCloseTo(pointXs[i], 6));
+    // ... and the shared axis really is a timeline: the fourteen-week gap is the widest gap on it.
+    const gaps = pointXs.slice(1).map((x, i) => x - pointXs[i]);
+    expect(Math.max(...gaps)).toBeGreaterThan(gaps[0] * 10);
+  });
+
+  it('discloses the denominator every percentage on the card is out of', () => {
+    render(<RomTrend history={IMPROVING} />);
+    const note = screen.getByTestId('trend-denominator-knee_extension:left');
+    expect(note.textContent).toMatch(/range calibrated on the day/i);
+    expect(note.textContent).toMatch(/20° to 80°/);
+    expect(note.textContent).toMatch(/60° of travel/);
+  });
+
+  it('plots the peak in the movement own units as a SEPARATE quantity with its own title', () => {
+    render(<RomTrend history={IMPROVING} />);
+    const card = screen.getByTestId('trend-knee_extension:left');
+    const abs = screen.getByTestId('trend-absolute-knee_extension:left');
+    expect(abs.textContent).toContain('Peak angle reached');
+    expect(abs.textContent).toContain('63°'); // 20 + 0.72 x 60
+    expect(abs.textContent).toContain('+12°'); // 51° → 63°
+    // Not folded into the ROM heading, and not "pts".
+    expect(card.querySelector('svg[aria-label*="peak angle reached"]')).toBeTruthy();
+    expect(abs.textContent).not.toContain('pts');
+  });
+
+  it('answers "did the range improve?" across a re-calibration that makes the percentage fall', () => {
+    render(
+      <RomTrend
+        history={[
+          session('b', 2_000_000, [lane({ romMean: 0.7, calibratedMin: 20, calibratedMax: 120 })]),
+          session('a', 1_000_000, [lane({ romMean: 0.9, calibratedMin: 20, calibratedMax: 80 })]),
+        ]}
+      />,
+    );
+    const card = screen.getByTestId('trend-knee_extension:left');
+    expect(card.textContent).toContain('−20 pts'); // the percentage fell...
+    expect(screen.getByTestId('trend-absolute-knee_extension:left').textContent).toContain('+16°'); // ...the joint did not
+  });
+
+  it('draws accuracy on an absolute scale with a different mark, so no false slope comparison is invited', () => {
+    render(<RomTrend history={IMPROVING} />);
+    const card = screen.getByTestId('trend-knee_extension:left');
+    const accuracy = card.querySelector('svg[aria-label*="accuracy"]')!;
+    // Columns from a true zero out of a fixed 100 %, not a fourth autoscaled polyline.
+    expect(accuracy.querySelectorAll('rect').length).toBe(3);
+    expect(accuracy.querySelector('polyline')).toBeNull();
+    expect(accuracy.textContent).toContain('100%');
+    expect(accuracy.textContent).toContain('0%');
+  });
+
+  it('lists every session by date, and never writes "not measured" as a zero', () => {
+    render(
+      <RomTrend
+        history={[
+          session('c', 3_000_000, [lane({ romMean: 0.72 })]),
+          session('b', 2_000_000, [lane({ romMean: null, romBest: null, romSamples: 0 })]),
+          session('a', 1_000_000, [lane({ romMean: 0.52 })]),
+        ]}
+      />,
+    );
+    const rows = [...screen.getByTestId('trend-knee_extension:left').querySelectorAll('.trend-points tbody tr')];
+    expect(rows.length).toBe(3);
+    const middle = rows[1].textContent ?? '';
+    expect(middle).toMatch(/not measured/);
+    expect(middle).not.toMatch(/\b0%/);
+  });
+
+  it('titles two fingertips on one hand differently, even when the stored labels collide', () => {
+    const pinch = (fingertip: 'index' | 'pinky', patch: Partial<LaneResultSummary>) =>
+      lane({ movement: 'finger_opposition', side: 'left', fingertip, label: 'L pinch', ...patch });
+    render(
+      <RomTrend
+        history={[session('a', 1_000_000, [pinch('index', { lane: 0, romMean: 0.8 }), pinch('pinky', { lane: 1, romMean: 0.4 })])]}
+      />,
+    );
+    const a = screen.getByTestId('trend-finger_opposition:left:index');
+    const b = screen.getByTestId('trend-finger_opposition:left:pinky');
+    expect(a.querySelector('h4')!.textContent).toBe('L index pinch');
+    expect(b.querySelector('h4')!.textContent).toBe('L little pinch');
+  });
+
+  it('gives every chart in the document its own gradient id', () => {
+    // Two cards that share a series name used to emit the same SVG id, and both areas then resolved
+    // to whichever gradient the document defined first.
+    render(<RomTrend history={IMPROVING} />);
+    const ids = [...document.querySelectorAll('linearGradient')].map((g) => g.id);
+    expect(ids.length).toBeGreaterThan(1);
+    expect(new Set(ids).size).toBe(ids.length);
   });
 
   it('reports a single session honestly instead of inventing a trend', () => {

@@ -30,17 +30,37 @@ const GLYPH: Record<string, string> = {
   unknown: '📷',
 };
 
-export default function CameraFallback({ error, onRetry }: { error: unknown; onRetry: () => Promise<void> | void }) {
+export default function CameraFallback({
+  error,
+  onRetry,
+  retries = 0,
+}: {
+  error: unknown;
+  onRetry: () => Promise<void> | void;
+  /**
+   * Retries the HOST has already made on this visit to the camera.
+   *
+   * This screen cannot count its own: both hosts clear the error before re-requesting, which unmounts
+   * this component and resets its state, so a locally-held counter never got past 1 and the escalation
+   * below — the advice for the single most likely clinic failure, a permission the browser remembered
+   * on a shared tablet — was unreachable in the running app while its unit test passed. The count that
+   * survives the remount lives with the thing doing the retrying.
+   */
+  retries?: number;
+}) {
   const goto = useStore((s) => s.goto);
   const setInputMode = useStore((s) => s.setInputMode);
   const [retrying, setRetrying] = useState(false);
-  const [attempts, setAttempts] = useState(0);
+  const [localAttempts, setLocalAttempts] = useState(0);
+  // Whichever counted more: the host's (survives the remount) or this screen's own (for a host that
+  // keeps the component mounted across the retry).
+  const attempts = Math.max(localAttempts, retries);
 
   const failure = classifyCameraError(error);
 
   const retry = () => {
     setRetrying(true);
-    setAttempts((n) => n + 1);
+    setLocalAttempts((n) => n + 1);
     // The camera is re-REQUESTED, not just re-rendered: the caller disposes the vision input and
     // builds a new one, which calls getUserMedia again and re-prompts where the browser allows it.
     void Promise.resolve(onRetry()).finally(() => setRetrying(false));

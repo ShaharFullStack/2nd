@@ -10,7 +10,7 @@
  */
 import type { SongManifest } from '../audio/manifest.ts';
 import { attributionText } from '../audio/manifest.ts';
-import { movementLabel } from '../render/palette.ts';
+import { laneLabel } from '../render/palette.ts';
 import { compensationKind } from '../vision/features.ts';
 import type { RomCalibration } from '../vision/calibration.ts';
 import type { LaneRepStats, RunSummary } from './GameRunner.ts';
@@ -55,7 +55,7 @@ export function buildSessionResult(opts: BuildResultOptions): SessionResult {
       movement: spec.movement,
       side: spec.side,
       ...(spec.movement === 'finger_opposition' ? { fingertip: spec.fingertip ?? 'index' } : {}),
-      label: movementLabel(spec.movement, spec.side),
+      label: laneLabel(spec),
       hits: stats?.hits ?? 0,
       perfects: stats?.perfects ?? 0,
       goods: stats?.goods ?? 0,

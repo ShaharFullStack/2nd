@@ -11,11 +11,10 @@ import { SILENT_GRID, buildSessionChart, songGridOf } from '../session/chart.ts'
 import { buildSessionResult } from '../session/results.ts';
 import { runtime } from '../session/runtime.ts';
 import { useStore } from '../state/store.ts';
-import { MOVEMENT_INFO } from '../vision/features.ts';
 import { DEFAULT_REARM_FRACTION, receptorLookInto, type ReceptorLook } from '../render/receptor.ts';
 import CameraFallback from './CameraFallback.tsx';
 import { CameraPreview } from './CameraPreview.tsx';
-import { Meter, Toast } from './common.tsx';
+import { Meter, Toast, laneName } from './common.tsx';
 
 /**
  * The credit line drawn in the corner of the play screen.
@@ -96,6 +95,8 @@ function LaneMeters({ source, threshold }: { source: InputSource; threshold: num
 export default function PlayScreen() {
   const goto = useStore((s) => s.goto);
   const inputMode = useStore((s) => s.inputMode);
+  /** The prescription, for naming a lane in the messages a therapist has to act on. */
+  const lanes = useStore((s) => s.lanes);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const pipRef = useRef<HTMLDivElement>(null);
@@ -314,7 +315,7 @@ export default function PlayScreen() {
     await visionAttempt.current?.catch(() => undefined);
   }, []);
 
-  if (phase === 'camera') return <CameraFallback error={cameraError} onRetry={retryCamera} />;
+  if (phase === 'camera') return <CameraFallback error={cameraError} onRetry={retryCamera} retries={attempt} />;
 
   const countdown = hud?.countdown ?? 0;
 
@@ -388,7 +389,7 @@ export default function PlayScreen() {
               {blocked.map((b) => (
                 <Toast kind="bad" key={b.lane}>
                   <strong data-testid={`play-blocked-${b.lane}`}>
-                    Lane {b.lane + 1} ({MOVEMENT_INFO[b.movement].label}, {b.side}):
+                    Lane {b.lane + 1} ({laneName(lanes[b.lane] ?? b)}):
                   </strong>{' '}
                   {b.reason}.
                 </Toast>

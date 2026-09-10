@@ -1,14 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { runtime } from '../session/runtime.ts';
-import { laneFingertip, useStore } from '../state/store.ts';
-import { MOVEMENT_INFO, requiredPostures } from '../vision/features.ts';
+import { useStore } from '../state/store.ts';
+import { requiredPostures } from '../vision/features.ts';
 import { POSTURE_INFO } from '../vision/features.ts';
 import type { VisionStatus } from '../input/types.ts';
 import type { InvalidCalibration } from '../input/VisionInput.ts';
 import type { DetectionResult } from '../vision/mediapipe.ts';
 import { drawDetection } from './overlay.ts';
 import CameraFallback from './CameraFallback.tsx';
-import { Screen, Toast, TopBar } from './common.tsx';
+import { Screen, Toast, TopBar, laneName } from './common.tsx';
 
 export default function CameraCheck() {
   const goto = useStore((s) => s.goto);
@@ -141,7 +141,7 @@ export default function CameraCheck() {
   const postures = requiredPostures(lanes);
 
   // A camera that never started is not a corner of the camera-check screen — it is the screen.
-  if (error !== null) return <CameraFallback error={error} onRetry={retry} />;
+  if (error !== null) return <CameraFallback error={error} onRetry={retry} retries={attempt} />;
 
   return (
     <Screen>
@@ -223,7 +223,7 @@ export default function CameraCheck() {
             {refusals.map((r) => (
               <Toast kind="bad" key={r.lane}>
                 <strong data-testid={`camera-refusal-${r.lane}`}>
-                  Lane {r.lane + 1} ({MOVEMENT_INFO[r.movement].label}) will not score:
+                  Lane {r.lane + 1} ({laneName(lanes[r.lane] ?? r)}) will not score:
                 </strong>{' '}
                 {r.reason}.
               </Toast>
@@ -255,8 +255,7 @@ export default function CameraCheck() {
             <ul className="list-reset dim">
               {lanes.map((l, i) => (
                 <li key={i}>
-                  Lane {i + 1}: {l.side === 'left' ? 'Left' : 'Right'} {MOVEMENT_INFO[l.movement].label}
-                  {laneFingertip(l) ? ` (${laneFingertip(l)} finger)` : ''}
+                  Lane {i + 1}: {laneName(l)}
                 </li>
               ))}
             </ul>

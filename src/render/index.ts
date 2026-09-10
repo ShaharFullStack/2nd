@@ -53,6 +53,7 @@ export {
   HIGH_CONTRAST_PALETTE,
   getPalette,
   laneColor,
+  laneLabel,
   movementLabel,
   multiplierTier,
   JUDGMENT_STYLE,
@@ -63,7 +64,19 @@ export {
   hexToRgb,
 } from './palette';
 export type { LaneColor, LanePalette } from './palette';
-export { receptorLook, receptorLookInto, DEFAULT_REARM_FRACTION } from './receptor';
+export {
+  receptorLook,
+  receptorLookInto,
+  emptyReceptorLook,
+  goalStrength,
+  ReceptorHistory,
+  DEFAULT_REARM_FRACTION,
+  DEFAULT_MAX_GAP_SEC,
+  GOAL_HOLD_SEC,
+  GOAL_FADE_SEC,
+  LOST_HOLD_SEC,
+  METER_OVER_RANGE,
+} from './receptor';
 export type { ReceptorLook, LaneStateLike } from './receptor';
 export { runDemo, buildDemoChart, mountDemoIfRequested, DEMO_QUERY } from './demo';
 export type { DemoOptions, DemoHandle } from './demo';

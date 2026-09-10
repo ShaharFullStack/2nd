@@ -203,3 +203,33 @@ describe('storage that is not storing is said out loud', () => {
     expect(await screen.findByText(/not saving calibrations/i)).toBeTruthy();
   });
 });
+
+/**
+ * THE SENTENCE THE PATIENT IS READ WHILE BEING MEASURED.
+ *
+ * The header names the tip, so the THERAPIST knows which lane they are on. The patient performing the
+ * rep cannot see the header — they are looking at the camera — and the one string they are read aloud
+ * was `MOVEMENT_INFO.calibrationInstruction`: "Touch your thumb to the fingertip", which is wrong for
+ * three of the four digits a therapist can now prescribe. Measuring the wrong finger's range and
+ * filing it under this one is worse than measuring nothing.
+ */
+describe('the instruction names the prescribed digit', () => {
+  it('reads out the little finger for a pinky lane, not "the fingertip"', async () => {
+    render(<RomCalibrationScreen />);
+    const line = await screen.findByTestId('rom-instruction');
+    expect(line.textContent).toMatch(/little finger/i);
+    expect(line.textContent).not.toMatch(/to the fingertip/i);
+  });
+
+  it('follows the therapist to another digit', async () => {
+    useStore.setState({ lanes: [{ index: 0, movement: 'finger_opposition', side: 'right', fingertip: 'ring' }, LANES[1]] });
+    render(<RomCalibrationScreen />);
+    expect((await screen.findByTestId('rom-instruction')).textContent).toMatch(/ring finger/i);
+  });
+
+  it('leaves a movement with no fingertip dimension on its own wording', async () => {
+    useStore.setState({ lanes: [LANES[1], LANES[0]] });
+    render(<RomCalibrationScreen />);
+    expect((await screen.findByTestId('rom-instruction')).textContent).toMatch(/Open your hand as wide as is comfortable/i);
+  });
+});

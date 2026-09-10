@@ -1,4 +1,4 @@
-import type { Judgment, Movement, Side } from '../engine/types';
+import type { Fingertip, Judgment, LaneSpec, Movement, Side } from '../engine/types';
 
 /** One lane's color set. All colors are hex `#rrggbb`. */
 export interface LaneColor {
@@ -144,9 +144,42 @@ const MOVEMENT_LABEL: Record<Movement, string> = {
   finger_spread: 'spread',
 };
 
-/** Short label drawn under a lane, e.g. "L knee lift". */
-export function movementLabel(movement: Movement, side: Side): string {
-  return `${side === 'left' ? 'L' : 'R'} ${MOVEMENT_LABEL[movement] ?? movement}`;
+/**
+ * How each fingertip is named INSIDE a lane label — short, because this string is drawn under a
+ * ~46 px lane on a portrait canvas. "little", never "pinky": it is the word a therapist says out loud.
+ */
+const FINGERTIP_LABEL: Record<Fingertip, string> = {
+  index: 'index',
+  middle: 'middle',
+  ring: 'ring',
+  pinky: 'little',
+};
+
+/**
+ * Short label drawn under a lane, e.g. "L knee lift", "L index pinch".
+ *
+ * The fingertip is part of the NAME, not a decoration. Two `finger_opposition` lanes on one hand are
+ * a legitimate (and the intended) prescription, and without the tip they both read "L pinch": the
+ * patient's only cue for which finger to oppose becomes the lane colour, and two trend cards for two
+ * different digits carry the same title. `fingertip` is optional and ignored for every other
+ * movement, so every existing call site keeps its exact output.
+ */
+export function movementLabel(movement: Movement, side: Side, fingertip?: Fingertip): string {
+  const base = MOVEMENT_LABEL[movement] ?? movement;
+  const tip = movement === 'finger_opposition' && fingertip ? `${FINGERTIP_LABEL[fingertip]} ` : '';
+  return `${side === 'left' ? 'L' : 'R'} ${tip}${base}`;
+}
+
+/**
+ * `movementLabel` for a lane spec, applying the prescription's DEFAULT fingertip.
+ *
+ * A `finger_opposition` lane with no explicit `fingertip` is measured on the index finger (see
+ * `laneFingertip` in the store), so its label has to say "index" too — otherwise the same lane is
+ * named two different ways depending on whether the therapist touched the control.
+ */
+export function laneLabel(spec: Pick<LaneSpec, 'movement' | 'side' | 'fingertip'>): string {
+  const tip = spec.movement === 'finger_opposition' ? (spec.fingertip ?? 'index') : undefined;
+  return movementLabel(spec.movement, spec.side, tip);
 }
 
 /** Parse `#rgb` / `#rrggbb` → [r,g,b]. Unknown formats return white. */

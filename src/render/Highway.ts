@@ -60,13 +60,17 @@
  *     if it is missing — with overshoot headroom above it, so "half way" reads differently from
  *     "nearly there" from across a clinic room;
  *   - the receptor has four categorically different looks, one per state the input layer can
- *     actually be in — rising, at the trigger point, locked out by hysteresis
+ *     actually be in — rising, the threshold crossing, locked out by hysteresis
  *     (`RenderLaneState.armed === false`) and tracking lost (`tracking === false`) — and they
  *     differ by WHICH MARKS EXIST, not by hue or brightness, so they survive low acuity and
  *     colour-vision deficits; see `drawReceptors` and receptor.ts. Level line + target ticks mean
- *     "keep going", the additive rim + corona mean "this rep is scoring", a grey ring with a
- *     chevron and a return-to-rest arc means "lower to reset", and the only ring with gaps in it
- *     means "the camera cannot see you";
+ *     "keep going", a split cap + two solid arrowheads + the additive rim and corona mean "you
+ *     reached your target", a desaturated ring with a chevron and a return-to-rest arc means
+ *     "lower to reset", and the only ring with gaps in it means "the camera cannot see you". The
+ *     crossing is LATCHED (`ReceptorHistory`) because it lasts one camera frame and the trigger has
+ *     already disarmed by the time the state is published — without that, the one look the whole
+ *     session is for is unreachable and the patient's reward for reaching their range is the ring
+ *     going grey;
  *   - meters and labels are matched to lanes by `LaneState.lane` / `LaneSpec.index` when those are
  *     present, not by array position alone;
  *   - every judgment cue is kept inside the canvas (`missCueY`, `POPUP_MAX_RISE_FRAC`);
@@ -112,14 +116,14 @@ import {
   getPalette,
   laneColor,
   mixHex,
-  movementLabel,
+  laneLabel,
   multiplierTier,
   withAlpha,
   type LaneColor,
   type LanePalette,
 } from './palette';
 import { PARTICLE_RING, PARTICLE_SMOKE, PARTICLE_SPARK, PARTICLE_STREAK, ParticlePool, emitHitBurst, makeRng } from './particles';
-import { DEFAULT_REARM_FRACTION, receptorLookInto, type ReceptorLook } from './receptor';
+import { DEFAULT_MAX_GAP_SEC, DEFAULT_REARM_FRACTION, ReceptorHistory, emptyReceptorLook, type ReceptorLook } from './receptor';
 import { SpriteCache, blit } from './sprites';
 import { DigitRoller, TextCache, defaultCanvasFactory, fontPx, type Ctx2D, type TextStyle } from './text';
 import type { CanvasLike, HighwayOptions, RenderFrame, RenderLaneState, RenderNote, RenderStats } from './types';
@@ -243,13 +247,41 @@ const LOCK_HINT_COLOR = '#c08cff';
  */
 const METER_TARGET_POS = 0.76;
 /**
- * Ceiling on a LOCKED lane's liquid column, as a fraction of the target height. A locked lane
- * cannot score at any value, so it may never paint into the overshoot headroom (that band means
- * "this rep cleared the target") — and it may not stop flush on the target height either, because a
- * column whose top edge sits exactly where the trigger point is reads as being at the trigger
- * point. The 10 % shortfall is ~7 px of empty well at 720p, which survives a 4× downscale.
+ * Ceiling on the liquid column, as a fraction of the well's height — the same in EVERY state,
+ * because the column is a position gauge and the patient's position does not change meaning with
+ * the lane's arming.
+ *
+ * It is a drawing constraint, not a semantic one: the well is an ellipse, so a column drawn flush
+ * to the very top has almost no width there, and the hard-edged cap bar that rides its top edge
+ * (the split white cap in (b), the violet drain cap in (c)) would be clipped to a few pixels
+ * exactly when the patient is at their fullest range. At 0.93 the cap is still ~half the well's
+ * width. The value that reaches it is full calibrated ROM, so nothing readable is lost below it.
+ *
+ * THERE USED TO BE A SECOND, LOWER CEILING ON LOCKED LANES ONLY (0.9 of the target height), so a
+ * locked column could never reach the height that means "at the trigger point". It cost far more
+ * than it bought: combined with a `fill` clamped at 1 it froze the column — and with it the drain
+ * cap, the chevron and the return-to-rest arc — for every value between the threshold and full ROM,
+ * i.e. for 71 % of the return journey on the default 'easy' difficulty. The patient who has just
+ * been told "lower to reset" started lowering and the gauge did not move. What (c) may never wear
+ * is the "this counts" MARK SET (target line, ticks, level line, hot fill, halo, rim, corona) — and
+ * it does not; the height itself is just where the patient is.
  */
-const LOCK_LEVEL_CEIL = 0.9;
+const METER_LEVEL_CEIL = 0.93;
+/**
+ * Ring scale while the lane is locked out. The 12 % shrink is one of the marks of (c); it is
+ * reached by gliding over the tail of the goal latch (`ReceptorLook.goal`) rather than by stepping,
+ * so the gauge does not visibly shrink at the exact instant the patient reaches their target.
+ */
+const LOCK_RING_SCALE = 0.88;
+/**
+ * Length of one arm of the goal arrowheads that replace the threshold ticks in state (b), and how
+ * far the pair is inset toward the ring, both in receptor radii. They are solid triangles pointing
+ * at the target line from outside the ring: a SHAPE change (and a much larger filled area) where
+ * (a) has two thin bars, so "you reached it" survives the 1280 → 220 px downscale a low-vision
+ * patient at 2 m effectively applies, in either palette, without depending on hue or on the thin
+ * additive rings.
+ */
+const GOAL_WEDGE_R = 0.34;
 /** Ground of the meter well: flat and dark, so the liquid's top edge is a hard step, not a bevel. */
 const METER_WELL_COLOR = '#080a12';
 /** Threshold (target) line and the white-hot level cap at the trigger point. */
@@ -268,7 +300,7 @@ const RESET_ARC_START = -Math.PI / 4;
 const RESET_ARC_SWEEP = Math.PI * 1.5;
 /** Arc segments of the broken "no signal" ring, and the gap between them in radians. */
 const LOST_RING_SEGMENTS = 4;
-const LOST_RING_GAP_RAD = 0.38;
+const LOST_RING_GAP_RAD = 0.52;
 /**
  * Rotation of the broken ring's segments. Without it the four gaps sit at 0, π/2, π and 3π/2, so
  * the left and right ones land exactly where the white strike line crosses the receptor and are
@@ -370,7 +402,18 @@ export class Highway {
   /** Song time each lane last became able to fire again (hysteresis re-arm). */
   private laneRearmT0 = new Float64Array(MAX_LANES).fill(-10);
   /** Scratch receptor state, refilled per lane per frame (see receptor.ts). */
-  private readonly look: ReceptorLook = { fill: 0, over: 0, willFire: false, locked: false, resetProgress: 0, resetLevel: DEFAULT_REARM_FRACTION, glowTarget: 0, tracking: true };
+  private readonly look: ReceptorLook = emptyReceptorLook();
+  /**
+   * The per-lane memory the four-state model needs: the threshold-crossing latch that makes state
+   * (b) reachable at all, and the anti-strobe hold before a lane admits it has lost tracking. See
+   * receptor.ts — neither can be decided from one frame of `LaneState`.
+   */
+  private readonly history = new ReceptorHistory();
+  /**
+   * Effective (post-hold) tracking per lane, as `drawReceptors` resolved it this frame. Read by
+   * `drawLabels` so the label under a receptor never disagrees with the receptor above it.
+   */
+  private laneTracking = new Uint8Array(MAX_LANES).fill(1);
   /** lane → index into frame.laneStates / frame.lanes for this frame (see `resolveLaneMaps`). */
   private stateIdx = new Int8Array(MAX_LANES);
   private specIdx = new Int8Array(MAX_LANES);
@@ -535,6 +578,8 @@ export class Highway {
     this.laneGlow.fill(0);
     this.laneArmed.fill(1);
     this.laneRearmT0.fill(-10);
+    this.laneTracking.fill(1);
+    this.history.reset();
     this.lastCombo = 0;
     this.lastComboShown = 0;
     this.comboBounceT0 = -10;
@@ -1315,43 +1360,92 @@ export class Highway {
    * warm-up glow with no resolvable level, which is exactly what a rising meter must not be.
    *
    * The meter is a GAUGE: a flat dark well, a liquid column with a hard-edged top, a fixed target
-   * line at `thresholdFraction` with ~24 % overshoot headroom above it (`METER_TARGET_POS`), and
-   * two ticks marking that same threshold outside the ring where no liquid can cover them.
+   * line at `thresholdFraction` (`METER_TARGET_POS`) with the rest of the patient's calibrated ROM
+   * as headroom above it (`meterOverSpan`), and two ticks marking that same threshold outside the
+   * ring where no liquid can cover them.
+   *
+   * THE COLUMN IS ONE SCALE IN ALL FOUR STATES, and it is a POSITION, not a verdict: the same
+   * height always means the same millimetres of movement. It cannot saturate anywhere inside the
+   * reachable range, so it moves with the patient throughout the concentric rise AND the eccentric
+   * return — the return is a therapeutic target in its own right, and a gauge that flatlines while
+   * the patient performs the movement it just asked for reads as broken. What that position MEANS
+   * for the next rep is carried entirely by which marks surround it, below.
    *
    *   (a) rising, armed        → lane-coloured ring with the beat pulse; liquid rising in the well;
    *                              a lane-coloured LEVEL LINE at the patient's current value; the
    *                              white TARGET LINE + ticks above it; halo growing with fill².
    *                              "Keep going — this much further." The fixed target line is what
    *                              makes half way distinguishable from nearly there.
-   *   (b) at/over threshold,
-   *       armed (`willFire`)   → the liquid crosses the target line into the headroom (the only
-   *                              state where anything is drawn above that line), the level line
-   *                              SPLITS into two white-hot segments with a gap in the middle (a
-   *                              change in the number of marks, which survives the high-contrast
-   *                              palette where the rising cap is already near-white), and two
-   *                              additive rings appear that exist in no other state: an inner rim
-   *                              and a corona outside the ring. "That is scoring."
+   *   (b) the threshold
+   *       CROSSING (`goal`)    → the frame the lane actually fired on, held ~0.45 s (see
+   *                              receptor.ts: the crossing is one frame and the trigger has already
+   *                              disarmed by the time `LaneState` is published, so this is a latch,
+   *                              not a level test). The liquid stands in the overshoot headroom
+   *                              above the target line — here, and only here, that height is read
+   *                              as "this rep cleared the target by this much", which is the
+   *                              ROM-achieved number a therapist is after — the
+   *                              level line SPLITS into two white-hot segments with a gap in the
+   *                              middle (a change in the NUMBER of marks, which survives the
+   *                              high-contrast palette where the rising cap is already near-white),
+   *                              the two threshold ticks are replaced by two solid ARROWHEADS
+   *                              pointing at the target line (a change in shape and ~10× the filled
+   *                              area, so the state survives a 220 px downscale without relying on
+   *                              the hairline rings), and two additive rings appear that exist in no
+   *                              other state: an inner rim and a corona. "You reached it."
+   *                              Then it glides — ring scale and ring alpha both ramp — into (c),
+   *                              rather than stepping down 12 % at the instant of success. The
+   *                              column itself does not move at the handover at all: it is the same
+   *                              gauge on the same scale before and after.
+   *                              GUARDED: an armed → not-armed edge is not always a crossing (a
+   *                              stream break longer than `maxGapSec` and a mid-song threshold
+   *                              change both disarm a lane at whatever value it has, and publish
+   *                              the identical frame while emitting nothing), so the latch expires
+   *                              its evidence exactly the way `LaneTrigger` expires its own — see
+   *                              receptor.ts. A patient whose limb left frame for half a second
+   *                              mid-rep gets (c), not a celebration for a rep that scored nothing.
    *   (c) at/over threshold,
    *       NOT armed (`locked`) → the lane has already fired (or has never been seen below the
    *                              re-arm level) and CANNOT fire again until the value falls below
    *                              `thresholdFraction * rearmFraction`. Dead grey ring shrunk 12 %,
-   *                              grey liquid capped short of the target height (`LOCK_LEVEL_CEIL` —
-   *                              it never reaches, let alone crosses, the height that means "at the
-   *                              trigger point"), NO level line, NO target line or ticks, NO halo —
+   *                              grey liquid at the patient's true height (which is where they
+   *                              really are — it may start above the target height and travels down
+   *                              through it), NO level line, NO target line or ticks, NO halo —
    *                              and instead the four return-to-rest marks that exist only here: a
    *                              violet drain cap on top of the column, a dashed re-arm line at the
-   *                              level to come back down to, a downward chevron that settles onto
-   *                              it, and an arc outside the ring that grows as they lower and
-   *                              completes exactly when the lane re-arms (how much further, not
-   *                              just which way). A patient holding at end range sees the light go
+   *                              level to come back down to, a downward chevron half way between
+   *                              the two that lands on the line as the cap does, and an arc outside
+   *                              the ring that grows with the fraction of the return journey
+   *                              actually travelled (`ReceptorLook.resetProgress`, measured from
+   *                              the observed peak) and completes exactly when the lane re-arms.
+   *                              ALL FOUR MOVE FROM THE FIRST MILLIMETRE OF THE DESCENT — that is
+   *                              the state's whole job, and the reason none of them is derived from
+   *                              a value clamped at the threshold. A patient holding at end range sees the light go
    *                              out and a target to return to — never a lit receptor that is
-   *                              quietly scoring nothing.
+   *                              quietly scoring nothing. The two marks that give an ORDER (the
+   *                              violet drain cap and the chevron) are keyed to `needsLower`, not
+   *                              to `locked`: a lane can be locked while already BELOW the re-arm
+   *                              line ('unconfirmed' describes what has been observed, not the
+   *                              current value), and pointing a patient down at a line they are
+   *                              under is an order they cannot obey. Plus a dark keyline between
+   *                              the column and the ring, so the ring survives the high-contrast
+   *                              palette (where ring and column share one desaturated hue) at a
+   *                              220 px-board downscale.
    *   (d) tracking lost        → there is no measurement at all, so NOTHING that encodes a value is
    *                              drawn: no well, no liquid, no level line, no halo, no lock cues,
    *                              no beat pulse (a dead signal must not dance with the music). Just
    *                              a broken, slowly breathing light-grey ring — the only ring on the
    *                              board with gaps in it — with a big "?" in it. "I cannot see you",
    *                              which is a different instruction from "lower to reset".
+   *                              DEBOUNCED: `tracking` comes off a per-frame visibility gate that
+   *                              nothing else in the chain smooths, so one marginal frame must not
+   *                              flip the row to "?" and back at frame rate. `ReceptorHistory`
+   *                              holds the last tracked look for `LOST_HOLD_SEC` (0.2 s) first — but
+   *                              a lane that was never tracked, including one with no `LaneState`
+   *                              at all, shows (d) immediately.
+   *
+   * A lane is in exactly one of these every frame, and every one of them is reachable from the
+   * input layer as it actually runs — `Highway.test.ts` drives a real `VisionInput` over a real rep
+   * and asserts all four are produced, because a state only the tests can build is not a state.
    */
   private drawReceptors(ctx: Ctx2D, frame: RenderFrame, dt: number, beatPulse: number): void {
     const g = this.geom;
@@ -1371,13 +1465,39 @@ export class Highway {
     }
     const threshold = clamp(frame.thresholdFraction ?? 0.5, 0.05, 1);
     const rearm = clamp(frame.rearmFraction ?? DEFAULT_REARM_FRACTION, 0.05, 0.99);
+    // How long the input layer's stream may be silent before it throws a lane's arming away. The
+    // receptor's "you reached your target" latch expires on the same clock, because the disarming a
+    // break causes is published as exactly the frame a real crossing is. See RenderFrame.maxGapSec.
+    const maxGap = Number.isFinite(frame.maxGapSec as number) && (frame.maxGapSec as number) > 0 ? (frame.maxGapSec as number) : DEFAULT_MAX_GAP_SEC;
     const st = this.stNow;
     const still = this.opts.reducedMotion;
     const r = g.receptorRadius;
     const ry = r * GEM_ASPECT;
     const look = this.look;
     for (let lane = 0; lane < g.laneCount; lane++) {
-      receptorLookInto(look, this.laneState(frame, lane), threshold, rearm);
+      // The two things one frame cannot decide — that the threshold was just crossed, and whether a
+      // `tracking: false` is a dropout or one noisy frame — come from `ReceptorHistory`.
+      this.history.update(look, lane, this.laneState(frame, lane), threshold, rearm, st, maxGap);
+      // State (b) is LATCHED, not a level test: no input source in this repo ever publishes
+      // `armed && value >= threshold` (the trigger disarms on the crossing sample, before
+      // getLaneStates reads it), so "you reached your target" is drawn from the crossing EDGE and
+      // held ~0.45 s. `goal` is 1 for the hold and then ramps to 0. See receptor.ts.
+      const goal = look.goal ?? 0;
+      const hot = goal > 0;
+      // The return-to-rest marks belong to (c) alone. During the latch the lane is both locked and
+      // freshly scored, and the patient is told the second thing first; when the latch ends the
+      // ring has already glided into the lockout look and the "lower to reset" instruction appears.
+      const showLock = look.locked && !hot;
+      // ...and, inside (c), whether the patient has anywhere left to lower TO. A lane can be locked
+      // while already below the re-arm line ('unconfirmed' is a statement about what has been
+      // observed, not about the current value: `setThreshold`, a reset, or a stream break can leave
+      // one at 0.1 of ROM). Pointing a "lower to reset" chevron at a line the patient is already
+      // under is an order they cannot obey, so the two ORDER marks — the violet drain cap read as
+      // "bring this down" and the chevron — are keyed to this, not to `locked`. Everything else
+      // about (c) stays: the lane still cannot score and still says so.
+      const showLower = showLock && look.needsLower !== false;
+      // What the label under this receptor must agree with (post-hold, not the raw flag).
+      this.laneTracking[lane] = look.tracking ? 1 : 0;
       const color = laneColor(this.palette, lane);
       const lockColor = this.palette.miss;
       const x = laneX(g, lane, 0);
@@ -1407,10 +1527,15 @@ export class Highway {
         continue;
       }
 
-      // Ring scale: a real (≈9 %) beat pulse while the lane is live, a hard 12 % shrink while it is
+      // Ring scale: a real (≈9 %) beat pulse while the lane is live, a 12 % shrink while it is
       // locked out, plus the re-arm pop. The old 3.5 % wobble was sub-pixel and was not tied to
       // arming at all.
-      let pulse = look.locked ? 0.88 : 1 + (still ? 0 : 0.09 * beatPulse);
+      //
+      // `lockK` is 0 for a live lane and 1 for a locked one, and glides between the two over the
+      // tail of the goal latch. Stepping it instead meant the ring shrank 12 % and dimmed on the
+      // very frame the patient reached their target range — the gauge shrinking away from success.
+      const lockK = look.locked ? 1 - goal : 0;
+      let pulse = 1 - (1 - LOCK_RING_SCALE) * lockK + (still ? 0 : 0.09 * beatPulse * (1 - lockK));
       if (!still) pulse += 0.22 * popK;
 
       // Halo behind the receptor grows with the meter (live lanes only).
@@ -1443,9 +1568,9 @@ export class Highway {
       // than as "that lane, resetting". Lockout is still unmistakable: the ring shrinks 12 %, drops
       // to 60 % alpha, loses its halo, loses its target ticks and gains the violet chevron and the
       // return-to-rest arc — five marks, none of which is hue.
-      const ringColor = look.locked ? this.lockedColor(color, lockColor) : color;
+      const ringColor = showLock ? this.lockedColor(color, lockColor) : color;
       const spr = this.sprites.receptor(ringColor, r);
-      ctx.globalAlpha = clamp((look.locked ? 0.6 : 1) + popK * 0.4, 0, 1);
+      ctx.globalAlpha = clamp(1 - 0.4 * lockK + popK * 0.4, 0, 1);
       if (spr) blit(ctx, spr, x, y, pulse);
       else {
         ctx.strokeStyle = ringColor.base;
@@ -1466,25 +1591,29 @@ export class Highway {
       const yBot = y + wry;
       const span = wry * 2;
       const yTarget = yBot - METER_TARGET_POS * span;
-      // Where the top of the liquid goes.
+      // Where the top of the liquid goes. ONE SCALE, IN EVERY STATE: the threshold sits at
+      // METER_TARGET_POS of the well, and the band above it spans the rest of the patient's
+      // calibrated ROM (`ReceptorLook.over` / `meterOverSpan`), up to `METER_LEVEL_CEIL` so the cap
+      // bar riding the top of the column always has width to be drawn at.
       //
-      // Live lane: the threshold sits at METER_TARGET_POS of the well and the overshoot headroom
-      // above it is a "this rep cleared the target" cue.
+      // The column is therefore a POSITION and nothing else — the same height means the same
+      // millimetres of movement whatever the lane's arming is doing. What that position MEANS for
+      // the next rep is carried by the mark set around it: (a)/(b) draw the target line, its ticks
+      // and a level line; (c) draws none of those and instead draws the drain cap, the dashed
+      // re-arm line, the chevron and the return-to-rest arc.
       //
-      // Locked lane: nothing scores, so the headroom is not merely unearned, it would be a lie —
-      // and stopping *exactly on* the target-line height is no better, because a column whose top
-      // edge coincides with the height that means "at the trigger point" is read as being at the
-      // trigger point. So a locked column is capped at `LOCK_LEVEL_CEIL` of the target height,
-      // which leaves a permanent, visible band of empty well between it and where the (absent)
-      // target line would be. Below that ceiling the height is the patient's true value, which is
-      // the part that matters while locked: the whole job is to bring the column DOWN to the dashed
-      // re-arm line, and the entire path from the ceiling to that line is drawn to scale.
-      const levelFrac = look.locked
-        ? METER_TARGET_POS * Math.min(look.fill, LOCK_LEVEL_CEIL)
-        : METER_TARGET_POS * look.fill + (1 - METER_TARGET_POS) * look.over;
-      const yLevel = yBot - clamp(levelFrac, 0, 1) * span;
+      // IT USED TO BE TWO SCALES, and that was the defect. A locked column was clamped to
+      // `min(fill, 0.9)` of the target height, and `fill` itself saturates at the threshold, so a
+      // patient holding at end range and then lowering saw the column — and the drain cap, the
+      // chevron and the arc that hang off it — sit perfectly still for the whole span from their
+      // real peak down to the threshold: 71 % of the return journey on the default 'easy'
+      // difficulty, one to two seconds of "you have given nothing back yet" while they were in fact
+      // doing exactly what the gauge had just asked them to do. The eccentric phase is a
+      // therapeutic target in its own right, and concurrent feedback that flatlines through it
+      // reads as "broken" or "I am doing this wrong".
+      const levelFrac = METER_TARGET_POS * look.fill + (METER_LEVEL_CEIL - METER_TARGET_POS) * look.over;
+      const yLevel = yBot - clamp(levelFrac, 0, METER_LEVEL_CEIL) * span;
       const yRearm = yBot - METER_TARGET_POS * look.resetLevel * span;
-      const hot = look.willFire;
       ctx.save();
       ctx.beginPath();
       ctx.ellipse(x, y, wr, wry, 0, 0, Math.PI * 2);
@@ -1494,13 +1623,14 @@ export class Highway {
       ctx.fillRect(x - wr, y - wry, wr * 2, span);
       ctx.globalAlpha = 1;
       // Liquid. The *material* is what changes between locked and live; the height is the patient's
-      // real value in both (a locked column is additionally capped short of the target height, see
-      // `LOCK_LEVEL_CEIL`). The locked grey is deliberately not a whisper: measured on real pixels
+      // real value in both, on the same scale (see `levelFrac`), so the descent of a locked column
+      // is drawn to scale from wherever the patient actually is. The locked grey is deliberately
+      // not a whisper: measured on real pixels
       // the old 0.55/0.75-alpha column came out at ~42/255 against a ~14/255 well, which at 2 m on a
       // clinic tablet is one uniform dark disc — the column that is supposed to be the thing the
       // patient lowers was not visible while they lowered it.
       if (yLevel < yBot - 0.5) {
-        ctx.fillStyle = look.locked
+        ctx.fillStyle = showLock
           ? // Desaturated toward the dead grey but still the lane's hue (`lockedColor`, the same
             // treatment the locked ring gets), and cached per lane. A neutral grey column filling a
             // ring whose colour had also been replaced left the struck fret with no lane identity
@@ -1521,7 +1651,7 @@ export class Highway {
             });
         ctx.fillRect(x - wr, yLevel, wr * 2, yBot - yLevel);
       }
-      if (!look.locked) {
+      if (!showLock) {
         // Level line: "here is your current level, and it counts" — the one thing a locked lane
         // must never say.
         //
@@ -1563,7 +1693,11 @@ export class Highway {
         // the dim grey column the hard top edge it needs to be resolvable at 2 m at all.
         if (yLevel < yBot - 0.5) {
           const th = Math.max(3, 3.4 * this.u);
-          ctx.fillStyle = LOCK_HINT_COLOR;
+          // Violet ONLY while it is an instruction. Below the re-arm line the same bar would say
+          // "bring this down to there" about a column that is already under "there" — so it reverts
+          // to a plain hard top edge in the column's own dulled tint, which is all the dim grey
+          // liquid needs to stay resolvable at 2 m, and carries no order.
+          ctx.fillStyle = showLower ? LOCK_HINT_COLOR : this.lockedColor(color, lockColor).bright;
           ctx.globalAlpha = 0.95;
           ctx.fillRect(x - wr, yLevel - th * 0.5, wr * 2, th);
           ctx.globalAlpha = 1;
@@ -1577,23 +1711,61 @@ export class Highway {
         for (let k = 0; k < 3; k++) {
           ctx.fillRect(x - wr * 0.85 + k * dashW * 2, yRearm - Math.max(1, this.u), dashW, Math.max(2, 2.4 * this.u));
         }
+        // KEYLINE. A dark rim between the locked column and the ring outline, drawn last and
+        // clipped to the well so only its inner half shows. In the high-contrast palette the locked
+        // ring and the locked column are the SAME desaturated hue (both come from `lockedColor`),
+        // and at a 220 px-board acuity downscale on the magenta lane they merged into one filled
+        // blob — (c) lost its ring cue entirely and was carried by the violet marks alone, which is
+        // one shape cue for a patient with a blue-violet deficit. A dark separator is palette- and
+        // hue-independent, so the ring stays a ring in every palette and at every scale.
+        ctx.strokeStyle = METER_WELL_COLOR;
+        ctx.globalAlpha = 0.95;
+        ctx.lineWidth = Math.max(2, r * 0.14);
+        ctx.beginPath();
+        ctx.ellipse(x, y, wr, wry, 0, 0, Math.PI * 2);
+        ctx.stroke();
         ctx.globalAlpha = 1;
       }
       ctx.restore();
 
-      if (!look.locked) {
+      if (!showLock) {
         // ...and the same target line marked OUTSIDE the ring, where no liquid can ever cover it
         // and no acuity loss can merge it with the level line. Two ticks flush against the ring's
         // outline at exactly the threshold height.
         const dy = clamp((yTarget - y) / (ry * pulse), -1, 1);
         const edge = r * pulse * Math.sqrt(Math.max(0, 1 - dy * dy));
-        const tick = Math.max(3, r * 0.24);
-        const th = Math.max(2, 2.2 * this.u);
-        ctx.fillStyle = TARGET_LINE_COLOR;
-        ctx.globalAlpha = 0.92;
-        ctx.fillRect(x + edge, yTarget - th * 0.5, tick, th);
-        ctx.fillRect(x - edge - tick, yTarget - th * 0.5, tick, th);
-        ctx.globalAlpha = 1;
+        if (hot) {
+          // GOAL REACHED. The two thin ticks become two SOLID ARROWHEADS pointing at the target
+          // line from outside the ring — the same two marks, changed in shape and roughly ten times
+          // the filled area. This is the mark (b) survives a hard downscale on: the additive rim and
+          // corona are hairlines that thin out to nothing at 220 px, and "white and brighter" is not
+          // a distinction in the high-contrast palette, where the rising cap is already near-white.
+          // Solid triangles at a fixed height either side of the ring are still two unmistakable
+          // blobs at the target line when everything else has blurred together.
+          const wl = Math.max(5, r * GOAL_WEDGE_R);
+          const wh = Math.max(4, r * GOAL_WEDGE_R * 0.9);
+          ctx.fillStyle = TARGET_LINE_COLOR;
+          ctx.globalAlpha = clamp(0.95 * goal, 0, 1);
+          for (const dir of [1, -1]) {
+            const tip = x + dir * (edge + Math.max(1, this.u));
+            ctx.beginPath();
+            ctx.moveTo(tip, yTarget);
+            ctx.lineTo(tip + dir * wl, yTarget - wh * 0.5);
+            ctx.lineTo(tip + dir * wl, yTarget + wh * 0.5);
+            ctx.closePath();
+            ctx.fill();
+          }
+          ctx.globalAlpha = 1;
+        } else {
+          // Two ticks flush against the ring's outline at exactly the threshold height.
+          const tick = Math.max(3, r * 0.24);
+          const th = Math.max(2, 2.2 * this.u);
+          ctx.fillStyle = TARGET_LINE_COLOR;
+          ctx.globalAlpha = 0.92;
+          ctx.fillRect(x + edge, yTarget - th * 0.5, tick, th);
+          ctx.fillRect(x - edge - tick, yTarget - th * 0.5, tick, th);
+          ctx.globalAlpha = 1;
+        }
       } else {
         // "Lower to reset" chevron, pointing down, settling onto the re-arm line as the value
         // drains toward it. The only chevron on the board.
@@ -1601,17 +1773,27 @@ export class Highway {
         // mark inside the ring, and on the frame of a hit (lockout starts there) two blind
         // reviewers read the receptor as "a stray, wrongly-scaled sprite" because of it. The
         // chevron is an instruction attached to the ring, so the ring has to win.
-        const chev = r * 0.26;
-        const cy = y - ry * 0.3 + chev * 0.5 * look.resetProgress;
-        ctx.globalAlpha = clamp(1 - 0.45 * look.resetProgress, 0, 1);
         ctx.strokeStyle = LOCK_HINT_COLOR;
-        ctx.lineWidth = Math.max(2, r * 0.1);
         ctx.lineCap = 'round';
-        ctx.beginPath();
-        ctx.moveTo(x - chev, cy - chev * 0.5);
-        ctx.lineTo(x, cy + chev * 0.5);
-        ctx.lineTo(x + chev, cy - chev * 0.5);
-        ctx.stroke();
+        if (showLower) {
+          const chev = r * 0.26;
+          // IT SITS IN THE GAP IT IS ASKING THE PATIENT TO CLOSE: half way between the drain cap
+          // (where they are) and the dashed re-arm line (where they have to get to). So it descends
+          // monotonically for the WHOLE return, from any starting height, and lands ON the line at
+          // the instant the lane re-arms — it cannot leave the ring and it cannot stall.
+          //
+          // It used to be a fixed height nudged down by `resetProgress`, which meant it could not
+          // move at all through the part of the descent where `resetProgress` could not: the entire
+          // span from the patient's real peak down to the threshold.
+          const cy = yLevel + (yRearm - yLevel) * 0.5;
+          ctx.globalAlpha = clamp(1 - 0.45 * look.resetProgress, 0, 1);
+          ctx.lineWidth = Math.max(2, r * 0.1);
+          ctx.beginPath();
+          ctx.moveTo(x - chev, cy - chev * 0.5);
+          ctx.lineTo(x, cy + chev * 0.5);
+          ctx.lineTo(x + chev, cy - chev * 0.5);
+          ctx.stroke();
+        }
         // Return-to-rest progress: an arc outside the ring that grows as the value drains back
         // toward the re-arm level and is complete the instant the lane can fire again. The chevron
         // says what to do; this says how much further, which is the part a patient holding at end
@@ -1632,7 +1814,7 @@ export class Highway {
       // actually fire. It pulses with the beat, which is what "pulses when armed" has to look like.
       if (hot) {
         ctx.globalCompositeOperation = 'lighter';
-        ctx.globalAlpha = clamp(0.5 + 0.35 * (still ? 0.4 : beatPulse), 0, 1);
+        ctx.globalAlpha = clamp((0.5 + 0.35 * (still ? 0.4 : beatPulse)) * goal, 0, 1);
         ctx.strokeStyle = color.bright;
         ctx.lineWidth = Math.max(2, r * 0.13);
         ctx.beginPath();
@@ -1641,7 +1823,7 @@ export class Highway {
         // ...and a corona just outside the ring. The inner rim can be swallowed by the fill it sits
         // on at a bright lane colour; the corona sits on the dark road, so "this rep is scoring"
         // survives being read across a clinic room.
-        ctx.globalAlpha = clamp(0.34 + 0.3 * (still ? 0.4 : beatPulse), 0, 1);
+        ctx.globalAlpha = clamp((0.34 + 0.3 * (still ? 0.4 : beatPulse)) * goal, 0, 1);
         ctx.lineWidth = Math.max(2, r * 0.1);
         ctx.beginPath();
         ctx.ellipse(x, y, r * 1.16 * pulse, ry * 1.16 * pulse, 0, 0, Math.PI * 2);
@@ -1668,7 +1850,11 @@ export class Highway {
     const breathe = still ? 0.8 : 0.6 + 0.4 * (0.5 - 0.5 * Math.cos(st * LOST_BREATHE_RATE));
     const arc = (Math.PI * 2) / LOST_RING_SEGMENTS;
     ctx.strokeStyle = LOST_RING_COLOR;
-    ctx.lineWidth = Math.max(2, r * 0.16);
+    // Fat arcs and wide gaps, because at a 220 px-board acuity downscale (~2 m on a clinic tablet)
+    // the "?" blurs down to a smudge and the BROKEN RING is what is left carrying the state on its
+    // own. A gap pattern survives that blur in proportion to how much of the ring it removes, so
+    // this is deliberately coarse: four thick arcs and four unmistakable holes, not a dotted line.
+    ctx.lineWidth = Math.max(3, r * 0.2);
     ctx.lineCap = 'butt';
     ctx.globalAlpha = clamp(breathe, 0, 1);
     for (let k = 0; k < LOST_RING_SEGMENTS; k++) {
@@ -2438,6 +2624,8 @@ export class Highway {
   private labelText: string[] = [];
   private labelMovement: string[] = [];
   private labelSide: string[] = [];
+  /** Part of the cache key: two lanes can share movement+side and differ only by the opposed tip. */
+  private labelFingertip: string[] = [];
   private labelStagger = false;
   private labelRowH = 0;
   private labelU = -1;
@@ -2449,7 +2637,12 @@ export class Highway {
     if (ok) {
       for (let lane = 0; lane < g.laneCount; lane++) {
         const spec = this.laneSpec(frame, lane);
-        if (!spec || this.labelMovement[lane] !== spec.movement || this.labelSide[lane] !== spec.side) {
+        if (
+          !spec ||
+          this.labelMovement[lane] !== spec.movement ||
+          this.labelSide[lane] !== spec.side ||
+          this.labelFingertip[lane] !== (spec.fingertip ?? '')
+        ) {
           ok = false;
           break;
         }
@@ -2461,13 +2654,15 @@ export class Highway {
     this.labelText.length = 0;
     this.labelMovement.length = 0;
     this.labelSide.length = 0;
+    this.labelFingertip.length = 0;
     let widest = 0;
     for (let lane = 0; lane < g.laneCount; lane++) {
       const spec = this.laneSpec(frame, lane);
-      const raw = spec ? movementLabel(spec.movement, spec.side) : '';
+      const raw = spec ? laneLabel(spec) : '';
       this.labelText.push(raw);
       this.labelMovement.push(spec ? spec.movement : '');
       this.labelSide.push(spec ? spec.side : '');
+      this.labelFingertip.push(spec ? (spec.fingertip ?? '') : '');
       widest = Math.max(widest, this.text.measure(raw, style));
     }
     // One row while everything fits inside its lane; two staggered rows otherwise (labels on the
@@ -2490,8 +2685,10 @@ export class Highway {
     for (let lane = 0; lane < g.laneCount; lane++) {
       const label = this.labelText[lane];
       if (!label) continue;
-      const ls = this.laneState(frame, lane);
-      const tracking = ls ? ls.tracking !== false : true;
+      // Post-hold tracking as `drawReceptors` resolved it this frame (it runs first), not the raw
+      // per-frame flag: a label that greys out on a single noisy frame while the receptor above it
+      // stays live is the same two-meters-disagreeing failure the receptor contract exists to stop.
+      const tracking = this.laneTracking[lane] === 1;
       const x = laneX(g, lane, -0.02);
       const row = this.labelStagger ? lane % 2 : 0;
       this.text.draw(ctx, label, x, y + row * rowH, this.style(this.laneLabelKey(lane, tracking)), 1, tracking ? 0.85 : 0.5);

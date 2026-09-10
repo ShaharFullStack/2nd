@@ -21,13 +21,31 @@
  *    ROM line instead of drawing a zero. Accuracy is known for every included session.
  *  - A re-calibration is called out: `romMean` is a percentage OF THE RANGE CALIBRATED THAT DAY, so a
  *    patient given a wider range can improve while the percentage falls.
+ *  - THE DENOMINATOR IS DISCLOSED AND THE ABSOLUTE FIGURE IS PLOTTED BESIDE IT. A percentage of a
+ *    range the therapist can move cannot, on its own, answer "did this patient's range improve?".
+ *    The movement's own units (degrees for a joint angle; a body-scaled ratio otherwise) are
+ *    reconstructed from what is already persisted — `calibratedMin + rom x span` — and given their
+ *    own block with their own title, because they are a DIFFERENT QUANTITY from the percentage and
+ *    the two may never share a line or a heading.
+ *  - ONLY THE TWO PLOTS WHOSE SHAPES MAY BE COMPARED ARE DRAWN THE SAME WAY. The ROM percentage and
+ *    the absolute peak are the SAME reps expressed twice, so a divergence between their shapes is
+ *    itself the finding (the calibrated range moved under them) and stacking two autoscaled lines is
+ *    exactly right. Accuracy is a different quantity; it is drawn as columns on a fixed 0–100 % axis,
+ *    so nothing invites a slope comparison the axes do not license.
+ *  - EVERY POINT IS READABLE AS A DATE. The end sessions are dated on the axis and the full
+ *    session-by-session list sits under the card — a clinic tablet has no hover.
+ *  - EVERY CHART IN A CARD SHARES ONE HORIZONTAL AXIS. The line plots and the accuracy columns are
+ *    positioned by the same function of the same real dates (`sessionAxis` in common.tsx), so the
+ *    column under a point is that point's session. Two marks stacked in one card, sharing gutters and
+ *    printing the same end dates, invite that cross-read whatever the caption says; the fix is to
+ *    make it true.
  */
 import { useMemo, useState } from 'react';
-import { formatDate, formatPercent } from '../session/results.ts';
+import { formatPercent } from '../session/results.ts';
 import { DEFAULT_TREND_WINDOW, movementTrends, trendCoverage } from '../session/trends.ts';
-import type { MovementTrend } from '../session/trends.ts';
+import type { MovementTrend, TrendPoint } from '../session/trends.ts';
 import type { SessionResult } from '../session/types.ts';
-import { DeltaBadge, Sparkline } from './common.tsx';
+import { DeltaBadge, SessionBars, Sparkline, shortDate } from './common.tsx';
 
 const WINDOWS = [4, 8, 16];
 
@@ -52,14 +70,39 @@ function plural(n: number, one: string, many = `${one}s`): string {
   return `${n} ${n === 1 ? one : many}`;
 }
 
+/** The movement's own units, for the absolute (calibration-independent) figures. */
+function formatUnit(v: number | null, unit: 'deg' | 'ratio'): string {
+  if (v === null || !Number.isFinite(v)) return '—';
+  return unit === 'deg' ? `${Math.round(v)}\u00b0` : v.toFixed(2);
+}
+
+/**
+ * What the absolute block is CALLED. Never "ROM" and never a percentage: it is the peak the patient
+ * reached in the units the extractor measures, which is the figure a re-calibration cannot move.
+ */
+function absoluteTitle(unit: 'deg' | 'ratio'): string {
+  return unit === 'deg' ? 'Peak angle reached' : 'Peak reach (body-scaled)';
+}
+
+/** Same quantity, column-width. The full name is on the block above and in the column's tooltip. */
+function absoluteColumn(unit: 'deg' | 'ratio'): string {
+  return unit === 'deg' ? 'Peak °' : 'Peak';
+}
+
 function TrendCard({ trend }: { trend: MovementTrend }) {
   const romValues = trend.points.map((p) => p.rom);
   const accuracyValues = trend.points.map((p) => p.accuracy);
+  const absoluteValues = trend.points.map((p) => p.absoluteMean);
   const at = trend.points.map((p) => p.at);
   const sessions = trend.points.length;
   const measured = trend.romPoints.length;
+  const absMeasured = trend.absolutePoints.length;
   const first = trend.points[0];
   const last = trend.points[sessions - 1];
+  const unit = trend.unit;
+
+  const rangeKnown = trend.latestCalibratedMin !== null && trend.latestCalibratedMax !== null;
+  const rangeSpan = rangeKnown ? (trend.latestCalibratedMax as number) - (trend.latestCalibratedMin as number) : null;
 
   return (
     <div className="trend-card" data-testid={`trend-${trend.key}`}>
@@ -82,14 +125,53 @@ function TrendCard({ trend }: { trend: MovementTrend }) {
           <Sparkline
             values={romValues}
             at={at}
-            label={`${trend.label}: range of motion over the last ${sessions} camera sessions`}
+            label={`${trend.label}: range of motion, as a percentage of that day's calibrated range, over the last ${sessions} camera sessions`}
             color="#ff3d7f"
             band={1}
           />
         ) : (
           <span className="dim">Range was not measured in these sessions — only completed camera reps record it.</span>
         )}
+        <span className="dim" data-testid={`trend-denominator-${trend.key}`}>
+          {rangeKnown
+            ? `Out of the range calibrated on the day — most recently ${formatUnit(trend.latestCalibratedMin, unit)} to ${formatUnit(trend.latestCalibratedMax, unit)} (${formatUnit(rangeSpan, unit)} of travel).`
+            : 'The calibrated range these percentages are out of was not recorded for these sessions.'}
+        </span>
       </div>
+
+      {/* A DIFFERENT QUANTITY, so a separate block with its own title and its own units: the peak the
+          patient actually reached. This is the one figure a re-calibration cannot move. */}
+      {absMeasured > 0 && (
+        <div className="trend-block" data-testid={`trend-absolute-${trend.key}`}>
+          <div className="trend-row">
+            <div className="trend-figure">
+              <span className="k">{absoluteTitle(unit)}</span>
+              <span className="v">{formatUnit(trend.latestAbsolute, unit)}</span>
+            </div>
+            <DeltaBadge
+              value={trend.absoluteChange}
+              scale={1}
+              digits={unit === 'deg' ? 0 : 2}
+              unit={unit === 'deg' ? '\u00b0' : 'units'}
+            />
+          </div>
+          <Sparkline
+            values={absoluteValues}
+            at={at}
+            min={Number.NEGATIVE_INFINITY}
+            max={Number.POSITIVE_INFINITY}
+            minSpan={unit === 'deg' ? 8 : 0.08}
+            label={`${trend.label}: ${absoluteTitle(unit).toLowerCase()}, in the movement's own units, over the last ${sessions} camera sessions`}
+            color="#ffc945"
+            format={(v) => formatUnit(v, unit)}
+          />
+          <span className="dim">
+            {unit === 'deg'
+              ? 'Same reps as the plot above, in degrees at the joint, reconstructed from that day\u2019s calibrated range — independent of where the range was set, so it answers "is the range itself bigger?".'
+              : 'Same reps as the plot above, in the extractor\u2019s own body-scaled ratio (normalised by torso or palm size), independent of where the range was set, so it answers "is the movement itself bigger?".'}
+          </span>
+        </div>
+      )}
 
       <div className="trend-block">
         <div className="trend-row">
@@ -99,18 +181,70 @@ function TrendCard({ trend }: { trend: MovementTrend }) {
           </div>
           <DeltaBadge value={trend.accuracyChange} />
         </div>
-        <Sparkline
+        {/* COLUMNS ON A FIXED 0–100 % AXIS, not a third autoscaled line. Accuracy is a different
+            quantity from the two plots above, and an autoscaled line under an autoscaled line reads
+            as a comparable slope when it is not one. Accuracy has a true zero and a real ceiling, so
+            it is the series that can carry an absolute scale — which also makes "not measured" a
+            missing column rather than a point on a moving axis. */}
+        <SessionBars
           values={accuracyValues}
           at={at}
-          label={`${trend.label}: accuracy over the last ${sessions} camera sessions`}
+          label={`${trend.label}: accuracy of the notes judged in this lane, out of 100 %, over the last ${sessions} camera sessions`}
           color="#35d6ff"
         />
+        <span className="dim">
+          Columns are out of 100 % of the notes judged in this lane — an absolute scale, unlike the plots above.
+        </span>
       </div>
 
       <div className="dim">
         {plural(trend.totalReps, 'movement')} performed
-        {first && last && sessions > 1 ? ` · ${formatDate(first.at)} → ${formatDate(last.at)}` : first ? ` · ${formatDate(first.at)}` : ''}
+        {/* A session-date RANGE, not a pair of timestamps: "Jul 30, 2026, 10:20 PM → Sep 8, 2026,
+            10:20 PM" spends half a line on a time of day nobody reads. */}
+        {first && last && sessions > 1 ? ` · ${shortDate(first.at)} → ${shortDate(last.at)}` : first ? ` · ${shortDate(first.at)}` : ''}
       </div>
+
+      {/* The per-point readout. There is no hover on a clinic tablet, so a dip in a line has to be
+          traceable to a DATE somewhere on the card, not only in the session table on another screen
+          (which is not per-movement and cannot answer "which session was that dip?"). */}
+      <details className="trend-points">
+        <summary className="dim" data-testid={`trend-points-${trend.key}`}>Session by session ({sessions})</summary>
+        <div className="table-wrap">
+          <table className="table">
+            <thead>
+              <tr>
+                <th>Session</th>
+                <th>ROM</th>
+                {absMeasured > 0 && <th title={absoluteTitle(unit)}>{absoluteColumn(unit)}</th>}
+                <th>Accuracy</th>
+                <th>Reps</th>
+              </tr>
+            </thead>
+            <tbody>
+              {trend.points
+                .slice()
+                .reverse()
+                .map((p: TrendPoint) => (
+                  <tr key={p.sessionId}>
+                    <td>
+                      {shortDate(p.at)}
+                      {p.recalibrated && <span className="badge badge-warn">re-calibrated</span>}
+                    </td>
+                    {/* "not measured", never 0 %. */}
+                    <td className="mono">{p.rom === null ? <span className="dim">not measured</span> : formatPercent(p.rom)}</td>
+                    {absMeasured > 0 && (
+                      <td className="mono">
+                        {p.absoluteMean === null ? <span className="dim">not measured</span> : formatUnit(p.absoluteMean, unit)}
+                      </td>
+                    )}
+                    <td className="mono">{formatPercent(p.accuracy)}</td>
+                    <td className="mono">{p.reps}</td>
+                  </tr>
+                ))}
+            </tbody>
+          </table>
+        </div>
+      </details>
 
       {trend.excludedSessions > 0 && (
         <div className="dim" data-testid={`trend-excluded-${trend.key}`}>
@@ -121,8 +255,8 @@ function TrendCard({ trend }: { trend: MovementTrend }) {
       )}
       {trend.anyRecalibration && (
         <div className="dim">
-          The calibrated range changed during this window — percentages are of the range in force on the
-          day, so compare the shape, not only the number.
+          The calibrated range changed during this window, so the percentages above are against different
+          denominators from session to session. {absMeasured > 0 ? `The ${absoluteTitle(unit).toLowerCase()} plot is not affected — read the range question there.` : 'Compare the shape, not only the number.'}
         </div>
       )}
       {measured > 0 && measured < sessions && (
@@ -135,8 +269,10 @@ function TrendCard({ trend }: { trend: MovementTrend }) {
 }
 
 export default function RomTrend({ history }: { history: readonly SessionResult[] }) {
-  const [window, setWindow] = useState(DEFAULT_TREND_WINDOW);
-  const trends = useMemo(() => movementTrends(history, window), [history, window]);
+  // NOT `window`: a state variable of that name shadows the global for the whole component body, so
+  // the next `window.matchMedia('(prefers-reduced-motion)')` added in here would silently read 8.
+  const [windowSize, setWindowSize] = useState(DEFAULT_TREND_WINDOW);
+  const trends = useMemo(() => movementTrends(history, windowSize), [history, windowSize]);
   const coverage = useMemo(() => trendCoverage(history), [history]);
 
   // Nothing the patient drove: say so plainly rather than plotting the bot's keypresses as progress.
@@ -166,7 +302,7 @@ export default function RomTrend({ history }: { history: readonly SessionResult[
         <div className="grow" />
         <div className="seg seg-sm" role="group" aria-label="Sessions shown per movement">
           {WINDOWS.map((n) => (
-            <button key={n} aria-pressed={window === n} onClick={() => setWindow(n)} data-testid={`trend-window-${n}`}>
+            <button key={n} aria-pressed={windowSize === n} onClick={() => setWindowSize(n)} data-testid={`trend-window-${n}`}>
               Last {n}
             </button>
           ))}
@@ -188,10 +324,13 @@ export default function RomTrend({ history }: { history: readonly SessionResult[
       </div>
 
       <span className="dim">
-        ROM is the mean peak of each rep as a fraction of that session's calibrated range. The grey dashed line is
-        where this window started — the gap between it and the last point IS the change. The vertical axis is scaled to
-        the data and labelled at both ends, and each point sits at its real date, so a slow gain does not draw the same
-        slope as a fast one. A gold dashed line appears at 100 % of the calibrated range when the patient gets near it.
+        ROM is the mean peak of each rep as a fraction of that session's calibrated range; the peak figure under it is
+        the same reps in the movement's own units (degrees, or a body-scaled ratio), which is the figure a
+        re-calibration cannot move. The grey dashed line is where this window started — the gap between it and the last
+        point IS the change. Each vertical axis is scaled to its data and labelled at both ends, the two percentage
+        plots in a card carry the same reps, and every chart in a card shares one horizontal axis of real dates — a
+        column and the points above it are the same session, and a slow gain does not draw the same slope as a fast
+        one. A gold dashed line appears at 100 % of the calibrated range when the patient gets near it.
       </span>
     </div>
   );

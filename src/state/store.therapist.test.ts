@@ -26,6 +26,7 @@ function reset(lanes: LaneSpec[] = defaultLanes('hand')) {
     latencyOffsetSec: 0.12,
     latencyMeasured: false,
     latencyNote: '',
+    latencySetAt: null,
   });
 }
 
@@ -111,15 +112,42 @@ describe('applySuggestedLatency', () => {
 
   it('writes the measured value and reports the before/after', () => {
     const change = useStore.getState().applySuggestedLatency(205, 'Demo Groove');
-    expect(change).toEqual({ previousMs: 120, appliedMs: 205, deltaMs: 85 });
+    expect(change).toEqual({ previousMs: 120, appliedMs: 205, deltaMs: 85, previousMeasured: false, previousNote: '' });
     expect(useStore.getState().latencyOffsetSec).toBeCloseTo(0.205, 6);
     expect(useStore.getState().latencyMeasured).toBe(true);
     expect(useStore.getState().latencyNote).toContain('Demo Groove');
   });
 
+  it('reports the PROVENANCE of the value it replaced, so an undo can restore it losslessly', () => {
+    // The failure this guards: Undo on the Results hand-over wrote `measured: false` unconditionally,
+    // so correcting a misclick silently downgraded a value the latency screen HAD measured — and the
+    // calibration screen keys its "already measured" state off exactly that flag.
+    useStore.getState().setLatency(0.14, true, 'measured on the latency screen');
+    const change = useStore.getState().applySuggestedLatency(265, 'Demo Groove');
+    expect(change?.previousMs).toBe(140);
+    expect(change?.previousMeasured).toBe(true);
+    expect(change?.previousNote).toBe('measured on the latency screen');
+  });
+
   it('persists so the next session starts from it', () => {
     useStore.getState().applySuggestedLatency(205);
     expect(localStorage.getItem(storageKey('latency'))).toBe('0.205');
+  });
+
+  it('stamps the write, so a later screen can tell "0 ms in force" from "nothing set yet"', () => {
+    // The latency screen's fast path turns on exactly this: with nothing ever set it may store the
+    // 120 ms default, and with something in force it may not.
+    expect(useStore.getState().latencySetAt).toBeNull();
+    useStore.getState().applySuggestedLatency(205, 'Demo Groove');
+    expect(useStore.getState().latencySetAt).toBeGreaterThan(0);
+  });
+
+  it('persists the provenance next to the number, so a reload does not strip it', () => {
+    useStore.getState().applySuggestedLatency(205, 'Demo Groove');
+    const meta = JSON.parse(localStorage.getItem(storageKey('latencyMeta')) as string);
+    expect(meta.measured).toBe(true);
+    expect(meta.note).toContain('Demo Groove');
+    expect(meta.at).toBeGreaterThan(0);
   });
 
   it('clamps to the range the engine accepts', () => {

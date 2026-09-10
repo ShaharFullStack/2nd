@@ -96,6 +96,26 @@ describe('a camera failure during the Play boot', () => {
     await waitFor(() => expect(screen.queryByTestId('camera-fallback')).toBeNull());
   });
 
+  it('escalates its advice across retries, because the count survives the screen being torn down', async () => {
+    // The bug this pins: the escalation lived in CameraFallback's own state, and BOTH hosts clear the
+    // error before re-requesting — which unmounts the screen and resets that state. The advice for the
+    // most likely clinic failure (a permission a shared tablet has remembered) was unreachable in the
+    // running app while its component test passed, because that test rendered the component standalone
+    // with a no-op onRetry that never unmounted it.
+    camera.failures = 5;
+    render(<PlayScreen />);
+    await screen.findByTestId('camera-fallback');
+
+    fireEvent.click(screen.getByTestId('camera-retry'));
+    await waitFor(() => expect(camera.attempts).toBe(2));
+    await screen.findByTestId('camera-fallback');
+    fireEvent.click(screen.getByTestId('camera-retry'));
+    await waitFor(() => expect(camera.attempts).toBe(3));
+
+    await waitFor(() => expect(screen.getByText(/Still no camera after 2 attempts/i)).toBeTruthy());
+    expect(screen.getByText(/site settings/i)).toBeTruthy();
+  });
+
   it('switching to the keyboard leaves the session on the keyboard, recorded as such', async () => {
     render(<PlayScreen />);
     await screen.findByTestId('camera-fallback');

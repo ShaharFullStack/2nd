@@ -158,6 +158,45 @@ describe('LatencyHandover', () => {
     expect(screen.getByTestId('apply-latency')).toBeTruthy();
   });
 
+  it('an undo restores the PROVENANCE of the value, not only its number', () => {
+    // `latencyMeasured` is what the calibration screen keys its "already measured" state off. Undo
+    // used to write `measured: false` unconditionally, so correcting a misclick quietly demoted a
+    // value the latency screen HAD measured to an unmeasured one.
+    useStore.getState().setLatency(0.12, true, 'measured on the latency screen, 10 taps');
+    render(<LatencyHandover result={result()} />);
+    fireEvent.click(screen.getByTestId('apply-latency'));
+    fireEvent.click(screen.getByTestId('revert-latency'));
+
+    expect(useStore.getState().latencyOffsetSec).toBeCloseTo(0.12, 6);
+    expect(useStore.getState().latencyMeasured).toBe(true);
+    expect(useStore.getState().latencyNote).toBe('measured on the latency screen, 10 taps');
+  });
+
+  it('leaves an unmeasured value unmeasured when it is restored', () => {
+    render(<LatencyHandover result={result()} />);
+    fireEvent.click(screen.getByTestId('apply-latency'));
+    fireEvent.click(screen.getByTestId('revert-latency'));
+    expect(useStore.getState().latencyMeasured).toBe(false);
+    expect(useStore.getState().latencyNote).toMatch(/restored after undoing/i);
+  });
+
+  it('names the two different offsets apart when the device has moved on since the run', () => {
+    // The prose quotes the offset THIS RUN was judged at (from the stored record); the swap widget
+    // quotes what is on the device right now. They diverge when the latency screen has been re-run
+    // between the session and reading its results, and used to sit 40 px apart, unlabelled, with a
+    // therapist deciding plausibility against whichever one they happened to read.
+    useStore.setState({ latencyOffsetSec: 0 });
+    render(<LatencyHandover result={result({ latencyOffsetMs: 120, suggestedLatencyMs: 320 })} />);
+    const drift = screen.getByTestId('latency-drift');
+    expect(drift.textContent).toMatch(/0 ms is the value the swap below replaces/i);
+    expect(drift.textContent).toMatch(/120 ms is what the figures on this page were judged against/i);
+  });
+
+  it('says nothing about a drift when there is none', () => {
+    render(<LatencyHandover result={result()} />);
+    expect(screen.queryByTestId('latency-drift')).toBeNull();
+  });
+
   it('does not claim an update when the clamped value was already in force', () => {
     useStore.setState({ latencyOffsetSec: 0 });
     render(<LatencyHandover result={result({ latencyOffsetMs: 0, suggestedLatencyMs: -2 })} />);

@@ -85,6 +85,29 @@ describe('Play refuses to start a session on a lane that cannot score', () => {
     expect(useStore.getState().screen).toBe('play');
   });
 
+  it('tells two pinch lanes on one hand APART — the banner is what the therapist acts on', async () => {
+    // Identified by `MOVEMENT_INFO[movement].label` + side, both of these read "Finger opposition,
+    // left" and the therapist has no way to know which lane to go and re-calibrate.
+    useStore.setState({
+      lanes: [
+        { index: 0, movement: 'finger_opposition', side: 'left', fingertip: 'index' },
+        { index: 1, movement: 'finger_opposition', side: 'left', fingertip: 'pinky' },
+      ],
+    });
+    refusals.push(
+      { lane: 0, movement: 'finger_opposition', side: 'left', reason: 'the calibrated range is only 2%' },
+      { lane: 1, movement: 'finger_opposition', side: 'left', reason: 'it was measured on the index finger' },
+    );
+
+    render(<PlayScreen />);
+    await screen.findByTestId('play-blocked');
+    const first = screen.getByTestId('play-blocked-0').textContent ?? '';
+    const second = screen.getByTestId('play-blocked-1').textContent ?? '';
+    expect(first).toMatch(/index finger/);
+    expect(second).toMatch(/little finger/);
+    expect(first).not.toBe(second);
+  });
+
   it('starts normally when nothing is refused', async () => {
     render(<PlayScreen />);
     await waitFor(() => expect(screen.queryByTestId('play-blocked')).toBeNull());

@@ -66,11 +66,47 @@ export const DEFAULT_SONG_ID = 'demo-groove';
 const HISTORY_KEY = 'history';
 const SETTINGS_KEY = 'settings';
 const LATENCY_KEY = 'latency';
+/**
+ * Provenance for the offset in LATENCY_KEY, in its own key so the number itself keeps the bare-number
+ * shape every earlier build wrote (and every earlier build can still read).
+ *
+ * Split out rather than folded in because the two answer different questions and only one of them is
+ * safe to lose: the OFFSET decides how a session is judged, the PROVENANCE only decides what the
+ * latency screen says about it. A tablet whose meta blob is corrupt still judges the next session at
+ * the value the therapist applied.
+ */
+const LATENCY_META_KEY = 'latencyMeta';
 const CONFIG_KEY = 'lastConfig';
 const CALIBRATION_KEY = 'calibrations';
 
-/** Default input latency offered when the patient skips latency calibration (seconds). */
+/**
+ * Input latency used when NOTHING has ever been measured or applied on this device (seconds).
+ *
+ * It is a last resort, not a floor. The latency screen offers it only when `latencySetAt` is null;
+ * once any value is in force — a measurement, or an offset the therapist applied on the Results
+ * screen for exactly this session — skipping the screen keeps that value. A "skip" that wrote 120 ms
+ * over an applied 280 ms destroyed the one control the Results screen has, on the single screen every
+ * next session passes through.
+ */
 export const DEFAULT_LATENCY_SEC = 0.12;
+
+/** Provenance of the offset in force: was it measured, what wrote it, and when. */
+export interface LatencyMeta {
+  measured: boolean;
+  note: string;
+  /** Epoch ms of the write. 0 when it was restored from a build that did not record one. */
+  at: number;
+}
+
+function validateLatencyMeta(raw: unknown): LatencyMeta | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const r = raw as Partial<LatencyMeta>;
+  return {
+    measured: r.measured === true,
+    note: typeof r.note === 'string' ? r.note : '',
+    at: Number.isFinite(r.at) ? (r.at as number) : 0,
+  };
+}
 
 export function defaultLanes(mode: Mode): LaneSpec[] {
   const m: Movement = mode === 'leg' ? 'seated_march' : 'hand_open_close';
@@ -210,6 +246,16 @@ export interface LatencyChange {
   previousMs: number;
   appliedMs: number;
   deltaMs: number;
+  /**
+   * The PROVENANCE of the value that was replaced, so an Undo can put back what was really there.
+   *
+   * `latencyMeasured` is the label the latency screen prints beside the offset in force
+   * ("measured" / "not measured"), and a revert that wrote `false` unconditionally downgraded a
+   * measured offset to an unmeasured one as the price of correcting a misclick. Undo has to be
+   * lossless or it is not an undo.
+   */
+  previousMeasured: boolean;
+  previousNote: string;
 }
 
 export interface AppState {
@@ -231,8 +277,17 @@ export interface AppState {
   savedCalibrations: Record<string, RomCalibration>;
 
   latencyOffsetSec: number;
+  /** True when the offset in force came from a measurement (the probe, or a whole run's crossings). */
   latencyMeasured: boolean;
+  /** One line of provenance for the offset in force, shown wherever the number is shown. */
   latencyNote: string;
+  /**
+   * When the offset in force was written, epoch ms — and, more importantly, WHETHER one is in force
+   * at all. `null` means nothing has ever set a latency on this device, and only then may a screen
+   * fall back to DEFAULT_LATENCY_SEC. `0` means a value is in force but was restored from a build
+   * that did not record its date.
+   */
+  latencySetAt: number | null;
 
   settings: Settings;
   history: SessionResult[];
@@ -267,7 +322,10 @@ export interface AppState {
 
 const persistedSettings = readJson<Settings>(SETTINGS_KEY, DEFAULT_SETTINGS, validateSettings);
 const persistedHistory = readJson<SessionResult[]>(HISTORY_KEY, [], validateHistory);
-const persistedLatency = readJson<number>(LATENCY_KEY, 0, (raw) => (Number.isFinite(raw) ? (raw as number) : null));
+// `null` when the key is absent: "no offset has ever been set on this device" is a different state
+// from "the offset is 0 ms", and the latency screen's skip path turns on the difference.
+const persistedLatency = readJson<number | null>(LATENCY_KEY, null, (raw) => (Number.isFinite(raw) ? (raw as number) : null));
+const persistedLatencyMeta = readJson<LatencyMeta | null>(LATENCY_META_KEY, null, validateLatencyMeta);
 const persistedConfig = readJson<Partial<SessionConfig>>(CONFIG_KEY, {}, validateConfig);
 const persistedCalibrations = readJson<Record<string, RomCalibration>>(CALIBRATION_KEY, {}, validateCalibrations);
 
@@ -310,9 +368,13 @@ export const useStore = create<AppState>((set, get) => {
     calibrations: initialLanes.map(() => null),
     savedCalibrations: persistedCalibrations,
 
-    latencyOffsetSec: persistedLatency,
-    latencyMeasured: false,
-    latencyNote: '',
+    latencyOffsetSec: persistedLatency ?? 0,
+    // Provenance survives the reload with the number it describes. It used to be reset to
+    // `false`/`''` on every load while the offset persisted, so the screens that quote the offset
+    // could only ever quote it anonymously.
+    latencyMeasured: persistedLatency !== null && (persistedLatencyMeta?.measured ?? false),
+    latencyNote: persistedLatency !== null ? (persistedLatencyMeta?.note ?? '') : '',
+    latencySetAt: persistedLatency === null ? null : (persistedLatencyMeta?.at ?? 0),
 
     settings: persistedSettings,
     history: persistedHistory,
@@ -412,20 +474,27 @@ export const useStore = create<AppState>((set, get) => {
       // Bounds (not rounding) from the same place the Results hand-over reads them, so the value the
       // therapist is offered is the value that ends up in force.
       const latencyOffsetSec = Number.isFinite(sec) ? Math.max(LATENCY_MIN_MS / 1000, Math.min(LATENCY_MAX_MS / 1000, sec)) : 0;
-      set({ latencyOffsetSec, latencyMeasured: measured, latencyNote: note });
+      const latencySetAt = Date.now();
+      set({ latencyOffsetSec, latencyMeasured: measured, latencyNote: note, latencySetAt });
       writeJson(LATENCY_KEY, latencyOffsetSec);
+      // Written second and separately: if this write is the one the quota refuses, the offset is
+      // still in force and merely loses its label.
+      writeJson(LATENCY_META_KEY, { measured, note, at: latencySetAt } satisfies LatencyMeta);
     },
 
     applySuggestedLatency: (suggestedMs, source = '') => {
       if (!Number.isFinite(suggestedMs)) return null;
-      const previousMs = Math.round(get().latencyOffsetSec * 1000);
+      const before = get();
+      const previousMs = Math.round(before.latencyOffsetSec * 1000);
+      const previousMeasured = before.latencyMeasured;
+      const previousNote = before.latencyNote;
       // The same clamp the panel labels its button with, so what is offered is what is stored.
       const appliedMs = clampLatencyMs(suggestedMs);
       const appliedSec = appliedMs / 1000;
       // `measured` stays true: the value came from a whole run's worth of judged crossings, which is
       // strictly more evidence than the ten taps of the latency screen.
       get().setLatency(appliedSec, true, source ? `${appliedMs} ms measured from ${source}` : `${appliedMs} ms measured from the last run`);
-      return { previousMs, appliedMs, deltaMs: appliedMs - previousMs };
+      return { previousMs, appliedMs, deltaMs: appliedMs - previousMs, previousMeasured, previousNote };
     },
 
     updateSettings: (patch) => {

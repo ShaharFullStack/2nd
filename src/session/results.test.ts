@@ -181,3 +181,42 @@ describe('formatters', () => {
     expect(formatDuration(-1)).toBe('0:00');
   });
 });
+
+/**
+ * THE LABEL IS THE LANE'S NAME EVERYWHERE DOWNSTREAM — the Results per-movement table, the History
+ * table and the trend card title all read it back. It has to name the digit that was prescribed.
+ */
+describe('the stored per-lane label', () => {
+  const pinchConfig = (lanes: SessionConfig['lanes']): SessionConfig => ({ ...CONFIG, mode: 'hand', lanes });
+
+  it('names the fingertip, so two pinch lanes on one hand are not both "L pinch"', () => {
+    const r = buildSessionResult({
+      summary: summary(),
+      config: pinchConfig([
+        { index: 0, movement: 'finger_opposition', side: 'left', fingertip: 'index' },
+        { index: 1, movement: 'finger_opposition', side: 'left', fingertip: 'pinky' },
+      ]),
+      inputMode: 'camera',
+      latencyOffsetSec: 0.12,
+    });
+    expect(r.lanes.map((l) => l.label)).toEqual(['L index pinch', 'L little pinch']);
+    expect(r.lanes.map((l) => l.fingertip)).toEqual(['index', 'pinky']);
+  });
+
+  it('names the DEFAULT tip when the therapist never touched the control — the lane is still measured on it', () => {
+    const r = buildSessionResult({
+      summary: summary(),
+      config: pinchConfig([
+        { index: 0, movement: 'finger_opposition', side: 'right' },
+        { index: 1, movement: 'hand_open_close', side: 'right' },
+      ]),
+      inputMode: 'camera',
+      latencyOffsetSec: 0.12,
+    });
+    expect(r.lanes[0].label).toBe('R index pinch');
+    expect(r.lanes[0].fingertip).toBe('index');
+    // A movement with no fingertip dimension is untouched.
+    expect(r.lanes[1].label).toBe('R open hand');
+    expect(r.lanes[1].fingertip).toBeUndefined();
+  });
+});

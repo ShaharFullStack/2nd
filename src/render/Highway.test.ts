@@ -6,14 +6,21 @@ import { runDemo } from './demo';
 import { FAR_FADE_FRAC, GEM_ASPECT, laneX, roadEdgeX, visibleTailSec, yAt } from './geometry';
 import { GH_PALETTE, HIGH_CONTRAST_PALETTE, hexToRgb } from './palette';
 import { TextCache, type Ctx2D } from './text';
+import { VisionInput } from '../input/VisionInput';
+import { LaneStateCache } from '../input/laneStates';
+import { extractFeature } from '../vision/features';
+import { seatedPose } from '../vision/fixtures';
+import type { Landmark } from '../vision/landmarks';
+import type { LandmarkDetector } from '../vision/mediapipe';
+import type { RomCalibration } from '../vision/calibration';
 import type { CanvasLike, RenderFrame, RenderNote } from './types';
 
 /** Mirrors of the receptor's private drawing constants (Highway.ts). */
 const METER_WELL = '#080a12';
 const WHITE = '#ffffff';
 const METER_TARGET_POS = 0.76;
-/** Ceiling on a locked lane's column, as a fraction of the target height (Highway.LOCK_LEVEL_CEIL). */
-const LOCK_LEVEL_CEIL = 0.9;
+/** Ceiling on the liquid column in EVERY state, as a fraction of the well (Highway.METER_LEVEL_CEIL). */
+const METER_LEVEL_CEIL = 0.93;
 /** A locked receptor's ring — and with it its whole gauge — is drawn 12 % smaller (Highway pulse). */
 const LOCK_RING_SCALE = 0.88;
 /** Drain cap / re-arm line / chevron / return-to-rest arc — violet, a hue no lane palette contains. */
@@ -1446,6 +1453,25 @@ function rearmDashes(canvas: MockCanvas, hw: Highway, lane: number): Array<{ y: 
 }
 
 /**
+ * The "lower to reset" chevron: a stroked polyline in the lock hint colour inside a lane's ring. One
+ * per lane in (c) while the patient still has somewhere to lower TO, and nowhere else — the arc that
+ * shares its colour is an `ellipse`, not a path.
+ */
+function chevrons(canvas: MockCanvas, hw: Highway, lane: number): number {
+  const g = hw.geometry;
+  const cx = laneX(g, lane, 0);
+  let n = 0;
+  canvas.ctx.calls.forEach((c, i) => {
+    if (c.name !== 'moveTo') return;
+    if (canvas.ctx.propBefore(i, 'strokeStyle') !== LOCK_HINT) return;
+    const [x, y] = c.args as number[];
+    if (Math.abs(x - cx) > g.receptorRadius || Math.abs(y - g.strikeY) > g.receptorRadius) return;
+    n++;
+  });
+  return n;
+}
+
+/**
  * Where the meter well's value axis lives for a lane (reduced motion ⇒ no beat pulse, so exact).
  * `scale` is the ring scale in force: 1 for a live lane, `LOCK_RING_SCALE` for a locked one, whose
  * ring — and therefore whose whole gauge — is drawn 12 % smaller.
@@ -1538,19 +1564,26 @@ describe('receptor tells the truth about whether the lane can fire', () => {
     const at = (t: number, armed: boolean, value = VALUE): void => {
       hw.draw(makeFrame({ lanes: LANES, songTime: t, laneStates: states(armed).map((s) => ({ ...s, value })), thresholdFraction: THRESH }));
     };
-    for (let i = 0; i < 30; i++) at(1 + i * 0.016, true);
+    // Rising below the threshold: armed, and the halo is up.
+    for (let i = 0; i < 30; i++) at(1 + i * 0.016, true, 0.5);
     canvas.ctx.reset();
-    at(1.5, true);
+    at(1.5, true, 0.5);
     expect(haloBlits(canvas, hw)).toBe(4);
-    // Lane fires → unarmed. The halo drains over a few frames rather than snapping, but it goes.
-    for (let i = 0; i < 30; i++) at(1.52 + i * 0.016, false);
+    // The crossing: the trigger disarms on the sample that crosses, so this IS the frame the lane
+    // fired on. The halo stays up for the goal latch — that is the acknowledgement of the rep.
+    at(1.52, false);
     canvas.ctx.reset();
-    at(2.02, false);
+    at(1.54, false);
+    expect(haloBlits(canvas, hw)).toBe(4);
+    // ...and once the latch has expired and the patient is merely holding at end range, it goes.
+    for (let i = 0; i < 30; i++) at(1.56 + i * 0.016, false);
+    canvas.ctx.reset();
+    at(2.3, false);
     expect(haloBlits(canvas, hw)).toBe(0);
     // Patient lowers past the re-arm line → armed again, and the meter lights up again.
-    for (let i = 0; i < 30; i++) at(2.04 + i * 0.016, true);
+    for (let i = 0; i < 30; i++) at(2.32 + i * 0.016, true);
     canvas.ctx.reset();
-    at(2.54, true);
+    at(2.82, true);
     expect(haloBlits(canvas, hw)).toBe(4);
   });
 
@@ -1631,9 +1664,9 @@ describe('the receptor draws four distinct states', () => {
   type Rec = { canvas: MockCanvas; hw: Highway; scratch: MockCanvas[] };
 
   /** Warm the smoothed halo up on one lane state, then record exactly one frame of it. */
-  const record = (value: number, armed: boolean, tracking = true, beatPhase = 0.5): Rec => {
-    const s = setup(1280, 720);
-    s.hw.resize(1280, 720, 1);
+  const record = (value: number, armed: boolean, tracking = true, beatPhase = 0.5, w = 1280, h = 720): Rec => {
+    const s = setup(w, h);
+    s.hw.resize(w, h, 1);
     const ls = LANES.map((l) => ({ lane: l.index, value, armed, tracking }));
     const frame = (t: number): RenderFrame =>
       makeFrame({ lanes: LANES, songTime: t, laneStates: ls, thresholdFraction: THRESH, rearmFraction: 0.6, beatPhase });
@@ -1705,13 +1738,64 @@ describe('the receptor draws four distinct states', () => {
   const risingCaps = (s: Rec): number =>
     LANES.filter((l) => levelLine(s.canvas, s.hw, l.index, GH_PALETTE.lanes[l.index].bright)).length;
 
+  /**
+   * Solid white arrowheads at the target line, just outside the ring — 2 per lane in (b) and
+   * nowhere else. They are filled TRIANGLES where (a) has two thin bars: a change of shape and
+   * ~10× the filled area, which is what carries state (b) through a hard downscale when the
+   * hairline rim and corona have thinned to nothing.
+   */
+  const goalWedges = (s: Rec): number => {
+    const g = s.hw.geometry;
+    const { yTarget } = meterAxis(s.hw);
+    let n = 0;
+    s.canvas.ctx.calls.forEach((c, i) => {
+      if (c.name !== 'moveTo') return;
+      if (s.canvas.ctx.propBefore(i, 'fillStyle') !== WHITE) return;
+      const [x, y] = c.args as number[];
+      if (Math.abs(y - yTarget) > g.receptorRadius * 0.2) return;
+      // Counted against the NEAREST lane only: at 4 lanes a neighbouring receptor's centre is
+      // itself inside the 1.6 r window, and counting per lane would make the total depend on the
+      // lane-width : radius ratio instead of on the marks actually drawn (the same trap
+      // `targetTicks` fell into).
+      const d = Math.min(...LANES.map((l) => Math.abs(x - laneX(g, l.index, 0))));
+      if (d > g.receptorRadius * 0.5 && d < g.receptorRadius * 1.6) n++;
+    });
+    return n;
+  };
+
   /** Was the "?" glyph rasterized at all (the text cache is per-Highway, so per recorded state)? */
   const questionGlyph = (s: Rec): boolean => s.scratch.some((c) => c.ctx.calls.some((k) => k.name === 'fillText' && k.args[0] === '?'));
 
-  // (a) rising toward threshold, armed   (b) at threshold, armed
+  /**
+   * (b) THE CROSSING, built the way the input layer really publishes it — which is the whole point.
+   * `LaneTrigger` moves to 'triggered' on the sample that crosses and `VisionInput` pushes it before
+   * it publishes `armed`, so the frame the lane fires on arrives as `{ value >= threshold, armed:
+   * false }`; there is no such thing as an `armed && value >= threshold` frame. So: 40 frames rising
+   * and armed, then one crossing frame, already disarmed. (`the receptor states are reachable from
+   * the real input layer` below proves this shape is what a real VisionInput emits.)
+   */
+  const recordCrossing = (beatPhase = 0.5, w = 1280, h = 720): Rec => {
+    const s = setup(w, h);
+    s.hw.resize(w, h, 1);
+    const frame = (t: number, value: number, armed: boolean): RenderFrame =>
+      makeFrame({
+        lanes: LANES,
+        songTime: t,
+        laneStates: LANES.map((l) => ({ lane: l.index, value, armed, tracking: true })),
+        thresholdFraction: THRESH,
+        rearmFraction: 0.6,
+        beatPhase,
+      });
+    for (let i = 0; i < 40; i++) s.hw.draw(frame(1 + i * 0.016, 0.5, true));
+    s.canvas.ctx.reset();
+    s.hw.draw(frame(1.64, 0.75, false));
+    return s;
+  };
+
+  // (a) rising toward threshold, armed   (b) the threshold crossing (published already disarmed)
   // (c) at threshold, NOT armed          (d) tracking lost (with a stale value still in the meter)
   const rising = (): Rec => record(0.36, true);
-  const firing = (): Rec => record(0.75, true);
+  const firing = (): Rec => recordCrossing();
   const locked = (): Rec => record(0.75, false);
   const lost = (): Rec => record(0.75, true, false);
 
@@ -1735,15 +1819,19 @@ describe('the receptor draws four distinct states', () => {
     expect(solidRings(a)).toBe(4);
     expect(risingCaps(a)).toBe(4); // one continuous lane-tinted cap per lane
     expect(hotCaps(a)).toBe(0);
+    expect(goalWedges(a)).toBe(0);
     expect(drainCaps(a)).toBe(0);
 
-    // (b) at/over threshold and armed: the only state with the additive rim + corona, and the only
-    //     one whose fill is drawn from the hot gradient (a separate cached gradient per lane). It
-    //     keeps the target line — it has to, because the liquid now stands *above* it.
+    // (b) the crossing: the only state with the additive rim + corona, and the only one whose fill
+    //     is drawn from the hot gradient (a separate cached gradient per lane). It keeps the target
+    //     line — it has to, because the liquid now stands *above* it — but its two ticks are
+    //     replaced by two solid arrowheads, so the state does not depend on the hairline rings to
+    //     survive a downscale.
     expect(willFireRings(b)).toBe(8); // rim + corona per lane
     expect(haloBlits(b.canvas, b.hw)).toBe(4);
     expect(targetLines(b)).toBe(4);
-    expect(tickCount(b)).toBe(8);
+    expect(tickCount(b)).toBe(0); // the thin ticks are gone...
+    expect(goalWedges(b)).toBe(8); // ...replaced by two solid arrowheads per lane
     expect(lockHints(b)).toBe(0);
     expect(brokenArcs(b)).toHaveLength(0);
     expect(solidRings(b)).toBe(4);
@@ -1766,6 +1854,7 @@ describe('the receptor draws four distinct states', () => {
     expect(solidRings(c)).toBe(4);
     expect(drainCaps(c)).toBe(4); // the violet bar the patient has to bring down to the dashes
     expect(hotCaps(c)).toBe(0);
+    expect(goalWedges(c)).toBe(0);
     expect(risingCaps(c)).toBe(0);
     for (const l of LANES) expect(rearmDashes(c.canvas, c.hw, l.index), `lane ${l.index} dashes`).toHaveLength(3);
 
@@ -1780,6 +1869,7 @@ describe('the receptor draws four distinct states', () => {
     expect(lockHints(d)).toBe(0);
     expect(solidRings(d)).toBe(0);
     expect(hotCaps(d)).toBe(0);
+    expect(goalWedges(d)).toBe(0);
     expect(drainCaps(d)).toBe(0);
     expect(risingCaps(d)).toBe(0);
     expect(brokenArcs(d)).toHaveLength(4 * 4); // four arcs per lane
@@ -1855,7 +1945,12 @@ describe('the receptor draws four distinct states', () => {
     expect(at(0.5).level).toBeCloseTo(axis.yBot - 0.5 * METER_TARGET_POS * axis.span, 1);
   });
 
-  it('is the only state that paints liquid above the target line, and only once it really fires', () => {
+  it('draws the column on ONE scale in every state, and never saturates it inside the patient\'s range', () => {
+    // (1) HONESTY + (3) THE GAUGE MUST MOVE. The column is a POSITION: the same height means the
+    // same millimetres of movement whatever the lane's arming is doing, and it cannot pin anywhere
+    // inside the reachable range (LaneState.value is clamp01'd by the calibration), because a
+    // pinned column is a gauge that flatlines while the patient is moving. What the position MEANS
+    // for the next rep is carried by the marks around it, which is asserted elsewhere in this file.
     const { canvas, hw } = setup(1280, 720, { reducedMotion: true });
     hw.resize(1280, 720, 1);
     const axis = meterAxis(hw);
@@ -1874,24 +1969,190 @@ describe('the receptor draws four distinct states', () => {
     expect(topOfLiquid(THRESH * 0.99)).toBeGreaterThan(axis.yTarget); // below the line
     expect(topOfLiquid(THRESH)).toBeCloseTo(axis.yTarget, 1); // exactly on it
     expect(topOfLiquid(THRESH * 1.25)).toBeLessThan(axis.yTarget - 1); // into the headroom
-    expect(topOfLiquid(THRESH * 1.5)).toBeLessThan(topOfLiquid(THRESH * 1.25)); // and further
-    // A locked lane at the same value never reaches the line's height, let alone crosses it: the
-    // headroom is a "you cleared the target" cue it has not earned, and a column stopping flush ON
-    // the trigger height reads as being at the trigger point. It is capped a visible band short.
-    // A locked ring is also drawn 12 % smaller, so its gauge has its own axis; the ceiling is a
-    // fraction of THAT well, and the shortfall against the live target line is larger still.
+    // The headroom spans the REST OF THE ROM, so every step up to full ROM is a real distance and
+    // the top of the well is reached only at 1.0 (this is the property that killed the frozen
+    // zone: with the old fixed 1.5x-threshold headroom, everything past THRESH * 1.5 was one pixel
+    // row, and everything past the threshold was one pixel row once the lane locked).
+    let prev = Infinity;
+    for (const v of [0.6, 0.7, 0.8, 0.9, 0.95, 1]) {
+      const top = topOfLiquid(v);
+      expect(top, `live top at ${v}`).toBeLessThan(prev - 2);
+      prev = top;
+    }
+    expect(topOfLiquid(1)).toBeCloseTo(axis.yBot - METER_LEVEL_CEIL * axis.span, 1);
+    // A LOCKED lane at the same value stands at the same place on its own well's axis (a locked
+    // ring, and with it its whole gauge, is drawn 12 % smaller). It is allowed above the target
+    // height and it travels down THROUGH it: the patient really is up there, and the whole job of
+    // the state is to show them coming back down from wherever that is.
     const lockAxis = meterAxis(hw, LOCK_RING_SCALE);
-    const capped = lockAxis.yBot - METER_TARGET_POS * LOCK_LEVEL_CEIL * lockAxis.span;
-    for (const v of [THRESH, THRESH * 1.25, THRESH * 1.5, THRESH * 3]) {
-      expect(topOfLiquid(v, false), `locked at ${v}`).toBeGreaterThan(axis.yTarget);
-      expect(topOfLiquid(v, false) - axis.yTarget, `locked gap at ${v}`).toBeGreaterThan(4); // ≥1 px at 4×
-      expect(topOfLiquid(v, false), `locked at ${v}`).toBeCloseTo(capped, 0);
+    const lockedTop = (value: number): number =>
+      lockAxis.yBot - Math.min(METER_TARGET_POS * Math.min(value / THRESH, 1) + (METER_LEVEL_CEIL - METER_TARGET_POS) * Math.min(Math.max(value - THRESH, 0) / Math.max(1 - THRESH, THRESH * 0.5), 1), METER_LEVEL_CEIL) * lockAxis.span;
+    for (const v of [0.18, 0.3, 0.42, 0.6, 0.75, 0.9, 1]) {
+      expect(topOfLiquid(v, false), `locked at ${v}`).toBeCloseTo(lockedTop(v), 0);
     }
-    // Below that ceiling the locked column is the patient's true value on its own well's scale —
-    // that is what makes it a gauge they can lower against the re-arm line.
-    for (const f of [0.3, 0.5, 0.7]) {
-      expect(topOfLiquid(THRESH * f, false), `locked at ${f}×`).toBeCloseTo(lockAxis.yBot - METER_TARGET_POS * f * lockAxis.span, 0);
+    expect(topOfLiquid(1, false)).toBeLessThan(lockAxis.yTarget); // above the (undrawn) target height
+    expect(topOfLiquid(0.6, false)).toBeCloseTo(lockAxis.yTarget, 1); // and passes through it
+  });
+
+  it('moves every return-to-rest mark on every step of the descent, from the real peak down', () => {
+    // THE BUG THIS TEST EXISTS FOR. A locked column used to be min(fill, 0.9) of the target height
+    // and `fill` saturates at the threshold, so a patient holding at end range and then lowering
+    // saw {fill: 1, resetProgress: 0} — a pixel-identical receptor — for the whole span from their
+    // real peak down to the threshold: 71 % of the return journey on the default 'easy' difficulty.
+    // Every locked-lane assertion in this file used to be built at or below the threshold, which is
+    // exactly why 1052 passing tests did not notice. So: walk a lane from FULL ROM down to the
+    // re-arm line and require all four return-to-rest marks to move on every single step.
+    const { canvas, hw } = setup(1280, 720, { reducedMotion: true });
+    hw.resize(1280, 720, 1);
+    const REARM = 0.6;
+    const REARM_ROM = THRESH * REARM;
+    let t = 1;
+    const step = (value: number, armed: boolean): void => {
+      t += 0.033;
+      canvas.ctx.reset();
+      hw.draw(
+        makeFrame({
+          lanes: LANES,
+          songTime: t,
+          laneStates: LANES.map((l) => ({ lane: l.index, value, armed, tracking: true })),
+          thresholdFraction: THRESH,
+          rearmFraction: REARM,
+        }),
+      );
+    };
+    /** The violet chevron's apex y (its first `moveTo`). */
+    const chevronY = (): number | undefined => {
+      const g = hw.geometry;
+      let y: number | undefined;
+      canvas.ctx.calls.forEach((c, i) => {
+        if (c.name !== 'moveTo' || canvas.ctx.propBefore(i, 'strokeStyle') !== LOCK_HINT) return;
+        if (Math.abs((c.args[0] as number) - laneX(g, 0, 0)) > g.receptorRadius) return;
+        if (y === undefined) y = c.args[1] as number;
+      });
+      return y;
+    };
+    /** Angular span of the return-to-rest arc (0 when it is not drawn at all). */
+    const arcSweep = (): number => {
+      const g = hw.geometry;
+      let span = 0;
+      canvas.ctx.calls.forEach((c, i) => {
+        if (c.name !== 'ellipse' || c.args.length < 7) return;
+        if (Math.abs((c.args[1] as number) - g.strikeY) > 0.5) return;
+        if (Math.abs((c.args[2] as number) - g.receptorRadius * 1.16) > 0.5) return;
+        if (canvas.ctx.propBefore(i, 'strokeStyle') !== LOCK_HINT) return;
+        span = Math.max(span, (c.args[6] as number) - (c.args[5] as number));
+      });
+      return span;
+    };
+
+    // Rise to full ROM armed, cross (published already disarmed, as VisionInput really does), then
+    // hold at the top past the goal latch so the lockout look is the one on screen.
+    for (const v of [0.2, 0.4, 0.55]) step(v, true);
+    step(1, false);
+    for (let i = 0; i < 25; i++) step(1, false); // ~0.8 s: the 0.45 s + 0.15 s latch has expired
+    expect(drainCap(canvas, hw, 0), 'drain cap while held at the top').toBeDefined();
+    expect(arcSweep(), 'nothing given back yet').toBe(0);
+
+    // ...and now the descent, in ROM steps a slow hemiparetic patient would really produce.
+    const descent = [0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5, 0.45, 0.4, REARM_ROM];
+    let prevCap = (drainCap(canvas, hw, 0) as MeterRect).y;
+    let prevChev = chevronY() as number;
+    let prevArc = 0;
+    const minStep = hw.geometry.receptorRadius * 0.02; // ~1.3 px at 720p, ~1 px after a 5x downscale
+    for (const v of descent) {
+      step(v, false);
+      const cap = drainCap(canvas, hw, 0);
+      const chev = chevronY();
+      const arc = arcSweep();
+      expect(cap, `drain cap at ${v}`).toBeDefined();
+      expect(chev, `chevron at ${v}`).toBeDefined();
+      // Cap and chevron travel DOWN the well (larger y), the arc grows — every step, no exceptions.
+      expect((cap as MeterRect).y - prevCap, `cap moved at ${v}`).toBeGreaterThan(minStep);
+      // The chevron sits half way between the cap and the line, so it closes half the gap the cap
+      // does — still real motion on every step, in the same direction, landing on the line with it.
+      expect((chev as number) - prevChev, `chevron moved at ${v}`).toBeGreaterThan(minStep * 0.45);
+      expect(arc - prevArc, `arc grew at ${v}`).toBeGreaterThan(0.02);
+      prevCap = (cap as MeterRect).y;
+      prevChev = chev as number;
+      prevArc = arc;
     }
+    // It ends exactly on the re-arm line — the instant the input layer re-arms the lane — with the
+    // arc complete but still open at the top (a closed ring would read as a lit ring).
+    const dash = rearmDashes(canvas, hw, 0)[0];
+    expect(Math.abs(prevCap - dash.y)).toBeLessThan(1.5);
+    expect(Math.abs(prevChev - dash.y)).toBeLessThan(hw.geometry.receptorRadius * 0.2);
+    expect(prevArc).toBeCloseTo(Math.PI * 1.5, 6);
+    // More than half of that motion happened ABOVE the threshold — the span that used to be dead.
+    // (0.36..0.6 of ROM is the old live span; 0.6..1.0 is the span this test was written for.)
+    expect(descent.filter((v) => v >= THRESH)).toHaveLength(8);
+  });
+
+  it('keeps the four mark sets apart at desktop, tablet and portrait aspect ratios', () => {
+    // (2) FOUR STATES, FOUR MARK SETS — and the marks are what has to differ, not the hue or the
+    // brightness, at every shape of clinic screen. A tablet in portrait shrinks the receptor
+    // radius by more than half, which is where a distinction carried by a hairline or by a 2 px
+    // thickness difference quietly stops existing. Each state is identified here by WHICH marks are
+    // on the canvas, and the four signatures have to stay mutually exclusive at every size.
+    for (const [w, h] of [
+      [1280, 720], // desktop
+      [1024, 768], // clinic tablet, landscape
+      [768, 1024], // ...and portrait
+      [400, 800], // phone-shaped, the hardest case
+    ]) {
+      const tag = `${w}x${h}`;
+      const a = record(0.36, true, true, 0.5, w, h);
+      const b = recordCrossing(0.5, w, h);
+      const c = record(0.75, false, true, 0.5, w, h);
+      const d = record(0.75, true, false, 0.5, w, h);
+      // A signature per state: [target line, threshold ticks, split hot cap, goal arrowheads,
+      // violet drain cap, dashed re-arm line, chevron, broken ring arcs].
+      const sig = (s: Rec): string =>
+        [
+          targetLine(s.canvas, s.hw, 0) ? 1 : 0,
+          targetTicks(s.canvas, s.hw, 0).length,
+          hotCapSegments(s.canvas, s.hw, 0).length,
+          goalWedges(s) > 0 ? 1 : 0,
+          drainCap(s.canvas, s.hw, 0) ? 1 : 0,
+          rearmDashes(s.canvas, s.hw, 0).length,
+          chevrons(s.canvas, s.hw, 0),
+          brokenArcs(s).length > 0 ? 1 : 0,
+        ].join(',');
+      // (a) rising: level + target line and its two ticks, nothing else.
+      expect(sig(a), `${tag} rising`).toBe('1,2,0,0,0,0,0,0');
+      // (b) crossing: the split cap and the two solid arrowheads REPLACE the ticks.
+      expect(sig(b), `${tag} crossing`).toBe('1,0,2,1,0,0,0,0');
+      // (c) locked: the three return-to-rest marks, and no target line or ticks at all.
+      expect(sig(c), `${tag} locked`).toBe('0,0,0,0,1,3,1,0');
+      // (d) no signal: the broken ring alone — nothing value-derived survives into it.
+      expect(sig(d), `${tag} lost`).toBe('0,0,0,0,0,0,0,1');
+    }
+  });
+
+  it('stops ordering a locked lane down once it is already below the re-arm line', () => {
+    // A locked lane is not always a HIGH lane: 'unconfirmed' is a statement about what the trigger
+    // has observed, not about the current value, so a reset, a mid-song retune or a stream break can
+    // leave one locked at 0.1 of ROM. Drawing the "lower to reset" chevron and the violet drain cap
+    // there points the patient at a line they are already under — an order they cannot carry out.
+    // The lane still cannot score, so everything else about (c) stays.
+    const under = record(0.1, false); // re-arm line is at 0.36 of ROM
+    const over = locked();            // ...the ordinary held-at-end-range case, for contrast
+    // The two ORDER marks are gone.
+    expect(chevrons(over.canvas, over.hw, 0)).toBe(1);
+    expect(drainCaps(over)).toBe(4);
+    expect(chevrons(under.canvas, under.hw, 0)).toBe(0);
+    expect(drainCaps(under)).toBe(0);
+    // ...and nothing else has changed: it is still (c), not (a), (b) or (d).
+    expect(meterWells(under)).toBe(4);
+    expect(meterFills(under)).toBe(4); // the column is still drawn, to its true (low) height
+    expect(LANES.every((l) => rearmDashes(under.canvas, under.hw, l.index).length === 3)).toBe(true);
+    expect(targetLines(under)).toBe(0);
+    expect(tickCount(under)).toBe(0);
+    expect(hotCaps(under)).toBe(0);
+    expect(goalWedges(under)).toBe(0);
+    expect(willFireRings(under)).toBe(0);
+    expect(haloBlits(under.canvas, under.hw)).toBe(0);
+    expect(brokenArcs(under)).toHaveLength(0);
+    expect(solidRings(under)).toBe(4);
   });
 
   it('turns the locked column into a "how much further to lower" gauge that ends on the re-arm line', () => {
@@ -2099,6 +2360,423 @@ describe('the receptor draws four distinct states', () => {
 // -------------------------------------------------------------------------------------------------
 
 /** A canvas factory with no 2D context: forces every sprite path into its plain-ctx fallback. */
+
+// -------------------------------------------------------------------------------------------------
+// REACHABILITY. A receptor look that no input source can produce is not a feature, it is dead code
+// with a test around it — and the look it was hiding was the one the whole session is for ("you
+// reached your target range"). So these tests do not build LaneStates by hand: they drive the real
+// VisionInput / the real scripted-source publisher and classify what actually lands on the canvas.
+// -------------------------------------------------------------------------------------------------
+
+type ReceptorState = 'rising' | 'goal' | 'locked' | 'lost' | 'none';
+
+/** Which of the four looks lane `lane` is wearing in the frame recorded on `canvas`. */
+function receptorState(canvas: MockCanvas, hw: Highway, lane: number): ReceptorState {
+  const g = hw.geometry;
+  const cx = laneX(g, lane, 0);
+  const broken = canvas.ctx.calls.some(
+    (c, i) =>
+      c.name === 'ellipse' &&
+      c.args.length >= 7 &&
+      Math.abs((c.args[0] as number) - cx) < 1 &&
+      Math.abs((c.args[1] as number) - g.strikeY) < 0.5 &&
+      (c.args[6] as number) - (c.args[5] as number) < Math.PI * 2 - 1e-6 &&
+      canvas.ctx.propBefore(i, 'strokeStyle') === LOST_RING_GREY,
+  );
+  if (!wellRect(canvas, hw, lane)) return broken ? 'lost' : 'none';
+  if (hotCapSegments(canvas, hw, lane).length === 2) return 'goal';
+  if (drainCap(canvas, hw, lane) || rearmDashes(canvas, hw, lane).length === 3) return 'locked';
+  if (targetLine(canvas, hw, lane)) return 'rising';
+  return 'none';
+}
+const LOST_RING_GREY = '#a9b0bb';
+
+describe('every receptor look is one the real input layer produces', () => {
+  const THRESH = 0.6;
+  const REP_LANES: LaneSpec[] = [
+    { index: 0, movement: 'seated_march', side: 'left' },
+    { index: 1, movement: 'knee_extension', side: 'right' },
+  ];
+  class FakeClock {
+    currentTime = 0;
+  }
+  const stubDetector = (): LandmarkDetector => ({
+    mode: 'leg',
+    delegate: 'CPU',
+    detect: () => ({ tMs: 0, pose: null, hands: [] }),
+    close: () => undefined,
+  });
+  const calFor = (movement: LaneSpec['movement'], side: LaneSpec['side'], gen: (a: number) => Landmark[]): RomCalibration => ({
+    min: extractFeature(movement, gen(0), side) as number,
+    max: extractFeature(movement, gen(1), side) as number,
+    samples: 1,
+    movement,
+  });
+
+  it('drives a real VisionInput through one rep and draws all four states, in order', async () => {
+    const input = new VisionInput({
+      mode: 'leg',
+      lanes: REP_LANES,
+      calibrations: [
+        calFor('seated_march', 'left', (a) => seatedPose({ kneeLift: a, side: 'left' })),
+        calFor('knee_extension', 'right', (a) => seatedPose({ kneeExtension: a, side: 'right' })),
+      ],
+      thresholdFraction: THRESH,
+      audioContext: new FakeClock(),
+      detector: stubDetector(),
+      driveLoop: false,
+      smoothing: { kind: 'none' },
+    });
+    const fired: number[] = [];
+    input.onEvent((e) => fired.push(e.ctxTime));
+    await input.start();
+
+    const { canvas, hw } = setup(1280, 720);
+    hw.resize(1280, 720, 1);
+    const seen: Array<{ t: number; state: ReceptorState; other: ReceptorState }> = [];
+    const step = (t: number, pose: Landmark[] | null): void => {
+      input.processDetection({ tMs: t * 1000, pose, hands: [] }, t);
+      canvas.ctx.reset();
+      hw.draw(
+        makeFrame({
+          lanes: REP_LANES,
+          songTime: t,
+          laneStates: input.getLaneStates(),
+          thresholdFraction: THRESH,
+          rearmFraction: 0.6,
+        }),
+      );
+      seen.push({ t, state: receptorState(canvas, hw, 0), other: receptorState(canvas, hw, 1) });
+    };
+
+    // One real rep of the left leg at 30 fps: rest, rise past the threshold, HOLD at end range —
+    // the single most common thing a rehab patient does, and the state the contract exists for —
+    // then lower back to rest.
+    const profile: number[] = [];
+    for (let i = 0; i < 15; i++) profile.push(0);
+    for (let i = 1; i <= 15; i++) profile.push((0.9 * i) / 15);
+    for (let i = 0; i < 40; i++) profile.push(0.9);
+    for (let i = 1; i <= 15; i++) profile.push(0.9 * (1 - i / 15));
+    for (let i = 0; i < 15; i++) profile.push(0);
+    profile.forEach((amount, i) => step(i / 30, seatedPose({ kneeLift: amount, side: 'left' })));
+    // ...then the patient leaves the frame.
+    const lastT = seen[seen.length - 1].t;
+    for (let i = 1; i <= 20; i++) step(lastT + i / 30, null);
+
+    const order = seen.map((f) => f.state);
+    // Nothing is ever undrawn, and every one of the four looks really happens.
+    expect(order).not.toContain('none');
+    for (const want of ['rising', 'goal', 'locked', 'lost'] as ReceptorState[]) {
+      expect(order.filter((k) => k === want).length, `${want} frames`).toBeGreaterThan(0);
+    }
+    // ...in the order a rep happens in: rise, reach, hold/lower, and (here) out of frame.
+    const firstOf = (k: ReceptorState): number => order.indexOf(k);
+    expect(firstOf('rising')).toBeLessThan(firstOf('goal'));
+    expect(firstOf('goal')).toBeLessThan(firstOf('locked'));
+    expect(firstOf('locked')).toBeLessThan(firstOf('lost'));
+    // The lane re-arms as the patient comes back down, so the gauge goes live again before the end.
+    expect(order.lastIndexOf('rising')).toBeGreaterThan(firstOf('locked'));
+
+    // THE CLAIM: the goal look starts on the very frame the input engine emitted its event, not a
+    // frame before it (that would be a promise) and not a frame after it (that would be a shrug).
+    expect(fired).toHaveLength(1);
+    const goalFrames = seen.filter((f) => f.state === 'goal');
+    expect(goalFrames[0].t).toBeGreaterThanOrEqual(fired[0]);
+    const prev = seen[seen.indexOf(goalFrames[0]) - 1];
+    expect(prev.t).toBeLessThan(fired[0]);
+    expect(prev.state).toBe('rising');
+    // ...and it is held long enough to be caught mid-rep, then hands over to "lower to reset".
+    const goalSpan = goalFrames[goalFrames.length - 1].t - goalFrames[0].t;
+    expect(goalSpan).toBeGreaterThan(0.3);
+    expect(goalSpan).toBeLessThan(0.8);
+
+    // The lane the patient never moved never claims anything: no crossing, no lockout.
+    expect(seen.every((f) => f.other === 'rising' || f.other === 'lost')).toBe(true);
+    input.stop();
+  });
+
+  it('never celebrates a rep the real VisionInput threw away in a dropout', async () => {
+    // THE FALSE POSITIVE, end to end and on the canvas. A lane is disarmed by a break in the sample
+    // stream as well as by a crossing — VisionInput pushes a null sample for every untracked frame,
+    // and past LaneTrigger.maxGapSec the lane goes to 'unconfirmed' AT WHATEVER VALUE IT HAS. The
+    // recovery frame is then published as { value: 0.95, armed: false }, byte for byte the frame a
+    // real crossing is published as, with no LaneInputEvent and (breakContinuity closes the rep with
+    // no CompletedRep) no rep either. This is the patient with hemiparesis or tremor whose knee
+    // landmark drops under MIN_VISIBILITY mid-rep, or the therapist who walks past the tablet.
+    const input = new VisionInput({
+      mode: 'leg',
+      lanes: REP_LANES,
+      calibrations: [
+        calFor('seated_march', 'left', (a) => seatedPose({ kneeLift: a, side: 'left' })),
+        calFor('knee_extension', 'right', (a) => seatedPose({ kneeExtension: a, side: 'right' })),
+      ],
+      thresholdFraction: THRESH,
+      audioContext: new FakeClock(),
+      detector: stubDetector(),
+      driveLoop: false,
+      smoothing: { kind: 'none' },
+    });
+    const fired: number[] = [];
+    const reps: number[] = [];
+    input.onEvent((e) => fired.push(e.ctxTime));
+    input.onRep((r) => reps.push(r.ctxTime));
+    await input.start();
+
+    const { canvas, hw } = setup(1280, 720);
+    hw.resize(1280, 720, 1);
+    const seen: Array<{ t: number; state: ReceptorState }> = [];
+    const step = (t: number, pose: Landmark[] | null): void => {
+      input.processDetection({ tMs: t * 1000, pose, hands: [] }, t);
+      canvas.ctx.reset();
+      hw.draw(
+        makeFrame({
+          lanes: REP_LANES,
+          songTime: t,
+          laneStates: input.getLaneStates(),
+          thresholdFraction: THRESH,
+          rearmFraction: 0.6,
+        }),
+      );
+      seen.push({ t, state: receptorState(canvas, hw, 0) });
+    };
+
+    let f = 0;
+    const at = (): number => f++ / 30;
+    for (let i = 0; i < 15; i++) step(at(), seatedPose({ kneeLift: 0, side: 'left' })); // rest: the lane arms
+    for (let i = 0; i < 5; i++) step(at(), seatedPose({ kneeLift: 0.4, side: 'left' })); // rising, short of 0.6
+    expect(seen[seen.length - 1].state).toBe('rising');
+    for (let i = 0; i < 30; i++) step(at(), null); // 1 s out of frame: past maxGapSec (0.5 s)
+    expect(seen[seen.length - 1].state).toBe('lost');
+    const recoveryFrom = seen.length;
+    // ...and the patient reappears at end range. Held there for longer than the goal latch would
+    // have lasted, so a latch that fired even for one frame is caught.
+    for (let i = 0; i < 20; i++) step(at(), seatedPose({ kneeLift: 0.95, side: 'left' }));
+
+    // THE INPUT LAYER CREDITED NOTHING — not a hit, not even a rep.
+    expect(fired).toHaveLength(0);
+    expect(reps).toHaveLength(0);
+    expect(input.getLaneStates()[0]).toMatchObject({ armed: false, tracking: true });
+    expect(input.getLaneStates()[0].value).toBeGreaterThan(THRESH);
+    // ...so the gauge must not claim otherwise, on any frame of the recovery.
+    const after = seen.slice(recoveryFrom).map((k) => k.state);
+    expect(after).not.toContain('goal');
+    // What it says instead is the true and actionable thing: this lane cannot score, lower to reset.
+    expect(after.every((k) => k === 'locked')).toBe(true);
+    // And it is the real "lower to reset", with the return-to-rest readout keyed to the re-arm level.
+    expect(drainCap(canvas, hw, 0)).toBeDefined();
+    expect(rearmDashes(canvas, hw, 0)).toHaveLength(3);
+    expect(chevrons(canvas, hw, 0)).toBe(1);
+    input.stop();
+  });
+
+  it('the scripted sources (keyboard / replay / autoplay) reach the goal look too', () => {
+    // KeyboardInput, ReplayInput and AutoplayInput all publish through LaneStateCache, which
+    // reports a held lane as { value: 1, armed: false } — the same "already disarmed" crossing
+    // frame VisionInput publishes. Driving the real publisher keeps `?input=keyboard` and
+    // `?autoplay=1` (the screenshot / critic configurations) honest.
+    const cache = new LaneStateCache();
+    const { canvas, hw } = setup(1280, 720);
+    hw.resize(1280, 720, 1);
+    const at = (t: number, held: number[]): ReceptorState => {
+      canvas.ctx.reset();
+      hw.draw(
+        makeFrame({
+          lanes: LANES,
+          songTime: t,
+          laneStates: cache.get(LANES.length, (lane) => held.includes(lane)),
+          thresholdFraction: THRESH,
+          rearmFraction: 0.6,
+        }),
+      );
+      return receptorState(canvas, hw, 0);
+    };
+    expect(at(1, [])).toBe('rising');
+    expect(at(1.033, [0])).toBe('goal'); // key down = the crossing
+    expect(at(1.033 + 0.7, [0])).toBe('locked'); // still held, and now it cannot fire again
+    expect(at(1.033 + 0.75, [])).toBe('rising'); // released → re-armed
+  });
+
+  it('a lane with no LaneState at all reads as "I cannot see you", not as an idle gauge', () => {
+    // GameRunner's first frame ships `laneStates: []`. An absent measurement is not a measurement
+    // of zero, and four live at-rest gauges under a camera that has not produced a sample yet is
+    // the same lie as a meter left pinned at 90 % after the camera dies.
+    const { canvas, hw } = setup(1280, 720);
+    hw.resize(1280, 720, 1);
+    hw.draw(makeFrame({ lanes: LANES, songTime: 1, laneStates: [], thresholdFraction: THRESH }));
+    for (const l of LANES) expect(receptorState(canvas, hw, l.index)).toBe('lost');
+  });
+});
+
+// -------------------------------------------------------------------------------------------------
+// STABILITY. `tracking` is a hard per-frame visibility gate with nothing debouncing it upstream, and
+// during Play the receptor is the patient's only out-of-frame signal — so it may not strobe.
+// -------------------------------------------------------------------------------------------------
+
+describe('the receptor does not strobe on one noisy tracking frame', () => {
+  const THRESH = 0.6;
+  const draw = (hw: Highway, canvas: MockCanvas, t: number, tracking: boolean): ReceptorState => {
+    canvas.ctx.reset();
+    hw.draw(
+      makeFrame({
+        lanes: LANES,
+        songTime: t,
+        laneStates: LANES.map((l) => ({ lane: l.index, value: 0.3, armed: true, tracking })),
+        thresholdFraction: THRESH,
+      }),
+    );
+    return receptorState(canvas, hw, 0);
+  };
+
+  it('holds the gauge through a single dropped frame and gives up on a real dropout', () => {
+    const { canvas, hw } = setup(1280, 720);
+    hw.resize(1280, 720, 1);
+    let t = 1;
+    expect(draw(hw, canvas, t, true)).toBe('rising');
+    // A landmark chattering across MIN_VISIBILITY: two frames out of three fail the gate. The old
+    // renderer flipped the whole row between a full gauge and "?" at frame rate on exactly this.
+    for (const ok of [false, true, false, false, true, false]) {
+      t += 1 / 30;
+      expect(draw(hw, canvas, t, ok), `t=${t.toFixed(3)} tracking=${ok}`).toBe('rising');
+    }
+    // A patient who has really left the frame is told so, and quickly.
+    for (let i = 0; i < 8; i++) t += 1 / 30;
+    expect(draw(hw, canvas, t, false)).toBe('lost');
+    // ...and the gauge comes straight back when they are seen again (no hold on the way in).
+    expect(draw(hw, canvas, t + 1 / 30, true)).toBe('rising');
+  });
+});
+
+// -------------------------------------------------------------------------------------------------
+// DISTINCTNESS BY MARKS, in every layout and both palettes. The four states must differ in WHICH
+// marks exist, not in hue or brightness — a patient with low vision reading a tablet at 2 m has
+// neither.
+// -------------------------------------------------------------------------------------------------
+
+describe('the four states differ by marks at every size and in both palettes', () => {
+  const THRESH = 0.6;
+  /** The mark inventory of lane 0 as a comparable signature. No hue, no alpha, no brightness. */
+  const signature = (canvas: MockCanvas, hw: Highway, lanes: LaneSpec[]): string => {
+    const g = hw.geometry;
+    const cx = laneX(g, 0, 0);
+    const arcs = canvas.ctx.calls.filter(
+      (c) => c.name === 'ellipse' && c.args.length >= 7 && Math.abs((c.args[0] as number) - cx) < 1 && Math.abs((c.args[1] as number) - g.strikeY) < 0.5,
+    ).length;
+    const wedges = canvas.ctx.calls.filter((c, i) => {
+      if (c.name !== 'moveTo' || canvas.ctx.propBefore(i, 'fillStyle') !== WHITE) return false;
+      const d = Math.min(...lanes.map((l) => Math.abs((c.args[0] as number) - laneX(g, l.index, 0))));
+      return d > g.receptorRadius * 0.5 && d < g.receptorRadius * 1.6;
+    }).length;
+    return [
+      wellRect(canvas, hw, 0) ? 'well' : '-',
+      liquidRect(canvas, hw, 0) ? 'liquid' : '-',
+      targetLine(canvas, hw, 0) ? 'target' : '-',
+      `ticks${targetTicks(canvas, hw, 0).length}`,
+      `wedges${wedges}`,
+      `hotcap${hotCapSegments(canvas, hw, 0).length}`,
+      drainCap(canvas, hw, 0) ? 'drain' : '-',
+      `dashes${rearmDashes(canvas, hw, 0).length}`,
+      `rings${arcs}`,
+      `halo${haloBlits(canvas, hw)}`,
+    ].join('|');
+  };
+
+  const CONFIGS = [
+    { name: '1280x720 GH', w: 1280, h: 720, lanes: LANES, opts: {} },
+    { name: '1280x720 high contrast', w: 1280, h: 720, lanes: LANES, opts: { highContrast: true } },
+    { name: '1024x768 GH', w: 1024, h: 768, lanes: LANES, opts: {} },
+    { name: '720x1280 portrait, 2 lanes', w: 720, h: 1280, lanes: LANES.slice(0, 2), opts: {} },
+    { name: '400x225 (2 m acuity), 2 lanes', w: 400, h: 225, lanes: LANES.slice(0, 2), opts: {} },
+    { name: '220x124 (low vision), 4 lanes', w: 220, h: 124, lanes: LANES, opts: { highContrast: true } },
+  ];
+
+  for (const cfg of CONFIGS) {
+    it(`keeps the four states apart at ${cfg.name}`, () => {
+      const sigs = new Map<string, string>();
+      for (const state of ['rising', 'goal', 'locked', 'lost'] as const) {
+        const { canvas, hw } = setup(cfg.w, cfg.h, cfg.opts);
+        hw.resize(cfg.w, cfg.h, 1);
+        const frame = (t: number, value: number, armed: boolean, tracking: boolean): RenderFrame =>
+          makeFrame({
+            lanes: cfg.lanes,
+            songTime: t,
+            laneStates: cfg.lanes.map((l) => ({ lane: l.index, value, armed, tracking })),
+            thresholdFraction: THRESH,
+            rearmFraction: 0.6,
+            beatPhase: 0.5,
+          });
+        // Every state is reached the way the input layer reaches it: (b) and (c) both start from a
+        // rising, armed lane, because that is the only way a lane can lock out.
+        for (let i = 0; i < 30; i++) hw.draw(frame(1 + i * 0.016, state === 'rising' ? 0.3 : 0.5, true, true));
+        canvas.ctx.reset();
+        if (state === 'rising') hw.draw(frame(1.5, 0.3, true, true));
+        else if (state === 'goal') hw.draw(frame(1.5, 0.75, false, true));
+        else if (state === 'locked') {
+          hw.draw(frame(1.5, 0.75, false, true)); // the crossing...
+          for (let i = 0; i < 60; i++) hw.draw(frame(1.52 + i * 0.016, 0.75, false, true)); // ...held
+          canvas.ctx.reset();
+          hw.draw(frame(2.6, 0.75, false, true));
+        } else {
+          for (let i = 0; i < 30; i++) hw.draw(frame(1.5 + i * 0.016, 0.5, true, false));
+          canvas.ctx.reset();
+          hw.draw(frame(2.0, 0.5, true, false));
+        }
+        sigs.set(state, signature(canvas, hw, cfg.lanes));
+      }
+      const seen = new Map<string, string>();
+      for (const [state, sig] of sigs) {
+        const clash = seen.get(sig);
+        expect(clash, `${state} and ${clash} draw the same marks: ${sig}`).toBeUndefined();
+        seen.set(sig, state);
+      }
+    });
+  }
+
+  it('does not shrink the gauge at the moment the patient reaches their target', () => {
+    // The failure this guards: the crossing frame used to be the FIRST locked frame, so at the
+    // instant of success the ring shrank 12 %, the column was capped ~10 % below the target line
+    // and the whole receptor dimmed and greyed. On a note-timed rep the hit burst covered it; on a
+    // practice rep (the common case in ROM repetition work) it was the only feedback there was.
+    const { canvas, hw } = setup(1280, 720, { reducedMotion: true });
+    hw.resize(1280, 720, 1);
+    const frame = (t: number, value: number, armed: boolean): RenderFrame =>
+      makeFrame({
+        lanes: LANES,
+        songTime: t,
+        laneStates: LANES.map((l) => ({ lane: l.index, value, armed, tracking: true })),
+        thresholdFraction: 0.6,
+        rearmFraction: 0.6,
+      });
+    for (let i = 0; i < 20; i++) hw.draw(frame(1 + i * 0.016, 0.58, true));
+    canvas.ctx.reset();
+    hw.draw(frame(1.32, 0.58, true)); // last frame before the crossing: 97 % of threshold
+    const before = liquidRect(canvas, hw, 0);
+    canvas.ctx.reset();
+    hw.draw(frame(1.336, 0.75, false)); // the crossing, published already disarmed
+    const at = liquidRect(canvas, hw, 0);
+    const { yTarget } = meterAxis(hw);
+    expect(before).toBeDefined();
+    expect(at).toBeDefined();
+    // The column goes UP (smaller y = higher on screen), not down...
+    expect((at as MeterRect).y).toBeLessThan((before as MeterRect).y);
+    // ...and it is the only thing on the board that ever paints above the target line: that band is
+    // the "cleared the target by this much" reading.
+    expect((at as MeterRect).y).toBeLessThan(yTarget);
+    expect((before as MeterRect).y).toBeGreaterThan(yTarget);
+    // And it does not step down when the acknowledgement ends — it glides.
+    let prevY = (at as MeterRect).y;
+    let worstStep = 0;
+    for (let i = 1; i <= 60; i++) {
+      canvas.ctx.reset();
+      hw.draw(frame(1.336 + i * 0.016, 0.75, false));
+      const r = liquidRect(canvas, hw, 0);
+      if (!r) continue;
+      worstStep = Math.max(worstStep, Math.abs(r.y - prevY));
+      prevY = r.y;
+    }
+    expect(worstStep).toBeLessThan(hw.geometry.receptorRadius * 0.05);
+  });
+});
+
 const noSpriteFactory = (w: number, h: number): CanvasLike => ({ width: w, height: h, getContext: () => null });
 
 /** Gem discs drawn below the strike line (the sprite-less fallback draws them as ellipses). */

@@ -24,7 +24,9 @@
  *    range can improve while their percentage falls, so the calibrated span is carried on every point
  *    and a change of span is flagged (`recalibrated`) rather than silently averaged away.
  */
-import type { Movement, Side } from '../engine/types.ts';
+import type { Fingertip, Movement, Side } from '../engine/types.ts';
+import { laneLabel } from '../render/palette.ts';
+import { MOVEMENT_INFO } from '../vision/features.ts';
 import type { InputMode, LaneResultSummary, SessionResult } from './types.ts';
 
 /** One session's contribution to one movement's trend. */
@@ -43,6 +45,20 @@ export interface TrendPoint {
   reps: number;
   /** The calibrated span this session's percentages are against (feature units), when recorded. */
   calibratedSpan: number | null;
+  /** The bottom of that day's calibrated range (feature units) — the zero the percentage is from. */
+  calibratedMin: number | null;
+  /**
+   * The mean peak in the movement's OWN units (degrees, or a torso/palm-normalized ratio), i.e.
+   * `calibratedMin + rom x span`.
+   *
+   * This is the only figure on the card that survives a re-calibration. `rom` is a percentage of a
+   * denominator the therapist can move: widen the range on Tuesday and the same knee angle reads
+   * lower, which is exactly the case where "did this patient's range improve?" must still be
+   * answerable. Null when ROM was not measured or no range was recorded — never 0.
+   */
+  absoluteMean: number | null;
+  /** Best single rep in the same units. */
+  absoluteBest: number | null;
   /** True when the calibrated span differs from the previous session's by more than 5 %. */
   recalibrated: boolean;
   /** Compensation flags in this lane (0 when clean or unmonitored). */
@@ -55,10 +71,16 @@ export interface MovementTrend {
   label: string;
   movement: Movement;
   side: Side;
+  /** finger_opposition only — the digit this series was measured on. Part of `label`. */
+  fingertip?: Fingertip;
+  /** Units of `absolute*`: 'deg' for a joint angle, 'ratio' for a normalized distance. */
+  unit: 'deg' | 'ratio';
   /** Oldest first, so a chart reads left-to-right in time. */
   points: TrendPoint[];
   /** Points whose ROM was actually measured (the ones a ROM chart can draw). */
   romPoints: TrendPoint[];
+  /** Points that also carry a calibrated range, so an absolute peak can be plotted. */
+  absolutePoints: TrendPoint[];
   /** First and latest MEASURED ROM, and the change between them (null when fewer than two). */
   firstRom: number | null;
   latestRom: number | null;
@@ -67,6 +89,13 @@ export interface MovementTrend {
   firstAccuracy: number | null;
   latestAccuracy: number | null;
   accuracyChange: number | null;
+  /** First/latest absolute peak (feature units) and the change between them. */
+  firstAbsolute: number | null;
+  latestAbsolute: number | null;
+  absoluteChange: number | null;
+  /** The calibrated range in force on the most recent session that recorded one — the denominator. */
+  latestCalibratedMin: number | null;
+  latestCalibratedMax: number | null;
   /** Movements performed in this lane across the whole window. */
   totalReps: number;
   /** True when any point in the window sits on a different calibrated span than its predecessor. */
@@ -120,6 +149,25 @@ const RECALIBRATION_TOLERANCE = 0.05;
 
 function laneKey(l: Pick<LaneResultSummary, 'movement' | 'side' | 'fingertip'>): string {
   return l.fingertip ? `${l.movement}:${l.side}:${l.fingertip}` : `${l.movement}:${l.side}`;
+}
+
+/**
+ * The card's title, DERIVED rather than read back from `lane.label`.
+ *
+ * Records written before the fingertip reached the label carry a stored `label` of "L pinch" for
+ * every digit, so two cards for two different fingers would arrive identically titled — which is the
+ * one thing a per-movement outcome record may not do. The key already distinguishes them; the title
+ * is rebuilt from the same three fields so it always agrees with the key.
+ */
+function trendLabel(l: Pick<LaneResultSummary, 'movement' | 'side' | 'fingertip'>): string {
+  return laneLabel({ movement: l.movement, side: l.side, fingertip: l.fingertip });
+}
+
+/** Mean peak expressed in the movement's own units, or null when either half is unknown. */
+function absolute(rom: number | null, min: number | null, spanValue: number | null): number | null {
+  if (rom === null || min === null || spanValue === null || !Number.isFinite(rom)) return null;
+  const v = min + rom * spanValue;
+  return Number.isFinite(v) ? v : null;
 }
 
 function span(l: LaneResultSummary): number | null {
@@ -182,15 +230,20 @@ export function movementTrends(history: readonly SessionResult[], window: number
         s !== null && previousSpan !== null && previousSpan > 0
           ? Math.abs(s - previousSpan) / previousSpan > RECALIBRATION_TOLERANCE
           : false;
+      const rom = lane.romSamples > 0 ? lane.romMean : null;
+      const romBest = lane.romSamples > 0 ? lane.romBest : null;
       points.push({
         sessionId: session.id,
         inputMode: session.inputMode,
         at: session.startedAt,
-        rom: lane.romSamples > 0 ? lane.romMean : null,
-        romBest: lane.romSamples > 0 ? lane.romBest : null,
+        rom,
+        romBest,
         accuracy: Number.isFinite(lane.accuracy) ? lane.accuracy : 0,
         reps: lane.reps,
         calibratedSpan: s,
+        calibratedMin: lane.calibratedMin,
+        absoluteMean: absolute(rom, lane.calibratedMin, s),
+        absoluteBest: absolute(romBest, lane.calibratedMin, s),
         recalibrated,
         compensationFlags: lane.compensationMonitored ? lane.compensationFlags : 0,
       });
@@ -198,25 +251,41 @@ export function movementTrends(history: readonly SessionResult[], window: number
     }
 
     const romPoints = points.filter((p) => p.rom !== null);
+    const absolutePoints = points.filter((p) => p.absoluteMean !== null);
     const first = rows[0]?.lane;
     const latest = rows[rows.length - 1]?.lane;
+    const spec = latest ?? first;
     const firstRom = romPoints[0]?.rom ?? null;
     const latestRom = romPoints[romPoints.length - 1]?.rom ?? null;
     const firstAccuracy = points[0]?.accuracy ?? null;
     const latestAccuracy = points[points.length - 1]?.accuracy ?? null;
+    const firstAbsolute = absolutePoints[0]?.absoluteMean ?? null;
+    const latestAbsolute = absolutePoints[absolutePoints.length - 1]?.absoluteMean ?? null;
+    // The denominator that was in force most recently — disclosed on the card, because every
+    // percentage above is a fraction of it.
+    const withRange = rows.filter((r) => r.lane.calibratedMin !== null && r.lane.calibratedMax !== null);
+    const latestRange = withRange[withRange.length - 1]?.lane ?? null;
     return {
       key,
-      label: latest?.label ?? first?.label ?? key,
-      movement: (latest ?? first).movement,
-      side: (latest ?? first).side,
+      label: trendLabel(spec),
+      movement: spec.movement,
+      side: spec.side,
+      ...(spec.fingertip ? { fingertip: spec.fingertip } : {}),
+      unit: MOVEMENT_INFO[spec.movement]?.unit ?? 'ratio',
       points,
       romPoints,
+      absolutePoints,
       firstRom,
       latestRom,
       romChange: change(firstRom, latestRom, romPoints.length),
       firstAccuracy,
       latestAccuracy,
       accuracyChange: change(firstAccuracy, latestAccuracy, points.length),
+      firstAbsolute,
+      latestAbsolute,
+      absoluteChange: change(firstAbsolute, latestAbsolute, absolutePoints.length),
+      latestCalibratedMin: latestRange?.calibratedMin ?? null,
+      latestCalibratedMax: latestRange?.calibratedMax ?? null,
       totalReps: points.reduce((n, p) => n + p.reps, 0),
       anyRecalibration: points.some((p) => p.recalibrated),
       excludedSessions: excluded.length,

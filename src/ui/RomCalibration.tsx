@@ -5,9 +5,15 @@ import { runtime } from '../session/runtime.ts';
 import { calibrationKey, laneFingertip, useStore } from '../state/store.ts';
 import { RomCalibrator, calibrationMismatch } from '../vision/calibration.ts';
 import type { CalibrationMismatch, CalibrationStatus, RomCalibration } from '../vision/calibration.ts';
-import { MOVEMENT_INFO } from '../vision/features.ts';
+import { FINGERTIP_NAME, MOVEMENT_INFO, movementCalibrationInstruction } from '../vision/features.ts';
 import { CameraPreview } from './CameraPreview.tsx';
-import { Meter, ProgressRing, Screen, Toast, TopBar } from './common.tsx';
+import { Meter, ProgressRing, Screen, Toast, TopBar, laneName } from './common.tsx';
+
+/** "little finger" for a lane that has a prescribed tip, "" for a movement with no tip dimension. */
+function tipName(spec: Parameters<typeof laneFingertip>[0]): string {
+  const tip = laneFingertip(spec);
+  return tip ? FINGERTIP_NAME[tip] : '';
+}
 
 interface Live {
   status: CalibrationStatus;
@@ -63,6 +69,8 @@ export default function RomCalibrationScreen() {
 
   const lane = lanes[laneIndex];
   const info = lane ? MOVEMENT_INFO[lane.movement] : null;
+  /** The "do three reps" wording for THIS lane — fingertip-aware, so it names the prescribed digit. */
+  const moveInstruction = lane ? movementCalibrationInstruction(lane.movement, laneFingertip(lane)) : '';
   const threshold = DIFFICULTIES[difficulty].thresholdFraction;
   const previous = lane ? savedCalibrations[calibrationKey(lane)] : undefined;
 
@@ -254,7 +262,7 @@ export default function RomCalibrationScreen() {
     <Screen>
       <TopBar
         eyebrow={`Range of motion — lane ${laneIndex + 1} of ${lanes.length}`}
-        title={`${lane.side === 'left' ? 'Left' : 'Right'} ${info.label.toLowerCase()}${laneFingertip(lane) ? ` — ${laneFingertip(lane)} finger` : ''}`}
+        title={`${lane.side === 'left' ? 'Left' : 'Right'} ${info.label.toLowerCase()}${tipName(lane) ? ` \u2014 ${tipName(lane)}` : ''}`}
         onBack={() => goto('camera')}
         right={
           <button
@@ -274,10 +282,16 @@ export default function RomCalibrationScreen() {
             <ProgressRing value={ringValue} label={ringLabel} />
             <div className="stack grow" style={{ gap: 10 }}>
               <div className="eyebrow">{restPhase ? 'Hold still' : status?.phase === 'move' ? 'Now move' : 'Done'}</div>
-              <p style={{ fontSize: '1.25rem' }}>{restPhase ? info.restInstruction : info.calibrationInstruction}</p>
+              {/* THE SENTENCE THE PATIENT IS READ WHILE BEING MEASURED. It must name the digit that was
+                  prescribed: `MOVEMENT_INFO.calibrationInstruction` says "touch your thumb to the
+                  fingertip", which is wrong for three of the four tips a therapist can choose, and the
+                  patient performing the rep is the one person who cannot see the heading above. */}
+              <p style={{ fontSize: '1.25rem' }} data-testid="rom-instruction">
+                {restPhase ? info.restInstruction : moveInstruction}
+              </p>
               {/* The calibrator's message repeats the instruction in the quiet phases — only show it
                   when it is actually saying something else (progress, a problem, a next step). */}
-              {status && status.message !== info.restInstruction && status.message !== info.calibrationInstruction && (
+              {status && status.message !== info.restInstruction && status.message !== info.calibrationInstruction && status.message !== moveInstruction && (
                 <p className="muted">{status.message}</p>
               )}
             </div>
@@ -327,7 +341,7 @@ export default function RomCalibrationScreen() {
             .map((r) => (
               <Toast kind="bad" key={r.lane}>
                 <strong data-testid={`rom-refusal-${r.lane}`}>
-                  Lane {r.lane + 1} ({MOVEMENT_INFO[r.movement].label}) will not score:
+                  Lane {r.lane + 1} ({laneName(lanes[r.lane] ?? r)}) will not score:
                 </strong>{' '}
                 {r.reason}.
               </Toast>
@@ -392,7 +406,7 @@ export default function RomCalibrationScreen() {
                   </span>
                   <span className={i === laneIndex ? '' : 'muted'}>
                     {l.side === 'left' ? 'L' : 'R'} {MOVEMENT_INFO[l.movement].label}
-                    {laneFingertip(l) ? ` · ${laneFingertip(l)}` : ''}
+                    {tipName(l) ? ` · ${tipName(l)}` : ''}
                   </span>
                   <div className="grow" />
                   {refused && <span className="dim">not calibrated</span>}

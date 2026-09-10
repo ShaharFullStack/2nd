@@ -191,3 +191,86 @@ describe('movementTrends', () => {
     expect(movementTrends([])).toEqual([]);
   });
 });
+
+/**
+ * TWO CARDS FOR TWO DIGITS MUST NOT BE CALLED THE SAME THING.
+ *
+ * The key already separated an index lane from a little-finger lane; the TITLE did not, because it
+ * was read back from `LaneResultSummary.label`, which said "L pinch" for every tip. A therapist
+ * looking at two side-by-side cards reading "L pinch", one ▲ +15 and one ▼ −9, cannot tell which
+ * finger regressed — and neither can they for the same lane worked in March and April.
+ */
+describe('the label a human reads carries the fingertip', () => {
+  const pinch = (fingertip: 'index' | 'middle' | 'ring' | 'pinky', patch: Partial<LaneResultSummary> = {}) =>
+    lane({ movement: 'finger_opposition', side: 'left', fingertip, label: 'L pinch', ...patch });
+
+  it('gives two fingertips on one hand two different titles', () => {
+    const trends = movementTrends([
+      session('a', 1000, [pinch('index', { lane: 0, romMean: 0.8 }), pinch('pinky', { lane: 1, romMean: 0.4 })]),
+    ]);
+    expect(trends).toHaveLength(2);
+    const labels = trends.map((t) => t.label);
+    expect(new Set(labels).size).toBe(2);
+    expect(labels).toContain('L index pinch');
+    expect(labels).toContain('L little pinch');
+    expect(trends.map((t) => t.fingertip).sort()).toEqual(['index', 'pinky']);
+  });
+
+  it('ignores a stored label that predates the fingertip, rather than repeating its collision', () => {
+    // Every one of these records claims to be "L pinch". The title is rebuilt from the same fields
+    // the key is built from, so it can never disagree with the key.
+    const trends = movementTrends([
+      session('apr', 2000, [pinch('pinky')]),
+      session('mar', 1000, [pinch('index')]),
+    ]);
+    expect(trends.map((t) => t.label).sort()).toEqual(['L index pinch', 'L little pinch']);
+  });
+
+  it('leaves a movement with no fingertip dimension exactly as it was', () => {
+    expect(movementTrends([session('a', 1, [lane()])])[0].label).toBe('L knee ext');
+  });
+});
+
+/**
+ * THE DENOMINATOR AND THE FIGURE THAT DOES NOT DEPEND ON IT.
+ *
+ * `romMean` is a percentage of the range calibrated THAT DAY. Widen the range and the same knee angle
+ * reads lower, so the percentage alone cannot answer "did this patient's range improve?". The
+ * absolute peak is `calibratedMin + rom x span` — already implied by what is persisted.
+ */
+describe('absolute peak, in the movement units', () => {
+  it('reconstructs the peak in the movement own units', () => {
+    const t = movementTrends([session('a', 1, [lane({ romMean: 0.5, romBest: 0.75, calibratedMin: 20, calibratedMax: 80 })])])[0];
+    expect(t.unit).toBe('deg');
+    expect(t.points[0].absoluteMean).toBeCloseTo(50, 6); // 20 + 0.5 x 60
+    expect(t.points[0].absoluteBest).toBeCloseTo(65, 6);
+    expect(t.latestAbsolute).toBeCloseTo(50, 6);
+  });
+
+  it('rises across a re-calibration that makes the PERCENTAGE fall', () => {
+    // Session 1: 20..80 deg, 90 % => 74 deg. Session 2: recalibrated to 20..120, 70 % => 90 deg.
+    // The percentage says the patient got worse by 20 points; the joint angle says they gained 16 deg.
+    const t = movementTrends([
+      session('b', 2000, [lane({ romMean: 0.7, calibratedMin: 20, calibratedMax: 120 })]),
+      session('a', 1000, [lane({ romMean: 0.9, calibratedMin: 20, calibratedMax: 80 })]),
+    ])[0];
+    expect(t.romChange).toBeCloseTo(-0.2, 6);
+    expect(t.absoluteChange).toBeCloseTo(16, 6);
+    expect(t.anyRecalibration).toBe(true);
+    expect(t.latestCalibratedMin).toBe(20);
+    expect(t.latestCalibratedMax).toBe(120);
+  });
+
+  it('never invents an absolute peak from an unmeasured session', () => {
+    const t = movementTrends([session('a', 1, [lane({ romMean: null, romBest: null, romSamples: 0 })])])[0];
+    expect(t.points[0].absoluteMean).toBeNull();
+    expect(t.absolutePoints).toHaveLength(0);
+    expect(t.latestAbsolute).toBeNull();
+  });
+
+  it('never invents one from a session with no recorded range', () => {
+    const t = movementTrends([session('a', 1, [lane({ calibratedMin: null, calibratedMax: null })])])[0];
+    expect(t.points[0].absoluteMean).toBeNull();
+    expect(t.latestCalibratedMin).toBeNull();
+  });
+});

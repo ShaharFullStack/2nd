@@ -222,6 +222,28 @@ function pageProbe(W, H) {
     };
     const live = settle(true, 'receptor-armed');
     const held = settle(false, 'receptor-locked');
+    // (b) THE CROSSING — the frame the lane actually fires on, which the input layer publishes with
+    // `armed: false` (the trigger disarms on the crossing sample). The renderer latches it, so this
+    // is the "you reached your target range" look as the patient really sees it: driven the way a
+    // real rep drives it — rising and armed, then one crossing frame.
+    const goal = (() => {
+      const rising = LANES.map((l) => ({ lane: l.index, value: 0.5, armed: true, tracking: true }));
+      const crossed = LANES.map((l) => ({ lane: l.index, value: 0.9, armed: false, tracking: true }));
+      const frames = [];
+      for (let i = 0; i < 20; i++) frames.push(base(t + i * 0.016, { laneStates: rising, thresholdFraction: 0.6 }));
+      frames.push(base(t + 0.336, { laneStates: crossed, thresholdFraction: 0.6 }));
+      return scene(frames, 'receptor-goal');
+    })();
+    // ...and the same lane ~0.7 s later, once the acknowledgement has handed over to "lower to
+    // reset" — the pair is what a therapist should be able to tell apart from the back of the room.
+    const goalAfter = (() => {
+      const rising = LANES.map((l) => ({ lane: l.index, value: 0.5, armed: true, tracking: true }));
+      const crossed = LANES.map((l) => ({ lane: l.index, value: 0.9, armed: false, tracking: true }));
+      const frames = [];
+      for (let i = 0; i < 20; i++) frames.push(base(t + i * 0.016, { laneStates: rising, thresholdFraction: 0.6 }));
+      for (let i = 0; i <= 45; i++) frames.push(base(t + 0.336 + i * 0.016, { laneStates: crossed, thresholdFraction: 0.6 }));
+      return scene(frames, 'receptor-goal-expired');
+    })();
     const g = live.hw.geometry;
     const cx = laneX(g, lane, 0);
     const box = { x0: Math.round(cx - g.receptorRadius), x1: Math.round(cx + g.receptorRadius), y0: Math.round(g.strikeY - g.receptorRadius), y1: Math.round(g.strikeY + g.receptorRadius) };
@@ -265,6 +287,17 @@ function pageProbe(W, H) {
     out.receptorHintArmed = a.hint;
     out.receptorHintLocked = b.hint;
     out.receptorStepLocked = centreStep(held.data);
+    const gs = stats(goal.data);
+    const ga = stats(goalAfter.data);
+    out.receptorLumaGoal = gs.luma;
+    out.receptorChromaGoal = gs.chroma;
+    out.receptorHintGoal = gs.hint;
+    // The moment of success must not be the moment the gauge goes dim and violet: brighter than the
+    // lockout, and carrying none of its "lower to reset" hint pixels.
+    out.receptorGoalBrighterThanLocked = gs.luma > b.luma;
+    out.receptorGoalHasNoLockHint = gs.hint === 0;
+    // ...and once the latch expires the same lane really has become the lockout look.
+    out.receptorGoalExpiresToLocked = ga.hint > 0 && ga.luma < gs.luma;
   }
 
   // --- 4c. the miss cue is fully inside the canvas at the latest possible verdict ---------------
@@ -625,7 +658,13 @@ try {
   check(
     'a locked-out receptor shows the "lower to reset" line/chevron, and a live one never does',
     out.receptorHintLocked > 20 && out.receptorHintArmed === 0,
-    `hint pixels: locked ${out.receptorHintLocked}, armed ${out.receptorHintArmed}`,
+    `hint pixels: locked ${out.receptorHintLocked}, armed ${out.receptorHintArmed}, goal ${out.receptorHintGoal}`,
+  );
+  check(
+    'the goal look (the frame the rep actually fires on) is a reward, not the lockout it precedes',
+    out.receptorGoalBrighterThanLocked && out.receptorGoalHasNoLockHint && out.receptorGoalExpiresToLocked,
+    `luma goal ${out.receptorLumaGoal.toFixed(1)} vs locked ${out.receptorLumaLocked.toFixed(1)}, ` +
+      `lock-hint pixels in the goal frame ${out.receptorHintGoal}, and 0.7 s later it has become the lockout look (${out.receptorGoalExpiresToLocked})`,
   );
   check(
     'a locked receptor\'s column has a hard top edge, so "how much further to lower" is readable at 2 m',

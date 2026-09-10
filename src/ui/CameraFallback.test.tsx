@@ -88,4 +88,20 @@ describe('CameraFallback', () => {
     fireEvent.click(screen.getByTestId('camera-retry'));
     await waitFor(() => expect(screen.getByText(/Still no camera after 2 attempts/i)).toBeTruthy());
   });
+
+  /**
+   * The case above only holds because this test keeps the component mounted across the retry. Both
+   * real hosts clear the error before re-requesting, which UNMOUNTS this screen and resets its own
+   * counter — so the count that matters comes in as a prop. PlayCameraFallback.test.tsx drives the
+   * same escalation through the real host; this pins the seam.
+   */
+  it('escalates from the host retry count, which survives the screen being unmounted', () => {
+    render(<CameraFallback error={domError('NotAllowedError', 'denied')} onRetry={() => {}} retries={3} />);
+    expect(screen.getByText(/Still no camera after 3 attempts/i)).toBeTruthy();
+  });
+
+  it('does not escalate on the first failure', () => {
+    render(<CameraFallback error={domError('NotAllowedError', 'denied')} onRetry={() => {}} retries={1} />);
+    expect(screen.queryByText(/Still no camera after/i)).toBeNull();
+  });
 });
