@@ -1,0 +1,44 @@
+{
+  "capturedAt": "2026-09-10T23:05:50.770Z",
+  "failures": [],
+  "stems": {
+    "stems": [
+      "drums",
+      "bass",
+      "keys",
+      "lead"
+    ],
+    "playerStem": "drums"
+  },
+  "whileHitting": {
+    "gains": {
+      "drums": 1,
+      "bass": 1,
+      "keys": 1,
+      "lead": 1
+    },
+    "playerStemGain": 1,
+    "ducked": false,
+    "hits": 3,
+    "misses": 0,
+    "songTime": 3.3216326530612243
+  },
+  "whileMissing": {
+    "gains": {
+      "drums": 1,
+      "bass": 1,
+      "keys": 1,
+      "lead": 1
+    },
+    "playerStemGain": 0.05,
+    "ducked": true,
+    "hits": 3,
+    "misses": 2,
+    "songTime": 5.452063492063491
+  },
+  "recovery": {
+    "before": 0.05,
+    "after": 1,
+    "ducked": false
+  }
+}

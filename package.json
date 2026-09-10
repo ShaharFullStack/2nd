@@ -12,7 +12,10 @@
     "typecheck": "tsc -b --noEmit",
     "fetch-stems": "node scripts/fetch-stems.mjs",
     "gen-demo-stems": "node scripts/gen-demo-stems.mjs",
-    "critic:shots": "node critic/shots.mjs"
+    "critic:smoke": "node critic/smoke.mjs",
+    "critic:frames": "node critic/frames.mjs",
+    "critic:motion": "node critic/motion.mjs",
+    "critic:audio": "node critic/audio-reactivity.mjs"
   },
   "dependencies": {
     "@mediapipe/tasks-vision": "^1.0.1",

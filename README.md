@@ -98,12 +98,21 @@ input and audio contracts.
 npm test               # vitest
 npm run typecheck
 npm run build
-node critic/smoke.mjs  # boots the app in headless Chromium and plays a session end to end
-node critic/frames.mjs # captures 1080p gameplay frames for visual review
+npm run critic:smoke   # boots the app in headless Chromium and plays a session end to end
+npm run critic:frames  # captures 1080p gameplay frames for visual review
+npm run critic:motion  # frame bursts across a hit and a miss, plus frame pacing and clock drift
+npm run critic:audio   # proves the player's stem really ducks on a miss and returns on a hit
 ```
 
-`critic/smoke.mjs` starts and stops its own dev server, drives the whole flow, and asserts
-the engine actually scored, the clock froze on pause, and the session was saved.
+Each of these starts and stops its own dev server. `critic:smoke` drives the whole flow and
+asserts the engine scored, the clock froze on pause, and the session was saved.
+`critic:audio` is the one that checks the game's central promise: it plays a session, stops
+feeding the engine, and reads the live Web Audio gains to confirm the player's instrument
+falls out of the mix while the rest of the band keeps going.
+
+Measured on this build: 59 fps median with one dropped frame in 118, audio-to-render clock
+drift under 4 ms over 3 seconds, and the player stem ducking 1.0 → 0.05 → 1.0 across a miss
+and the next hit.
 
 ## A note on safety and scope
 
