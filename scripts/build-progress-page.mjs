@@ -5,7 +5,9 @@ const log = JSON.parse(fs.readFileSync(new URL('../progress/log.json', import.me
 const out = process.argv[2] || new URL('../progress/standalone.html', import.meta.url).pathname;
 const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 const pieces = Object.entries(log.pieces);
-const statusClass = s => /pass|done|met/i.test(s) ? 'ok' : /fail|open|gap/i.test(s) ? 'bad' : 'run';
+const statusClass = s => /pass|done|met|won/i.test(s) ? 'ok' : /fail|open|gap|lost/i.test(s) ? 'bad' : 'run';
+// Inline images as data URIs so the page is self-contained when published.
+const dataUri = rel => { try { const abs = new URL('../progress/' + rel, import.meta.url); const b = fs.readFileSync(abs); return 'data:image/png;base64,' + b.toString('base64'); } catch { return null; } };
 const html = `<title>Beat Rehab Build Log</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Rubik:wght@500;700&family=IBM+Plex+Sans:wght@400;600&family=IBM+Plex+Mono&display=swap">
 <style>
@@ -35,7 +37,7 @@ code{font:13px "IBM Plex Mono",monospace;background:var(--bg);padding:0 4px;bord
 <div class="sub">camera-controlled rhythm rehab · last update ${esc(log.updated)} · ${log.entries.length} entries</div>
 <div class="tiles">${pieces.map(([k,v])=>`<div class="tile"><b>${esc(k)}</b><span class="m">round ${v.round}</span><span><span class="pill ${statusClass(v.status)}">${esc(v.status)}</span></span></div>`).join('')||'<div class="tile"><b>no pieces judged yet</b><span class="m">critic loops start after the first build</span></div>'}</div>
 <h2>Timeline, newest first</h2>
-<div class="log">${log.entries.slice().reverse().map(e=>`<div class="e ${e.kind||'info'}"><div><div class="t">${esc(e.time)}</div><span class="p">${esc(e.piece)}</span></div><div>${e.text}${e.image?`<img src="${e.image}" alt="">`:''}</div></div>`).join('')}</div>
+<div class="log">${log.entries.slice().reverse().map(e=>`<div class="e ${e.kind||'info'}"><div><div class="t">${esc(e.time)}</div><span class="p">${esc(e.piece)}</span></div><div>${e.text}${e.image&&dataUri(e.image)?`<img src="${dataUri(e.image)}" alt="">`:''}</div></div>`).join('')}</div>
 </div>`;
 fs.writeFileSync(out, html);
 console.log('wrote', out);

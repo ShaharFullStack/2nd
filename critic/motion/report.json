@@ -1,0 +1,27 @@
+{
+  "capturedAt": "2026-09-10T21:27:52.318Z",
+  "notes": [],
+  "pacing": {
+    "frames": 118,
+    "meanMs": 16.94830508474577,
+    "medianMs": 16.699999999999818,
+    "p95Ms": 16.800000000000182,
+    "worstMs": 33.399999999999636,
+    "over33ms": 2
+  },
+  "clockDrift": {
+    "songElapsed": 3.009886621315194,
+    "wallElapsed": 3.0147999999970203,
+    "driftMs": -4.913378681826508
+  },
+  "responsiveness": {
+    "hudUpdateWithinMs": 107.89999999850988
+  },
+  "hud": {
+    "score": 2600,
+    "hits": 18,
+    "misses": 8,
+    "combo": 0,
+    "multiplier": 1
+  }
+}
