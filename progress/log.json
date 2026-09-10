@@ -1,5 +1,5 @@
 {
- "updated": "2026-09-10T10:08Z",
+ "updated": "2026-09-10T13:31Z",
  "pieces": {
   "engine": {
    "round": 5,
@@ -20,6 +20,11 @@
    "round": 4,
    "status": "round 5",
    "note": "Round 4, score 8. Miss visuals now readable at real engine timing, score odometer fixed. Open: receptor ring must read full exactly when the"
+  },
+  "highway": {
+   "round": 1,
+   "status": "blind round 1",
+   "note": "Blind loop round 1: three independent judges rank five unlabelled rhythm-game frames (three ours, two shipped games) without being told whic"
   }
  },
  "entries": [
@@ -106,6 +111,18 @@
    "piece": "render",
    "kind": "info",
    "text": "Round 4, score 8. Miss visuals now readable at real engine timing, score odometer fixed. Open: receptor ring must read full exactly when the lane would trigger."
+  },
+  {
+   "time": "2026-09-10T13:31Z",
+   "piece": "orchestrator",
+   "kind": "info",
+   "text": "Integration complete: full app runs (Home → Mode → Setup → Camera → ROM calibration → Latency → Play → Results → History). 792 tests green. Fetched two real Guitar-Hero-lineage screenshots as reference; blind A/B critic loop now running."
+  },
+  {
+   "time": "2026-09-10T13:31Z",
+   "piece": "highway",
+   "kind": "info",
+   "text": "Blind loop round 1: three independent judges rank five unlabelled rhythm-game frames (three ours, two shipped games) without being told which is which."
   }
  ]
 }
