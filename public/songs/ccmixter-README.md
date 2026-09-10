@@ -64,6 +64,13 @@ stems are committed.
 ## Tips
 
 * If stems come as MP3, keep them: `AudioContext.decodeAudioData` handles MP3/OGG/WAV.
+* Bandwidth: the committed demo stems are 16-bit/44.1 kHz WAV (≈34 MB per song before the
+  first note). For a deployment on a slow clinic Wi-Fi, transcode them once with ffmpeg and
+  point `stems[].file` at the `.ogg` files (decoding is identical, sample-accurate start is
+  unaffected — the mixer schedules decoded buffers, not files):
+  `for s in drums bass keys lead; do ffmpeg -i stems/$s.wav -c:a libvorbis -q:a 5 stems/$s.ogg; done`
+  (≈1.5 MB per stem). The repo keeps WAV so the generator output stays byte-reproducible
+  and dependency-free.
 * Stems must all start at the same time (sample 0 = same moment). Most ccMixter packs do;
   if one stem is shorter it simply ends early.
 * Set `offset` carefully: notes are generated on the beat grid starting at `offset`.

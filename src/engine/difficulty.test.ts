@@ -49,6 +49,21 @@ describe('windowsFor', () => {
     const w = windowsForLanes(lanes, 'medium', 2);
     expect(w[0]).toEqual({ perfectMs: 140, goodMs: 280 });
     expect(w[1].goodMs).toBeCloseTo(140 * 1.6 * 2);
-    expect(windowsForLanes([{ index: 2, movement: 'seated_march', side: 'left' }], 'easy')).toHaveLength(3);
+    expect(windowsForLanes([{ index: 0, movement: 'seated_march', side: 'left' }], 'easy')).toHaveLength(1);
+  });
+  it('rejects lane specs that do not cover 0..n-1 exactly once (no silent gross-motor fallback)', () => {
+    expect(() => windowsForLanes([{ index: 2, movement: 'finger_spread', side: 'left' }], 'easy')).toThrow(/index 2 out of range/);
+    expect(() => windowsForLanes([{ index: -1, movement: 'seated_march', side: 'left' }], 'easy')).toThrow(/out of range/);
+    expect(() => windowsForLanes([{ index: 0.5, movement: 'seated_march', side: 'left' }], 'easy')).toThrow(/out of range/);
+    expect(() =>
+      windowsForLanes(
+        [
+          { index: 0, movement: 'finger_spread', side: 'left' },
+          { index: 0, movement: 'seated_march', side: 'right' },
+        ],
+        'easy',
+      ),
+    ).toThrow(/duplicate lane index 0/);
+    expect(() => windowsForLanes([], 'easy')).toThrow(/no lanes/);
   });
 });

@@ -62,10 +62,20 @@ export function windowsFor(
   return scaleWindows(base, mult * clampWindowScale(scale));
 }
 
-/** Per-lane windows for a set of lane specs (array indexed by `LaneSpec.index`). */
+/**
+ * Per-lane windows for a set of lane specs (array indexed by `LaneSpec.index`).
+ * The specs must cover exactly the indices 0..n-1 once each: a missing, duplicate or out-of-range
+ * index throws (a mis-indexed fine-motor lane must never silently get gross-motor windows).
+ */
 export function windowsForLanes(lanes: readonly LaneSpec[], difficulty: Difficulty | DifficultyName, scale = 1): TimingWindows[] {
-  const out: TimingWindows[] = [];
-  for (const l of lanes) out[l.index] = windowsFor(l.movement, difficulty, undefined, scale);
-  for (let i = 0; i < out.length; i++) if (!out[i]) out[i] = windowsFor('seated_march', difficulty, 1, scale);
-  return out;
+  if (lanes.length === 0) throw new RangeError('windowsForLanes: no lanes');
+  const out: (TimingWindows | undefined)[] = new Array<TimingWindows | undefined>(lanes.length).fill(undefined);
+  for (const l of lanes) {
+    if (!Number.isInteger(l.index) || l.index < 0 || l.index >= lanes.length) {
+      throw new RangeError(`windowsForLanes: lane index ${l.index} out of range [0, ${lanes.length}) for ${lanes.length} lane(s)`);
+    }
+    if (out[l.index]) throw new RangeError(`windowsForLanes: duplicate lane index ${l.index}`);
+    out[l.index] = windowsFor(l.movement, difficulty, undefined, scale);
+  }
+  return out as TimingWindows[];
 }

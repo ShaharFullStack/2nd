@@ -197,3 +197,82 @@ describe('DuckController', () => {
     expect(a.calls.filter((c) => c[0] === 'exp')).toHaveLength(1); // no new automation on a
   });
 });
+
+// ---------------------------------------------------------------- cancelAndHoldAtTime + linear ramps
+
+import { SmoothGain, linearRampValueAt, supportsCancelAndHold, type LinearParamLike } from './ducking';
+
+type HoldCall = Call | ['hold', number] | ['lin', number, number];
+
+/** Fake with cancelAndHoldAtTime (Chrome/Safari/Firefox ≥ 137): the audio thread anchors itself. */
+class FakeHoldParam implements GainParamLike, LinearParamLike {
+  value: number;
+  calls: HoldCall[] = [];
+  constructor(v = 1) { this.value = v; }
+  cancelScheduledValues(t: number) { this.calls.push(['cancel', t]); return this; }
+  cancelAndHoldAtTime(t: number) { this.calls.push(['hold', t]); return this; }
+  setValueAtTime(v: number, t: number) { this.calls.push(['set', v, t]); this.value = v; return this; }
+  exponentialRampToValueAtTime(v: number, t: number) { this.calls.push(['exp', v, t]); return this; }
+  linearRampToValueAtTime(v: number, t: number) { this.calls.push(['lin', v, t]); return this; }
+}
+
+describe('scheduleRamp with cancelAndHoldAtTime', () => {
+  it('feature-detects the method', () => {
+    expect(supportsCancelAndHold(new FakeHoldParam())).toBe(true);
+    expect(supportsCancelAndHold(new FakeAudioParam())).toBe(false);
+    expect(supportsCancelAndHold({})).toBe(false);
+  });
+
+  it('holds on the audio thread instead of pinning the analytic anchor, and still tracks the ramp', () => {
+    const p = new FakeHoldParam(1);
+    const d = new DuckController(p);
+    d.miss(10);
+    expect(p.calls).toEqual([['hold', 10], ['exp', 0.05, 10.04]]); // no cancel/set pair
+    d.hit(10.02, 1);
+    expect(p.calls.slice(2)).toEqual([['hold', 10.02], ['exp', 1, 10.08]]);
+    // the controller's own tracking is unchanged: anchored at the analytic mid-ramp value
+    expect(d.currentRamp.from).toBeCloseTo(Math.sqrt(0.05), 12);
+    expect(d.valueAt(10.05)).toBeCloseTo(Math.sqrt(0.05) * Math.pow(1 / Math.sqrt(0.05), 0.5), 12);
+    // reset/rebind pin the nominal level explicitly (they are not ramps)
+    d.reset(11);
+    expect(p.calls.slice(-2)).toEqual([['cancel', 11], ['set', 1, 11]]);
+  });
+});
+
+describe('linear ramps / SmoothGain', () => {
+  it('linearRampValueAt interpolates linearly and clamps outside the ramp', () => {
+    const r: RampState = { from: 0.8, to: 0.2, t0: 1, t1: 2 };
+    expect(linearRampValueAt(r, 0)).toBe(0.8);
+    expect(linearRampValueAt(r, 1.5)).toBeCloseTo(0.5, 12);
+    expect(linearRampValueAt(r, 1.25)).toBeCloseTo(0.65, 12);
+    expect(linearRampValueAt(r, 3)).toBe(0.2);
+  });
+
+  it('sets the initial value and anchors successive ramps on the analytic position (a dragged slider)', () => {
+    const p = new FakeHoldParam(1);
+    const g = new SmoothGain(p, 0.5);
+    expect(p.value).toBe(0.5);
+    expect(g.target).toBe(0.5);
+    g.set(1, 10, 0.1);
+    expect(p.calls).toEqual([['hold', 10], ['lin', 1, expect.closeTo(10.1, 12)]]);
+    g.set(0, 10.05, 0.1); // halfway: analytic value 0.75, regardless of what `.value` reports
+    expect(g.currentRamp).toEqual({ from: expect.closeTo(0.75, 12), to: 0, t0: 10.05, t1: expect.closeTo(10.15, 12) });
+    expect(g.valueAt(10.1)).toBeCloseTo(0.375, 12);
+    expect(g.target).toBe(0);
+    // without cancelAndHoldAtTime the analytic anchor is pinned with setValueAtTime
+    const legacy: LinearParamLike & { calls: HoldCall[] } = {
+      value: 0.2,
+      calls: [],
+      cancelScheduledValues(t: number) { this.calls.push(['cancel', t]); },
+      setValueAtTime(v: number, t: number) { this.calls.push(['set', v, t]); },
+      linearRampToValueAtTime(v: number, t: number) { this.calls.push(['lin', v, t]); },
+    };
+    const h = new SmoothGain(legacy);
+    h.set(1, 0, 0.1);
+    h.set(0.5, 0.05, 0.1);
+    expect(legacy.calls.slice(-3)).toEqual([['cancel', 0.05], ['set', expect.closeTo(0.6, 12), 0.05], ['lin', 0.5, expect.closeTo(0.15, 12)]]);
+    // negatives are clamped and the ramp never shorter than 1 ms
+    expect(h.set(-1, 1, 0).to).toBe(0);
+    expect(h.currentRamp.t1).toBeCloseTo(1.001, 12);
+  });
+});

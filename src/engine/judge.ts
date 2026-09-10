@@ -30,6 +30,15 @@ export interface JudgeOptions {
 /** Miss grace used by `RhythmEngine`: covers 30 fps capture + inference delivery delay. */
 export const DEFAULT_MISS_GRACE_MS = 100;
 
+/** Validate a timing window: finite, positive, perfectMs <= goodMs. Throws RangeError. */
+export function validateTimingWindows(w: TimingWindows, label = 'windows'): void {
+  if (!w || typeof w !== 'object') throw new RangeError(`Judge: ${label} missing`);
+  const { perfectMs, goodMs } = w;
+  if (!Number.isFinite(perfectMs) || !Number.isFinite(goodMs)) throw new RangeError(`Judge: ${label} must be finite (got perfect ${perfectMs}, good ${goodMs})`);
+  if (perfectMs <= 0 || goodMs <= 0) throw new RangeError(`Judge: ${label} must be positive (got perfect ${perfectMs}, good ${goodMs})`);
+  if (perfectMs > goodMs) throw new RangeError(`Judge: ${label} perfectMs ${perfectMs} exceeds goodMs ${goodMs}`);
+}
+
 /** Validate chart invariants the Judge relies on: unique ids, lanes in [0, chart.lanes), finite times. Throws. */
 export function validateChartForJudge(chart: Chart): void {
   const lanes = chart.lanes;
@@ -81,7 +90,8 @@ export class Judge {
    * @param windows one TimingWindows for every lane, or an array indexed by lane (the last entry
    *                is reused for lanes beyond the array).
    * @param options `JudgeOptions`, or a bare number for `latencyOffsetSec` (legacy form).
-   * @throws RangeError when the chart has duplicate note ids or lanes outside [0, chart.lanes).
+   * @throws RangeError when the chart has duplicate note ids or lanes outside [0, chart.lanes), or a
+   *         window is non-finite, non-positive or has perfectMs > goodMs.
    */
   constructor(chart: Chart, windows: TimingWindows | TimingWindows[], options: number | JudgeOptions = {}) {
     validateChartForJudge(chart);
@@ -91,7 +101,8 @@ export class Judge {
     this.windows = [];
     for (let l = 0; l < lanes; l++) {
       const w = Array.isArray(windows) ? (windows[l] ?? windows[windows.length - 1]) : windows;
-      if (!w) throw new Error('Judge: no timing windows supplied');
+      if (!w) throw new RangeError('Judge: no timing windows supplied');
+      validateTimingWindows(w, `lane ${l} windows`);
       this.windows.push({ perfectMs: w.perfectMs, goodMs: w.goodMs });
     }
     this.latencyOffsetSec = opts.latencyOffsetSec ?? 0;
@@ -187,8 +198,10 @@ export class Judge {
 
   /**
    * Advance the judge to `songTimeSec`, declaring misses for pending notes whose good window
-   * (plus miss grace) has elapsed. Returns newly missed notes ordered by note time; a shared
-   * frozen empty array when none. Miss events carry `time` = note time + goodMs (the deadline).
+   * (plus miss grace) has elapsed. Returns newly missed notes ordered by *note time* (then id) —
+   * not by deadline, which differs per lane when fine-motor (x1.6) and gross-motor lanes are mixed;
+   * a shared frozen empty array when none. Miss events carry `time` = note time + goodMs (the
+   * deadline) and `deltaMs` = goodMs.
    */
   update(songTimeSec: number): readonly HitEvent[] {
     const t = songTimeSec - this.latencyOffsetSec - this.missGraceSec;
@@ -215,7 +228,7 @@ export class Judge {
       this.laneCursor[lane] = i;
     }
     if (out === null) return EMPTY;
-    if (out.length > 1) out.sort((a, b) => a.time - b.time || a.noteId - b.noteId);
+    if (out.length > 1) out.sort((a, b) => a.time - a.deltaMs / 1000 - (b.time - b.deltaMs / 1000) || a.noteId - b.noteId);
     // hand back a fresh copy so callers may retain it; scratch is reused
     const copy = out.slice();
     out.length = 0;

@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { describe, expect, it } from 'vitest';
 import { DIFFICULTIES } from './difficulty.ts';
-import { Judge, validateChartForJudge } from './judge.ts';
+import { Judge, validateChartForJudge, validateTimingWindows } from './judge.ts';
 import type { NoteState } from './judge.ts';
 import type { Chart, HitEvent, Note, TimingWindows } from './types.ts';
 
@@ -79,6 +79,19 @@ describe('Judge validation', () => {
     expect(() => validateChartForJudge(chart([], 0))).toThrow(/lanes/);
     expect(() => validateChartForJudge(chart([{ id: 0, lane: 0, time: 1 }]))).not.toThrow();
   });
+  it('throws on invalid timing windows (perfect > good, non-positive, non-finite)', () => {
+    const c = chart([{ id: 0, lane: 0, time: 1 }]);
+    expect(() => new Judge(c, { perfectMs: 500, goodMs: 100 })).toThrow(/perfectMs 500 exceeds goodMs 100/);
+    expect(() => new Judge(c, { perfectMs: 0, goodMs: 100 })).toThrow(/positive/);
+    expect(() => new Judge(c, { perfectMs: -10, goodMs: 100 })).toThrow(/positive/);
+    expect(() => new Judge(c, { perfectMs: Number.NaN, goodMs: 100 })).toThrow(/finite/);
+    expect(() => new Judge(c, { perfectMs: 50, goodMs: Number.POSITIVE_INFINITY })).toThrow(/finite/);
+    expect(() => new Judge(c, [W, { perfectMs: 200, goodMs: 100 }])).toThrow(/lane 1 windows/);
+    expect(() => new Judge(c, [])).toThrow(/no timing windows/);
+    expect(() => validateTimingWindows({ perfectMs: 70, goodMs: 70 })).not.toThrow();
+    expect(() => validateTimingWindows(undefined as unknown as TimingWindows)).toThrow(/missing/);
+    expect(new Judge(c, { perfectMs: 70, goodMs: 70 }).onInput(0, 1.07)!.judgment).toBe('perfect');
+  });
   it('pendingCount reaches 0 once every note is judged', () => {
     const notes: Note[] = [];
     for (let i = 0; i < 50; i++) notes.push({ id: i, lane: i % 3, time: i * 0.5 });
@@ -103,6 +116,15 @@ describe('Judge.update', () => {
     expect(j.update(1.3)).toEqual([]);
     expect(j.update(10).map((e) => e.noteId)).toEqual([2]);
     expect(j.getPendingCount()).toBe(0);
+  });
+  it('orders misses by note time even when per-lane windows differ (fine-motor x1.6 lanes)', () => {
+    // lane 0: gross motor 140 ms; lane 1: fine motor 224 ms. Note 1 (lane 1) is earlier but its deadline is later.
+    const j = new Judge(chart([{ id: 0, lane: 0, time: 1.1 }, { id: 1, lane: 1, time: 1.05 }, { id: 2, lane: 0, time: 1.2 }]), [W, { perfectMs: 112, goodMs: 224 }]);
+    const m = j.update(2);
+    expect(m.map((e) => e.noteId)).toEqual([1, 0, 2]);
+    expect(m[0].time).toBeCloseTo(1.05 + 0.224, 9);
+    expect(m[1].time).toBeCloseTo(1.1 + 0.14, 9);
+    expect(m[0].deltaMs).toBe(224);
   });
   it('returned arrays are independent of later updates', () => {
     const j = new Judge(chart([{ id: 0, lane: 0, time: 1 }, { id: 1, lane: 0, time: 2 }]), W);
@@ -202,16 +224,17 @@ class RefJudge {
   }
   update(u0: number): HitEvent[] {
     const u = u0 - this.latency - this.graceSec;
-    const out: HitEvent[] = [];
+    const out: { noteTime: number; ev: HitEvent }[] = [];
     for (const n of this.notes) {
       if (this.state.get(n.id) !== 'pending') continue;
       const goodSec = this.windows[n.lane].goodMs / 1000;
       if (n.time + goodSec <= u) {
         this.state.set(n.id, 'miss');
-        out.push({ noteId: n.id, lane: n.lane, judgment: 'miss', deltaMs: this.windows[n.lane].goodMs, time: n.time + goodSec });
+        out.push({ noteTime: n.time, ev: { noteId: n.id, lane: n.lane, judgment: 'miss', deltaMs: this.windows[n.lane].goodMs, time: n.time + goodSec } });
       }
     }
-    return out.sort((a, b) => a.time - b.time || a.noteId - b.noteId);
+    // ordered by note time (then id), not by deadline
+    return out.sort((a, b) => a.noteTime - b.noteTime || a.ev.noteId - b.ev.noteId).map((x) => x.ev);
   }
 }
 

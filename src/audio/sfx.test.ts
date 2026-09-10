@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { DEFAULT_SFX_LEVELS, SFX_PEAKS, Sfx, type SfxKind } from './sfx';
+import { DEFAULT_SFX_LEVELS, LANE_SEMITONES, SFX_PEAKS, Sfx, laneRatio, type SfxKind } from './sfx';
 
 // ---------------------------------------------------------------- fake Web Audio
 
@@ -199,5 +199,60 @@ describe('Sfx', () => {
     expect(out.gain.events).toEqual([['cancel', 0, 3], ['set', 0.5, 3], ['lin', 1, 3.02]]);
     sfx.volume = Number.NaN;
     expect(sfx.volume).toBe(0);
+  });
+});
+
+describe('per-lane hit layer', () => {
+  it('transposes the hit/perfect cues per lane, wraps lanes, and can be switched off', () => {
+    const ratio = (lane: number | undefined, perLane = true, kind: 'hit' | 'perfect' = 'hit') => {
+      const ctx = new FakeCtx();
+      const sfx = new Sfx(asCtx(ctx));
+      sfx.perLane = perLane;
+      if (kind === 'hit') sfx.hit(0, lane); else sfx.perfect(0, lane);
+      return ctx.oscs[0].frequency.value / (kind === 'hit' ? 1500 : 1800);
+    };
+    expect(LANE_SEMITONES).toEqual([0, 3, 7, 12]);
+    expect(laneRatio(undefined)).toBe(1);
+    expect(laneRatio(0)).toBe(1);
+    expect(laneRatio(1)).toBeCloseTo(Math.pow(2, 3 / 12), 12);
+    expect(laneRatio(3)).toBe(2);
+    expect(laneRatio(4)).toBe(1); // wraps
+    expect(laneRatio(-1)).toBe(2);
+    expect(ratio(undefined)).toBe(1);
+    expect(ratio(2)).toBeCloseTo(Math.pow(2, 7 / 12), 12);
+    expect(ratio(2, true, 'perfect')).toBeCloseTo(Math.pow(2, 7 / 12), 12);
+    expect(ratio(2, false)).toBe(1); // toggled off: every lane identical
+    // the glide target and the sparkle notes are transposed with the tick
+    const ctx = new FakeCtx();
+    new Sfx(asCtx(ctx)).perfect(0, 3);
+    expect(ctx.oscs.slice(1).map((o) => o.frequency.value)).toEqual([1568 * 2, 2093 * 2, 3136 * 2]);
+    expect(ctx.oscs[0].frequency.events.find((e) => e[0] === 'exp')?.[1]).toBe(1200 * 2);
+    // play() accepts the options object and the legacy milestone number
+    const c2 = new FakeCtx();
+    const s2 = new Sfx(asCtx(c2));
+    s2.play('hit', 0, { lane: 3 });
+    expect(c2.oscs[0].frequency.value).toBe(3000);
+    c2.oscs = [];
+    s2.play('combo', 0, 25);
+    expect(c2.oscs).toHaveLength(5);
+    c2.oscs = [];
+    s2.play('combo', 0, { milestone: 100 });
+    expect(c2.oscs).toHaveLength(7);
+    // miss and combo never vary per lane
+    c2.oscs = [];
+    s2.play('miss', 0, { lane: 3 });
+    expect(c2.oscs[0].frequency.value).toBe(150);
+  });
+
+  it('volume ramps anchor on the analytic value when the slider moves faster than the ramp', () => {
+    const ctx = new FakeCtx();
+    ctx.currentTime = 1;
+    const sfx = new Sfx(asCtx(ctx), undefined, 0);
+    const out = ctx.gains[0];
+    sfx.volume = 1; // 0 → 1 over [1, 1.02]
+    ctx.currentTime = 1.01;
+    sfx.volume = 0.2; // anchored at 0.5 although the fake param reports 1
+    expect(out.gain.value).toBe(1);
+    expect(out.gain.events.slice(-3)).toEqual([['cancel', 0, 1.01], ['set', expect.closeTo(0.5, 12), 1.01], ['lin', 0.2, expect.closeTo(1.03, 12)]]);
   });
 });

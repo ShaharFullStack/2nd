@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it } from 'vitest';
-import { HEALTH_START, Scoring, multiplierForCombo, starsForAccuracy } from './scoring.ts';
+import { GOOD_STAR_WEIGHT, HEALTH_START, Scoring, multiplierForCombo, starAccuracyOf, starsForAccuracy } from './scoring.ts';
 import type { HitEvent, Judgment } from './types.ts';
 
 function ev(judgment: Judgment, lane = 0, deltaMs = 0): HitEvent {
@@ -69,7 +69,8 @@ describe('Scoring', () => {
     expect(st.misses).toBe(1);
     expect(st.accuracy).toBeCloseTo(0.75);
     expect(st.meanDeltaMs).toBeCloseTo(20 / 3);
-    expect(st.stars).toBe(3);
+    expect(st.starAccuracy).toBeCloseTo((2 + 0.75) / 4);
+    expect(st.stars).toBe(2);
     expect(JSON.parse(JSON.stringify(st))).toEqual(st); // plain snapshot
     s.reset();
     expect(s.getState()).toMatchObject({ score: 0, combo: 0, hits: 0, misses: 0, health: HEALTH_START, accuracy: 0 });
@@ -83,5 +84,23 @@ describe('Scoring', () => {
   });
   it('star rating', () => {
     expect([0, 0.2, 0.25, 0.5, 0.7, 0.85, 0.95, 1, Number.NaN].map(starsForAccuracy)).toEqual([0, 0, 1, 2, 3, 4, 5, 5, 0]);
+    expect(GOOD_STAR_WEIGHT).toBe(0.75);
+    expect(starAccuracyOf(0, 0, 0)).toBe(0);
+  });
+  it('stars reward timing: all-perfect is 5, all-good is 3, a miss-free run of mostly goods is not 5', () => {
+    const perfect = new Scoring(1);
+    for (let i = 0; i < 20; i++) perfect.apply(ev('perfect'));
+    expect(perfect.getState().stars).toBe(5);
+    const good = new Scoring(1);
+    for (let i = 0; i < 20; i++) good.apply(ev('good'));
+    expect(good.getState().accuracy).toBe(1);
+    expect(good.getState().starAccuracy).toBeCloseTo(0.75);
+    expect(good.getState().stars).toBe(3);
+    const mixed = new Scoring(1);
+    for (let i = 0; i < 20; i++) mixed.apply(ev(i < 4 ? 'perfect' : 'good'));
+    expect(mixed.getState().stars).toBe(3); // (4 + 12) / 20 = 0.8
+    const strong = new Scoring(1);
+    for (let i = 0; i < 20; i++) strong.apply(ev(i < 18 ? 'perfect' : 'miss'));
+    expect(strong.getState().stars).toBe(4); // 0.9
   });
 });

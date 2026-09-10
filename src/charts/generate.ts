@@ -5,20 +5,20 @@ import type { Chart, Difficulty, DifficultyName, Note } from '../engine/types.ts
 export interface SongGrid {
   id: string;
   bpm: number;
-  /** Seconds from audio start to the first beat. */
+  /** Seconds from audio start to the first beat (= the first bar's downbeat). */
   offset: number;
   durationSec: number;
   beatsPerBar?: number;
 }
 
 export interface GenerateOptions {
-  /** Guarantee a note on every bar downbeat when a lane is free (default true). */
+  /** Guarantee a note on every bar downbeat whenever a pacing-feasible pattern exists (default true). */
   accents?: boolean;
   /** Beats of silence before the first note (default 2). */
   leadInBeats?: number;
   /** Seconds at the end of the song kept free of notes (default 1). */
   tailSec?: number;
-  /** Bars per repeating phrase (default 4). */
+  /** Bars per repeating phrase; the last bar of each phrase is a seeded variation (default 4). */
   phraseBars?: number;
   /** Override the per-lane minimum spacing (seconds). */
   minLaneSpacingSec?: number;
@@ -45,6 +45,13 @@ export const MIN_CROSS_LANE_GAP_SEC: Readonly<Record<DifficultyName, number>> = 
 
 export const CHART_FORMAT_VERSION = 1;
 
+/** Lane share imbalance (max/min) above which a warning is emitted. */
+export const LANE_SHARE_WARN_RATIO = 1.15;
+/** Off-beat fraction above which an easy chart gets a warning. */
+export const EASY_OFFBEAT_WARN_FRACTION = 0.1;
+/** Bars longer than this are laid out as repeated 8-beat pattern groups (pattern search is 2^(2*beats)). */
+export const MAX_PATTERN_BEATS_PER_BAR = 8;
+
 /** Small fast seeded PRNG (mulberry32); returns floats in [0, 1). */
 export function mulberry32(seed: number): () => number {
   let a = seed >>> 0;
@@ -59,53 +66,215 @@ export function mulberry32(seed: number): () => number {
 
 const SLOTS_PER_BEAT = 2; // half-beat resolution
 const EPS = 1e-9;
+/** A variation bar may use any pattern scoring within this much of the best pattern of its note count. */
+const VARIATION_SCORE_SLACK = 24;
+/** A "B" section may swap the base pattern for one scoring within this much of the best. */
+const SECTION_SCORE_SLACK = 6;
+/** Variation bars pick uniformly among this many top candidates. */
+const VARIATION_TOP_K = 4;
+/** Phrases per section (A A A A B B B B ...). */
+const PHRASES_PER_SECTION = 4;
+
+/* ---------- bar patterns ---------- */
+
+/** One bar's rhythm: which half-beat slots carry a note. */
+export interface BarPattern {
+  /** Bit s set = note on slot s (slot 0 = downbeat, even slots = beats, odd slots = off-beats). */
+  mask: number;
+  slots: readonly number[];
+  count: number;
+  /** Musicality score (higher = more on-beat, downbeat present, evenly spread). */
+  score: number;
+  downbeat: boolean;
+  /** Number of notes on off-beats. */
+  offBeats: number;
+}
+
+interface PatternTable {
+  slotsPerBar: number;
+  /** Feasible patterns per note count, best first. */
+  byCount: BarPattern[][];
+  /** Largest note count that has a feasible pattern. */
+  maxCount: number;
+  /** Largest note count that has a feasible pattern with every note on a beat. */
+  maxOnBeatCount: number;
+}
+
+const EMPTY_PATTERN: BarPattern = Object.freeze({ mask: 0, slots: Object.freeze([]) as readonly number[], count: 0, score: 0, downbeat: false, offBeats: 0 });
+
 /**
- * When the target is at least this fraction of the spacing-limited maximum, notes are laid on a
- * regular lattice (the only way to reach the maximum) and thinned to the target; below it the
- * musical weighted sampler is used.
+ * A bar pattern is feasible when, repeated forever, it honours both pacing constraints on the
+ * half-beat grid: consecutive notes >= crossGapSlots apart and no window of laneGapSlots
+ * consecutive slots holding more than `lanes` notes. The second condition is exactly what makes a
+ * round-robin lane assignment valid: notes k and k+lanes are then always >= laneGapSlots apart.
  */
-const LATTICE_THRESHOLD = 0.7;
+function periodicFeasible(mask: number, slots: readonly number[], slotsPerBar: number, lanes: number, laneGapSlots: number, crossGapSlots: number): boolean {
+  const n = slots.length;
+  if (n === 0) return true;
+  for (let i = 0; i < n; i++) {
+    const next = i + 1 < n ? slots[i + 1] : slots[0] + slotsPerBar;
+    if (next - slots[i] < crossGapSlots) return false;
+  }
+  for (let s = 0; s < slotsPerBar; s++) {
+    let cnt = 0;
+    for (let k = 0; k < laneGapSlots; k++) if (mask & (1 << (s + k) % slotsPerBar)) cnt++;
+    if (cnt > lanes) return false;
+  }
+  return true;
+}
+
+function beatStrength(beat: number, beatsPerBar: number): number {
+  if (beat === 0) return 3;
+  if (beatsPerBar % 2 === 0 && beat === beatsPerBar / 2) return 2;
+  return 1;
+}
+
+function scorePattern(mask: number, slots: readonly number[], slotsPerBar: number, beatsPerBar: number, accents: boolean): number {
+  let sc = 0;
+  for (const s of slots) {
+    if (s % SLOTS_PER_BEAT === 0) sc += 10 + 2 * beatStrength(s / SLOTS_PER_BEAT, beatsPerBar);
+    else {
+      sc -= 10; // off-beat
+      if (mask & (1 << (s - 1))) {
+        sc += 4; // "1 &" figure: off-beat right after a played beat
+        if (beatStrength((s - 1) / SLOTS_PER_BEAT, beatsPerBar) >= 2) sc += 2;
+      }
+    }
+  }
+  if (accents && (mask & 1) !== 0) sc += 30;
+  if (slots.length >= 2) {
+    let maxGap = 0;
+    let minGap = Infinity;
+    for (let i = 0; i < slots.length; i++) {
+      const next = i + 1 < slots.length ? slots[i + 1] : slots[0] + slotsPerBar;
+      const g = next - slots[i];
+      if (g > maxGap) maxGap = g;
+      if (g < minGap) minGap = g;
+    }
+    sc -= 3 * (maxGap - minGap); // evenly spread beats
+  }
+  return sc;
+}
+
+function buildPatternTable(beatsPerBar: number, lanes: number, laneGapSlots: number, crossGapSlots: number, accents: boolean): PatternTable {
+  const S = beatsPerBar * SLOTS_PER_BEAT;
+  const byCount: BarPattern[][] = [];
+  for (let c = 0; c <= S; c++) byCount.push([]);
+  const slots: number[] = [];
+  const total = 1 << S;
+  for (let mask = 0; mask < total; mask++) {
+    if (accents && mask !== 0 && (mask & 1) === 0) continue; // accents: every non-empty bar starts on the downbeat
+    slots.length = 0;
+    for (let s = 0; s < S; s++) if (mask & (1 << s)) slots.push(s);
+    if (!periodicFeasible(mask, slots, S, lanes, laneGapSlots, crossGapSlots)) continue;
+    let offBeats = 0;
+    for (const x of slots) if (x % SLOTS_PER_BEAT !== 0) offBeats++;
+    byCount[slots.length].push({
+      mask,
+      slots: Object.freeze(slots.slice()),
+      count: slots.length,
+      score: scorePattern(mask, slots, S, beatsPerBar, accents),
+      downbeat: (mask & 1) !== 0,
+      offBeats,
+    });
+  }
+  let maxCount = 0;
+  let maxOnBeatCount = 0;
+  for (let c = 0; c <= S; c++) {
+    byCount[c].sort((a, b) => b.score - a.score || a.mask - b.mask);
+    if (byCount[c].length > 0) maxCount = c;
+    if (byCount[c].some((p) => p.offBeats === 0)) maxOnBeatCount = c;
+  }
+  return { slotsPerBar: S, byCount, maxCount, maxOnBeatCount };
+}
+
+/** Linear feasibility of `prev` followed by `cur` (only the bar boundary can fail when both are periodic-feasible). */
+function compatible(prev: BarPattern | null, cur: BarPattern, slotsPerBar: number, lanes: number, laneGapSlots: number, crossGapSlots: number): boolean {
+  if (prev === null || prev.count === 0 || cur.count === 0) return true;
+  const seq: number[] = [];
+  for (const s of prev.slots) seq.push(s - slotsPerBar);
+  for (const s of cur.slots) seq.push(s);
+  for (let i = prev.count; i < seq.length; i++) {
+    if (seq[i] - seq[i - 1] < crossGapSlots) return false;
+    let cnt = 1;
+    for (let j = i - 1; j >= 0 && seq[j] > seq[i] - laneGapSlots; j--) cnt++;
+    if (cnt > lanes) return false;
+  }
+  return true;
+}
+
+/* ---------- density budget ---------- */
 
 export interface DensityBudget {
   /** Difficulty's nominal notes per beat. */
   targetDensity: number;
-  /** Theoretical maximum notes per beat under the lane / cross-lane spacing constraints on the half-beat grid. */
+  /** Theoretical maximum notes per beat under the lane / cross-lane spacing constraints on the half-beat grid (any rhythm). */
   maxFeasibleDensity: number;
-  /** Density the generator actually aims for: min(target, maxFeasible). */
+  /**
+   * Maximum notes per beat of a bar-periodic pattern that honours the constraints (and carries the
+   * downbeat when accents are on), off-beats allowed.
+   */
+  maxBarDensity: number;
+  /** Same, but with every note on a beat. */
+  maxOnBeatDensity: number;
+  /**
+   * Density the generator actually aims for: min(target, maxOnBeatDensity) when the target is at
+   * most one note per beat (easy/medium: syncopation is never a substitute for pacing), otherwise
+   * min(target, maxBarDensity).
+   */
   effectiveTargetDensity: number;
   /** Minimum same-lane gap in half-beat slots. */
   laneGapSlots: number;
   /** Minimum any-lane gap in half-beat slots. */
   crossGapSlots: number;
-  /** True when the regular lattice placement is used (target close to the maximum). */
-  lattice: boolean;
+  /** Beats per bar the patterns were built for (input clamped to [1, MAX_PATTERN_BEATS_PER_BAR]). */
+  beatsPerBar: number;
 }
 
-/** Compute the spacing-limited density budget for a tempo / lane count / spacing configuration. */
-export function densityBudget(bpm: number, lanes: number, targetDensity: number, minLaneSpacingSec: number, minCrossLaneGapSec: number): DensityBudget {
+function computeBudget(
+  bpm: number,
+  lanes: number,
+  targetDensity: number,
+  minLaneSpacingSec: number,
+  minCrossLaneGapSec: number,
+  beatsPerBar: number,
+  accents: boolean,
+): { budget: DensityBudget; table: PatternTable } {
   const slotSec = 60 / bpm / SLOTS_PER_BEAT;
   const laneGapSlots = Math.max(1, Math.ceil((minLaneSpacingSec - EPS) / slotSec));
   const crossGapSlots = Math.max(1, Math.ceil((minCrossLaneGapSec - EPS) / slotSec));
   const maxPerSlot = Math.min(1, lanes / laneGapSlots, 1 / crossGapSlots);
   const maxFeasibleDensity = maxPerSlot * SLOTS_PER_BEAT;
-  const effectiveTargetDensity = Math.min(targetDensity, maxFeasibleDensity);
-  const lattice = maxFeasibleDensity > 0 && effectiveTargetDensity >= LATTICE_THRESHOLD * maxFeasibleDensity - EPS;
-  return { targetDensity, maxFeasibleDensity, effectiveTargetDensity, laneGapSlots, crossGapSlots, lattice };
+  const table = buildPatternTable(beatsPerBar, lanes, laneGapSlots, crossGapSlots, accents);
+  const maxBarDensity = table.maxCount / beatsPerBar;
+  const maxOnBeatDensity = table.maxOnBeatCount / beatsPerBar;
+  const target = Math.max(0, targetDensity);
+  const effectiveTargetDensity = Math.min(target, target <= 1 + EPS ? maxOnBeatDensity : maxBarDensity);
+  return {
+    budget: { targetDensity, maxFeasibleDensity, maxBarDensity, maxOnBeatDensity, effectiveTargetDensity, laneGapSlots, crossGapSlots, beatsPerBar },
+    table,
+  };
 }
 
-/**
- * Lane that fires at global slot `J` on the maximum-density lattice, or -1.
- * Two regimes: cross-gap bound (a note every crossGapSlots, lanes cycling) or lane-spacing bound
- * (each lane fires every laneGapSlots with evenly spread phases). Both honour both constraints.
- */
-function latticeLane(J: number, lanes: number, laneGapSlots: number, crossGapSlots: number): number {
-  if (1 / crossGapSlots <= lanes / laneGapSlots) {
-    return J % crossGapSlots === 0 ? (J / crossGapSlots) % lanes : -1;
-  }
-  const phase = J % laneGapSlots;
-  for (let l = 0; l < lanes; l++) if (Math.floor((l * laneGapSlots) / lanes) === phase) return l;
-  return -1;
+function clampBeatsPerBar(beatsPerBar: number | undefined): number {
+  const b = Math.floor(beatsPerBar ?? 4);
+  return Math.min(MAX_PATTERN_BEATS_PER_BAR, Math.max(1, Number.isFinite(b) ? b : 4));
 }
+
+/** Compute the spacing-limited density budget for a tempo / lane count / spacing configuration. */
+export function densityBudget(
+  bpm: number,
+  lanes: number,
+  targetDensity: number,
+  minLaneSpacingSec: number,
+  minCrossLaneGapSec: number,
+  beatsPerBar = 4,
+  accents = true,
+): DensityBudget {
+  return computeBudget(bpm, Math.max(1, Math.floor(lanes)), targetDensity, minLaneSpacingSec, minCrossLaneGapSec, clampBeatsPerBar(beatsPerBar), accents).budget;
+}
+
+/* ---------- generation ---------- */
 
 export interface GenerateResult extends DensityBudget {
   chart: Chart;
@@ -113,7 +282,13 @@ export interface GenerateResult extends DensityBudget {
   achievedDensity: number;
   /** Beats between the first and last slot that may hold a note. */
   usableBeats: number;
-  /** Human-readable notes, e.g. when the density had to be reduced to honour rehab pacing. */
+  /** Fraction of notes in each lane (sums to 1; all zero for an empty chart). Round-robin: max/min <= 1 + 1/min. */
+  laneShares: number[];
+  /** Fraction of notes on off-beats (the 'and' of a beat). */
+  offBeatFraction: number;
+  /** Fraction of bar downbeats inside the playable range that carry a note (1 when there are none). */
+  downbeatCoverage: number;
+  /** Human-readable notes, e.g. when the density had to be reduced to honour rehab pacing, or lanes are unbalanced. */
   warnings: string[];
 }
 
@@ -132,14 +307,21 @@ export function generateChart(
 }
 
 /**
- * Generate a chart and report the density budget.
- * - notes on beats / half-beats according to difficulty.noteDensity (notes per beat), reduced to
- *   what the pacing constraints allow (warnings say so)
- * - phrase structure: the first phrase's rhythm becomes a template that later phrases follow with
- *   variation (every 4th phrase varies more, every 8th starts a new "section" template)
- * - lanes cycle; the same lane is never hit twice within MIN_LANE_SPACING_SEC[difficulty] and
- *   any two notes are at least MIN_CROSS_LANE_GAP_SEC[difficulty] apart
- * - 2-beat lead-in silence, optional accent notes on bar downbeats
+ * Generate a chart and report the density budget and balance metrics.
+ *
+ * Layout (bar grid anchored at `song.offset`, half-beat resolution):
+ * - every bar gets a *bar pattern* chosen from an exhaustive, scored table of rhythms that honour
+ *   the pacing constraints when repeated (see `periodicFeasible`); the score prefers the downbeat,
+ *   beats over off-beats, "1 &" figures over lone off-beats and evenly spread notes — so easy is
+ *   on-beat, medium is one note per beat and hard adds off-beats only where the count demands it;
+ * - note counts per bar follow difficulty.noteDensity (fractional counts alternate between bars),
+ *   reduced to what the pacing allows (`effectiveTargetDensity`, warned);
+ * - phrases of `phraseBars` bars are [A A A A']: the same base pattern repeated, the last bar a
+ *   seeded variation (different pattern of similar musicality, sometimes ±1 note); every 4 phrases
+ *   a new section may swap the base pattern for an equally good one;
+ * - lanes are assigned round-robin (0,1,2,…), which is provably spacing-safe for these patterns and
+ *   gives every lane an equal share of reps (bilateral rehab: left/right get the same work);
+ * - 2-beat lead-in silence, `tailSec` free at the end, accent notes on bar downbeats.
  */
 export function generateChartDetailed(
   song: SongGrid,
@@ -151,206 +333,213 @@ export function generateChartDetailed(
   const diff = resolveDifficulty(difficulty);
   const laneCount = Math.max(1, Math.floor(lanes));
   const bpm = song.bpm > 0 && Number.isFinite(song.bpm) ? song.bpm : 120;
-  const beatsPerBar = Math.max(1, Math.floor(song.beatsPerBar ?? 4));
+  const requestedBpb = Math.floor(song.beatsPerBar ?? 4);
+  const beatsPerBar = clampBeatsPerBar(song.beatsPerBar);
   const beatSec = 60 / bpm;
+  const slotSec = beatSec / SLOTS_PER_BEAT;
   const accents = opts.accents ?? true;
-  const leadInBeats = opts.leadInBeats ?? 2;
+  const leadInBeats = Math.max(0, opts.leadInBeats ?? 2);
   const tailSec = opts.tailSec ?? 1;
-  const phraseBars = Math.max(1, opts.phraseBars ?? 4);
+  const phraseBars = Math.max(1, Math.floor(opts.phraseBars ?? 4));
   const minSpacing = opts.minLaneSpacingSec ?? MIN_LANE_SPACING_SEC[diff.name] ?? 0.6;
   const crossGap = opts.minCrossLaneGapSec ?? MIN_CROSS_LANE_GAP_SEC[diff.name] ?? 0;
   const density = Math.max(0, diff.noteDensity);
-  const budget = densityBudget(bpm, laneCount, density, minSpacing, crossGap);
-  const effDensity = budget.effectiveTargetDensity;
+  const { budget, table } = computeBudget(bpm, laneCount, density, minSpacing, crossGap, beatsPerBar, accents);
+  const eff = budget.effectiveTargetDensity;
+  const G = budget.laneGapSlots;
+  const C = budget.crossGapSlots;
+  const S = table.slotsPerBar;
   const warnings: string[] = [];
-  if (effDensity < density - EPS) {
+  if (requestedBpb !== beatsPerBar && Number.isFinite(requestedBpb)) {
+    warnings.push(`beatsPerBar ${requestedBpb} clamped to ${beatsPerBar} for pattern layout`);
+  }
+  const preferOnBeat = density <= 1 + EPS;
+  if (eff < density - EPS) {
     warnings.push(
-      `note density reduced from ${density} to ${effDensity.toFixed(3)} notes/beat: at ${bpm} bpm with ${laneCount} lane(s), ` +
-        `lane spacing ${minSpacing}s and cross-lane gap ${crossGap}s allow at most ${budget.maxFeasibleDensity.toFixed(3)} notes/beat`,
+      `note density reduced from ${density} to ${eff.toFixed(3)} notes/beat: at ${bpm} bpm with ${laneCount} lane(s), ` +
+        `lane spacing ${minSpacing}s and cross-lane gap ${crossGap}s allow at most ${eff.toFixed(3)} notes/beat ` +
+        `on a${preferOnBeat ? 'n on-beat' : ' musical'} bar pattern (${budget.maxFeasibleDensity.toFixed(3)} on the raw grid)`,
     );
   }
-  const rand = mulberry32(seed);
 
-  const notes: Note[] = [];
   const mk = (chartNotes: Note[]): Chart => ({ songId: song.id, lanes: laneCount, notes: chartNotes, bpm, offset: song.offset, difficulty: diff, durationSec: song.durationSec });
+  const empty = (why: string): GenerateResult => ({
+    chart: mk([]),
+    ...budget,
+    achievedDensity: 0,
+    usableBeats: 0,
+    laneShares: new Array<number>(laneCount).fill(0),
+    offBeatFraction: 0,
+    downbeatCoverage: 1,
+    warnings: [...warnings, why],
+  });
 
-  const phraseBeats = phraseBars * beatsPerBar;
-  const phraseSlots = phraseBeats * SLOTS_PER_BEAT;
-  const slotSec = beatSec / SLOTS_PER_BEAT;
-  const firstNoteTime = song.offset + leadInBeats * beatSec;
-  const lastNoteTime = song.durationSec - tailSec;
-  if (lastNoteTime < firstNoteTime) {
-    return { chart: mk(notes), ...budget, achievedDensity: 0, usableBeats: 0, warnings: [...warnings, 'song too short for any note'] };
+  // absolute half-beat slot j is at time offset + j * slotSec; bar b covers slots [b*S, (b+1)*S)
+  const firstSlot = Math.ceil(leadInBeats * SLOTS_PER_BEAT - EPS);
+  const lastSlot = Math.floor((song.durationSec - tailSec - song.offset) / slotSec + EPS);
+  if (!Number.isFinite(lastSlot) || lastSlot < firstSlot) return empty('song too short for any note');
+  const usableBeats = (lastSlot - firstSlot + 1) / SLOTS_PER_BEAT;
+  const firstBar = Math.floor(firstSlot / S);
+  const lastBar = Math.floor(lastSlot / S);
+
+  const rand = mulberry32(seed);
+  const startLane = Math.floor(rand() * laneCount);
+
+  const isCompatible = (prev: BarPattern | null, cur: BarPattern): boolean => compatible(prev, cur, S, laneCount, G, C);
+  /** Cumulative note count after `bars` full bars (fractional per-bar counts alternate deterministically). */
+  const cum = (bars: number): number => Math.round(eff * beatsPerBar * bars + EPS);
+  const countFor = (i: number): number => Math.min(table.maxCount, Math.max(0, cum(i + 1) - cum(i)));
+  /** Candidate patterns for a count, best first; on-beat patterns only when the target prefers them and any exist. */
+  const candidatesFor = (count: number): readonly BarPattern[] => {
+    const list = table.byCount[count] ?? [];
+    if (!preferOnBeat) return list;
+    const onBeat = list.filter((p) => p.offBeats === 0);
+    return onBeat.length > 0 ? onBeat : list;
+  };
+  const bestScore = (count: number): number => candidatesFor(count)[0]?.score ?? -Infinity;
+
+  const baseCache = new Map<string, BarPattern>();
+  /** Base pattern of a section for a note count: the best pattern (A sections) or a seeded near-equivalent (B sections). */
+  const basePattern = (section: number, count: number): BarPattern => {
+    const key = `${section % 2}:${count}`;
+    const cached = baseCache.get(key);
+    if (cached) return cached;
+    const list = candidatesFor(count);
+    let pat = list[0] ?? EMPTY_PATTERN;
+    if (section % 2 === 1 && list.length > 1) {
+      const cands = list.filter((p) => p.score >= list[0].score - SECTION_SCORE_SLACK);
+      pat = cands[Math.floor(rand() * cands.length)];
+    }
+    baseCache.set(key, pat);
+    return pat;
+  };
+  /** First pattern in `list` (already best-first) compatible with `prev`, or the first one. */
+  const firstCompatible = (list: readonly BarPattern[], prev: BarPattern | null): BarPattern => {
+    for (const p of list) if (isCompatible(prev, p)) return p;
+    return list[0] ?? EMPTY_PATTERN;
+  };
+
+  const chosen: BarPattern[] = [];
+  let prev: BarPattern | null = null;
+  for (let b = firstBar; b <= lastBar; b++) {
+    const i = b - firstBar;
+    const phrase = Math.floor(i / phraseBars);
+    const q = i - phrase * phraseBars;
+    const section = Math.floor(phrase / PHRASES_PER_SECTION);
+    const count = countFor(i);
+    const isVariation = phraseBars > 1 && q === phraseBars - 1;
+    let pat: BarPattern;
+    if (!isVariation) {
+      pat = basePattern(section, count);
+      if (!isCompatible(prev, pat)) pat = firstCompatible(candidatesFor(count), prev);
+    } else {
+      const base = basePattern(section, count);
+      const baseBest = bestScore(count);
+      // ±1 note (15 % each), only when the resulting bar is about as musical as the base
+      const r = rand();
+      let c = count;
+      if (r < 0.15 && count + 1 <= table.maxCount && bestScore(count + 1) >= baseBest - VARIATION_SCORE_SLACK) c = count + 1;
+      else if (r >= 0.85 && count >= 2 && bestScore(count - 1) >= baseBest - VARIATION_SCORE_SLACK) c = count - 1;
+      const nextSection = Math.floor((phrase + 1) / PHRASES_PER_SECTION);
+      const nextBase = b < lastBar ? basePattern(nextSection, countFor(i + 1)) : null;
+      // a fill may add at most one off-beat over the base (none at easy: notes stay on the beat)
+      const maxOffBeats = base.offBeats + (preferOnBeat && density < 1 - EPS ? 0 : 1);
+      const list = table.byCount[c] ?? [];
+      let cands = list.filter((p) => p.score >= (list[0]?.score ?? 0) - VARIATION_SCORE_SLACK && p.offBeats <= maxOffBeats);
+      if (cands.length > 1) cands = cands.filter((p) => p !== base);
+      const fitting = cands.filter((p) => isCompatible(prev, p) && (nextBase === null || isCompatible(p, nextBase)));
+      if (fitting.length > 0) cands = fitting;
+      if (cands.length === 0) cands = [base];
+      const k = Math.min(VARIATION_TOP_K, cands.length);
+      pat = cands[Math.floor(rand() * k)];
+    }
+    chosen.push(pat);
+    prev = pat;
   }
-  const totalSlots = Math.floor((lastNoteTime - firstNoteTime) / slotSec + EPS) + 1;
-  const usableBeats = totalSlots / SLOTS_PER_BEAT;
 
-  // last note time per lane / any lane from *previous* phrases (notes of the current phrase are scanned directly)
-  const prevLast: number[] = new Array<number>(laneCount).fill(-Infinity);
-  let prevAny = -Infinity;
-  let prevLastLane = laneCount - 1;
-  let phraseStart = 0;
-  const eligible: number[] = [];
-
-  /** Lanes that may take a note at time `t` given every note placed so far (both temporal neighbours). */
-  const eligibleLanes = (t: number): number[] => {
-    eligible.length = 0;
-    if (t - prevAny < crossGap - EPS) return eligible;
-    for (let k = phraseStart; k < notes.length; k++) if (Math.abs(notes[k].time - t) < crossGap - EPS) return eligible;
-    for (let l = 0; l < laneCount; l++) {
-      if (t - prevLast[l] < minSpacing - EPS) continue;
-      let ok = true;
-      for (let k = phraseStart; k < notes.length; k++) {
-        const n = notes[k];
-        if (n.lane === l && Math.abs(n.time - t) < minSpacing - EPS) {
-          ok = false;
+  // candidate slots in time order, then a repair pass that enforces both constraints linearly
+  // (only bar transitions can conflict; downbeats win over the non-downbeat note before them)
+  const kept: number[] = [];
+  const keptDown: boolean[] = [];
+  const isDownbeat = (slot: number): boolean => slot % S === 0;
+  const fits = (slot: number): boolean => {
+    if (kept.length === 0) return true;
+    if (slot - kept[kept.length - 1] < C) return false;
+    let cnt = 0;
+    for (let j = kept.length - 1; j >= 0 && kept[j] > slot - G; j--) cnt++;
+    return cnt < laneCount;
+  };
+  for (let b = firstBar; b <= lastBar; b++) {
+    const pat = chosen[b - firstBar];
+    for (const s of pat.slots) {
+      const slot = b * S + s;
+      if (slot < firstSlot || slot > lastSlot) continue;
+      for (;;) {
+        if (fits(slot)) {
+          kept.push(slot);
+          keptDown.push(isDownbeat(slot));
           break;
         }
-      }
-      if (ok) eligible.push(l);
-    }
-    return eligible;
-  };
-
-  /** Lane of the latest note strictly before `t` (for cyclic lane order). */
-  const laneBefore = (t: number): number => {
-    let bestT = prevAny;
-    let lane = prevLastLane;
-    for (let k = phraseStart; k < notes.length; k++) {
-      const n = notes[k];
-      if (n.time < t && n.time > bestT) {
-        bestT = n.time;
-        lane = n.lane;
-      }
-    }
-    return lane;
-  };
-
-  const halfWeight = effDensity > 1 ? 0.8 : 0.15;
-  const baseWeight = (j: number): number => {
-    if (j % (beatsPerBar * SLOTS_PER_BEAT) === 0) return accents ? 3 : 2;
-    if (j % SLOTS_PER_BEAT === 0) return 1.2;
-    return halfWeight;
-  };
-
-  let template: boolean[] | null = null;
-  const weights = new Array<number>(phraseSlots).fill(0);
-  const order: number[] = [];
-
-  for (let phrase = 0, slot0 = 0; slot0 < totalSlots; phrase++, slot0 += phraseSlots) {
-    const slotsHere = Math.min(phraseSlots, totalSlots - slot0);
-    const beatsHere = slotsHere / SLOTS_PER_BEAT;
-    const isVariation = template !== null && phrase % 4 === 3;
-    const isNewSection = template !== null && phrase % 8 === 4; // re-roll template for a "B" section
-    phraseStart = notes.length;
-
-    let target = Math.round(effDensity * beatsHere);
-    if (template !== null && slotsHere === phraseSlots) {
-      const r = rand();
-      if (r < 0.15) target += 1;
-      else if (r < 0.3) target -= 1;
-      target = Math.max(0, target);
-    }
-
-    const useTemplate = template !== null && !isNewSection;
-    const placed: boolean[] = new Array<boolean>(phraseSlots).fill(false);
-
-    let remW = 0;
-    for (let j = 0; j < slotsHere; j++) {
-      let w = baseWeight(j);
-      if (useTemplate) {
-        const on = template![j];
-        if (isVariation) w *= on ? 1.5 : 0.8;
-        else w *= on ? 4 : 0.35;
-      }
-      weights[j] = w;
-      remW += w;
-    }
-
-    const place = (j: number, t: number, lanesOk: number[]): void => {
-      const lane = pickLane(lanesOk, laneBefore(t), laneCount, rand);
-      notes.push({ id: 0, lane, time: round6(t) });
-      placed[j] = true;
-    };
-
-    let remaining = target;
-    if (budget.lattice) {
-      // regular lattice at the spacing-limited maximum, thinned to the target (keep high-weight slots)
-      order.length = 0;
-      for (let j = 0; j < slotsHere; j++) if (latticeLane(slot0 + j, laneCount, budget.laneGapSlots, budget.crossGapSlots) >= 0) order.push(j);
-      const keys = order.map((j) => weights[j] * (0.5 + rand()));
-      const idx = order.map((_, k) => k).sort((a, b) => keys[b] - keys[a] || order[a] - order[b]);
-      for (let k = 0; k < idx.length && remaining > 0; k++) {
-        const j = order[idx[k]];
-        const t = firstNoteTime + (slot0 + j) * slotSec;
-        notes.push({ id: 0, lane: latticeLane(slot0 + j, laneCount, budget.laneGapSlots, budget.crossGapSlots), time: round6(t) });
-        placed[j] = true;
-        remaining--;
-      }
-      remaining = 0;
-    }
-
-    // pass 1: probabilistic, in time order (rhythm follows the weights)
-    for (let j = 0; j < slotsHere && remaining > 0; j++) {
-      const w = weights[j];
-      const t = firstNoteTime + (slot0 + j) * slotSec;
-      const lanesOk = eligibleLanes(t);
-      if (lanesOk.length > 0) {
-        const downbeat = j % (beatsPerBar * SLOTS_PER_BEAT) === 0;
-        const p = accents && downbeat ? 1 : remW > 0 ? (remaining * w) / remW : 0;
-        if (p >= 1 || rand() < p) {
-          place(j, t, lanesOk);
-          remaining--;
+        if (isDownbeat(slot) && kept.length > 0 && !keptDown[keptDown.length - 1]) {
+          kept.pop();
+          keptDown.pop();
+          continue;
         }
-      }
-      remW -= w;
-    }
-
-    // pass 2: fill the shortfall in weight order (beats before half-beats), honouring both neighbours
-    if (remaining > 0) {
-      order.length = 0;
-      for (let j = 0; j < slotsHere; j++) if (!placed[j]) order.push(j);
-      // beats before half-beats, each in time order (earliest-first packs best under spacing constraints)
-      order.sort((a, b) => Number(b % SLOTS_PER_BEAT === 0) - Number(a % SLOTS_PER_BEAT === 0) || a - b);
-      for (let k = 0; k < order.length && remaining > 0; k++) {
-        const j = order[k];
-        const t = firstNoteTime + (slot0 + j) * slotSec;
-        const lanesOk = eligibleLanes(t);
-        if (lanesOk.length > 0) {
-          place(j, t, lanesOk);
-          remaining--;
-        }
+        break; // drop this note
       }
     }
-
-    // finalize phrase: time order, update carry-over state
-    const phraseNotes = notes.slice(phraseStart).sort((a, b) => a.time - b.time || a.lane - b.lane);
-    for (let k = 0; k < phraseNotes.length; k++) notes[phraseStart + k] = phraseNotes[k];
-    for (const n of phraseNotes) {
-      prevLast[n.lane] = n.time;
-      if (n.time > prevAny) {
-        prevAny = n.time;
-        prevLastLane = n.lane;
-      }
-    }
-
-    if (template === null || isNewSection) template = placed;
   }
 
-  for (let i = 0; i < notes.length; i++) notes[i].id = i;
-  return { chart: mk(notes), ...budget, achievedDensity: usableBeats > 0 ? notes.length / usableBeats : 0, usableBeats, warnings };
-}
+  const notes: Note[] = [];
+  const laneCounts = new Array<number>(laneCount).fill(0);
+  let offBeats = 0;
+  for (let k = 0; k < kept.length; k++) {
+    const lane = (startLane + k) % laneCount;
+    laneCounts[lane]++;
+    if (kept[k] % SLOTS_PER_BEAT !== 0) offBeats++;
+    notes.push({ id: k, lane, time: round6(song.offset + kept[k] * slotSec) });
+  }
 
-function pickLane(eligible: number[], lastLane: number, laneCount: number, rand: () => number): number {
-  if (eligible.length === 1) return eligible[0];
-  if (rand() < 0.7) {
-    // next eligible lane in cyclic order after lastLane
-    for (let k = 1; k <= laneCount; k++) {
-      const cand = (lastLane + k) % laneCount;
-      if (eligible.includes(cand)) return cand;
+  // metrics
+  let downbeatsTotal = 0;
+  let downbeatsHit = 0;
+  const keptSet = new Set(kept);
+  for (let b = firstBar; b <= lastBar; b++) {
+    const d = b * S;
+    if (d < firstSlot || d > lastSlot) continue;
+    downbeatsTotal++;
+    if (keptSet.has(d)) downbeatsHit++;
+  }
+  const total = notes.length;
+  const laneShares = laneCounts.map((c) => (total > 0 ? c / total : 0));
+  const offBeatFraction = total > 0 ? offBeats / total : 0;
+  const downbeatCoverage = downbeatsTotal > 0 ? downbeatsHit / downbeatsTotal : 1;
+
+  if (total >= laneCount && laneCount > 1) {
+    const max = Math.max(...laneCounts);
+    const min = Math.min(...laneCounts);
+    if (min === 0) warnings.push(`lane balance: lane(s) ${laneCounts.map((c, l) => (c === 0 ? l : -1)).filter((l) => l >= 0).join(', ')} received no notes`);
+    else if (max / min > LANE_SHARE_WARN_RATIO && max - min > 1) {
+      warnings.push(`lane balance: reps per lane ${laneCounts.join('/')} (max/min ${(max / min).toFixed(2)} > ${LANE_SHARE_WARN_RATIO})`);
     }
   }
-  return eligible[Math.floor(rand() * eligible.length)];
+  if (accents && downbeatCoverage < 1 - EPS) {
+    warnings.push(`accents: ${downbeatsHit} of ${downbeatsTotal} bar downbeats carry a note (pacing constraints)`);
+  }
+  if (diff.name === 'easy' && offBeatFraction > EASY_OFFBEAT_WARN_FRACTION) {
+    warnings.push(`easy: ${(offBeatFraction * 100).toFixed(0)}% of notes are off-beat`);
+  }
+
+  return {
+    chart: mk(notes),
+    ...budget,
+    achievedDensity: usableBeats > 0 ? total / usableBeats : 0,
+    usableBeats,
+    laneShares,
+    offBeatFraction,
+    downbeatCoverage,
+    warnings,
+  };
 }
 
 function round6(x: number): number {

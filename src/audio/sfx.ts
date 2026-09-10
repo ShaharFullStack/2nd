@@ -4,7 +4,13 @@
  *
  * Levels: the miss cue is deliberately quieter than the hit cue (see `DEFAULT_SFX_LEVELS`) so a
  * run of misses is a soft reminder rather than a barrage; per-kind levels are adjustable.
+ *
+ * Per-lane layer (ARCHITECTURE "optional per-lane hit SFX layer, toggleable"): when `perLane`
+ * is on (default) the hit tick and the perfect sparkle are transposed by `LANE_SEMITONES[lane]`
+ * so each lane has its own pitch; `perLane = false` makes every lane sound identical.
  */
+
+import { SmoothGain } from './ducking';
 
 export type SfxKind = 'hit' | 'perfect' | 'miss' | 'combo';
 
@@ -32,11 +38,30 @@ const FLOOR = 1e-4;
 /** Peak envelope gain of each cue before per-kind levels (the loudest partial). */
 export const SFX_PEAKS: SfxLevels = { hit: 0.5, perfect: 0.45, miss: 0.5, combo: 0.32 };
 
+/** Transposition of the hit/perfect cues per lane (semitones; lanes beyond the list wrap). */
+export const LANE_SEMITONES: readonly number[] = [0, 3, 7, 12];
+
+/** Frequency ratio applied to the hit/perfect cues of `lane` (1 for an undefined lane). */
+export function laneRatio(lane: number | undefined): number {
+  if (lane === undefined || !Number.isFinite(lane)) return 1;
+  const i = ((Math.floor(lane) % LANE_SEMITONES.length) + LANE_SEMITONES.length) % LANE_SEMITONES.length;
+  return Math.pow(2, LANE_SEMITONES[i] / 12);
+}
+
+export interface SfxPlayOptions {
+  /** Combo milestone (10, 25, 50, …) for the 'combo' cue. */
+  milestone?: number;
+  /** Lane index for the per-lane hit/perfect variation. */
+  lane?: number;
+}
+
 export class Sfx {
   readonly ctx: BaseAudioContext;
   private readonly out: GainNode;
+  private readonly volumeCtl: SmoothGain;
   private volumeValue: number;
   private enabledValue = true;
+  private perLaneValue = true;
   private disposed = false;
   private readonly levels: SfxLevels;
 
@@ -44,22 +69,24 @@ export class Sfx {
     this.ctx = ctx;
     this.out = ctx.createGain();
     this.volumeValue = clamp01(volume);
-    this.out.gain.value = this.volumeValue;
+    this.volumeCtl = new SmoothGain(this.out.gain, this.volumeValue);
     this.out.connect(destination ?? ctx.destination);
     this.levels = { ...DEFAULT_SFX_LEVELS, ...levels };
   }
 
   get volume(): number { return this.volumeValue; }
+  /** Anchored 20 ms ramp (a slider can set this every frame without steps). */
   set volume(v: number) {
     this.volumeValue = clamp01(v);
-    const now = this.ctx.currentTime;
-    this.out.gain.cancelScheduledValues(now);
-    this.out.gain.setValueAtTime(this.out.gain.value, now);
-    this.out.gain.linearRampToValueAtTime(this.volumeValue, now + 0.02);
+    this.volumeCtl.set(this.volumeValue, this.ctx.currentTime, 0.02);
   }
 
   get enabled(): boolean { return this.enabledValue; }
   set enabled(v: boolean) { this.enabledValue = v; }
+
+  /** Per-lane pitch variation of the hit/perfect cues (default on). */
+  get perLane(): boolean { return this.perLaneValue; }
+  set perLane(v: boolean) { this.perLaneValue = v; }
 
   /** Per-kind level multiplier (0..1). */
   getLevel(kind: SfxKind): number { return this.levels[kind]; }
@@ -68,31 +95,37 @@ export class Sfx {
   /** Effective peak gain of a cue's loudest partial (kind level × master volume). */
   effectivePeak(kind: SfxKind): number { return SFX_PEAKS[kind] * this.levels[kind] * this.volumeValue; }
 
-  /** Play a sound; `when` is an AudioContext time (defaults to now). */
-  play(kind: SfxKind, when?: number, milestone: number = 10): void {
+  /**
+   * Play a sound; `when` is an AudioContext time (defaults to now). The third argument is the
+   * combo milestone (number, kept for the original API) or `{ milestone, lane }`.
+   */
+  play(kind: SfxKind, when?: number, opts: number | SfxPlayOptions = {}): void {
+    const o: SfxPlayOptions = typeof opts === 'number' ? { milestone: opts } : opts;
     switch (kind) {
-      case 'hit': this.hit(when); break;
-      case 'perfect': this.perfect(when); break;
+      case 'hit': this.hit(when, o.lane); break;
+      case 'perfect': this.perfect(when, o.lane); break;
       case 'miss': this.miss(when); break;
-      case 'combo': this.combo(milestone, when); break;
+      case 'combo': this.combo(o.milestone ?? 10, when); break;
     }
   }
 
-  /** Short bright tick. */
-  hit(when?: number): void {
+  /** Short bright tick (transposed per lane when `perLane`). */
+  hit(when?: number, lane?: number): void {
     const t = this.at(when);
     const l = this.levels.hit;
-    this.tone({ type: 'triangle', freq: 1500, freqEnd: 900, start: t, dur: 0.045, peak: 0.5 * l });
-    this.tone({ type: 'square', freq: 3200, start: t, dur: 0.015, peak: 0.12 * l, lowpass: 6000 });
+    const r = this.ratio(lane);
+    this.tone({ type: 'triangle', freq: 1500 * r, freqEnd: 900 * r, start: t, dur: 0.045, peak: 0.5 * l });
+    this.tone({ type: 'square', freq: 3200 * r, start: t, dur: 0.015, peak: 0.12 * l, lowpass: 6000 });
   }
 
-  /** Tick plus a rising three-note sparkle. */
-  perfect(when?: number): void {
+  /** Tick plus a rising three-note sparkle (transposed per lane when `perLane`). */
+  perfect(when?: number, lane?: number): void {
     const t = this.at(when);
     const l = this.levels.perfect;
-    this.tone({ type: 'triangle', freq: 1800, freqEnd: 1200, start: t, dur: 0.04, peak: 0.45 * l });
+    const r = this.ratio(lane);
+    this.tone({ type: 'triangle', freq: 1800 * r, freqEnd: 1200 * r, start: t, dur: 0.04, peak: 0.45 * l });
     const notes = [1568, 2093, 3136];
-    notes.forEach((f, i) => this.tone({ type: 'sine', freq: f, start: t + i * 0.035, dur: 0.16, peak: 0.28 * l, attack: 0.004 }));
+    notes.forEach((f, i) => this.tone({ type: 'sine', freq: f * r, start: t + i * 0.035, dur: 0.16, peak: 0.28 * l, attack: 0.004 }));
   }
 
   /** Low, damped thud (quieter than the hit tick by default). */
@@ -121,6 +154,8 @@ export class Sfx {
     this.disposed = true;
     this.out.disconnect();
   }
+
+  private ratio(lane: number | undefined): number { return this.perLaneValue ? laneRatio(lane) : 1; }
 
   private at(when?: number): number {
     const now = this.ctx.currentTime;

@@ -35,6 +35,15 @@ function mulberry32(seed) {
   };
 }
 
+/** FNV-1a 32-bit hash of a string (so every stem gets its own PRNG stream from the song seed). */
+export function hashString(str) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+  return h >>> 0;
+}
+/** Per-stem PRNG seed: song seed mixed with a hash of the stem id (never depends on the id's length alone). */
+export const stemSeed = (songSeed, stemId) => (songSeed ^ hashString(stemId)) >>> 0;
+
 const midiToHz = (m) => 440 * Math.pow(2, (m - 69) / 12);
 
 /** Chamberlin state-variable filter; cheap and cutoff can move every sample. */
@@ -457,7 +466,7 @@ export function renderSong(songId, { bars: barsOverride } = {}) {
   const stems = {};
   for (const stemId of Object.keys(STEM_MIX)) {
     const buf = new Float32Array(totalSamples);
-    const rnd = mulberry32(song.seed ^ stemId.length * 7919);
+    const rnd = mulberry32(stemSeed(song.seed, stemId));
     RENDERERS[stemId](song, { buf, rnd, stepSec, bars, barSec, swing, progression: song.progression });
     master(buf, STEM_MIX[stemId].peak * (song.mix?.[stemId] ?? 1), STEM_MIX[stemId].drive);
     stems[stemId] = buf;

@@ -19,6 +19,26 @@ export interface GainParamLike {
   cancelScheduledValues(startTime: number): unknown;
   setValueAtTime(value: number, startTime: number): unknown;
   exponentialRampToValueAtTime(value: number, endTime: number): unknown;
+  /**
+   * Optional (Chrome 57+, Safari 14.1+, Firefox 137+): cancels pending automation AND holds the
+   * exact automation value at `cancelTime`, so a new ramp starts from the audio thread's own value
+   * instead of a main-thread estimate. Feature-detected by `scheduleRamp`.
+   */
+  cancelAndHoldAtTime?(cancelTime: number): unknown;
+}
+
+/** AudioParam subset for linear (slider-style) ramps. */
+export interface LinearParamLike {
+  value: number;
+  cancelScheduledValues(startTime: number): unknown;
+  setValueAtTime(value: number, startTime: number): unknown;
+  linearRampToValueAtTime(value: number, endTime: number): unknown;
+  cancelAndHoldAtTime?(cancelTime: number): unknown;
+}
+
+/** True when the param implements cancelAndHoldAtTime (exact anchoring on the audio thread). */
+export function supportsCancelAndHold(param: { cancelAndHoldAtTime?: unknown }): boolean {
+  return typeof param.cancelAndHoldAtTime === 'function';
 }
 
 export interface DuckOptions {
@@ -67,8 +87,13 @@ export function rampValueAt(r: RampState, t: number): number {
 }
 
 /**
- * Cancel pending automation, anchor `from` at `now`, then ramp exponentially to `target` over
+ * Cancel pending automation, anchor at `now`, then ramp exponentially to `target` over
  * `rampSec`. Returns the ramp actually scheduled (values clamped to MIN_GAIN, min 1 ms).
+ *
+ * Anchoring: with `cancelAndHoldAtTime` available the audio thread itself holds the exact
+ * in-flight value at `now` (no discontinuity even when the main thread's `now` is a few render
+ * quanta stale); otherwise the analytic `from` is pinned with setValueAtTime. `from` is always
+ * recorded in the returned RampState so callers can keep tracking the ramp analytically.
  */
 export function scheduleRamp(param: GainParamLike, from: number, now: number, target: number, rampSec: number): RampState {
   const r: RampState = {
@@ -77,10 +102,58 @@ export function scheduleRamp(param: GainParamLike, from: number, now: number, ta
     t0: now,
     t1: now + Math.max(rampSec, 1e-3),
   };
-  param.cancelScheduledValues(now);
-  param.setValueAtTime(r.from, now);
+  if (supportsCancelAndHold(param)) {
+    param.cancelAndHoldAtTime!(now);
+  } else {
+    param.cancelScheduledValues(now);
+    param.setValueAtTime(r.from, now);
+  }
   param.exponentialRampToValueAtTime(r.to, r.t1);
   return r;
+}
+
+/** Analytic value of a linear ramp at time `t`. */
+export function linearRampValueAt(r: RampState, t: number): number {
+  if (t <= r.t0) return r.from;
+  if (t >= r.t1) return r.to;
+  return r.from + (r.to - r.from) * ((t - r.t0) / (r.t1 - r.t0));
+}
+
+/**
+ * Anchored linear ramps for slider-style controls (stem/master volume, SFX volume): tracks the
+ * ramp it scheduled so a burst of `set()` calls (a slider being dragged) starts each new ramp
+ * from where the previous one actually is instead of from a stale `param.value`.
+ */
+export class SmoothGain {
+  private readonly param: LinearParamLike;
+  private ramp: RampState;
+
+  constructor(param: LinearParamLike, initial: number = param.value) {
+    this.param = param;
+    const v = Math.max(0, initial);
+    this.ramp = { from: v, to: v, t0: -Infinity, t1: -Infinity };
+    this.param.value = v;
+  }
+
+  /** Destination of the last ramp (the "set" value a UI should display). */
+  get target(): number { return this.ramp.to; }
+  get currentRamp(): RampState { return { ...this.ramp }; }
+  valueAt(now: number): number { return linearRampValueAt(this.ramp, now); }
+
+  /** Ramp linearly from the analytic current value to `target` over `rampSec` (min 1 ms). */
+  set(target: number, now: number, rampSec: number): RampState {
+    const from = this.valueAt(now);
+    const r: RampState = { from, to: Math.max(0, target), t0: now, t1: now + Math.max(rampSec, 1e-3) };
+    if (supportsCancelAndHold(this.param)) {
+      this.param.cancelAndHoldAtTime!(now);
+    } else {
+      this.param.cancelScheduledValues(now);
+      this.param.setValueAtTime(from, now);
+    }
+    this.param.linearRampToValueAtTime(r.to, r.t1);
+    this.ramp = r;
+    return r;
+  }
 }
 
 /**
@@ -119,7 +192,7 @@ export class DuckController {
   rebind(param: GainParamLike, now: number): void {
     if (param === this.param) return;
     this.param.cancelScheduledValues(now);
-    this.param.setValueAtTime(this.opts.hitGain, now);
+    this.param.setValueAtTime(Math.max(this.opts.hitGain, MIN_GAIN), now);
     this.param = param;
     this.reset(now);
   }
@@ -142,6 +215,6 @@ export class DuckController {
     const v = Math.max(this.opts.hitGain, MIN_GAIN);
     this.ramp = { from: v, to: v, t0: now, t1: now };
     this.param.cancelScheduledValues(now);
-    this.param.setValueAtTime(this.opts.hitGain, now);
+    this.param.setValueAtTime(v, now);
   }
 }

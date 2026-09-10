@@ -70,4 +70,22 @@ describe('RhythmEngine', () => {
     eng.setInputLatency(0.2);
     expect(eng.judge.getLatencyOffset()).toBe(0.2);
   });
+  it('judges inputs stamped before a pause but delivered after it; ignores stamps from inside the pause', () => {
+    const ctx = { currentTime: 0 };
+    const eng = new RhythmEngine({ chart, windows: W, ctx });
+    eng.start(0);
+    ctx.currentTime = 1.02;
+    eng.pause(1.02);
+    // camera crossing at ctx 1.0 (note 0 at song time 1), delivered 100 ms later while paused
+    const hit = eng.handleInput({ lane: 0, ctxTime: 1.0, strength: 1 })!;
+    expect(hit.judgment).toBe('perfect');
+    expect(eng.getScoreState().hits).toBe(1);
+    // a movement made during the pause is not judged
+    expect(eng.handleInput({ lane: 1, ctxTime: 1.5, strength: 1 })).toBeNull();
+    eng.resume(5);
+    ctx.currentTime = 5.5; // song time 1.52
+    expect(eng.handleInput({ lane: 1, ctxTime: 5.48, strength: 1 })!.noteId).toBe(1);
+    eng.stop();
+    expect(eng.handleInput({ lane: 0, ctxTime: 6, strength: 1 })).toBeNull();
+  });
 });

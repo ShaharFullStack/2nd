@@ -40,6 +40,24 @@ describe('SongClock', () => {
     c.start(5, 30);
     expect(c.songTime(6)).toBe(31);
   });
+  it('songTimeOf maps stamps before the pause point while paused, null otherwise', () => {
+    const c = new SongClock({ currentTime: 0 });
+    expect(c.songTimeOf(1)).toBeNull(); // idle
+    c.start(10);
+    expect(c.songTimeOf(12)).toBe(2);
+    c.pause(12.5);
+    expect(c.songTime(13)).toBe(2.5);
+    expect(c.songTimeOf(12.4)).toBeCloseTo(2.4, 9); // stamped before the pause, delivered after
+    expect(c.songTimeOf(12.5)).toBeCloseTo(2.5, 9);
+    expect(c.songTimeOf(12.6)).toBeNull(); // stamped during the pause
+    c.resume(20);
+    expect(c.songTimeOf(21)).toBeCloseTo(3.5, 9);
+    expect(c.songTimeOf(21)).toBeCloseTo(c.songTime(21), 9);
+    c.setAvOffset(0.05);
+    expect(c.songTimeOf(21)).toBeCloseTo(3.55, 9);
+    // ReplayInput round trip: ctxTimeForSongTime then songTime is the identity (the A/V offset cancels)
+    expect(c.songTime(c.ctxTimeForSongTime(7.25))).toBeCloseTo(7.25, 9);
+  });
 });
 
 describe('beatAt', () => {
@@ -81,5 +99,15 @@ describe('NoteCursor / visibleNotes', () => {
     const other: Chart = { ...chart, notes: [{ id: 0, lane: 0, time: 20 }] };
     expect(visibleNotes(other, 20, 1).map((n) => n.id)).toEqual([0]);
     expect(visibleNotes(chart, 5, 0).map((n) => n.time)).toEqual([4.5, 5]);
+  });
+  it('rebuilds the per-chart cursor when the notes array is replaced or grows', () => {
+    const mutable: Chart = { ...chart, notes: [{ id: 0, lane: 0, time: 1 }] };
+    expect(visibleNotes(mutable, 1, 0).map((n) => n.id)).toEqual([0]);
+    mutable.notes = [{ id: 0, lane: 0, time: 1 }, { id: 1, lane: 1, time: 1 }];
+    expect(visibleNotes(mutable, 1, 0).map((n) => n.id)).toEqual([0, 1]);
+    mutable.notes.push({ id: 2, lane: 0, time: 1 });
+    expect(visibleNotes(mutable, 1, 0).map((n) => n.id)).toEqual([0, 1, 2]);
+    const cur = new NoteCursor(mutable);
+    expect(cur.sourceNotes).toBe(mutable.notes);
   });
 });

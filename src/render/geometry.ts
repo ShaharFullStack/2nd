@@ -66,7 +66,7 @@ export const DEFAULT_GEOMETRY_OPTIONS: GeometryOptions = {
   strikeY: 0.82,
   farScale: 0.28,
   roadWidth: 0.6,
-  pastLineSpeed: 0.55,
+  pastLineSpeed: 0.45,
 };
 
 export function clamp(v: number, lo: number, hi: number): number {

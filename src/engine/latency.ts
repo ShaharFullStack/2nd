@@ -10,7 +10,11 @@
  *   physically positive), so a crossing that consistently lands 300 ms after the beat still pairs;
  * - unpaired beats count as rejected samples, so "no data" is diagnosed, not reported as 0 ms;
  * - the spread threshold (MAD) is ~1.5 camera frames and confidence is graded (0..1) so the
- *   calibration screen can show a meter instead of a bare boolean.
+ *   calibration screen can show a meter instead of a bare boolean;
+ * - the *estimate itself* is checked for plausibility: the pipeline is 80–200 ms, so a median
+ *   offset beyond `LATENCY_MAX_OFFSET_SEC` (0.4 s) means the patient reacted to the click rather
+ *   than anticipating it — using it would shift judgment by a beat or more. It is flagged
+ *   (`implausibleOffset`), never confident, and its confidence is downgraded.
  */
 
 /** One calibration observation: the beat the patient was asked to hit and when the input arrived. */
@@ -35,12 +39,21 @@ export interface LatencyEstimate {
   rejected: number;
   /** Beats that never received an input (subset of `rejected`). */
   unpaired: number;
-  /** Graded confidence 0..1 (min of sample-count, spread and rejection scores; 0.5 = every threshold just met). */
+  /**
+   * Graded confidence 0..1 (min of sample-count, spread, rejection and offset-plausibility scores;
+   * 0.5 = every threshold just met).
+   */
   confidence: number;
   /** Convenience label for the UI: good (>= 0.75), fair (>= 0.5), poor (> 0), none (no accepted samples). */
   quality: LatencyQuality;
   /** True when every threshold is met (equivalent to confidence >= 0.5). */
   confident: boolean;
+  /**
+   * True when |offsetSec| exceeds `maxOffsetSec` (default 0.4 s): the patient moved consistently
+   * late/early rather than the pipeline being slow. Never confident; do not feed such an offset to
+   * the engine — ask the patient to move exactly on the click and repeat.
+   */
+  implausibleOffset: boolean;
 }
 
 export interface LatencyOptions {
@@ -56,6 +69,10 @@ export interface LatencyOptions {
   maxRejectedFraction?: number;
   /** Beats that received no input; counted as rejected (default 0; `calibrateLatency` fills it in). */
   unpaired?: number;
+  /** |offset| fully plausible up to this (default 0.3 s); the offset score declines above it. */
+  plausibleOffsetSec?: number;
+  /** |offset| above this is flagged implausible and never confident (default 0.4 s). */
+  maxOffsetSec?: number;
 }
 
 /** Camera frame period the defaults are tuned for (30 fps). */
@@ -73,6 +90,13 @@ export const LATENCY_MAX_MAD_SEC = 0.05;
  * rejected beats, not 6.
  */
 export const LATENCY_MAX_REJECTED_FRACTION = 1 / 3;
+/** Offsets up to this magnitude are fully plausible pipeline latency (+ a little anticipation error). */
+export const LATENCY_PLAUSIBLE_OFFSET_SEC = 0.3;
+/**
+ * Offsets beyond this magnitude are implausible as pipeline latency (80–200 ms documented): the
+ * patient is reacting to the click instead of moving on it. At 120 bpm 0.4 s is most of a beat.
+ */
+export const LATENCY_MAX_OFFSET_SEC = 0.4;
 /** Recommended metronome tempo for the calibration screen (beat interval 1 s ≫ pipeline latency). */
 export const CALIBRATION_BPM_RECOMMENDED = 60;
 export const CALIBRATION_BEATS_RECOMMENDED = 16;
@@ -113,6 +137,8 @@ export function estimateLatency(pairs: readonly LatencySample[], opts: LatencyOp
   const maxMad = opts.maxMadSec ?? LATENCY_MAX_MAD_SEC;
   const maxRejected = opts.maxRejectedFraction ?? LATENCY_MAX_REJECTED_FRACTION;
   const unpaired = Math.max(0, Math.floor(opts.unpaired ?? 0));
+  const maxOffset = opts.maxOffsetSec ?? LATENCY_MAX_OFFSET_SEC;
+  const plausibleOffset = Math.min(maxOffset, opts.plausibleOffsetSec ?? LATENCY_PLAUSIBLE_OFFSET_SEC);
 
   // pass 1: plausibility
   const plausible: number[] = [];
@@ -140,8 +166,14 @@ export function estimateLatency(pairs: readonly LatencySample[], opts: LatencyOp
   const sampleScore = samples === 0 ? 0 : clamp01(samples / (2 * minSamples));
   const spreadScore = samples === 0 ? 0 : clamp01(1 - madSec / (2 * maxMad));
   const rejectScore = samples === 0 ? 0 : clamp01(1 - rejectedFraction / (2 * maxRejected));
-  const confidence = Math.min(sampleScore, spreadScore, rejectScore);
-  const confident = samples >= minSamples && madSec <= maxMad && rejectedFraction <= maxRejected;
+  // plausibility of the estimate itself: 1 up to plausibleOffset, 0.5 at maxOffset, 0 at 2*maxOffset - plausibleOffset
+  const absOffset = Math.abs(offsetSec);
+  const implausibleOffset = samples > 0 && absOffset > maxOffset + 1e-9;
+  const ramp = Math.max(1e-9, maxOffset - plausibleOffset);
+  const offsetScore = samples === 0 ? 0 : clamp01(1 - 0.5 * Math.max(0, absOffset - plausibleOffset) / ramp);
+  const confidence = Math.min(sampleScore, spreadScore, rejectScore, offsetScore);
+  const confident = samples >= minSamples && madSec <= maxMad && rejectedFraction <= maxRejected && !implausibleOffset;
+  const quality: LatencyQuality = implausibleOffset ? 'poor' : qualityForConfidence(confidence, samples);
 
   return {
     offsetSec,
@@ -151,8 +183,9 @@ export function estimateLatency(pairs: readonly LatencySample[], opts: LatencyOp
     rejected,
     unpaired,
     confidence,
-    quality: qualityForConfidence(confidence, samples),
+    quality,
     confident,
+    implausibleOffset,
   };
 }
 

@@ -52,34 +52,46 @@ describe('Highway construction / resize', () => {
     const canvas = createMockCanvas(300, 150);
     canvas.clientWidth = 0;
     canvas.clientHeight = 0;
+    // Constructed at DPR 1 (jsdom): attribute size is the backing store → logical 300x150.
     const hw = new Highway(canvas, { createCanvas: mockCanvasFactory() });
-    hw.resize(undefined, undefined, 2);
-    hw.resize(undefined, undefined, 2);
-    hw.resize(undefined, undefined, 2);
-    // Attribute size is the backing store; logical = 150x75 at DPR 2.
+    expect(hw.size).toEqual({ width: 300, height: 150, dpr: 1 });
     expect(canvas.width).toBe(300);
-    expect(canvas.height).toBe(150);
-    expect(hw.geometry.width).toBe(150);
-    expect(hw.size).toEqual({ width: 150, height: 75, dpr: 2 });
-    // Explicit logical size still wins and is stable across further no-arg calls.
-    hw.resize(300, 150, 2);
-    expect(canvas.width).toBe(600);
+    // DPR changes to 2: the logical size is kept, the backing store becomes 600 — once.
     hw.resize(undefined, undefined, 2);
     hw.resize(undefined, undefined, 2);
+    hw.resize(undefined, undefined, 2);
+    hw.resize();
+    hw.resize(undefined, undefined, 2);
     expect(canvas.width).toBe(600);
+    expect(canvas.height).toBe(300);
     expect(hw.geometry.width).toBe(300);
+    expect(hw.size).toEqual({ width: 300, height: 150, dpr: 2 });
+    // Explicit logical size wins and stays stable across further no-arg calls.
+    hw.resize(200, 100, 2);
+    hw.resize(undefined, undefined, 2);
+    hw.resize(undefined, undefined, 2);
+    expect(canvas.width).toBe(400);
+    expect(hw.geometry.width).toBe(200);
   });
 
-  it('accepts an OffscreenCanvas-like target (no client size) at DPR 2 without double scaling', () => {
-    const canvas = createMockCanvas(1920, 1080);
-    canvas.clientWidth = 0;
-    canvas.clientHeight = 0;
-    const hw = new Highway(canvas, { createCanvas: mockCanvasFactory() });
-    hw.resize(undefined, undefined, 2);
-    expect(canvas.width).toBe(1920);
-    expect(canvas.height).toBe(1080);
-    expect(hw.geometry.width).toBe(960);
-    expect(() => hw.draw(makeFrame({ lanes: LANES }))).not.toThrow();
+  it('accepts an OffscreenCanvas-like target (no client size) on a DPR 2 main thread without double scaling', () => {
+    const desc = Object.getOwnPropertyDescriptor(window, 'devicePixelRatio');
+    Object.defineProperty(window, 'devicePixelRatio', { value: 2, configurable: true, writable: true });
+    try {
+      const canvas = createMockCanvas(1920, 1080);
+      canvas.clientWidth = 0;
+      canvas.clientHeight = 0;
+      const hw = new Highway(canvas, { createCanvas: mockCanvasFactory() });
+      hw.resize();
+      hw.resize();
+      expect(canvas.width).toBe(1920);
+      expect(canvas.height).toBe(1080);
+      expect(hw.size).toEqual({ width: 960, height: 540, dpr: 2 });
+      expect(hw.geometry.width).toBe(960);
+      expect(() => hw.draw(makeFrame({ lanes: LANES }))).not.toThrow();
+    } finally {
+      if (desc) Object.defineProperty(window, 'devicePixelRatio', desc);
+    }
   });
 
   it('accepts LaneState objects straight from an InputSource (tracking optional, extra lane field)', () => {
@@ -337,8 +349,9 @@ describe('Highway.draw', () => {
   });
 
   it('re-sizes lane labels when the lane count changes on a reused instance', () => {
-    const { hw, scratch } = setup(1280, 720);
-    hw.resize(1280, 720, 1);
+    // Small canvas: the label size is driven by lane width rather than the 22px cap.
+    const { hw, scratch } = setup(640, 360);
+    hw.resize(640, 360, 1);
     const fontFor = (): string => {
       const c = scratch.filter((s) => s.ctx.calls.some((k) => k.name === 'fillText' && k.args[0] === 'L knee lift')).pop();
       return String(c?.ctx.props.font);

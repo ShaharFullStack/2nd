@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { LatencyProbe, clickSchedule, computeProbeResult, diagnoseCalibration, diagnosisMessage } from './latencyProbe';
-import { CALIBRATION_BPM_RECOMMENDED, calibrateLatency } from '../engine/latency';
+import { CALIBRATION_BPM_RECOMMENDED, LATENCY_MAX_REJECTED_FRACTION, calibrateLatency } from '../engine/latency';
 
 describe('clickSchedule', () => {
   it('spaces clicks by 60/bpm from the start time', () => {
@@ -76,13 +76,19 @@ describe('computeProbeResult (delegates to engine calibrateLatency)', () => {
   });
 
   it('diagnoses outlier-heavy runs', () => {
-    // 10 tight samples, 6 far-off (>0.25 s from the median but inside the late window)
-    const inputs = clicks.map((t, i) => t + (i < 10 ? 0.1 : 0.7));
+    // the smallest number of far-off inputs (>0.25 s from the median but inside the late window)
+    // that exceeds the engine's rejected-fraction threshold — derived from the constant so this
+    // test tracks the engine's definition instead of hard-coding it
+    const outliers = Math.floor(clicks.length * LATENCY_MAX_REJECTED_FRACTION) + 1;
+    const tight = clicks.length - outliers;
+    expect(outliers / clicks.length).toBeGreaterThan(LATENCY_MAX_REJECTED_FRACTION);
+    expect(tight).toBeGreaterThanOrEqual(6); // still enough tight samples that "too-few" does not fire
+    const inputs = clicks.map((t, i) => t + (i < tight ? 0.1 : 0.7));
     const r = computeProbeResult(clicks, inputs);
-    expect(r.samples).toBe(10);
-    expect(r.rejected).toBe(6);
+    expect(r.samples).toBe(tight);
+    expect(r.rejected).toBe(outliers);
     expect(r.confident).toBe(false);
-    expect(diagnoseCalibration(r, 16)).toBe('too-many-outliers');
+    expect(diagnoseCalibration(r, clicks.length)).toBe('too-many-outliers');
   });
 
   it('every diagnosis has a message', () => {

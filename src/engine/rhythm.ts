@@ -104,11 +104,14 @@ export class RhythmEngine {
 
   /**
    * Judge an input event (ctx-timestamped). Returns the HitEvent (already applied to scoring) or
-   * null when it matched no note. Ignored while the clock is not running.
+   * null when it matched no note. Ignored while the clock is idle; while paused, events stamped
+   * before the pause point are still judged (a camera crossing captured just before `pause()` and
+   * delivered ~100 ms later must not lose its rep), later stamps are ignored.
    */
   handleInput(e: LaneInputEvent): HitEvent | null {
-    if (!this.clock.isRunning()) return null;
-    const hit = this.judge.onInput(e.lane, this.clock.songTime(e.ctxTime));
+    const songTime = this.clock.songTimeOf(e.ctxTime);
+    if (songTime === null) return null;
+    const hit = this.judge.onInput(e.lane, songTime);
     if (hit) this.lastHit = this.scoring.apply(hit);
     return hit;
   }

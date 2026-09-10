@@ -61,7 +61,7 @@ export const DEFAULT_HIGHWAY_OPTIONS: HighwayOptions = {
   strikeY: 0.82,
   farScale: 0.28,
   roadWidth: 0.6,
-  pastLineSpeed: 0.55,
+  pastLineSpeed: 0.45,
   highContrast: false,
   showLabels: true,
   showMissPopup: false,
@@ -262,6 +262,8 @@ export class Highway {
     this.displayScore = 0;
     this.healthSmooth = 1;
     this.lastSongTime = null;
+    this.stats.particles = 0;
+    this.stats.notesDrawn = 0;
   }
 
   /**
@@ -791,7 +793,17 @@ export class Highway {
       if (n.state === 'hit') continue;
       if (n.lane < 0 || n.lane >= g.laneCount) continue;
       const d = depthOf(g, n.time, st);
-      if (!isVisibleDepth(g, d)) continue;
+      if (n.state === 'miss') {
+        // Missed gems are culled by fizzle time, not depth (they decelerate while dying, see below).
+        if (d > g.maxDepth) continue;
+        let seenAt = this.seenHits.get(n.id);
+        if (seenAt === undefined) {
+          // No event seen for this miss (state handed to us already missed): fizzle from now.
+          seenAt = st;
+          this.seenHits.set(n.id, st);
+        }
+        if (st - seenAt >= MISS_FIZZLE_SEC) continue;
+      } else if (!isVisibleDepth(g, d)) continue;
       buf.push(n);
     }
     // Far notes first so nearer gems overlap them.
@@ -808,17 +820,15 @@ export class Highway {
       let y = p.y;
       if (missed) {
         // Fizzle driven by time since the engine declared the miss (first frame we saw the event),
-        // not by depth — the verdict can arrive up to ~280 ms after the note time. A miss note we
-        // never saw an event for (e.g. state handed to us already missed) fizzles from now.
-        let seenAt = this.seenHits.get(n.id);
-        if (seenAt === undefined) {
-          seenAt = st;
-          this.seenHits.set(n.id, st);
-        }
+        // not by depth — the verdict can arrive up to ~280 ms after the note time. The gem greys,
+        // shrinks, fades and decelerates (it only keeps 35% of its scroll motion) so the whole
+        // fizzle happens in view instead of below the canvas edge.
+        const seenAt = this.seenHits.get(n.id) ?? st;
         const k = clamp((st - seenAt) / MISS_FIZZLE_SEC, 0, 1);
+        const ySeen = yAt(g, depthOf(g, n.time, seenAt));
+        y = ySeen + (p.y - ySeen) * 0.35 + k * g.gemRadiusNear * 0.4;
         alpha = (1 - k) * 0.9;
         radius *= 1 - k * 0.35;
-        y += k * g.gemRadiusNear * 0.6; // sinks a little as it dies
       } else if (d < 0) {
         // Pending gem past the line: keep full colour (a late hit may still land) but dim gently
         // toward the bottom so it reads as "getting away".

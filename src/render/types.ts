@@ -77,7 +77,7 @@ export interface HighwayOptions {
   /**
    * Screen-space scroll speed below the strike line relative to the speed at the line (0.2..1).
    * Lower keeps gems visible longer past the line so the engine's late miss verdict
-   * (note time + goodMs + grace, up to ~280 ms) still lands on a visible gem. Default 0.55 ≈ ≥400 ms.
+   * (note time + goodMs + grace, up to ~280 ms) still lands on a visible gem. Default 0.45 ≈ ≥500 ms at 720p/1080p, ≥480 ms portrait.
    */
   pastLineSpeed: number;
   /** Use the rehab-friendly high-contrast palette instead of Guitar Hero colors. */

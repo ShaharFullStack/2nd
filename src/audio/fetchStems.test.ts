@@ -48,9 +48,9 @@ describe('scripts/fetch-stems.mjs against a local HTTP server', () => {
         flakyHits++;
         if (flakyHits === 1) { res.writeHead(503); res.end('busy'); return; }
         res.writeHead(200, { 'content-type': 'audio/wav', 'content-length': String(WAV.length) });
-        // stream in two chunks with a short gap: slow-but-moving must not trip the watchdog
+        // stream in two chunks with a 100 ms gap (10× below the 1 s watchdog): slow-but-moving must not trip it
         res.write(WAV.subarray(0, 1000));
-        setTimeout(() => res.end(WAV.subarray(1000)), 150);
+        setTimeout(() => res.end(WAV.subarray(1000)), 100);
         return;
       }
       if (url === '/stall.wav') { res.writeHead(200, { 'content-type': 'audio/wav', 'content-length': '999999' }); res.write('R'); stalled.push(res); return; }
@@ -87,15 +87,15 @@ describe('scripts/fetch-stems.mjs against a local HTTP server', () => {
   });
 
   it('downloads, skips existing + placeholders, retries a failed attempt, aborts a stalled one, rejects HTML', async () => {
-    const { status, out } = await run(['--root', root, '--retries', '1', '--timeout', '0.4']);
+    const { status, out } = await run(['--root', root, '--retries', '1', '--timeout', '1']);
     expect(status).toBe(1); // stall + page failed
     expect(out).toContain('"Song" by Someone (ccmixter.org) is licensed under CC BY 4.0');
     expect(out).toMatch(/ok: downloaded .* -> stems\/ok\.wav/);
     expect(out).toMatch(/attempt 1 failed \(HTTP 503/);
     expect(out).toMatch(/flaky: downloaded .* -> stems\/flaky\.wav/);
     expect(out).toContain('have: exists (stems/have.wav), skipping');
-    expect(out).toMatch(/attempt 1 failed \(transfer stalled after 400 ms\)/);
-    expect(out).toMatch(/stall: FAILED .*transfer stalled after 400 ms/);
+    expect(out).toMatch(/attempt 1 failed \(transfer stalled after 1000 ms\)/);
+    expect(out).toMatch(/stall: FAILED .*transfer stalled after 1000 ms/);
     expect(out).toMatch(/page: FAILED .*HTML page/);
     expect(out).toContain('todo: placeholder URL');
     expect(out).toContain('2 stem(s) failed to download.');
@@ -113,11 +113,11 @@ describe('scripts/fetch-stems.mjs against a local HTTP server', () => {
 
   it('second run skips what it already has; --force re-downloads', async () => {
     const before = fs.statSync(path.join(root, 'cc-song', 'stems', 'ok.wav')).mtimeMs;
-    const again = await run(['--root', root, '--song', 'cc-song', '--retries', '0', '--timeout', '0.3']);
+    const again = await run(['--root', root, '--song', 'cc-song', '--retries', '0', '--timeout', '1']);
     expect(again.out).toContain('ok: exists (stems/ok.wav), skipping');
     expect(again.out).toContain('flaky: exists (stems/flaky.wav), skipping');
     expect(fs.statSync(path.join(root, 'cc-song', 'stems', 'ok.wav')).mtimeMs).toBe(before);
-    const forced = await run(['--root', root, '--song', 'cc-song', '--force', '--retries', '0', '--timeout', '0.3']);
+    const forced = await run(['--root', root, '--song', 'cc-song', '--force', '--retries', '0', '--timeout', '1']);
     expect(forced.out).toMatch(/ok: downloaded/);
     expect(forced.out).toMatch(/have: downloaded/); // --force overwrites the placeholder file with the real stem
     expect(fs.readFileSync(path.join(root, 'cc-song', 'stems', 'have.wav')).equals(WAV)).toBe(true);

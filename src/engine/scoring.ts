@@ -17,7 +17,19 @@ export function multiplierForCombo(combo: number): number {
   return Math.max(1, m);
 }
 
-/** Star rating 0..5 from hit accuracy (0..1). */
+/** Weight of a 'good' hit relative to a 'perfect' in the star rating (a run of goods is 3 stars, not 5). */
+export const GOOD_STAR_WEIGHT = 0.75;
+
+/**
+ * Accuracy used for the star rating: (perfects + GOOD_STAR_WEIGHT * goods) / judged. Sits between
+ * plain accuracy (hits / judged) and `weightedAccuracy` (goods count half) so timing quality shows
+ * in the stars without making a consistently-'good' rehab session look like a failure.
+ */
+export function starAccuracyOf(perfects: number, goods: number, judged: number): number {
+  return judged > 0 ? (perfects + GOOD_STAR_WEIGHT * goods) / judged : 0;
+}
+
+/** Star rating 0..5 from an accuracy in 0..1 (feed it `starAccuracy`, see `starAccuracyOf`). */
 export function starsForAccuracy(accuracy: number): number {
   if (!Number.isFinite(accuracy)) return 0;
   if (accuracy >= 0.95) return 5;
@@ -62,6 +74,9 @@ export interface ScoreState {
   judged: number;
   accuracy: number;
   weightedAccuracy: number;
+  /** (perfects + 0.75*goods) / judged — the input of `stars`. */
+  starAccuracy: number;
+  /** 0..5 from `starAccuracy` (100 % perfect = 5, 100 % good = 3). */
   stars: number;
   meanDeltaMs: number;
   stdDeltaMs: number;
@@ -181,6 +196,7 @@ export class Scoring {
     const t = this.total;
     const judged = t.hits + t.misses;
     const accuracy = judged > 0 ? t.hits / judged : 0;
+    const starAccuracy = starAccuracyOf(t.perfects, t.goods, judged);
     return {
       score: this.score,
       combo: this.combo,
@@ -195,7 +211,8 @@ export class Scoring {
       judged,
       accuracy,
       weightedAccuracy: judged > 0 ? (t.perfects + 0.5 * t.goods) / judged : 0,
-      stars: starsForAccuracy(accuracy),
+      starAccuracy,
+      stars: starsForAccuracy(starAccuracy),
       meanDeltaMs: t.mean,
       stdDeltaMs: std(t),
       lanes: this.lanes.map((a, lane) => {

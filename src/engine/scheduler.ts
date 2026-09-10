@@ -82,6 +82,17 @@ export class SongClock {
     return t - this.startCtx - this.pausedTotal + this.avOffsetSec;
   }
 
+  /**
+   * Song time at which the event stamped `ctxTime` occurred, for events delivered late (e.g. a camera
+   * crossing stamped before `pause()` but delivered after it). Unlike `songTime`, a paused clock still
+   * maps stamps up to the pause point; returns null while idle or for stamps after the pause point.
+   */
+  songTimeOf(ctxTime: number): number | null {
+    if (this.state === 'idle') return null;
+    if (this.state === 'paused' && ctxTime > this.pausedAtCtx) return null;
+    return ctxTime - this.startCtx - this.pausedTotal + this.avOffsetSec;
+  }
+
   /** AudioContext time at which song time `songTime` will occur (valid while running or paused). */
   ctxTimeForSongTime(songTime: number): number {
     return songTime - this.avOffsetSec + this.startCtx + this.pausedTotal;
@@ -128,6 +139,8 @@ export class NoteCursor {
   /** Chart notes sorted by time (a copy; the chart itself is not mutated). */
   readonly notes: readonly Note[];
   readonly chart: Chart;
+  /** The `chart.notes` array the sorted copy was taken from (staleness check for `visibleNotes`). */
+  readonly sourceNotes: readonly Note[];
   private head = 0;
   private tailSec: number;
   private readonly range: NoteRange = { start: 0, end: 0 };
@@ -138,6 +151,7 @@ export class NoteCursor {
    */
   constructor(chart: Chart, tailSec = 0.5) {
     this.chart = chart;
+    this.sourceNotes = chart.notes;
     this.notes = chart.notes.slice().sort((a, b) => a.time - b.time || a.id - b.id);
     this.tailSec = tailSec;
   }
@@ -198,17 +212,25 @@ const cursorByChart = new WeakMap<Chart, NoteCursor>();
 
 /**
  * Visible notes for a frame — the spec signature `visibleNotes(chart, songTime, lookaheadSec)`.
- * The moving cursor is kept per chart (WeakMap) so repeated calls with the same chart are amortized
- * O(1); notes within `tailSec` (default 0.5 s) after their time are included so hit/miss animations
- * can draw them. Pass a `NoteCursor` instead of a chart to control the tail explicitly, and `out` to
- * avoid per-frame allocation.
+ *
+ * Convenience form: when given a Chart, ONE cursor per chart object is kept in a WeakMap, so this
+ * is amortized O(1) only for a single consumer that advances monotonically. Two consumers (e.g. the
+ * highway and a preview strip) polling the same chart at different song times make the shared
+ * cursor seek back and forth every frame — give each its own `NoteCursor` (or use
+ * `RhythmEngine.cursor`, the intended per-consumer path) and pass it here instead. The cached
+ * cursor snapshots `chart.notes` at first use; if the notes array is later replaced or its length
+ * changes the cursor is rebuilt, but in-place edits of note times are not detected — build a new
+ * NoteCursor after editing a chart.
+ *
+ * Notes within `tailSec` (default 0.5 s) after their time are included so hit/miss animations can
+ * draw them. Pass `out` to avoid per-frame allocation.
  */
 export function visibleNotes(source: Chart | NoteCursor, songTime: number, lookaheadSec: number, out?: Note[]): Note[] {
   let cursor: NoteCursor;
   if (source instanceof NoteCursor) cursor = source;
   else {
     let c = cursorByChart.get(source);
-    if (!c) {
+    if (!c || c.sourceNotes !== source.notes || c.notes.length !== source.notes.length) {
       c = new NoteCursor(source);
       cursorByChart.set(source, c);
     }
