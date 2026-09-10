@@ -1,5 +1,5 @@
 {
- "updated": "2026-09-10T13:31Z",
+ "updated": "2026-09-10T20:25Z",
  "pieces": {
   "engine": {
    "round": 5,
@@ -23,8 +23,8 @@
   },
   "highway": {
    "round": 1,
-   "status": "blind round 1",
-   "note": "Blind loop round 1: three independent judges rank five unlabelled rhythm-game frames (three ours, two shipped games) without being told whic"
+   "status": "blind round 2",
+   "note": "Blind round 1: ours ranked 2.56 vs shipped games 1.17 (lower is better); 1 of 3 judges put one of ours first. Unanimous deficit: the play fi"
   }
  },
  "entries": [
@@ -123,6 +123,12 @@
    "piece": "highway",
    "kind": "info",
    "text": "Blind loop round 1: three independent judges rank five unlabelled rhythm-game frames (three ours, two shipped games) without being told which is which."
+  },
+  {
+   "time": "2026-09-10T20:25Z",
+   "piece": "highway",
+   "kind": "fail",
+   "text": "Blind round 1: ours ranked 2.56 vs shipped games 1.17 (lower is better); 1 of 3 judges put one of ours first. Unanimous deficit: the play field was a postage stamp — vanishing point at 35% of frame height, strike line at 78%, only 2-4 gems on screen, ~55% dead space. Round 2 fix: road now runs near-full height with lane tints and a wider strike line."
   }
  ]
 }
