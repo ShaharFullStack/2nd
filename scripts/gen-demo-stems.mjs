@@ -10,7 +10,13 @@
 // usage: node scripts/gen-demo-stems.mjs [--out public/songs] [--song demo-groove|demo-sunrise|all] [--bars N]
 //   --bars N  overrides the song length (used by the unit tests to render a short excerpt)
 //
-// Everything here is deterministic (seeded PRNG) so re-running produces identical files.
+// Signal chain per stem: synthesis (drums / bass / keys / lead) → a fixed Schroeder reverb send
+// on keys and lead only (`reverbWet`; drums and bass stay dry so the timing reference the patient
+// plays against keeps its transients) → RMS-matched mastering with a tanh soft clipper and a peak
+// ceiling (`master`) → optional anti-aliased downsample (`--rate`) → 16-bit PCM.
+//
+// Everything here is deterministic (seeded PRNG, no RNG in the reverb) so re-running produces
+// identical files.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -199,6 +205,67 @@ function epNote(buf, t0, dur, hz, gain = 1) {
   }
 }
 
+/**
+ * Fixed mono Schroeder reverb: 4 parallel combs (mutually prime delays, one-pole damping in the
+ * feedback) into 2 series allpasses. Deterministic, no dependencies, ~2 passes over the stem.
+ *
+ * Why it is here: every voice above is a dry synth patch, and dryness is the single biggest tell
+ * that a demo is a synth demo rather than a record. The send is applied to KEYS and LEAD only —
+ * the drums are the player stem and the timing reference the patient plays against, so smearing
+ * their transients would trade the one thing the game cannot afford for a bit of polish, and the
+ * bass stays dry to keep the low end tight.
+ */
+export const REVERB_COMB_SEC = [0.0297, 0.0371, 0.0411, 0.0437];
+export const REVERB_ALLPASS_SEC = [0.005, 0.0017];
+const REVERB_ALLPASS_G = 0.7;
+
+/** Wet signal of `x` (same length; the tail is cut off with the buffer, which has TAIL_SEC spare). */
+export function reverbWet(x, { rt60 = 1.6, preDelaySec = 0.02, damp = 0.35 } = {}) {
+  const n = x.length;
+  const pre = Math.round(preDelaySec * SR);
+  const wet = new Float32Array(n);
+  for (const dSec of REVERB_COMB_SEC) {
+    const d = Math.max(1, Math.round(dSec * SR));
+    const g = Math.pow(10, (-3 * dSec) / rt60); // feedback for the requested RT60
+    const line = new Float32Array(d);
+    let idx = 0;
+    let lp = 0;
+    for (let i = 0; i < n; i++) {
+      const y = (i >= pre ? x[i - pre] : 0) + g * line[idx];
+      lp = y * (1 - damp) + lp * damp; // darker with every pass round the loop, like a real room
+      line[idx] = lp;
+      idx = idx + 1 === d ? 0 : idx + 1;
+      wet[i] += y * 0.25;
+    }
+  }
+  for (const dSec of REVERB_ALLPASS_SEC) {
+    const d = Math.max(1, Math.round(dSec * SR));
+    const line = new Float32Array(d);
+    let idx = 0;
+    for (let i = 0; i < n; i++) {
+      const v = line[idx];
+      const y = -REVERB_ALLPASS_G * wet[i] + v;
+      line[idx] = wet[i] + REVERB_ALLPASS_G * y;
+      idx = idx + 1 === d ? 0 : idx + 1;
+      wet[i] = y;
+    }
+  }
+  return wet;
+}
+
+/** Mix `mix` of the reverb of `buf` back into `buf` (in place). */
+export function applyReverb(buf, opts) {
+  const wet = reverbWet(buf, opts);
+  const mix = opts.mix;
+  for (let i = 0; i < buf.length; i++) buf[i] += mix * wet[i];
+}
+
+/** Per-stem reverb send (see `reverbWet`); stems not listed stay dry. */
+const STEM_REVERB = {
+  keys: { rt60: 1.9, mix: 0.3, preDelaySec: 0.02, damp: 0.4 },
+  lead: { rt60: 1.35, mix: 0.22, preDelaySec: 0.03, damp: 0.3 },
+};
+
 // ---------------------------------------------------------------------------
 // song definitions
 // ---------------------------------------------------------------------------
@@ -344,15 +411,39 @@ function renderBass(song, ctx) {
   }
 }
 
+/** Highest MIDI note the keys voicing folds down to (G4) — keeps the chords compact around C4. */
+export const KEYS_VOICING_CEILING = 67;
+
+/**
+ * Keys voicing: the chord two octaves above the bass register, with tones above `ceiling` folded
+ * down an octave — UNLESS the fold lands on a note the voicing already has, in which case the
+ * open tone is kept.
+ *
+ * `synthNote` starts every detuned saw at phase 0, so two voices struck on the same pitch at the
+ * same instant sum coherently: a folded unison comes out ~6 dB above the rest of the chord. C
+ * major ([0,4,7,12] over root 36) used to voice as 60,64,67,60 and shouted its root in every
+ * third bar of demo-groove's progression. An octave at the top is a voicing; a unison is a
+ * mixing accident.
+ */
+export function voiceChord(chord, ceiling = KEYS_VOICING_CEILING) {
+  const voicingRoot = chord.root + 24;
+  const out = [];
+  for (const iv of chord.tones) {
+    const open = voicingRoot + iv;
+    let m = open;
+    while (m > ceiling) m -= 12;
+    out.push(out.includes(m) ? open : m);
+  }
+  return out;
+}
+
 function renderKeys(song, ctx) {
   const { buf, stepSec, bars, barSec, swing, progression } = ctx;
   const funk = song.style === 'funk';
   const at = (bar, step) => bar * barSec + step * stepSec + (swing && step % 2 === 1 ? stepSec * swing : 0);
   for (let bar = 0; bar < bars; bar++) {
     const chord = progression[bar % progression.length];
-    const voicingRoot = chord.root + 24; // two octaves above the bass register
-    // keep voicings compact around C4: drop tones above ~G4 down an octave
-    const tones = chord.tones.map((iv) => { let m = voicingRoot + iv; while (m > 67) m -= 12; return m; });
+    const tones = voiceChord(chord);
     if (funk) {
       const hits = bar % 2 === 0 ? [[0, 6], [7, 1.5], [10, 2], [14, 2]] : [[0, 3], [3, 1], [6, 2], [10, 1.5], [12, 4]];
       for (const [s, len] of hits) {
@@ -517,7 +608,11 @@ export function encodeWav16(samples, sampleRate = SR) {
   out.write('data', 36);
   out.writeUInt32LE(n * 2, 40);
   for (let i = 0; i < n; i++) {
-    const s = Math.max(-1, Math.min(1, samples[i]));
+    const v = samples[i];
+    // Buffer.writeInt16LE coerces NaN/Infinity to 0 without complaining, so a numerically broken
+    // render used to be written out as *silence* rather than as an error. Fail loudly instead.
+    if (!Number.isFinite(v)) throw new Error(`encodeWav16: sample ${i} is ${v}, not a finite number`);
+    const s = Math.max(-1, Math.min(1, v));
     out.writeInt16LE(Math.round(s * 32767), 44 + i * 2);
   }
   return out;
@@ -556,6 +651,7 @@ export function renderSong(songId, { bars: barsOverride } = {}) {
     const buf = new Float32Array(totalSamples);
     const rnd = mulberry32(stemSeed(song.seed, stemId));
     RENDERERS[stemId](song, { buf, rnd, stepSec, bars, barSec, swing, progression: song.progression });
+    if (STEM_REVERB[stemId]) applyReverb(buf, STEM_REVERB[stemId]);
     const mix = STEM_MIX[stemId];
     // per-song trim, applied as a loudness offset (mix 1.25 → +1.9 dB)
     master(buf, { ...mix, rmsDb: mix.rmsDb + linToDb(song.mix?.[stemId] ?? 1) });
@@ -590,21 +686,69 @@ export function renderSong(songId, { bars: barsOverride } = {}) {
 }
 
 /**
- * Anti-aliased downsample (linear interpolation behind a 4-pole lowpass at 0.42×`toRate`).
- * Bandwidth reduction is the only size lever available here: the repo may not add dependencies,
- * and Node ships no Vorbis/Opus/MP3 encoder, so a compressed variant cannot be produced in-repo
- * (see public/songs/ccmixter-README.md for the ffmpeg one-liner).
+ * One RBJ-cookbook lowpass biquad, transposed direct form II, in float64.
+ *
+ * The anti-alias filter deliberately does NOT reuse the voice-synthesis `SVF`: that is a
+ * Chamberlin state-variable filter, which is only stable while `2·sin(π·fc/SR) < 2 − damp`.
+ * At the cutoffs a downsample needs (0.42 × 22050 Hz = 9.3 kHz against a 44.1 kHz SR, i.e.
+ * f = 1.20 against a limit of 0.8) it diverges instead of filtering — see `RESAMPLE_Q`.
+ * A biquad is unconditionally stable for any cutoff below Nyquist, so `--rate` is safe at
+ * every rate the CLI accepts.
+ */
+function biquadLowpass(fc, sr, q) {
+  const w0 = (2 * Math.PI * Math.min(fc, 0.49 * sr)) / sr;
+  const cw = Math.cos(w0);
+  const alpha = Math.sin(w0) / (2 * q);
+  const a0 = 1 + alpha;
+  const b0 = ((1 - cw) / 2) / a0;
+  const b1 = (1 - cw) / a0;
+  const b2 = b0;
+  const a1 = (-2 * cw) / a0;
+  const a2 = (1 - alpha) / a0;
+  let z1 = 0;
+  let z2 = 0;
+  return (x) => {
+    const y = b0 * x + z1;
+    z1 = b1 * x - a1 * y + z2;
+    z2 = b2 * x - a2 * y;
+    return y;
+  };
+}
+
+/**
+ * Q values of the two cascaded biquads that make a 4th-order Butterworth lowpass
+ * (1/(2·cos(π/8)) and 1/(2·cos(3π/8))): maximally flat passband, so the filter cannot add a
+ * resonant bump on top of an already-mastered stem.
+ */
+export const RESAMPLE_Q = [0.541196100146197, 1.3065629648763764];
+/** Anti-alias cutoff as a fraction of the target rate (0.42 × rate = 0.84 × target Nyquist). */
+export const RESAMPLE_CUTOFF_FRACTION = 0.42;
+
+/**
+ * Anti-aliased downsample: linear interpolation behind a 4th-order Butterworth lowpass at
+ * `RESAMPLE_CUTOFF_FRACTION` × `toRate`. Bandwidth reduction is the only size lever available
+ * here: the repo may not add dependencies, and Node ships no Vorbis/Opus/MP3 encoder, so a
+ * compressed variant cannot be produced in-repo (see public/songs/ccmixter-README.md for the
+ * ffmpeg one-liner).
+ *
+ * Guarantees, both asserted by genDemoStems.test.ts because the `--rate` build is what the README
+ * tells a clinic on slow Wi-Fi to run:
+ *  - every output sample is finite (a diverging filter used to reach float32 overflow and then
+ *    NaN, which `Buffer.writeInt16LE` coerces to 0 — a silent stem that nothing complained about);
+ *  - the output peak never exceeds the input peak, so a mastered stem cannot be pushed through
+ *    full scale by filter/interpolation overshoot and hard-clipped by `encodeWav16`, and the
+ *    peak in `masteringReport` stays true of the file actually written.
  */
 export function resample(buf, fromRate, toRate) {
   if (toRate === fromRate) return buf;
   if (!(toRate > 0) || !Number.isFinite(toRate)) throw new Error(`invalid rate ${toRate}`);
   let src = buf;
   if (toRate < fromRate) {
-    const fc = 0.42 * toRate;
-    const a = new SVF();
-    const b = new SVF();
+    const fc = RESAMPLE_CUTOFF_FRACTION * toRate;
+    const s1 = biquadLowpass(fc, fromRate, RESAMPLE_Q[0]);
+    const s2 = biquadLowpass(fc, fromRate, RESAMPLE_Q[1]);
     src = new Float32Array(buf.length);
-    for (let i = 0; i < buf.length; i++) src[i] = b.run(a.run(buf[i], fc, 1.2), fc, 1.2);
+    for (let i = 0; i < buf.length; i++) src[i] = s2(s1(buf[i]));
   }
   const n = Math.max(1, Math.round((buf.length * toRate) / fromRate));
   const out = new Float32Array(n);
@@ -615,6 +759,14 @@ export function resample(buf, fromRate, toRate) {
     const i1 = Math.min(src.length - 1, i0 + 1);
     const f = x - i0;
     out[i] = src[i0] * (1 - f) + src[i1] * f;
+  }
+  // Butterworth still overshoots a transient in the time domain (~10 % on a step). Trim rather
+  // than let encodeWav16 hard-clip the peaks of the player stem.
+  const inPeak = peakOf(buf);
+  const outPeak = peakOf(out);
+  if (inPeak > 0 && outPeak > inPeak) {
+    const g = inPeak / outPeak;
+    for (let i = 0; i < n; i++) out[i] *= g;
   }
   return out;
 }

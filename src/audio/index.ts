@@ -13,29 +13,42 @@
  * const manifest = catalog[0].manifest!;
  * showAttribution(attributionText(manifest));    // required in song select AND results
  *
- * // 3. load + play
+ * // 3. load (song select can already audition it: playPreview() never moves the transport)
  * await mixer.loadSong(manifest, '/songs', (p) => setProgress(p.fraction));
- * const startCtxTime = mixer.play();             // the ctx time the audio thread actually honoured
- * engine.start(startCtxTime);                    // drive the engine SongClock with this exact value
+ * mixer.playPreview();                           // …and mixer.isPreviewing while it runs
+ *
+ * // 4. play
+ * mixer.play();                                  // starts at song time 0, preview or not
+ * engine.start(mixer.getSongStartCtxTime());     // ctx time of song time 0 — right after ANY
+ * //                                                transport call (play/seek/preview/stop)
  * // …and on the therapist's pause button:
  * engine.pause(mixer.pause()!);  engine.resume((await mixer.resume())!);
  *
- * // 4. per judgment
+ * // 5. per judgment
  * mixer.onHit(combo);  sfx.play('perfect', undefined, { lane });
  * mixer.onMiss();      sfx.play('miss');
  *
- * // 5. clocks
+ * // 6. clocks
  * mixer.songTime()        // what the graph is producing — judge against this
  * mixer.displaySongTime() // what the listener hears (songTime − outputLatencySec) — DRAW this
  * ```
  *
- * Four things that are easy to get wrong:
+ * Five things that are easy to get wrong:
  *  - **Charting a swung song.** Take note times from `stepTimeSec(manifest, step)`, not from
  *    `offset + step × beat/4`: `demo-sunrise` publishes `swing: 1/3`, so its odd 16ths are 50 ms
- *    late. Notes on downbeats and straight 8ths are unaffected either way.
- *  - **SFX routing.** Build them with `mixer.createSfx()`, never `new Sfx(ctx)`. A bare Sfx
- *    connects to `ctx.destination` and bypasses the master limiter, and the music already runs at
- *    a ~0.9 ceiling — the cues would clip on exactly the moments the patient is being rewarded.
+ *    late. Notes on downbeats and straight 8ths are unaffected either way. Nothing downstream can
+ *    notice the mistake on its own (`Note` carries no swing), so assert it once where the chart is
+ *    built: `assertChartOnGrid(manifest, chart.notes)` throws with the worst offender, and
+ *    `findOffGridTimes()` returns them all.
+ *  - **Transport order.** `play()` never inherits a position it was not given: it is a no-op while
+ *    already playing, and a preview is unwound when it ends, so "select → preview → Start" begins
+ *    the session at song time 0. Only `play(_, t)` / `seek(t)` move the position. Drive the engine
+ *    clock from `getSongStartCtxTime()` rather than the return value and every order is safe.
+ *  - **SFX and metronome routing.** Build them with `mixer.createSfx()` / `mixer.createLatencyProbe()`,
+ *    never `new Sfx(ctx)` / `new LatencyProbe(ctx)`. Both bare constructors connect to
+ *    `ctx.destination` and bypass the master limiter: the cues would clip on exactly the moments
+ *    the patient is being rewarded (the music already runs at a ~0.91 ceiling), and the calibration
+ *    metronome would be audibly louder than the game the patient walks into next.
  *  - **Rendering vs judging.** Draw `displaySongTime()`, judge `songTime()`. See
  *    `StemMixer.outputLatencySec`. `ctxTimeForSongTime()` is exact and invertible in every
  *    transport state (playing, paused, stopped) and agrees with the engine SongClock, so an

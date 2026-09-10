@@ -4,7 +4,7 @@ import { VisionInput, visionStatusMessage } from './VisionInput.ts';
 import type { LaneInputEvent, LaneRepEvent, CompensationEvent } from './types.ts';
 import type { CameraSession, DetectionResult, LandmarkDetector } from '../vision/mediapipe.ts';
 import { extractFeature, captureCompensationBaseline } from '../vision/features.ts';
-import { handPose, repSequence, seatedPose, seatedPoseWorld, seatedRest } from '../vision/fixtures.ts';
+import { handPose, mirrorPoseLandmarks, repSequence, seatedPose, seatedPoseWorld, seatedRest } from '../vision/fixtures.ts';
 import type { Landmark } from '../vision/landmarks.ts';
 import { RomCalibrator } from '../vision/calibration.ts';
 import type { RomCalibration } from '../vision/calibration.ts';
@@ -428,19 +428,69 @@ describe('VisionInput never awards an unearned hit (rising edge only)', () => {
     input.stop();
   });
 
-  it('(C) recovering from an occlusion with the limb already up scores nothing', async () => {
+  it('(C) recovering from a LONG occlusion with the limb already up scores nothing', async () => {
     const input = make(new FakeClock());
     const events: LaneInputEvent[] = [];
     input.onEvent((e) => events.push(e));
     await input.start();
     input.processDetection({ tMs: 0, pose: seatedRest(), hands: [] }, 0);
-    input.processDetection({ tMs: 0, pose: null, hands: [] }, 0.05); // tracking lost mid-rep
-    input.processDetection({ tMs: 0, pose: seatedPose({ kneeLift: 0.95 }), hands: [] }, 0.1);
+    // Tracking lost for 0.9 s (longer than staleFrameSec): a whole rep could have happened unseen.
+    for (let t = 0.05; t < 0.95; t += 0.05) input.processDetection({ tMs: 0, pose: null, hands: [] }, t);
+    input.processDetection({ tMs: 0, pose: seatedPose({ kneeLift: 0.95 }), hands: [] }, 1);
     expect(events).toHaveLength(0);
     expect(input.getLaneStates()[0].value).toBeGreaterThan(0.9);
-    input.processDetection({ tMs: 0, pose: seatedRest(), hands: [] }, 0.2);
-    input.processDetection({ tMs: 0, pose: seatedPose({ kneeLift: 0.95 }), hands: [] }, 0.25);
+    input.processDetection({ tMs: 0, pose: seatedRest(), hands: [] }, 1.1);
+    input.processDetection({ tMs: 0, pose: seatedPose({ kneeLift: 0.95 }), hands: [] }, 1.15);
     expect(events).toHaveLength(1);
+    input.stop();
+  });
+
+  it('(C-short) ONE low-visibility frame during the rise costs neither the hit nor the rep', async () => {
+    // THE ROUND-3 GAP: a single lane dropout at 35% of ROM used to silently kill the whole rep - no
+    // LaneInputEvent, no LaneRepEvent - while getStatus() still read 'ok'. The patient saw an
+    // unexplained miss and the therapist's rep count under-reported.
+    const input = make(new FakeClock());
+    const events: LaneInputEvent[] = [];
+    const reps: LaneRepEvent[] = [];
+    input.onEvent((e) => events.push(e));
+    input.onRep((r) => reps.push(r));
+    await input.start();
+    input.processDetection({ tMs: 0, pose: seatedRest(), hands: [] }, 0);
+    input.processDetection({ tMs: 0, pose: seatedPose({ kneeLift: 0.35 }), hands: [] }, 1 / 30);
+    input.processDetection({ tMs: 0, pose: null, hands: [] }, 2 / 30); // ONE dropped frame mid-rise
+    input.processDetection({ tMs: 0, pose: seatedPose({ kneeLift: 0.95 }), hands: [] }, 3 / 30);
+    expect(events).toHaveLength(1);
+    // Flagged, not hidden: the crossing time is measured across the dropout.
+    expect(events[0].timingDegraded).toBe(true);
+    expect(events[0].gapSec).toBeCloseTo(2 / 30, 6);
+    expect(events[0].ctxTime).toBeLessThan(3 / 30);
+    expect(events[0].ctxTime).toBeGreaterThan(1 / 30);
+    input.processDetection({ tMs: 0, pose: seatedRest(), hands: [] }, 4 / 30);
+    expect(reps).toHaveLength(1);
+    expect(reps[0]).toMatchObject({ emitted: true, gapped: true });
+    expect(reps[0].truncated).toBeUndefined();
+    input.stop();
+  });
+
+  it('(C-short) a 2%-per-frame lane dropout loses no reps and no hits', async () => {
+    const input = make(new FakeClock());
+    const events: LaneInputEvent[] = [];
+    const reps: LaneRepEvent[] = [];
+    input.onEvent((e) => events.push(e));
+    input.onRep((r) => reps.push(r));
+    await input.start();
+    let seed = 7;
+    const rand = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
+    const repSec = 1.2;
+    const totalReps = 40;
+    for (let i = 0; i / 30 < totalReps * repSec; i++) {
+      const t = i / 30;
+      const lift = 0.5 * (1 - Math.cos((2 * Math.PI * t) / repSec));
+      const pose = rand() < 0.02 ? null : seatedPose({ kneeLift: lift });
+      input.processDetection({ tMs: 0, pose, hands: [] }, t);
+    }
+    expect(events.length).toBe(totalReps);
+    expect(reps.length).toBeGreaterThanOrEqual(totalReps - 1);
     input.stop();
   });
 });
@@ -676,6 +726,34 @@ describe('VisionInput compensation flags describe the rep they are attached to',
     expect(reps[1].compensation?.kind).toBe('heel_lift');
     input.stop();
   });
+
+  it('a dropped frame during the RISE does not erase the compensation already seen on that attempt', async () => {
+    // Same family as the dropped-frame rep loss: the attempt survives the dropout (the arming does), so
+    // the heel lift observed on the way up must survive with it, or the rep is reported clean.
+    const input = make(new FakeClock());
+    const reps: LaneRepEvent[] = [];
+    const events: LaneInputEvent[] = [];
+    input.onRep((r) => reps.push(r));
+    input.onEvent((e) => events.push(e));
+    await input.start();
+    let t = 0;
+    const push = (toeLift: number, heelLift: number) => {
+      input.processDetection({ tMs: 0, pose: seatedPose({ toeLift, heelLift }), hands: [] }, t);
+      t += 1 / 30;
+    };
+    push(0, 0); // observed at rest => armed
+    push(0.5, 1); // rising, heel already up
+    input.processDetection({ tMs: 0, pose: null, hands: [] }, t); // ONE dropped frame mid-rise
+    t += 1 / 30;
+    push(0.9, 1); // crossing
+    push(0, 0); // rep completes
+    expect(events).toHaveLength(1);
+    expect(events[0].compensation?.kind).toBe('heel_lift');
+    expect(reps).toHaveLength(1);
+    expect(reps[0].compensation?.kind).toBe('heel_lift');
+    expect(reps[0].gapped).toBe(true);
+    input.stop();
+  });
 });
 
 describe('VisionInput prescription guards and HUD honesty', () => {
@@ -689,16 +767,24 @@ describe('VisionInput prescription guards and HUD honesty', () => {
       calFor('wrist_extension', 'left', (a) => handPose({ wristExtension: a })),
       calFor('hand_open_close', 'left', (a) => handPose({ openness: a })),
     ];
-    const input = new VisionInput({ mode: 'hand', lanes, calibrations: cals, thresholdFraction: 0.6, audioContext: clock, detector: fakeDetector('hand', []), driveLoop: false, smoothing: { kind: 'none' } });
-    const conflicts = input.getLaneConflicts();
+    const base = { mode: 'hand', lanes, calibrations: cals, thresholdFraction: 0.6, audioContext: clock, driveLoop: false, smoothing: { kind: 'none' } } as const;
+    const refused = new VisionInput({ ...base, detector: fakeDetector('hand', []) });
+    const conflicts = refused.getLaneConflicts();
     expect(conflicts).toHaveLength(1);
     expect(conflicts[0].severity).toBe('error');
     expect(conflicts[0].kind).toBe('posture');
-    expect(input.hasBlockingConflict()).toBe(true);
-    expect(input.getRequiredPostures().map((p) => p.posture)).toEqual(['hand_over_edge', 'palm_to_camera']);
+    expect(refused.hasBlockingConflict()).toBe(true);
+    expect(refused.getRequiredPostures().map((p) => p.posture)).toEqual(['hand_over_edge', 'palm_to_camera']);
+    // AN INPUT SOURCE THAT CANNOT ATTRIBUTE A HIT MUST NOT RUN: start() refuses rather than leaving the
+    // guarantee to a Setup screen that may or may not check.
+    await expect(refused.start()).rejects.toThrow(/unusable lane prescription/);
+    expect(refused.isRunning()).toBe(false);
+    expect(refused.getStatus().reason).toBe('error');
 
     // The reason it is an ERROR: pure wrist-extension reps at CONSTANT hand openness would otherwise
     // score on the hand_open_close lane (a rigid rotation sweeps that 2D feature across its whole range).
+    // Observing that requires the explicit override — which is the point of making it explicit.
+    const input = new VisionInput({ ...base, detector: fakeDetector('hand', []), allowConflictingLanes: true });
     const events: LaneInputEvent[] = [];
     input.onEvent((e) => events.push(e));
     await input.start();
@@ -768,6 +854,297 @@ describe('VisionInput prescription guards and HUD honesty', () => {
     expect(st.inferenceMs).toBe(0); // no "0 fps / 18 ms" on the HUD
     expect(input.getLaneStates()).not.toBe(second); // liveness flipped => fresh (zeroed) states
     expect(input.getLaneStates()[0].value).toBe(0);
+    input.stop();
+  });
+});
+
+describe('VisionInput reports a rep the camera stopped watching, instead of merging it with the recovery', () => {
+  const laneSpec: LaneSpec[] = [{ index: 0, movement: 'seated_march', side: 'left' }];
+  const cal = [calFor('seated_march', 'left', (a) => seatedPose({ kneeLift: a, side: 'left' }))];
+
+  it('flags the rep truncated, ends it at the last frame seen, and scores nothing on recovery', async () => {
+    const clock = new FakeClock();
+    const input = new VisionInput({
+      mode: 'leg', lanes: laneSpec, calibrations: cal, thresholdFraction: 0.6, audioContext: clock,
+      detector: fakeDetector('leg', []), driveLoop: false, smoothing: { kind: 'none' }, staleFrameSec: 0.5,
+    });
+    const events: LaneInputEvent[] = [];
+    const reps: LaneRepEvent[] = [];
+    input.onEvent((e) => events.push(e));
+    input.onRep((r) => reps.push(r));
+    await input.start();
+
+    input.processDetection({ tMs: 0, pose: seatedPose({ kneeLift: 0, side: 'left' }), hands: [] }, 0);
+    for (let i = 1; i <= 5; i++) {
+      input.processDetection({ tMs: i * 33, pose: seatedPose({ kneeLift: 0.9, side: 'left' }), hands: [] }, i / 30);
+    }
+    expect(events).toHaveLength(1); // one earned crossing
+    expect(reps).toHaveLength(0);   // the rep is still open
+
+    // The camera wedges for 8 s with the knee up; the patient rests and re-lifts, unseen.
+    input.processDetection({ tMs: 8000, pose: seatedPose({ kneeLift: 0.9, side: 'left' }), hands: [] }, 8);
+    expect(events).toHaveLength(1); // NOT a rising edge: nothing was observed rising
+    expect(reps).toHaveLength(1);
+    expect(reps[0].truncated).toBe(true);
+    expect(reps[0].endCtxTime).toBeCloseTo(5 / 30, 9); // last frame actually seen, not 8 s later
+    expect(reps[0].peak).toBeGreaterThan(0.6);
+
+    // A genuine rep after the recovery scores normally and is not flagged.
+    input.processDetection({ tMs: 8100, pose: seatedPose({ kneeLift: 0, side: 'left' }), hands: [] }, 8.1);
+    input.processDetection({ tMs: 8200, pose: seatedPose({ kneeLift: 0.9, side: 'left' }), hands: [] }, 8.2);
+    input.processDetection({ tMs: 8300, pose: seatedPose({ kneeLift: 0, side: 'left' }), hands: [] }, 8.3);
+    expect(events).toHaveLength(2);
+    expect(reps).toHaveLength(2);
+    expect(reps[1].truncated).toBeUndefined();
+    input.stop();
+  });
+});
+
+/**
+ * The mirror bug, at the level a therapist would actually meet it: a hemiparetic patient whose AFFECTED
+ * (left) leg is the only one prescribed, on a UI that flips the frames before detection.
+ */
+describe('VisionInput with mirrored frames measures the prescribed limb', () => {
+  const affected: LaneSpec[] = [{ index: 0, movement: 'seated_march', side: 'left' }];
+
+  /** Build the calibration the way the calibration screen would: through the same mirrored config. */
+  function mirroredCal(): RomCalibration {
+    const gen = (a: number) => mirrorPoseLandmarks(seatedPose({ kneeLift: a, side: 'left' }));
+    return {
+      min: extractFeature('seated_march', gen(0), 'left', { mirrored: true })!,
+      max: extractFeature('seated_march', gen(1), 'left', { mirrored: true })!,
+      samples: 1,
+      movement: 'seated_march',
+    };
+  }
+
+  it('scores the affected leg and ignores the unaffected one', async () => {
+    const clock = new FakeClock();
+    const input = new VisionInput({
+      mode: 'leg', lanes: affected, calibrations: [mirroredCal()], thresholdFraction: 0.65,
+      audioContext: clock, detector: fakeDetector('leg', []), driveLoop: false, mirrored: true, smoothing: { kind: 'none' },
+    });
+    const events: LaneInputEvent[] = [];
+    input.onEvent((e) => events.push(e));
+    await input.start();
+
+    // 3 reps of the AFFECTED (left) leg, seen through flipped frames.
+    let peak = 0;
+    for (const { t, amount } of repSequence({ restSec: 1, reps: 3, repDurationSec: 1, amplitude: 0.9 })) {
+      const pose = mirrorPoseLandmarks(seatedPose({ kneeLift: amount, side: 'left' }));
+      input.processDetection({ tMs: t * 1000, pose, hands: [] }, t);
+      peak = Math.max(peak, input.getLaneStates()[0].value);
+    }
+    expect(peak).toBeGreaterThan(0.85); // it USED TO READ A FLAT 0.0 here
+    expect(events).toHaveLength(3);
+
+    // The UNAFFECTED (right) leg working just as hard must score nothing: before the fix this was the
+    // limb the lane was actually reading, so the whole game ran off the good side with no warning.
+    events.length = 0;
+    let unaffectedPeak = 0;
+    for (const { t, amount } of repSequence({ restSec: 1, reps: 3, repDurationSec: 1, amplitude: 1 })) {
+      const pose = mirrorPoseLandmarks(seatedPose({ kneeLift: amount, side: 'right' }));
+      input.processDetection({ tMs: t * 1000, pose, hands: [] }, 100 + t);
+      unaffectedPeak = Math.max(unaffectedPeak, input.getLaneStates()[0].value);
+    }
+    expect(unaffectedPeak).toBeLessThan(0.05);
+    expect(events).toHaveLength(0);
+    input.stop();
+  });
+
+  it('gives the same normalized value mirrored and unmirrored for every leg movement', async () => {
+    const cases = [
+      ['seated_march', (a: number, side: LaneSpec['side']) => seatedPose({ kneeLift: a, side })],
+      ['knee_extension', (a: number, side: LaneSpec['side']) => seatedPose({ kneeExtension: a, side })],
+      ['ankle_dorsiflexion', (a: number, side: LaneSpec['side']) => seatedPose({ toeLift: a, side })],
+      ['hip_abduction', (a: number, side: LaneSpec['side']) => seatedPose({ abduction: a, side })],
+    ] as const;
+    for (const [movement, gen] of cases) {
+      for (const side of ['left', 'right'] as const) {
+        const lanes: LaneSpec[] = [{ index: 0, movement, side }];
+        const raw = new VisionInput({
+          mode: 'leg', lanes, calibrations: [calFor(movement, side, (a) => gen(a, side))], thresholdFraction: 0.65,
+          audioContext: new FakeClock(), detector: fakeDetector('leg', []), driveLoop: false, smoothing: { kind: 'none' },
+        });
+        const mir = new VisionInput({
+          mode: 'leg', lanes, calibrations: [{
+            min: extractFeature(movement, mirrorPoseLandmarks(gen(0, side)), side, { mirrored: true })!,
+            max: extractFeature(movement, mirrorPoseLandmarks(gen(1, side)), side, { mirrored: true })!,
+            samples: 1, movement,
+          }], thresholdFraction: 0.65,
+          audioContext: new FakeClock(), detector: fakeDetector('leg', []), driveLoop: false, mirrored: true, smoothing: { kind: 'none' },
+        });
+        await raw.start();
+        await mir.start();
+        for (const amount of [0, 0.4, 0.8, 1]) {
+          raw.processDetection({ tMs: 0, pose: gen(amount, side), hands: [] }, amount);
+          mir.processDetection({ tMs: 0, pose: mirrorPoseLandmarks(gen(amount, side)), hands: [] }, amount);
+          expect(mir.getLaneStates()[0].value, `${movement}/${side} @ ${amount}`).toBeCloseTo(raw.getLaneStates()[0].value, 9);
+        }
+        raw.stop();
+        mir.stop();
+      }
+    }
+  });
+});
+
+describe('VisionInput lane index validation', () => {
+  const cal = calFor('seated_march', 'left', (a) => seatedPose({ kneeLift: a, side: 'left' }));
+  const make = (lanes: LaneSpec[]) => new VisionInput({
+    mode: 'leg', lanes, calibrations: lanes.map(() => cal), thresholdFraction: 0.6,
+    audioContext: new FakeClock(), detector: fakeDetector('leg', []), driveLoop: false,
+  });
+
+  it('rejects a duplicate lane index even when the movements differ', () => {
+    // laneConflicts does NOT catch this (different movements), but every event, meter and chart note is
+    // keyed by `index`: two lanes sharing one is ambiguous, not merely degraded.
+    expect(() => make([
+      { index: 1, movement: 'seated_march', side: 'left' },
+      { index: 1, movement: 'knee_extension', side: 'right' },
+    ])).toThrow(/duplicate lane index 1/);
+  });
+
+  it('rejects a negative or fractional lane index', () => {
+    expect(() => make([{ index: -1, movement: 'seated_march', side: 'left' }])).toThrow(/non-negative integer/);
+    expect(() => make([{ index: 1.5, movement: 'seated_march', side: 'left' }])).toThrow(/non-negative integer/);
+  });
+
+  it('accepts sparse but distinct indices', () => {
+    expect(() => make([
+      { index: 0, movement: 'seated_march', side: 'left' },
+      { index: 3, movement: 'knee_extension', side: 'right' },
+    ])).not.toThrow();
+  });
+});
+
+/**
+ * The silent death the round-4 code had no counterpart for: a lane that can no longer REACH its
+ * threshold. `getPinnedLanes` catches a lane stuck too high; this is the same failure from below, and
+ * the one that actually happens (fatigue over a three-minute song, or a ROM calibrated on a fresh
+ * patient with the threshold at 0.8 of it).
+ */
+describe('VisionInput unreachable-lane watchdog', () => {
+  const lanes: LaneSpec[] = [{ index: 0, movement: 'seated_march', side: 'left' }];
+  const cal = calFor('seated_march', 'left', (a) => seatedPose({ kneeLift: a, side: 'left' }));
+  const make = () => new VisionInput({
+    mode: 'leg', lanes, calibrations: [cal], thresholdFraction: 0.8, audioContext: new FakeClock(),
+    detector: fakeDetector('leg', []), driveLoop: false, smoothing: { kind: 'none' },
+    unreachableLaneSec: 5, nowMs: () => 0,
+  });
+
+  /** Feed reps whose amplitude is `amp` of the calibrated ROM, from ctx time `t0`. */
+  function feed(input: VisionInput, t0: number, sec: number, amp: number): number {
+    let t = t0;
+    for (; t < t0 + sec; t += 1 / 30) {
+      const amount = amp * (0.5 - 0.5 * Math.cos(2 * Math.PI * (t - t0)));
+      input.processDetection({ tMs: t * 1000, pose: seatedPose({ kneeLift: amount, side: 'left' }), hands: [] }, t);
+    }
+    return t;
+  }
+
+  it('reports a fatigued lane that is being attempted but can no longer score', async () => {
+    const input = make();
+    const events: LaneInputEvent[] = [];
+    input.onEvent((e) => events.push(e));
+    await input.start();
+    // Fresh: full reps, scoring normally, nothing to report.
+    let t = feed(input, 0, 4, 1.0);
+    expect(events.length).toBeGreaterThan(0);
+    expect(input.getUnreachableLanes()).toEqual([]);
+    expect(input.getStatus().reason).toBe('ok');
+    // Fatigued: still working hard (peaks ~0.6 of ROM) but never reaching the 0.8 threshold.
+    const before = events.length;
+    t = feed(input, t, 8, 0.6);
+    expect(events).toHaveLength(before); // every note in this lane is now missing…
+    expect(input.getUnreachableLanes()).toEqual([0]); // …and it SAYS SO
+    const st = input.getStatus();
+    expect(st.reason).toBe('lane_unreachable');
+    expect(st.unreachableLanes).toEqual([0]);
+    expect(st.message).toMatch(/no longer reaches the hit threshold/i);
+    expect(st.warnings?.join(' ')).toMatch(/best attempt/);
+    const act = input.getLaneActivity()[0];
+    expect(act.unreachable).toBe(true);
+    expect(act.peakSinceThreshold).toBeGreaterThan(0.4);
+    expect(act.peakSinceThreshold).toBeLessThan(0.8);
+    // Recovering (a rest, or the therapist lowering the difficulty) clears it.
+    feed(input, t, 3, 1.0);
+    expect(input.getUnreachableLanes()).toEqual([]);
+    expect(input.getStatus().reason).toBe('ok');
+    input.stop();
+  });
+
+  it('does NOT accuse a lane whose patient is simply resting between its notes', async () => {
+    const input = make();
+    await input.start();
+    for (let t = 0; t < 20; t += 1 / 30) {
+      input.processDetection({ tMs: t * 1000, pose: seatedRest('left'), hands: [] }, t);
+    }
+    expect(input.getUnreachableLanes()).toEqual([]);
+    expect(input.getStatus().reason).toBe('ok');
+    input.stop();
+  });
+
+  it('restarts its window when the threshold is lowered', async () => {
+    const input = make();
+    await input.start();
+    const t = feed(input, 0, 10, 0.6);
+    expect(input.getUnreachableLanes()).toEqual([0]);
+    input.setThresholdFraction(0.5); // the therapist makes it easier
+    expect(input.getUnreachableLanes()).toEqual([]);
+    feed(input, t, 3, 0.6);
+    expect(input.getUnreachableLanes()).toEqual([]); // and now the lane scores again
+    input.stop();
+  });
+});
+
+describe('VisionInput labels a crossing measured across dropped frames', () => {
+  it('sets timingDegraded when frames merely stopped arriving (no null pushed, no long break)', async () => {
+    const lanes: LaneSpec[] = [{ index: 0, movement: 'seated_march', side: 'left' }];
+    const cal = calFor('seated_march', 'left', (a) => seatedPose({ kneeLift: a, side: 'left' }));
+    const input = new VisionInput({
+      mode: 'leg', lanes, calibrations: [cal], thresholdFraction: 0.65, audioContext: new FakeClock(),
+      detector: fakeDetector('leg', []), driveLoop: false, smoothing: { kind: 'none' },
+    });
+    const events: LaneInputEvent[] = [];
+    const reps: LaneRepEvent[] = [];
+    input.onEvent((e) => events.push(e));
+    input.onRep((r) => reps.push(r));
+    await input.start();
+    const push = (t: number, amount: number) =>
+      input.processDetection({ tMs: t * 1000, pose: seatedPose({ kneeLift: amount, side: 'left' }), hands: [] }, t);
+
+    // A healthy 30 fps rest, so the stream's nominal cadence is established…
+    let t = 0;
+    for (; t < 1; t += 1 / 30) push(t, 0);
+    t -= 1 / 30; // the last frame actually pushed
+    // …then a 400 ms hole (a GC pause / tab hiccup) that the movement happened inside of. Nothing is
+    // pushed for it — this is exactly the case the old "only when a break was observed" rule missed.
+    push(t + 0.4, 0.95);
+    expect(events).toHaveLength(1);
+    expect(events[0].timingDegraded).toBe(true);
+    expect(events[0].gapSec).toBeCloseTo(0.4, 6);
+    // The rep it opened is a lower bound and says so.
+    push(t + 0.45, 0);
+    expect(reps).toHaveLength(1);
+    expect(reps[0].gapped).toBe(true);
+    input.stop();
+  });
+
+  it('leaves timingDegraded off for a clean 30 fps crossing', async () => {
+    const lanes: LaneSpec[] = [{ index: 0, movement: 'seated_march', side: 'left' }];
+    const cal = calFor('seated_march', 'left', (a) => seatedPose({ kneeLift: a, side: 'left' }));
+    const input = new VisionInput({
+      mode: 'leg', lanes, calibrations: [cal], thresholdFraction: 0.65, audioContext: new FakeClock(),
+      detector: fakeDetector('leg', []), driveLoop: false, smoothing: { kind: 'none' },
+    });
+    const events: LaneInputEvent[] = [];
+    input.onEvent((e) => events.push(e));
+    await input.start();
+    for (const { t, amount } of repSequence({ restSec: 1, reps: 3, repDurationSec: 1, amplitude: 1 })) {
+      input.processDetection({ tMs: t * 1000, pose: seatedPose({ kneeLift: amount, side: 'left' }), hands: [] }, t);
+    }
+    expect(events).toHaveLength(3);
+    for (const e of events) expect(e.timingDegraded).toBeUndefined();
     input.stop();
   });
 });

@@ -21,8 +21,16 @@ import type { Fingertip, Landmark } from './landmarks.ts';
 import type { LaneFilterSpec } from './filters.ts';
 import { median } from './stats.ts';
 
+/**
+ * The fingertip finger_opposition opposes the thumb with, unless the therapist chooses another
+ * (docs/ARCHITECTURE.md:77). Exported because the CHOICE IS PART OF THE MEASUREMENT: a range calibrated
+ * on the index normalizes a different quantity than a pinch played on the pinky, so the calibration
+ * records it (RomCalibration.fingertip) and the lane pipeline carries it (LanePipeline.getFingertip).
+ */
+export const DEFAULT_FINGERTIP: Fingertip = 'index';
+
 export interface FeatureOptions {
-  /** finger_opposition: which fingertip opposes the thumb (default 'index'). */
+  /** finger_opposition: which fingertip opposes the thumb (default DEFAULT_FINGERTIP = 'index'). */
   fingertip?: Fingertip;
   /** Minimum pose visibility (default MIN_VISIBILITY). */
   minVisibility?: number;
@@ -30,8 +38,21 @@ export interface FeatureOptions {
   worldLandmarks?: readonly Landmark[] | null;
   /**
    * True when the frames fed to the detector were horizontally flipped before detection (default false;
-   * see the mirror convention in src/vision/mediapipe.ts). Only the SIGNED lateral feature
-   * (hip_abduction) needs it: a mirrored image swaps which image-x direction is "outward".
+   * see the mirror convention in src/vision/mediapipe.ts).
+   *
+   * IT SELECTS THE LIMB, not just a sign. A mirrored human is indistinguishable from a real one, so the
+   * Pose model labels by APPARENT geometry: on flipped frames the patient's RIGHT leg is reported in the
+   * LEFT_* landmark indices and vice versa. Every LEG extractor therefore resolves its indices through
+   * `poseSideIndices(side, mirrored)`, which swaps them. Getting this wrong does not degrade the signal,
+   * it measures THE OTHER LEG — for a hemiparetic patient that means the affected lane reads flat 0 all
+   * session, or (if calibration ran in the same configuration) the whole game is driven by the
+   * unaffected limb with no error anywhere.
+   *
+   * ON TOP OF the index swap, the SIGNED lateral feature (hip_abduction) still needs the coordinate
+   * flip: mirroring reverses image x, so the outward direction for a given limb reverses with it. The
+   * two corrections are independent and BOTH are required (see abductionSign).
+   * Hand features are mirror-invariant (distances, unsigned angles, and a y-only wrist rise); which hand
+   * belongs to which side is decided by `pickHand` in mediapipe.ts, not here.
    */
   mirrored?: boolean;
   /**
@@ -47,10 +68,34 @@ export interface FeatureOptions {
 
 export type FeatureExtractor = (landmarks: readonly Landmark[] | null | undefined, side: Side, opts?: FeatureOptions) => number | null;
 
-function poseIdx(side: Side) {
-  return side === 'left'
-    ? { shoulder: POSE.LEFT_SHOULDER, hip: POSE.LEFT_HIP, knee: POSE.LEFT_KNEE, ankle: POSE.LEFT_ANKLE, heel: POSE.LEFT_HEEL, foot: POSE.LEFT_FOOT_INDEX }
-    : { shoulder: POSE.RIGHT_SHOULDER, hip: POSE.RIGHT_HIP, knee: POSE.RIGHT_KNEE, ankle: POSE.RIGHT_ANKLE, heel: POSE.RIGHT_HEEL, foot: POSE.RIGHT_FOOT_INDEX };
+export interface PoseSideIndices {
+  shoulder: number; hip: number; knee: number; ankle: number; heel: number; foot: number;
+}
+
+const LEFT_SIDE_IDX: Readonly<PoseSideIndices> = Object.freeze({
+  shoulder: POSE.LEFT_SHOULDER, hip: POSE.LEFT_HIP, knee: POSE.LEFT_KNEE, ankle: POSE.LEFT_ANKLE, heel: POSE.LEFT_HEEL, foot: POSE.LEFT_FOOT_INDEX,
+});
+const RIGHT_SIDE_IDX: Readonly<PoseSideIndices> = Object.freeze({
+  shoulder: POSE.RIGHT_SHOULDER, hip: POSE.RIGHT_HIP, knee: POSE.RIGHT_KNEE, ankle: POSE.RIGHT_ANKLE, heel: POSE.RIGHT_HEEL, foot: POSE.RIGHT_FOOT_INDEX,
+});
+
+/**
+ * The Pose landmark indices that hold the PATIENT's `side` leg, for the mirror convention in use.
+ *
+ * MediaPipe Pose labels anatomically from the image it is given, and a horizontally flipped image of a
+ * person is a perfectly valid image of a person whose left and right are swapped — the model has no way
+ * to know and no reason to care. So on `mirrored` frames the patient's left leg arrives in the RIGHT_*
+ * indices. Every leg extractor and the leg compensation checks go through this function; nothing in this
+ * module may pick POSE.LEFT_ / POSE.RIGHT_ landmark slots from `side` directly.
+ */
+export function poseSideIndices(side: Side, mirrored = false): Readonly<PoseSideIndices> {
+  const patientLeft = side === 'left';
+  // mirrored: the patient's left limb is reported under the RIGHT_* labels.
+  return patientLeft !== mirrored ? LEFT_SIDE_IDX : RIGHT_SIDE_IDX;
+}
+
+function poseIdx(side: Side, opts?: FeatureOptions): Readonly<PoseSideIndices> {
+  return poseSideIndices(side, opts?.mirrored ?? false);
 }
 
 const TORSO_IDX = [POSE.LEFT_SHOULDER, POSE.RIGHT_SHOULDER, POSE.LEFT_HIP, POSE.RIGHT_HIP];
@@ -82,7 +127,7 @@ function angleSource(pose: readonly Landmark[], opts: FeatureOptions | undefined
 
 /** seated_march: knee height above hip normalized by torso length. (hip.y - knee.y)/torsoLen */
 export const seatedMarch: FeatureExtractor = (pose, side, opts) => {
-  const i = poseIdx(side);
+  const i = poseIdx(side, opts);
   if (!allVisible(pose, [i.hip, i.knee], opts?.minVisibility)) return null;
   const torso = torsoLength(pose, opts?.minVisibility, xs(opts));
   if (torso === null) return null;
@@ -92,7 +137,7 @@ export const seatedMarch: FeatureExtractor = (pose, side, opts) => {
 
 /** knee_extension: interior angle hip-knee-ankle in degrees (90 = bent, 180 = straight). 3D (world landmarks preferred). */
 export const kneeExtension: FeatureExtractor = (pose, side, opts) => {
-  const i = poseIdx(side);
+  const i = poseIdx(side, opts);
   const idx = [i.hip, i.knee, i.ankle];
   if (!allVisible(pose, idx, opts?.minVisibility)) return null;
   const { lms: p, xScale } = angleSource(pose as readonly Landmark[], opts, idx);
@@ -101,10 +146,20 @@ export const kneeExtension: FeatureExtractor = (pose, side, opts) => {
 
 /**
  * ankle_dorsiflexion: 180 - (interior angle at the ankle between ankle->knee and ankle->foot_index).
- * Rest ~ 90 (foot flat, shin vertical); toes lifted => angle shrinks => feature grows. 3D (world landmarks preferred).
+ * Toes lifted => the ankle angle shrinks => the feature grows. 3D (world landmarks preferred).
+ *
+ * There is NO universal rest value: it is set by the patient's own shin/foot geometry and by how far the
+ * foot is placed forward of the knee (the module's seated fixture rests at ~76, not the 90 a foot flat
+ * under a vertical shin would give). That is exactly why the number is never used raw — RomCalibrator's
+ * rest hold measures this patient's own zero.
+ *
+ * It also RESPONDS TO KNEE ANGLE: extending the knee swings the shin, which changes the ankle-knee
+ * vector even with the foot held still (a knee_extension sweep drives this feature from ~76 down to ~9
+ * and back up to ~14, i.e. not even monotone in knee angle). Pairing the two movements on one leg is
+ * therefore reported as a 'coupled' conflict by `laneConflicts` rather than being silently scored.
  */
 export const ankleDorsiflexion: FeatureExtractor = (pose, side, opts) => {
-  const i = poseIdx(side);
+  const i = poseIdx(side, opts);
   const idx = [i.knee, i.ankle, i.foot];
   if (!allVisible(pose, idx, opts?.minVisibility)) return null;
   const { lms: p, xScale } = angleSource(pose as readonly Landmark[], opts, idx);
@@ -114,7 +169,17 @@ export const ankleDorsiflexion: FeatureExtractor = (pose, side, opts) => {
 /**
  * Image-x direction that is OUTWARD (abduction) for this side. In a raw, un-mirrored front-camera frame
  * the patient's LEFT side appears at the LARGER x (you face them, their left hand is on your right), so
- * outward for the left leg is +x and for the right leg -x; a mirrored stream flips both.
+ * outward for the left leg is +x and for the right leg -x; a mirrored stream reverses image x, so both
+ * flip.
+ *
+ * THIS IS NOT REDUNDANT WITH THE INDEX SWAP in `poseSideIndices`, and the two must not be collapsed:
+ * the swap picks WHICH LIMB's landmarks are read, this picks WHICH DIRECTION is outward for that limb in
+ * the coordinate system they arrived in. Worked example, patient's left knee abducted, torso 1 unit:
+ *   raw      hip.x 0.60, knee.x 0.75 under LEFT_*  -> poseSideIndices('left', false) = LEFT_*,
+ *            sign +1 -> +0.15
+ *   mirrored hip.x 0.40, knee.x 0.25 under RIGHT_* -> poseSideIndices('left', true)  = RIGHT_*,
+ *            sign -1 -> -1 * (0.25 - 0.40) = +0.15   (same physical abduction, same number)
+ * Dropping either correction gives the wrong limb, the wrong sign, or both.
  */
 export function abductionSign(side: Side, mirrored = false): number {
   const s = side === 'left' ? 1 : -1;
@@ -131,7 +196,7 @@ export function abductionSign(side: Side, mirrored = false): number {
  * i.e. adduction reads as "rest" and never scores. Direction-specificity is not optional in rehab.
  */
 export const hipAbduction: FeatureExtractor = (pose, side, opts) => {
-  const i = poseIdx(side);
+  const i = poseIdx(side, opts);
   if (!allVisible(pose, [i.hip, i.knee], opts?.minVisibility)) return null;
   const xScale = xs(opts);
   const torso = torsoLength(pose, opts?.minVisibility, xScale);
@@ -224,7 +289,7 @@ export const wristExtension: FeatureExtractor = (hand, _side, opts) => {
 export const fingerOpposition: FeatureExtractor = (hand, _side, opts) => {
   const xScale = xs(opts);
   if (!handOk(hand, xScale)) return null;
-  const tip = FINGERTIP_INDEX[opts?.fingertip ?? 'index'];
+  const tip = FINGERTIP_INDEX[opts?.fingertip ?? DEFAULT_FINGERTIP];
   return 1 - distance2d(hand[HAND.THUMB_TIP], hand[tip], xScale) / palmSize2d(hand, xScale);
 };
 
@@ -284,8 +349,21 @@ export interface CompensationBaseline {
 
 export interface CompensationResult {
   kind: CompensationKind;
-  /** Normalized magnitude: heel_lift = rise / shinLen; trunk_lean = extra tilt in degrees. */
+  /**
+   * Magnitude compared against `tolerance`: heel_lift = rise / shinLen; trunk_lean = the SIZE of the
+   * change in trunk tilt from rest, in degrees (direction-free — see `signed`). VisionInput keeps the
+   * LARGEST value seen during a rep as that rep's compensation, so this must grow with severity in
+   * whichever direction the patient compensated.
+   */
   value: number;
+  /**
+   * The same quantity WITH its direction. heel_lift: identical to `value` (positive = heel rising).
+   * trunk_lean: signed change in trunk tilt from the rest posture, positive = the trunk moved toward
+   * the RIGHT of the image. Therapist-facing output keeps the direction because "leaned 20 degrees
+   * further into the existing list" and "swung 20 degrees across to the other side" are different
+   * clinical events with the same magnitude.
+   */
+  signed: number;
   /** Tolerance the value is compared against. */
   tolerance: number;
   flagged: boolean;
@@ -297,7 +375,17 @@ export interface CompensationResult {
  * PHYSICAL amount on any webcam and survives the patient/camera moving between rest and the rep.
  */
 export const HEEL_LIFT_TOLERANCE = 0.12;
-/** Extra lateral trunk tilt (degrees beyond the rest tilt) that flags seated_march reps. */
+/**
+ * Change in lateral trunk tilt from the REST posture (degrees, either direction) that flags
+ * seated_march reps.
+ *
+ * Either direction, because the quantity that matters is how far the trunk MOVED from where the patient
+ * started, not how far it is from vertical. A post-stroke patient very often rests with a lateral list
+ * of 10-20 degrees; hiking the hip to lift the knee then swings the trunk AWAY from that list, which is
+ * a smaller angle from vertical and would never be flagged by an unsigned tilt-minus-rest rule (it
+ * reports a NEGATIVE extra). Same reasoning as heel_lift being measured relative to the ankle: the
+ * baseline is the patient's own resting posture, not the world.
+ */
 export const TRUNK_LEAN_TOLERANCE_DEG = 12;
 
 /** Which compensation (if any) is monitored for a movement. */
@@ -307,12 +395,26 @@ export function compensationKind(movement: Movement): CompensationKind | null {
   return null;
 }
 
-/** Trunk tilt from vertical (degrees) of the hip-mid -> shoulder-mid vector, image plane. */
+/**
+ * SIGNED lateral trunk tilt from vertical (degrees) of the hip-mid -> shoulder-mid vector, image plane.
+ *
+ * Positive = the shoulders are to the RIGHT of the hips in the IMAGE (which limb that is depends on the
+ * mirror convention, so this is deliberately an image-space quantity: the compensation rule only ever
+ * uses DIFFERENCES of it, which are mirror-symmetric in magnitude). 0 = upright.
+ *
+ * Signed rather than a bare angle-from-vertical because trunk lean is judged against the patient's own
+ * resting posture: with an unsigned angle, a trunk that swings from a 16-degree list THROUGH vertical to
+ * 16 degrees the other way — a 32-degree excursion — reports a change of exactly zero.
+ *
+ * `xScale` maps x into y units so the angle is the same on a 4:3 and a 16:9 frame.
+ */
 export function trunkTiltDeg(pose: readonly Landmark[] | null | undefined, minVisibility?: number, xScale = 1): number | null {
   if (!allVisible(pose, TORSO_IDX, minVisibility)) return null;
   const p = pose as readonly Landmark[];
   const up = sub(midpoint(p[POSE.LEFT_SHOULDER], p[POSE.RIGHT_SHOULDER]), midpoint(p[POSE.LEFT_HIP], p[POSE.RIGHT_HIP]));
-  return angleBetween2d(up, { x: 0, y: -1, z: 0 }, xScale);
+  // atan2 against the image-up direction (-y): |result| is the angle from vertical, the sign is the
+  // side the trunk is leaning to. Equivalent to the cross product of the trunk vector with vertical.
+  return (Math.atan2(up.x * xScale, -up.y) * 180) / Math.PI;
 }
 
 /** Measure this frame's raw compensation quantities for the movement (null: not applicable / not visible). */
@@ -321,7 +423,7 @@ export function measureCompensation(movement: Movement, pose: readonly Landmark[
   if (!kind || !pose) return null;
   const xScale = xs(opts);
   if (kind === 'heel_lift') {
-    const i = poseIdx(side);
+    const i = poseIdx(side, opts);
     if (!allVisible(pose, [i.knee, i.ankle, i.heel], opts?.minVisibility)) return null;
     const shin = distance(pose[i.knee], pose[i.ankle], xScale);
     if (shin < 1e-4) return null;
@@ -358,10 +460,15 @@ export function evaluateCompensation(sample: CompensationSample, baseline: Compe
   if (sample.kind === 'heel_lift') {
     // Both are (heel.y - ankle.y)/shin, already scale-free. y grows downward: rise = baseline - now.
     const rise = baseline.value - sample.value;
-    return { kind: 'heel_lift', value: rise, tolerance: HEEL_LIFT_TOLERANCE, flagged: rise > HEEL_LIFT_TOLERANCE };
+    return { kind: 'heel_lift', value: rise, signed: rise, tolerance: HEEL_LIFT_TOLERANCE, flagged: rise > HEEL_LIFT_TOLERANCE };
   }
-  const extra = sample.value - baseline.value;
-  return { kind: 'trunk_lean', value: extra, tolerance: TRUNK_LEAN_TOLERANCE_DEG, flagged: extra > TRUNK_LEAN_TOLERANCE_DEG };
+  // Both are SIGNED tilts from vertical, so this is the trunk's angular EXCURSION from its resting
+  // posture — in either direction. Magnitude is what the tolerance judges (a hip-hike that swings the
+  // trunk away from a resting list is the same compensation as one that deepens it); the direction is
+  // carried alongside for the therapist.
+  const change = sample.value - baseline.value;
+  const mag = Math.abs(change);
+  return { kind: 'trunk_lean', value: mag, signed: change, tolerance: TRUNK_LEAN_TOLERANCE_DEG, flagged: mag > TRUNK_LEAN_TOLERANCE_DEG };
 }
 
 /** Evaluate the compensation for the current frame against a rest baseline. */

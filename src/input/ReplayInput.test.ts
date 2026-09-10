@@ -87,4 +87,37 @@ describe('AutoplayInput', () => {
     const shifted = autoplayEvents(notes, { offsetSec: 0.1 });
     expect(shifted[0].songTime).toBeCloseTo(1.1);
   });
+
+});
+
+describe('ReplayInput timing guarantee', () => {
+  it('can seek past a backlog instead of dumping it, and can drop stale events', async () => {
+    const clock = { currentTime: 100.03 };
+    const song = new SongClock(clock);
+    song.start(40); // song time 0 at ctx 40, so the song is already 60 s in
+    const events = [0.5, 1, 30, 60.02, 61].map((songTime, i) => ({ lane: i % 4, songTime }));
+
+    // (1) A critic starting mid-song seeks: the past events are dropped WITHOUT being emitted.
+    const seeker = new ReplayInput({ events, audioContext: clock, songClock: song, autoTick: false });
+    const got: LaneInputEvent[] = [];
+    seeker.onEvent((e) => got.push(e));
+    await seeker.start();
+    expect(seeker.seek(60)).toBe(3);
+    expect(seeker.tick()).toHaveLength(1); // only the 60.02 event, which is genuinely due
+    expect(got[0].ctxTime).toBeCloseTo(100.02, 9);
+
+    // (2) Without a seek, a late first tick flushes the whole backlog with ctxTimes in the past...
+    const naive = new ReplayInput({ events, audioContext: clock, songClock: song, autoTick: false });
+    await naive.start();
+    const burst = naive.tick();
+    expect(burst).toHaveLength(4);
+    expect(burst[0].ctxTime).toBeLessThan(clock.currentTime - 1); // dated a minute ago
+
+    // (3) ...unless dropStaleSec is set, which is the documented way to keep the timing guarantee.
+    const strict = new ReplayInput({ events, audioContext: clock, songClock: song, autoTick: false, dropStaleSec: 0.2 });
+    await strict.start();
+    const kept = strict.tick();
+    expect(kept.map((e) => e.lane)).toEqual([3]); // only the 60.02 s event is still fresh
+    expect(strict.skipped()).toBe(3);
+  });
 });

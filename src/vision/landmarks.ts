@@ -57,6 +57,25 @@ export const POSE = {
 } as const;
 export const POSE_LANDMARK_COUNT = 33;
 
+/**
+ * For each Pose index, the index of its LEFT/RIGHT counterpart (identity for the midline nose).
+ *
+ * Used to build a mirrored detection: when the frames handed to the detector are horizontally flipped,
+ * the model labels the apparent — i.e. swapped — anatomy, so the patient's left leg comes back in the
+ * RIGHT_* slots. `mirrorPoseLandmarks` (fixtures.ts) applies this together with the x flip to produce
+ * exactly what a real mirrored capture looks like; `poseSideIndices` (features.ts) undoes it.
+ * Layout: 0 nose; 1-3 left eye inner/eye/outer vs 4-6 right; then every pair from 7 on is
+ * (odd = left, odd + 1 = right): 7/8 ears, 9/10 mouth, 11/12 shoulders … 31/32 foot indices.
+ */
+export const POSE_MIRROR_INDEX: readonly number[] = Object.freeze(
+  Array.from({ length: POSE_LANDMARK_COUNT }, (_, i) => {
+    if (i === 0) return 0;
+    if (i <= 3) return i + 3;
+    if (i <= 6) return i - 3;
+    return i % 2 === 1 ? i + 1 : i - 1;
+  }),
+);
+
 /* ---------------- MediaPipe Hands (21 landmarks) ---------------- */
 export const HAND = {
   WRIST: 0,

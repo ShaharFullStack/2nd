@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { Movement, Side } from '../engine/types.ts';
-import { EXTRACTORS, MOVEMENT_INFO, POSTURE_INFO, abductionSign, baselineFromSamples, captureCompensationBaseline, checkCompensation, evaluateCompensation, extractFeature, handPlausible, hasBlockingLaneConflict, laneConflicts, measureCompensation, requiredPostures, trunkTiltDeg } from './features.ts';
-import { handCollapsed, handPose, seatedPose, seatedPoseWorld, seatedRest, handOpen, handFist, seatedKneeAbducted, seatedKneeAdducted, seatedKneeLifted, handWristExtended, handWristRaised } from './fixtures.ts';
+import { EXTRACTORS, MOVEMENT_INFO, POSTURE_INFO, abductionSign, poseSideIndices, baselineFromSamples, captureCompensationBaseline, checkCompensation, evaluateCompensation, extractFeature, handPlausible, hasBlockingLaneConflict, laneConflicts, measureCompensation, requiredPostures, trunkTiltDeg } from './features.ts';
+import { handCollapsed, handPose, mirrorPoseLandmarks, mirrorPoseWorldLandmarks, seatedPose, seatedPoseWorld, seatedRest, handOpen, handFist, seatedKneeAbducted, seatedKneeAdducted, seatedKneeLifted, seatedLegExtended, seatedToesLifted, handWristExtended, handWristRaised } from './fixtures.ts';
 import { normalizeFeature } from './calibration.ts';
 import type { LaneSpec } from '../engine/types.ts';
 import { POSE, HAND_LANDMARK_COUNT, POSE_LANDMARK_COUNT } from './landmarks.ts';
@@ -94,16 +94,99 @@ describe('leg extractors (Pose fixtures)', () => {
     }
   });
 
-  it('hip_abduction respects the mirror convention', () => {
+  it('abductionSign flips with the frame, not with the limb selection', () => {
     expect(abductionSign('left', false)).toBe(1);
     expect(abductionSign('right', false)).toBe(-1);
     expect(abductionSign('left', true)).toBe(-1);
-    // Mirroring the frames flips which image-x direction is outward, so the sign of the feature flips.
-    const pose = seatedKneeAbducted(1, 'left');
-    const raw = extractFeature('hip_abduction', pose, 'left') as number;
-    const mirrored = extractFeature('hip_abduction', pose, 'left', { mirrored: true }) as number;
-    expect(mirrored).toBeCloseTo(-raw, 9);
+    expect(abductionSign('right', true)).toBe(1);
   });
+
+  it('poseSideIndices swaps the landmark slots on mirrored frames', () => {
+    expect(poseSideIndices('left', false).knee).toBe(POSE.LEFT_KNEE);
+    expect(poseSideIndices('right', false).knee).toBe(POSE.RIGHT_KNEE);
+    // Flipped frames: the model labels the apparent anatomy, so the patient's left leg is in RIGHT_*.
+    expect(poseSideIndices('left', true).knee).toBe(POSE.RIGHT_KNEE);
+    expect(poseSideIndices('right', true).heel).toBe(POSE.LEFT_HEEL);
+  });
+});
+
+/**
+ * THE CONFIGURATION THAT USED TO MEASURE THE WRONG LEG.
+ *
+ * `mirrorPoseLandmarks` builds what a detector actually returns for horizontally flipped frames: x
+ * flipped AND the left/right labels swapped (a mirrored human is an ordinary human to the model). The
+ * earlier test applied `{mirrored:true}` to UNMIRRORED landmarks, which only ever exercised the sign
+ * convention — the index swap it could not see made the affected lane read a flat 0 (seated_march), a
+ * resting 90° (knee_extension) or a negated value (hip_abduction) for the whole session.
+ *
+ * The contract asserted here: for EVERY leg movement and EVERY side, the feature computed from a real
+ * mirrored capture with `mirrored: true` equals the feature computed from the raw capture. Same patient,
+ * same limb, same number — that is what "the lane measures the prescribed limb in every supported
+ * configuration" has to mean.
+ */
+describe('leg extractors under mirrored capture', () => {
+  const cases: Array<[Movement, (amount: number, side: Side) => Landmark[]]> = [
+    ['seated_march', seatedKneeLifted],
+    ['knee_extension', seatedLegExtended],
+    ['ankle_dorsiflexion', seatedToesLifted],
+    ['hip_abduction', seatedKneeAbducted],
+  ];
+
+  for (const [movement, make] of cases) {
+    for (const side of SIDES) {
+      it(`${movement} (${side}) reads the same limb mirrored and unmirrored`, () => {
+        for (const amount of [0, 0.35, 0.7, 1]) {
+          const pose = make(amount, side);
+          const raw = extractFeature(movement, pose, side) as number;
+          const mirroredFeature = extractFeature(movement, mirrorPoseLandmarks(pose), side, { mirrored: true }) as number;
+          expect(raw).not.toBeNull();
+          expect(mirroredFeature, `${movement}/${side} @ ${amount}`).toBeCloseTo(raw, 9);
+        }
+      });
+
+      it(`${movement} (${side}) still rises with the movement on mirrored frames`, () => {
+        const values = STEPS.map((a) => extractFeature(movement, mirrorPoseLandmarks(make(a, side)), side, { mirrored: true }) as number);
+        expectStrictlyIncreasing(values, `${movement}/${side} mirrored`);
+      });
+
+      it(`${movement} (${side}) mirrored does NOT track the other leg`, () => {
+        // The other limb moves through its whole range while the prescribed one rests: a lane that
+        // silently swapped limbs would sweep here instead of sitting flat.
+        const other: Side = side === 'left' ? 'right' : 'left';
+        const values = STEPS.map((a) => extractFeature(movement, mirrorPoseLandmarks(make(a, other)), side, { mirrored: true }) as number);
+        for (const v of values) expect(v).toBeCloseTo(values[0], 9);
+      });
+    }
+  }
+
+  it('mirrored world landmarks feed the 3D angles for the prescribed leg', () => {
+    for (const side of SIDES) {
+      const params = { kneeExtension: 0.6, side } as const;
+      const pose = seatedPose(params);
+      const world = seatedPoseWorld(params);
+      const raw = extractFeature('knee_extension', pose, side, { worldLandmarks: world }) as number;
+      const mirrored = extractFeature('knee_extension', mirrorPoseLandmarks(pose), side, {
+        worldLandmarks: mirrorPoseWorldLandmarks(world), mirrored: true,
+      }) as number;
+      expect(mirrored).toBeCloseTo(raw, 9);
+    }
+  });
+
+  it('heel-lift compensation follows the prescribed leg on mirrored frames', () => {
+    for (const side of SIDES) {
+      const pose = seatedPose({ toeLift: 0.5, heelLift: 0.8, side });
+      const raw = measureCompensation('ankle_dorsiflexion', pose, side);
+      const mir = measureCompensation('ankle_dorsiflexion', mirrorPoseLandmarks(pose), side, { mirrored: true });
+      expect(raw).not.toBeNull();
+      expect(mir!.value).toBeCloseTo(raw!.value, 9);
+      // …and the other leg's resting heel is NOT what is being measured.
+      const otherRest = measureCompensation('ankle_dorsiflexion', mirrorPoseLandmarks(pose), side === 'left' ? 'right' : 'left', { mirrored: true });
+      expect(Math.abs(otherRest!.value - raw!.value)).toBeGreaterThan(0.05);
+    }
+  });
+});
+
+describe('leg extractors (Pose fixtures, continued)', () => {
 
   it('accepts a custom minVisibility', () => {
     const pose = seatedPose({ visibility: 0.4 });
@@ -330,5 +413,48 @@ describe('MOVEMENT_INFO', () => {
   it('fixtures have the right landmark counts', () => {
     expect(seatedRest()).toHaveLength(POSE_LANDMARK_COUNT);
     expect(handOpen()).toHaveLength(HAND_LANDMARK_COUNT);
+  });
+});
+
+describe('trunk lean is measured as an EXCURSION from the resting posture, in either direction', () => {
+  // The patient this test exists for: a post-stroke resting lateral list, who then hikes the opposite
+  // hip to lift the knee. The trunk swings THROUGH vertical instead of deeper into the list. With an
+  // unsigned tilt-from-vertical minus rest tilt, that ~32-degree excursion reported extra = 0.0 and was
+  // never flagged; only leaning further into the existing list could ever be caught.
+  const rest = seatedPose({ trunkLean: 0.5 });                       // a ~16-degree resting list
+  const baseline = captureCompensationBaseline('seated_march', rest, 'left')!;
+
+  it('measures the resting list with a SIGN, not just a magnitude', () => {
+    expect(trunkTiltDeg(rest)!).toBeGreaterThan(10);
+    expect(trunkTiltDeg(seatedPose({ trunkLean: -0.5 }))!).toBeCloseTo(-trunkTiltDeg(rest)!, 6);
+    expect(trunkTiltDeg(seatedPose())!).toBeCloseTo(0, 6);
+  });
+
+  it('FLAGS a lean to the other side (the excursion an unsigned rule reported as zero)', () => {
+    const away = checkCompensation('seated_march', seatedPose({ trunkLean: -0.5 }), 'left', baseline)!;
+    expect(away.signed).toBeLessThan(-25);            // swung the other way
+    expect(away.value).toBeGreaterThan(25);           // magnitude is what the tolerance judges
+    expect(away.flagged).toBe(true);
+  });
+
+  it('FLAGS deepening the existing list, and keeps the direction', () => {
+    const deeper = checkCompensation('seated_march', seatedPose({ trunkLean: 1 }), 'left', baseline)!;
+    expect(deeper.signed).toBeGreaterThan(0);
+    expect(deeper.flagged).toBe(true);
+  });
+
+  it('does NOT flag holding the resting posture, however tilted that posture is', () => {
+    const held = checkCompensation('seated_march', seatedPose({ trunkLean: 0.5 }), 'left', baseline)!;
+    expect(held.value).toBeCloseTo(0, 6);
+    expect(held.flagged).toBe(false);
+  });
+
+  it('is symmetric: the same excursion from an upright rest flags identically either way', () => {
+    const upright = captureCompensationBaseline('seated_march', seatedPose(), 'left')!;
+    const l = checkCompensation('seated_march', seatedPose({ trunkLean: 0.7 }), 'left', upright)!;
+    const r = checkCompensation('seated_march', seatedPose({ trunkLean: -0.7 }), 'left', upright)!;
+    expect(l.value).toBeCloseTo(r.value, 6);
+    expect(l.flagged).toBe(r.flagged);
+    expect(l.signed).toBeCloseTo(-r.signed, 6);
   });
 });

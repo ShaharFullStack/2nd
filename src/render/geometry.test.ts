@@ -10,6 +10,11 @@ import {
   isVisibleDepth,
   MAX_BEAT_LINES,
   visibleTailSec,
+  gemVisibleTailSec,
+  fullyVisibleDepth,
+  depthAtScale,
+  projectInto,
+  GEM_ASPECT,
   laneBoundaryX,
   laneX,
   makeGeometry,
@@ -42,7 +47,7 @@ describe('clamp', () => {
 describe('makeGeometry', () => {
   it('places the strike line and horizon at the requested fractions', () => {
     const g = makeGeometry(W, H, 4);
-    expect(g.strikeY).toBeCloseTo(0.82 * H, 6);
+    expect(g.strikeY).toBeCloseTo(DEFAULT_GEOMETRY_OPTIONS.strikeY * H, 6);
     expect(g.horizonY).toBeCloseTo(0.35 * H, 6);
     expect(yAt(g, 0)).toBeCloseTo(g.strikeY, 6);
     expect(yAt(g, 1)).toBeCloseTo(g.horizonY, 6);
@@ -246,6 +251,59 @@ describe('tail below the strike line', () => {
     }
   });
 
+  /**
+   * The judgment-cue bar: `visibleTailSec` counts a gem whose centre is up to two gem radii *below*
+   * the canvas as "visible", which is right for culling and wrong for a cue a patient has to see.
+   * The engine declares a miss at note.time + goodMs + grace = up to 280 ms past the line, so the
+   * *whole* gem must still be inside the canvas that late — at every resolution and lane count.
+   */
+  it('keeps the WHOLE gem inside the canvas past the latest miss verdict (+280 ms)', () => {
+    for (const [w, h] of [
+      [1280, 720],
+      [1920, 1080],
+      [1366, 768],
+      [720, 1280],
+      [400, 800],
+      [1024, 768],
+      [1920, 600],
+    ]) {
+      for (const lanes of [2, 3, 4]) {
+        const g = makeGeometry(w, h, lanes);
+        const tail = gemVisibleTailSec(g);
+        expect(tail, `${w}x${h} lanes=${lanes}`).toBeGreaterThanOrEqual(0.3);
+        // ...and at exactly the verdict time the gem's lower edge is above the bottom edge.
+        const d = depthOf(g, 0, 0.28);
+        const s = scaleAt(g, d);
+        const bottom = yAt(g, d) + g.gemRadiusNear * s * GEM_ASPECT;
+        expect(bottom, `${w}x${h} lanes=${lanes} bottom`).toBeLessThanOrEqual(h);
+        expect(tail).toBeLessThan(visibleTailSec(g)); // strictly stricter than the culling bound
+      }
+    }
+  });
+
+  it('fullyVisibleDepth / depthAtScale round-trip against yAt', () => {
+    const g = makeGeometry(W, H, 4);
+    const d = fullyVisibleDepth(g);
+    const s = scaleAt(g, d);
+    expect(yAt(g, d) + g.gemRadiusNear * s * GEM_ASPECT).toBeCloseTo(H, 6);
+    expect(depthAtScale(g, scaleAt(g, -0.2))).toBeCloseTo(-0.2, 9);
+    expect(depthAtScale(g, scaleAt(g, 0.7))).toBeCloseTo(0.7, 9);
+    // A margin only ever shortens the tail.
+    expect(gemVisibleTailSec(g, 20)).toBeLessThan(gemVisibleTailSec(g, 0));
+  });
+
+  it('projectInto writes into the caller object and matches project()', () => {
+    const g = makeGeometry(W, H, 3);
+    const out = { x: 0, y: 0, scale: 0, radius: 0 };
+    for (const d of [-0.3, -0.05, 0, 0.4, 1]) {
+      for (let lane = 0; lane < 3; lane++) {
+        const ret = projectInto(g, lane, d, out);
+        expect(ret).toBe(out);
+        expect(out).toEqual(project(g, lane, d));
+      }
+    }
+  });
+
   it('pastLineSpeed is tunable and clamped', () => {
     const slow = makeGeometry(W, H, 4, { pastLineSpeed: 0.3 });
     const fast = makeGeometry(W, H, 4, { pastLineSpeed: 1 });
@@ -260,7 +318,7 @@ describe('culling', () => {
 
   it('minDepth is negative (notes stay visible a little past the line) and maxDepth is just past the horizon', () => {
     expect(g.minDepth).toBeLessThan(0);
-    expect(g.minDepth).toBeGreaterThan(-0.5);
+    expect(g.minDepth).toBeGreaterThan(-0.8);
     expect(g.maxDepth).toBeGreaterThan(1);
   });
 

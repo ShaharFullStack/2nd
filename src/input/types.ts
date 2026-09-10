@@ -20,6 +20,16 @@ export interface LaneInputEvent {
    * dorsiflexion). Absent when none was detected / not monitored.
    */
   compensation?: LaneCompensation;
+  /**
+   * Present (true) when frames were dropped immediately before the crossing, so `ctxTime` was measured
+   * across the dropout: the rise WAS observed (from below the re-arm level to above the threshold) but
+   * its time is uncertain by roughly half of `gapSec` rather than half a frame. Scoring treats such an
+   * event exactly like any other — dropping it would lose a rep the patient really performed — but a
+   * timing analysis (latency calibration, a critic measuring crossing jitter) should exclude them.
+   */
+  timingDegraded?: boolean;
+  /** Interval the crossing time was measured across (seconds); ~1 frame normally, wider after a dropout. */
+  gapSec?: number;
 }
 export interface LaneState { lane: number; value: number; armed: boolean; tracking?: boolean; }
 export interface InputSource {
@@ -71,7 +81,15 @@ export type VisionTrackingReason =
    * edge — a drifted baseline / stuck limb / bad calibration. Every note in that lane would miss in
    * silence otherwise. See VisionStatus.pinnedLanes.
    */
-  | 'lane_pinned';
+  | 'lane_pinned'
+  /**
+   * The mirror image of 'lane_pinned', and the more common one clinically: at least one lane is being
+   * ATTEMPTED and can no longer REACH its hit threshold — the patient fatigued over a three-minute song,
+   * or the ROM was calibrated when they were fresh and the difficulty puts the threshold at 0.8 of it.
+   * The lane tracks perfectly, reports a healthy meter, and misses every remaining note. Lower the
+   * difficulty or re-calibrate. See VisionStatus.unreachableLanes.
+   */
+  | 'lane_unreachable';
 export interface VisionStatus {
   /** True when every lane has usable landmarks this frame. */
   tracking: boolean;
@@ -96,9 +114,56 @@ export interface VisionStatus {
    * pinned, no rising edge can occur, and every note in that lane misses until the lane is re-calibrated.
    */
   pinnedLanes?: number[];
+  /**
+   * Lanes the patient is visibly still working — the meter moves — but which have not reached the hit
+   * threshold for longer than the watchdog allows, so every note in them is missing under a green OK.
+   * A lane that is simply idle (no movement at all) is NOT listed: this reports failure to reach, not
+   * failure to try.
+   */
+  unreachableLanes?: number[];
+  /**
+   * Lanes whose movement MONITORS a compensation (heel lift on ankle_dorsiflexion, trunk lean on
+   * seated_march) but which have NO rest baseline to measure it against, so no compensation can be
+   * detected for the whole session. Without this the results screen shows "no compensation flags" for a
+   * session in which compensation was never measured at all — the difference between "the patient kept
+   * their heel down" and "nobody looked".
+   */
+  unmonitoredCompensationLanes?: number[];
+  /**
+   * True when frames are arriving but AudioContext.currentTime is not advancing (a suspended context:
+   * the autoplay policy before the first user gesture, or a hidden tab). Every event time and every
+   * lane watchdog in the vision module runs on that clock, so while this is true crossings cannot be
+   * interpolated and the pinned/unreachable watchdogs are frozen.
+   */
+  clockStalled?: boolean;
   /** True when the detection rate is too low for the engine's timing windows (see MIN_USABLE_DETECT_FPS). */
   lowFps?: boolean;
-  /** Non-fatal quality warnings (low fps, throttled inference, refused calibrations, pinned lanes). */
+  /**
+   * True when the app itself is duty-cycling inference to protect the main thread (DetectLoop's adaptive
+   * budget): frames ARE arriving, they are just not all being looked at. Distinct from `lowFps` and with
+   * a different remedy — the machine cannot afford this model at this rate, so the fix is a lighter
+   * render load or the GPU delegate, not "close other apps".
+   */
+  throttled?: boolean;
+  /**
+   * HAND MODE. Lanes currently driven by the lone hand in frame accepted WITHOUT a usable handedness
+   * label (the unilateral escape hatch, see PickHandOptions.acceptLoneHand). The movement is being
+   * measured, but which hand performed it is unconfirmed — so the affected limb's rep count and ROM
+   * trend may belong to the unaffected hand that drifted into frame.
+   */
+  unlabelledHandLanes?: number[];
+  /**
+   * LEG MODE. True when the tracked BODY jumped recently in a way a seated patient cannot (the pose
+   * model, which tracks one person and never says which, appears to have latched onto someone else —
+   * classically a therapist crossing the frame). Every other signal stays healthy while this happens,
+   * which is what makes it worth reporting.
+   */
+  subjectChanged?: boolean;
+  /**
+   * Non-fatal quality warnings in plain language (low fps, throttled inference, refused/suspect
+   * calibrations, pinned or unreachable lanes, unmonitored compensation, a suspended audio clock, an
+   * unidentified hand, a changed subject). Everything this module knows is degraded and nothing else.
+   */
   warnings?: string[];
 }
 
@@ -133,6 +198,27 @@ export interface LaneRepEvent {
    * toward the rehab metrics — it simply could not score.
    */
   emitted?: boolean;
+  /**
+   * True when the rep was closed by a break in the camera stream (occlusion, stalled camera, tab
+   * backgrounded) instead of by an observed return to rest: `endCtxTime` is the last frame actually
+   * seen and `peak`/`rawPeak` are LOWER BOUNDS. Count such reps, but never average their ROM into a
+   * cross-session trend as if it were measured.
+   */
+  truncated?: boolean;
+  /**
+   * True when frames were dropped during the rep (or just before its crossing) but the stream recovered
+   * quickly enough that the rep was kept. The rep is real and counts; `peak`/`rawPeak` are lower bounds
+   * (the maximum may have fallen inside the dropout) and `ctxTime` is less precise. Distinct from
+   * `truncated`, which means the rep was CUT SHORT by a break long enough to hide a whole movement.
+   */
+  gapped?: boolean;
   /** Worst compensation observed during the whole rep, if any. */
   compensation?: LaneCompensation;
+  /**
+   * Present only for movements that monitor a compensation (heel lift / trunk lean). True when it was
+   * actually being measured during this rep (a rest baseline was in effect), FALSE when it was not — in
+   * which case the absence of `compensation` means "not measured", not "none observed". A rehab metric
+   * must never be silently unmeasured: see VisionStatus.unmonitoredCompensationLanes.
+   */
+  compensationMonitored?: boolean;
 }

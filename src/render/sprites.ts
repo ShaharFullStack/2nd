@@ -2,7 +2,7 @@
  * Pre-rendered sprites: gems (per lane colour × size bucket), glow halos, receptor rings.
  * Rendering shadows/gradients once here keeps per-frame draws to plain drawImage calls.
  */
-import { bucketRadius, radiusBucket } from './geometry';
+import { GEM_ASPECT, bucketRadius, radiusBucket } from './geometry';
 import type { LaneColor } from './palette';
 import { withAlpha } from './palette';
 import type { CanvasFactory } from './text';
@@ -20,8 +20,12 @@ export interface Sprite {
 }
 
 export const GEM_BUCKETS = 12;
-/** Gem aspect: gems are slightly squashed ellipses viewed from above, GH-style. */
-export const GEM_ASPECT = 0.72;
+/**
+ * Gem aspect (squashed ellipse, viewed from above). Defined in `geometry.ts` — the pure geometry
+ * needs it to answer "is the whole gem on screen?" — and re-exported here where sprite code and
+ * every existing importer expect it.
+ */
+export { GEM_ASPECT };
 
 /**
  * Sprite lookups happen once per note, per lane and per particle colour batch, *every frame*.

@@ -147,19 +147,171 @@ describe('scripts/gen-demo-stems.mjs', () => {
     }
   });
 
-  it('--rate writes a smaller low-bandwidth build at the requested sample rate', () => {
+  /**
+   * `--rate` is what public/songs/ccmixter-README.md tells a clinic on slow Wi-Fi to run, so it is
+   * held to the same standard as the committed 44.1 kHz build: real music, same balance, no clipping.
+   *
+   * These assertions are deliberately about *content*, not just the header. A previous
+   * anti-alias filter (the voice-synthesis Chamberlin SVF, unstable at the cutoff a downsample
+   * needs) diverged to float32 overflow and then NaN, which `Buffer.writeInt16LE` coerces to 0:
+   * every low-rate stem was 203 full-scale clicks followed by minutes of digital silence. A bare
+   * `rms(samples) > 0.02` passes on exactly that file — the clicks alone carry that much energy —
+   * so the checks below compare against the full-rate render instead.
+   */
+  it('--rate writes a smaller low-bandwidth build: same music, same balance, no clipping', () => {
     const out3 = fs.mkdtempSync(path.join(os.tmpdir(), 'beat-rehab-stems3-'));
     execFileSync(process.execPath, [script, '--out', out3, '--song', 'demo-groove', '--bars', String(bars), '--rate', '22050'], { timeout: 120_000 });
-    const w = readWav(path.join(out3, 'demo-groove/stems/drums.wav'));
-    expect(w.sampleRate).toBe(22050);
-    expect(w.channels).toBe(1);
-    expect(w.bits).toBe(16);
-    expect(w.samples.length).toBe(Math.round(expectedSec * 22050));
-    // half the bytes, same music: the only size lever available without an encoder dependency
-    expect(w.dataBytes).toBeLessThan(readWav(path.join(dir, 'stems/drums.wav')).dataBytes * 0.55);
-    expect(rms(w.samples)).toBeGreaterThan(0.02);
-    const m3 = parseManifest(JSON.parse(fs.readFileSync(path.join(out3, 'demo-groove/song.json'), 'utf8')));
-    expect(m3.durationSec).toBeCloseTo(expectedSec, 3);
+    for (const stem of ['drums', 'bass', 'keys', 'lead']) {
+      const w = readWav(path.join(out3, `demo-groove/stems/${stem}.wav`));
+      const full = readWav(path.join(dir, `stems/${stem}.wav`));
+      expect(w.sampleRate, stem).toBe(22050);
+      expect(w.channels, stem).toBe(1);
+      expect(w.bits, stem).toBe(16);
+      expect(w.samples.length, stem).toBe(Math.round(expectedSec * 22050));
+      // half the bytes, same music: the only size lever available without an encoder dependency
+      expect(w.dataBytes, stem).toBeLessThan(full.dataBytes * 0.55);
+
+      // no clipping: the downsampler must not push a mastered stem through full scale
+      let clipped = 0;
+      let peak = 0;
+      for (let i = 0; i < w.samples.length; i++) {
+        const a = Math.abs(w.samples[i]);
+        if (a >= 32767) clipped++;
+        if (a > peak) peak = a;
+      }
+      expect(clipped, `${stem} clipped samples`).toBe(0);
+      // the peak of the source survives: never raised (that is what clips) and never collapsed
+      let fullPeak = 0;
+      for (let i = 0; i < full.samples.length; i++) fullPeak = Math.max(fullPeak, Math.abs(full.samples[i]));
+      expect(peak, `${stem} peak`).toBeLessThanOrEqual(fullPeak + 1);
+      expect(peak, `${stem} peak`).toBeGreaterThan(fullPeak * 0.7);
+
+      // the *music* survives: overall loudness within 2 dB of the full-rate stem (the lowpass
+      // takes the band above 9.3 kHz, which costs the drums ~1.3 dB of hi-hat), and the energy is
+      // spread over the whole file rather than concentrated in a transient at the start
+      const db = 20 * Math.log10(rms(w.samples));
+      const fullDb = 20 * Math.log10(rms(full.samples));
+      expect(db, `${stem} dBRMS vs ${fullDb.toFixed(2)}`).toBeGreaterThan(fullDb - 2);
+      expect(db, `${stem} dBRMS vs ${fullDb.toFixed(2)}`).toBeLessThan(fullDb + 2);
+      const half = w.samples.length >> 1;
+      const tailDb = 20 * Math.log10(rms(w.samples, half));
+      expect(tailDb, `${stem} second-half dBRMS`).toBeGreaterThan(db - 6);
+    }
+    const raw = JSON.parse(fs.readFileSync(path.join(out3, 'demo-groove/song.json'), 'utf8')) as { generated: { sampleRate: number } };
+    expect(parseManifest(raw).durationSec).toBeCloseTo(expectedSec, 3);
+    // the manifest records the rate actually written, so a low-bandwidth deployment is self-describing
+    expect(raw.generated.sampleRate).toBe(22050);
+  });
+
+  /**
+   * The filter has to stay stable at every rate the CLI accepts, not only at the 22050 the README
+   * suggests — a downsample cutoff is a high fraction of the source Nyquist and that is exactly
+   * where a state-variable filter blows up. Driven through a child process because the generator
+   * is untyped ESM.
+   */
+  it('resample() stays finite and never raises the peak, at every accepted rate', () => {
+    const code = `
+      import { resample, peakOf } from ${JSON.stringify(script)};
+      const n = 44100;
+      const src = new Float32Array(n);
+      // full-band torture signal: a swept sine plus an impulse train (worst case for ringing)
+      for (let i = 0; i < n; i++) {
+        const t = i / 44100;
+        src[i] = 0.7 * Math.sin(2 * Math.PI * (200 + 20000 * t) * t) + (i % 4410 === 0 ? 0.25 : 0);
+      }
+      const inPeak = peakOf(src);
+      const out = [];
+      for (const rate of [8000, 11025, 16000, 22050, 32000, 44100]) {
+        const r = resample(src, 44100, rate);
+        let finite = true;
+        for (let i = 0; i < r.length; i++) if (!Number.isFinite(r[i])) { finite = false; break; }
+        out.push({ rate, len: r.length, finite, peak: peakOf(r), inPeak, rms: Math.sqrt(r.reduce((a, v) => a + v * v, 0) / r.length) });
+      }
+      console.log(JSON.stringify(out));
+    `;
+    const stdoutJson = execFileSync(process.execPath, ['--input-type=module', '-e', code], { encoding: 'utf8', timeout: 60_000 });
+    const rows = JSON.parse(stdoutJson.trim().split('\n').pop()!) as { rate: number; len: number; finite: boolean; peak: number; inPeak: number; rms: number }[];
+    expect(rows).toHaveLength(6);
+    for (const r of rows) {
+      expect(r.finite, `rate ${r.rate}: every sample finite`).toBe(true);
+      expect(r.len, `rate ${r.rate}: length`).toBe(r.rate === 44100 ? 44100 : Math.round(r.rate));
+      expect(r.peak, `rate ${r.rate}: peak never raised`).toBeLessThanOrEqual(r.inPeak + 1e-6);
+      // and not collapsed to silence either: a band-limited copy keeps most of its energy
+      expect(r.rms, `rate ${r.rate}: rms`).toBeGreaterThan(0.1);
+    }
+  });
+
+  /**
+   * The keys chords are struck as several `synthNote` voices at once, all starting at phase 0, so
+   * two voices on the SAME pitch sum coherently and that note comes out ~6 dB above the chord.
+   * The octave fold that keeps voicings compact used to produce exactly that on C major.
+   */
+  it('every keys voicing is made of distinct pitches (no phase-coherent unison in a chord)', () => {
+    const code = `
+      import { SONGS, voiceChord, KEYS_VOICING_CEILING } from ${JSON.stringify(script)};
+      const rows = [];
+      for (const song of Object.values(SONGS)) {
+        for (const chord of song.progression) {
+          rows.push({ song: song.id, chord: chord.name, tones: voiceChord(chord), ceiling: KEYS_VOICING_CEILING });
+        }
+      }
+      console.log(JSON.stringify(rows));
+    `;
+    const rows = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', code], { encoding: 'utf8', timeout: 60_000 }).trim()) as
+      { song: string; chord: string; tones: number[]; ceiling: number }[];
+    expect(rows.length).toBeGreaterThanOrEqual(8);
+    for (const r of rows) {
+      expect(new Set(r.tones).size, `${r.song} ${r.chord}: ${r.tones.join()}`).toBe(r.tones.length);
+      // still compact: nothing folded lands below the register, and only an octave doubling of a
+      // tone that is already there is allowed above the ceiling
+      for (const m of r.tones) expect(m).toBeGreaterThan(r.ceiling - 24);
+      for (const m of r.tones) if (m > r.ceiling) expect(r.tones).toContain(m - 12);
+    }
+    // the regression itself: C major over root 36 keeps its octave instead of doubling the root
+    const c = rows.find((r) => r.chord === 'C')!;
+    expect(c.tones).toEqual([60, 64, 67, 72]);
+  });
+
+  it('the reverb send is a finite, decaying tail (and the dry stems stay dry)', () => {
+    const code = `
+      import { reverbWet, peakOf, rmsOf } from ${JSON.stringify(script)};
+      const n = 44100 * 3;
+      const x = new Float32Array(n);
+      x[0] = 1; // impulse response of the send
+      const wet = reverbWet(x, { rt60: 1.5, preDelaySec: 0.02, damp: 0.35 });
+      let finite = true;
+      for (let i = 0; i < n; i++) if (!Number.isFinite(wet[i])) { finite = false; break; }
+      const win = (a, b) => rmsOf(wet.subarray(Math.round(a * 44100), Math.round(b * 44100)));
+      console.log(JSON.stringify({
+        finite, peak: peakOf(wet), preDelaySilent: peakOf(wet.subarray(0, Math.round(0.019 * 44100))),
+        early: win(0.05, 0.15), mid: win(0.7, 0.8), late: win(1.9, 2.0),
+        all: rmsOf(wet), same: rmsOf(reverbWet(x, { rt60: 1.5, preDelaySec: 0.02, damp: 0.35 })),
+      }));
+    `;
+    const r = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', code], { encoding: 'utf8', timeout: 60_000 }).trim()) as
+      { finite: boolean; peak: number; preDelaySilent: number; early: number; mid: number; late: number; all: number; same: number };
+    expect(r.finite).toBe(true);
+    expect(r.preDelaySilent).toBe(0);        // nothing before the pre-delay
+    expect(r.peak).toBeLessThanOrEqual(1);   // a send, not a resonator running away
+    expect(r.early).toBeGreaterThan(0);
+    expect(r.mid).toBeLessThan(r.early);     // monotone decay …
+    expect(r.late).toBeLessThan(r.mid);
+    expect(r.late).toBeGreaterThan(0);       // … but still audible ~2 s in (RT60 1.5 s)
+    expect(r.same).toBe(r.all);              // deterministic: no RNG anywhere in the tail
+  });
+
+  it('encodeWav16 refuses a non-finite sample instead of writing it out as silence', () => {
+    const code = `
+      import { encodeWav16 } from ${JSON.stringify(script)};
+      let threw = 0;
+      for (const bad of [NaN, Infinity, -Infinity]) {
+        try { encodeWav16(Float32Array.from([0.1, bad, 0.2])); } catch { threw++; }
+      }
+      console.log(JSON.stringify({ threw, ok: encodeWav16(Float32Array.from([0.1, 0.2])).length }));
+    `;
+    const res = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', code], { encoding: 'utf8', timeout: 60_000 }).trim()) as { threw: number; ok: number };
+    expect(res.threw).toBe(3);
+    expect(res.ok).toBe(44 + 4);
   });
 
   it('rejects a --rate outside the supported range', () => {

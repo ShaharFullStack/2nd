@@ -80,6 +80,25 @@ export function isHttpUrl(v: unknown): v is string {
 /** Optional link field: anything that is not an absolute http(s) URL (blank, relative path, other scheme) is dropped. */
 const optUrl = (v: unknown): string | undefined => (isHttpUrl(v) ? v.trim() : undefined);
 
+/**
+ * True for a path that stays inside the song's own directory.
+ *
+ * `stems[].file` is pasted in by hand from a third party (public/songs/ccmixter-README.md tells
+ * users to copy a manifest from ccMixter), and it is concatenated straight into a URL by
+ * `stemUrl()`. `"file": "../../../secrets.wav"` would make the browser fetch outside the song
+ * directory — the same attack `scripts/fetch-stems.mjs` refuses with `assertSafeRelativePath`
+ * when it writes to disk. This is the browser-side half of that check, kept deliberately
+ * identical: no absolute path, no scheme, no drive letter or UNC prefix, no ".." segment, no NUL.
+ */
+export function isSafeStemPath(v: unknown): v is string {
+  if (typeof v !== 'string' || v.trim().length === 0) return false;
+  const rel = v.trim();
+  if (rel.includes('\0')) return false;
+  if (rel.startsWith('/') || rel.startsWith('\\\\') || /^[a-zA-Z]:/.test(rel)) return false;
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(rel)) return false; // http:, data:, javascript:, …
+  return !rel.split(/[\\/]+/).some((s) => s === '..');
+}
+
 /** Validate a decoded song.json; throws a descriptive Error when it is not usable. */
 export function parseManifest(json: unknown): SongManifest {
   if (!isRecord(json)) throw new Error('manifest must be an object');
@@ -90,14 +109,21 @@ export function parseManifest(json: unknown): SongManifest {
   for (const key of ['bpm', 'offset', 'durationSec'] as const) {
     if (!isFiniteNumber(json[key])) problems.push(`missing number "${key}"`);
   }
+  // Ranges, not just types: a manifest with durationSec 0 loads as a song that is already over,
+  // and a negative offset puts the first downbeat before the start of the file.
   if (isFiniteNumber(json.bpm) && json.bpm <= 0) problems.push('"bpm" must be > 0');
+  if (isFiniteNumber(json.offset) && json.offset < 0) problems.push('"offset" must be >= 0');
+  if (isFiniteNumber(json.durationSec) && json.durationSec <= 0) problems.push('"durationSec" must be > 0');
+  if (json.previewStart !== undefined && isFiniteNumber(json.previewStart) && json.previewStart < 0) problems.push('"previewStart" must be >= 0');
+  if (json.swing !== undefined && (!isFiniteNumber(json.swing) || json.swing < 0 || json.swing >= 1)) problems.push('"swing" must be a number in [0, 1)');
   const stemsRaw = json.stems;
   const stems: StemSpec[] = [];
   if (!Array.isArray(stemsRaw) || stemsRaw.length === 0) problems.push('"stems" must be a non-empty array');
   else {
     stemsRaw.forEach((s: unknown, i: number) => {
       if (!isRecord(s) || !isNonEmptyString(s.id) || !isNonEmptyString(s.file)) problems.push(`stems[${i}] needs "id" and "file"`);
-      else stems.push({ id: s.id, file: s.file, label: isNonEmptyString(s.label) ? s.label : s.id });
+      else if (!isSafeStemPath(s.file)) problems.push(`stems[${i}].file ${JSON.stringify(s.file)} must be a relative path inside the song directory`);
+      else stems.push({ id: s.id, file: s.file.trim(), label: isNonEmptyString(s.label) ? s.label : s.id });
     });
     const ids = new Set(stems.map((s) => s.id));
     if (ids.size !== stems.length) problems.push('stem ids must be unique');
@@ -151,6 +177,81 @@ export function stepTimeSec(m: SongManifest, step: number, stepsPerBeat = 4): nu
   const swing = m.swing ?? 0;
   if (swing === 0 || !Number.isInteger(sixteenth) || Math.abs(sixteenth % 2) !== 1) return t;
   return t + swing * sixteenthSec;
+}
+
+/** One note time that does not sit on the song's own grid (see `findOffGridTimes`). */
+export interface GridMismatch {
+  /** Index in the array that was checked. */
+  index: number;
+  /** The time that was checked (song seconds). */
+  time: number;
+  /** Nearest grid step (in `stepsPerBeat` steps per beat from the first downbeat). */
+  step: number;
+  /** Song time that step actually sounds at — `stepTimeSec(manifest, step, stepsPerBeat)`. */
+  expected: number;
+  /** time − expected, in milliseconds (positive = the note is late). */
+  deltaMs: number;
+}
+
+/** Default tolerance: a tenth of the tightest "perfect" window (hard = ±50 ms). */
+export const GRID_TOLERANCE_MS = 5;
+
+/**
+ * Every note time that is further than `toleranceMs` from the nearest step of THIS song's grid —
+ * the executable half of the swing contract on `SongManifest.swing`.
+ *
+ * The failure it exists to catch: a chart generator that computes `offset + step × beat/4`
+ * type-checks, looks right, and puts every odd 16th of a swung song (`demo-sunrise`, swing 1/3 at
+ * 100 BPM) 50 ms away from the drum hit it is asking the patient to play — inside the 'good'
+ * window, outside 'perfect', for the whole song. Nothing else in the pipeline can notice: `Note`
+ * carries no swing field, so the times simply look plausible.
+ *
+ * Feed it the chart's note times (numbers or `{ time }` objects, e.g. `Chart.notes`) whenever a
+ * chart is built or loaded — `assertChartOnGrid()` is the one-liner. Cheap: O(n).
+ */
+export function findOffGridTimes(
+  m: SongManifest,
+  times: readonly (number | { time: number })[],
+  opts: { stepsPerBeat?: number; toleranceMs?: number } = {},
+): GridMismatch[] {
+  const stepsPerBeat = opts.stepsPerBeat ?? 4;
+  const tol = (opts.toleranceMs ?? GRID_TOLERANCE_MS) / 1000;
+  const stepSec = 60 / m.bpm / stepsPerBeat;
+  const out: GridMismatch[] = [];
+  times.forEach((entry, index) => {
+    const time = typeof entry === 'number' ? entry : entry.time;
+    if (!Number.isFinite(time)) { out.push({ index, time, step: NaN, expected: NaN, deltaMs: NaN }); return; }
+    // Swing moves a step by less than one step, so the nearest straight step ±1 covers every case.
+    const guess = Math.round((time - m.offset) / stepSec);
+    let best = { step: guess, expected: stepTimeSec(m, guess, stepsPerBeat) };
+    for (const step of [guess - 1, guess + 1]) {
+      const expected = stepTimeSec(m, step, stepsPerBeat);
+      if (Math.abs(time - expected) < Math.abs(time - best.expected)) best = { step, expected };
+    }
+    const delta = time - best.expected;
+    if (Math.abs(delta) > tol) out.push({ index, time, step: best.step, expected: best.expected, deltaMs: delta * 1000 });
+  });
+  return out;
+}
+
+/**
+ * Throw when a chart's notes are not on the song's grid (swing included). One line of insurance
+ * for a chart generator or the Play screen:
+ * `assertChartOnGrid(manifest, chart.notes)`.
+ */
+export function assertChartOnGrid(
+  m: SongManifest,
+  times: readonly (number | { time: number })[],
+  opts: { stepsPerBeat?: number; toleranceMs?: number } = {},
+): void {
+  const bad = findOffGridTimes(m, times, opts);
+  if (bad.length === 0) return;
+  const worst = bad.reduce((a, b) => (Math.abs(b.deltaMs) > Math.abs(a.deltaMs) ? b : a));
+  throw new Error(
+    `chart for "${m.id}" is off the song grid: ${bad.length}/${times.length} notes, worst ${worst.deltaMs.toFixed(1)} ms ` +
+    `at note ${worst.index} (t=${worst.time.toFixed(3)} s, step ${worst.step} sounds at ${worst.expected.toFixed(3)} s). ` +
+    `Take note times from stepTimeSec(manifest, step)${m.swing ? ` — this song swings (${m.swing.toFixed(3)} of a 16th)` : ''}.`,
+  );
 }
 
 /** Human-readable attribution line (CC BY requires title, author, source and licence). */

@@ -1,9 +1,13 @@
 /**
- * Guitar-Hero style note highway renderer. Canvas 2D, DPR aware, no React. Bounded allocations on
- * the hot path: sprites, gradients and text are cached, particles are pooled, beat lines and
- * particle colour batches go through preallocated typed arrays. (A few small per-frame
- * allocations remain — e.g. the `getStats()` copy and a handful of colour strings in rarely
- * changing branches — but nothing that scales with note or particle count.)
+ * Guitar-Hero style note highway renderer. Canvas 2D, DPR aware, no React.
+ *
+ * Hot path allocation: nothing per note, per particle or per lane. Sprites, gradients, text sprites
+ * and fitted strings are cached; particles are pooled; beat lines, particle colour batches and the
+ * lane→state maps are preallocated typed arrays; `projectInto` and `receptorLookInto` fill scratch
+ * objects; the combo string is memoized. What *does* allocate on a normal frame, exhaustively: the
+ * closure passed to `grad()` on a cache miss (bounded by the key set), `Array#sort`'s internals for
+ * the note draw order, and — only when `showStats` is on — the stats line. `getStats()` returns a
+ * fresh copy, by design; it is not called by `draw()`.
  *
  * Usage:
  *   const hw = new Highway(canvas);           // canvas: HTMLCanvasElement or OffscreenCanvas
@@ -44,7 +48,22 @@
  * Degenerate input degrades gracefully. A non-finite `songTime`, `score`, `health`, `combo`,
  * `multiplier`, `beatPhase` or `energy` is treated as a missing value for that frame and cannot
  * reach the smoothed accumulators (receptor glow, rock meter, rolling score): the renderer keeps
- * drawing at the last good song time and recovers completely on the next healthy frame.
+ * drawing at the last good song time and recovers completely on the next healthy frame. "Missing"
+ * really means missing — a non-finite `beatPhase` goes *flat* (like reduced motion) rather than
+ * landing on phase 0, which is the maximum-pulse value, and a non-finite `multiplier` holds tier 1
+ * instead of restarting the badge pop on every frame.
+ *
+ * Honest biofeedback (the reason this is a rehab game and not a music game):
+ *   - the receptor meter fills against `RenderFrame.thresholdFraction`, the same number the engine
+ *     triggers on, and warns once if it is missing;
+ *   - a lane that is locked out by hysteresis (`RenderLaneState.armed === false`) is drawn as a
+ *     categorically different thing — see `drawReceptors` and receptor.ts — never as a dimmed
+ *     version of a live one, so "the ring is lit" always means "this will score";
+ *   - meters and labels are matched to lanes by `LaneState.lane` / `LaneSpec.index` when those are
+ *     present, not by array position alone;
+ *   - every judgment cue is kept inside the canvas (`missCueY`, `POPUP_MAX_RISE_FRAC`);
+ *   - and no clinical control is decorative: `reducedMotion`, `effectIntensity`, `highContrast` and
+ *     the HUD's minimum font sizes (including the CC-BY attribution) all hold at any canvas size.
  *
  * Pixel-level verification (fret proportions, strike-line uniformity, projection accuracy, miss and
  * hit feedback, the rolling-score odometer, frame cost) lives in `pixel-check.mjs` next to this
@@ -53,8 +72,9 @@
  * should wire it up as an npm script, `"check:render": "node src/render/pixel-check.mjs"`, so a
  * regression in the *look* is caught by CI and not only by someone reading this comment.
  */
-import type { Judgment } from '../engine/types';
+import type { Judgment, LaneSpec } from '../engine/types';
 import {
+  GEM_ASPECT,
   MAX_BEAT_LINES,
   clamp,
   depthAtY,
@@ -64,11 +84,12 @@ import {
   laneBoundaryX,
   laneX,
   makeGeometry,
-  project,
+  projectInto,
   roadEdgeX,
   scaleAt,
   yAt,
   type HighwayGeometry,
+  type Projected,
 } from './geometry';
 import {
   JUDGMENT_STYLE,
@@ -82,18 +103,19 @@ import {
   withAlpha,
   type LanePalette,
 } from './palette';
-import { PARTICLE_RING, PARTICLE_SPARK, PARTICLE_STREAK, ParticlePool, emitHitBurst, makeRng } from './particles';
-import { GEM_ASPECT, SpriteCache, blit } from './sprites';
+import { PARTICLE_RING, PARTICLE_SMOKE, PARTICLE_SPARK, PARTICLE_STREAK, ParticlePool, emitHitBurst, makeRng } from './particles';
+import { DEFAULT_REARM_FRACTION, receptorLookInto, type ReceptorLook } from './receptor';
+import { SpriteCache, blit } from './sprites';
 import { DigitRoller, TextCache, defaultCanvasFactory, fontPx, type Ctx2D, type TextStyle } from './text';
-import type { CanvasLike, HighwayOptions, RenderFrame, RenderNote, RenderStats } from './types';
+import type { CanvasLike, HighwayOptions, RenderFrame, RenderLaneState, RenderNote, RenderStats } from './types';
 
 export const DEFAULT_HIGHWAY_OPTIONS: HighwayOptions = {
   approachSec: 1.6,
   horizonY: 0.35,
-  strikeY: 0.82,
+  strikeY: 0.78,
   farScale: 0.28,
   roadWidth: 0.46,
-  pastLineSpeed: 0.42,
+  pastLineSpeed: 0.34,
   highContrast: false,
   showLabels: true,
   showMissPopup: false,
@@ -117,6 +139,15 @@ export const LONG_FRAME_MS = 25;
  */
 export const STATE_JUDGMENT_EARLY_SEC = 0.6;
 export const STATE_JUDGMENT_LATE_SEC = 1;
+/**
+ * Clearance (in UI units) kept between a dying gem / miss puff and the bottom edge of the canvas.
+ * The default geometry already puts the whole gem on screen at the latest possible miss verdict
+ * (see `gemVisibleTailSec`); this is the backstop for a tuned `strikeY` / `pastLineSpeed` / a very
+ * short canvas, so a judgment cue is never half-way off the board.
+ */
+export const MISS_CUE_MARGIN_U = 6;
+/** Duration (s) of the receptor's re-arm pop — the moment a locked-out lane can fire again. */
+export const REARM_POP_SEC = 0.28;
 
 const MAX_LANES = 8;
 /** Judgment popup slots. More than one per lane so 8th notes on a repeated lane never cut each other off. */
@@ -147,6 +178,10 @@ const BADGE_KEYS = ['badge1', 'badge2', 'badge3', 'badge4'];
 const FLASH_KEYS = Array.from({ length: MAX_LANES }, (_, i) => `flashHit${i}`);
 const METER_KEYS = Array.from({ length: MAX_LANES }, (_, i) => `meter${i}`);
 const METER_HOT_KEYS = Array.from({ length: MAX_LANES }, (_, i) => `meterHot${i}`);
+/** Locked-out (hysteresis) meter fill — dead grey, never the lane colour. */
+const METER_LOCK_KEY = 'meterLocked';
+/** Re-arm line / "lower to reset" chevron colour. */
+const LOCK_HINT_COLOR = '#ffcf5a';
 
 interface Popup {
   active: boolean;
@@ -232,12 +267,27 @@ export class Highway {
   private laneFlashT0 = new Float64Array(MAX_LANES).fill(-10);
   private laneFlashKind = new Uint8Array(MAX_LANES); // 0 none, 1 hit, 2 miss
   private laneGlow = new Float32Array(MAX_LANES);
+  /** Last frame's `armed` flag per lane (1 = armed), for the re-arm pop. */
+  private laneArmed = new Uint8Array(MAX_LANES).fill(1);
+  /** Song time each lane last became able to fire again (hysteresis re-arm). */
+  private laneRearmT0 = new Float64Array(MAX_LANES).fill(-10);
+  /** Scratch receptor state, refilled per lane per frame (see receptor.ts). */
+  private readonly look: ReceptorLook = { fill: 0, willFire: false, locked: false, resetProgress: 0, resetLevel: DEFAULT_REARM_FRACTION, glowTarget: 0, tracking: true };
+  /** lane → index into frame.laneStates / frame.lanes for this frame (see `resolveLaneMaps`). */
+  private stateIdx = new Int8Array(MAX_LANES);
+  private specIdx = new Int8Array(MAX_LANES);
+  private warnedLaneMap = false;
+  /** Scratch projection, refilled per note per frame (no object per note). */
+  private readonly proj: Projected = { x: 0, y: 0, scale: 1, radius: 0 };
   private popups: Popup[] = [];
   private lastCombo = 0;
   /** Scratch for the allocation-free de-dupe/fizzle map pruning (see `prune*` below). */
   private pruneNow = 0;
   private pruneKeep = 3;
   private lastComboShown = 0;
+  /** Cached `String(combo)` so the per-frame combo draw does not allocate a string. */
+  private comboStr = '0';
+  private comboStrN = -1;
   private comboBounceT0 = -10;
   private comboBreakT0 = -10;
   private lastMultiplier = 1;
@@ -316,21 +366,47 @@ export class Highway {
 
   /**
    * Update tunables at runtime (palette, approach speed, effect intensity, particle budget, ...).
-   * Every option in `HighwayOptions` takes effect on the next `draw()`: caches that depend on the
-   * palette or geometry are dropped, the pre-rendered background is re-baked at the new horizon,
-   * and the particle pool is reallocated when `maxParticles` changes.
+   * Every option in `HighwayOptions` takes effect on the next `draw()`, and each is rebuilt at its
+   * own cost: only a palette change drops the sprite cache, only a geometry change re-bakes the
+   * background, and only `maxParticles` reallocates the pool. Everything else (effectIntensity,
+   * reducedMotion, showLabels, showMissPopup, showStats) is free, so it is safe to drive from a
+   * therapist-facing slider at pointer-move rate. `createCanvas` is fixed at construction and is
+   * ignored here.
    */
   setOptions(patch: Partial<HighwayOptions>): void {
-    this.opts = { ...this.opts, ...patch };
-    this.palette = getPalette(this.opts.highContrast);
-    this.sprites.clear();
-    this.text.clear();
-    this.grads.clear();
-    this.particles.setCapacity(this.opts.maxParticles);
-    this.rebuildGeometry(this.geom.laneCount);
-    // The background layer bakes in the horizon position and the canvas size, so any change to
-    // horizonY / strikeY / farScale / roadWidth leaves a stale haze blob floating in the sky.
-    this.buildBackground();
+    const prev = this.opts;
+    const next = { ...prev, ...patch };
+    this.opts = next;
+    // Only rebuild what actually changed. `effectIntensity`, `reducedMotion`, `showLabels`,
+    // `showMissPopup` and `showStats` are therapist-facing *runtime* controls — a slider bound to
+    // effectIntensity fires this on every pointer move, and the old unconditional rebuild
+    // allocated ~12 scratch canvases per call (full-screen background + two star tiles + re-baked
+    // sprites and text) and threw away every cache the frame was about to use.
+    const paletteChanged = next.highContrast !== prev.highContrast;
+    const geomChanged =
+      next.approachSec !== prev.approachSec ||
+      next.horizonY !== prev.horizonY ||
+      next.strikeY !== prev.strikeY ||
+      next.farScale !== prev.farScale ||
+      next.roadWidth !== prev.roadWidth ||
+      next.pastLineSpeed !== prev.pastLineSpeed;
+    if (paletteChanged) {
+      this.palette = getPalette(next.highContrast);
+      this.sprites.clear();
+      // Text sprites are keyed by colour, so they need no flush; the *style* objects and the fitted
+      // lane labels are per-palette and do.
+      this.styleCache.clear();
+      this.labelKeyPalette = '';
+      this.labelText.length = 0;
+    }
+    if (paletteChanged || geomChanged) this.grads.clear();
+    if (next.maxParticles !== prev.maxParticles) this.particles.setCapacity(next.maxParticles);
+    if (geomChanged) {
+      this.rebuildGeometry(this.geom.laneCount);
+      // The background layer bakes in the horizon position and the canvas size, so any change to
+      // horizonY / strikeY / farScale / roadWidth leaves a stale haze blob floating in the sky.
+      this.buildBackground();
+    }
   }
 
   getStats(): RenderStats {
@@ -359,6 +435,8 @@ export class Highway {
     this.laneFlashT0.fill(-10);
     this.laneFlashKind.fill(0);
     this.laneGlow.fill(0);
+    this.laneArmed.fill(1);
+    this.laneRearmT0.fill(-10);
     this.lastCombo = 0;
     this.lastComboShown = 0;
     this.comboBounceT0 = -10;
@@ -504,10 +582,16 @@ export class Highway {
     this.lastSongTime = st;
     const energy = clamp(frame.energy ?? 0, 0, 1);
     const mult = clamp(frame.multiplier, 1, 8);
-    const beat = clamp(frame.beatPhase, 0, 1);
+    // A non-finite beat phase is a *missing* value, not beat zero. `clamp` maps NaN to its low
+    // bound, and the low bound here is exactly the on-beat value — so an unarmed beat clock used to
+    // pin rails, strike band, side panels, receptors and the multiplier badge at maximum pulse on
+    // every single frame. Missing phase now goes flat, the same way reduced motion does.
+    const beatOk = Number.isFinite(frame.beatPhase);
+    const beat = beatOk ? clamp(frame.beatPhase, 0, 1) : 0;
     // 1 on the beat, decays quickly. Reduced motion holds it at a steady mid value so every
     // beat-driven glow / size pulse in the frame goes flat in one place instead of ten.
-    const beatPulse = this.opts.reducedMotion ? 0.3 : Math.pow(1 - beat, 3);
+    const beatPulse = this.opts.reducedMotion || !beatOk ? 0.3 : Math.pow(1 - beat, 3);
+    this.resolveLaneMaps(frame);
 
     ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
     ctx.globalAlpha = 1;
@@ -515,10 +599,10 @@ export class Highway {
 
     this.processHits(frame);
     this.drawBackground(ctx, energy, mult, beatPulse);
-    this.drawRoad(ctx, frame, mult, beatPulse, energy);
+    this.drawRoad(ctx, frame, mult, beatPulse, energy, beat);
     this.drawLaneFlashes(ctx, st);
     this.drawStrikeLine(ctx, frame, beatPulse);
-    this.drawReceptors(ctx, frame, dt, beat);
+    this.drawReceptors(ctx, frame, dt, beatPulse);
     // Popups go *under* the gems on purpose: judgment text is redundant feedback (the lane flash,
     // the burst and the combo all say the same thing), the next target is not. Drawing them here
     // means a popup can never hide an oncoming note even if it overlaps one.
@@ -683,7 +767,7 @@ export class Highway {
     ctx.closePath();
   }
 
-  private drawRoad(ctx: Ctx2D, frame: RenderFrame, mult: number, beatPulse: number, energy: number): void {
+  private drawRoad(ctx: Ctx2D, frame: RenderFrame, mult: number, beatPulse: number, energy: number, beatPhase: number): void {
     const g = this.geom;
     const H = this.height;
     // Asphalt
@@ -698,7 +782,7 @@ export class Highway {
     ctx.fill();
 
     // Beat / bar lines
-    const nLines = fillBeatLines(g, this.stNow, frame.bpm, frame.beatPhase, this.beatTimes, this.beatBars, 4, frame.beatIndex);
+    const nLines = fillBeatLines(g, this.stNow, frame.bpm, beatPhase, this.beatTimes, this.beatBars, 4, frame.beatIndex);
     ctx.lineCap = 'butt';
     for (let pass = 0; pass < 2; pass++) {
       ctx.beginPath();
@@ -840,7 +924,84 @@ export class Highway {
     ctx.stroke();
   }
 
-  private drawReceptors(ctx: Ctx2D, frame: RenderFrame, dt: number, beat: number): void {
+  /**
+   * Resolve lane index → position in `frame.laneStates` / `frame.lanes` for this frame.
+   *
+   * `LaneState.lane` and `LaneSpec.index` are the lane's identity in the engine's own types; the
+   * renderer reads them when they are usable and falls back to array position otherwise. Silently
+   * trusting array order meant that an integrator passing `inputSource.getLaneStates()` in any
+   * other order — or a therapist config whose `LaneSpec.index` values were not 0..n-1 — attached
+   * every meter and every movement label to the wrong lane, with no warning at all. That is a
+   * clinical error (the patient watches a meter driven by their *other* leg), so a mapping that
+   * does not cover the lanes exactly once warns, once, and then uses array position.
+   */
+  private resolveLaneMaps(frame: RenderFrame): void {
+    const n = this.geom.laneCount;
+    let bad = false;
+    bad = this.fillLaneMap(this.stateIdx, n, frame.laneStates, 'lane') || bad;
+    bad = this.fillLaneMap(this.specIdx, n, frame.lanes, 'index') || bad;
+    if (bad && !this.warnedLaneMap) {
+      this.warnedLaneMap = true;
+      if (typeof console !== 'undefined' && typeof console.warn === 'function') {
+        console.warn(
+          '[Highway] RenderFrame.laneStates[].lane / lanes[].index do not cover lanes 0..n-1 exactly once; ' +
+            'falling back to array position. Meters and labels may belong to the wrong lane — pass the engine values through unchanged.',
+        );
+      }
+    }
+  }
+
+  /**
+   * Fill `map` (lane → array position) from an array whose entries may carry their own lane id.
+   * Returns true when the ids were present but unusable (out of range / duplicated / partial).
+   */
+  private fillLaneMap(map: Int8Array, laneCount: number, arr: readonly unknown[] | undefined, field: 'lane' | 'index'): boolean {
+    for (let i = 0; i < laneCount; i++) map[i] = i;
+    if (!arr || arr.length === 0) return false;
+    let tagged = 0;
+    let usable = 0;
+    for (let i = 0; i < laneCount; i++) map[i] = -1;
+    for (let i = 0; i < arr.length; i++) {
+      const raw = (arr[i] as Record<string, unknown> | undefined)?.[field];
+      if (typeof raw !== 'number' || !Number.isFinite(raw)) continue;
+      tagged++;
+      const lane = Math.round(raw);
+      if (lane < 0 || lane >= laneCount || map[lane] >= 0) continue;
+      map[lane] = i;
+      usable++;
+    }
+    // All lanes covered by explicit ids: use them.
+    if (usable === laneCount) return tagged !== usable;
+    // Otherwise fall back to array position — and only complain if ids were actually offered.
+    for (let i = 0; i < laneCount; i++) map[i] = i;
+    return tagged > 0;
+  }
+
+  /** The lane meter for a lane index, honouring `RenderLaneState.lane` (see `resolveLaneMaps`). */
+  private laneState(frame: RenderFrame, lane: number): RenderLaneState | undefined {
+    const i = this.stateIdx[lane];
+    return i >= 0 ? frame.laneStates[i] : undefined;
+  }
+
+  /** The lane definition for a lane index, honouring `LaneSpec.index` (see `resolveLaneMaps`). */
+  private laneSpec(frame: RenderFrame, lane: number): LaneSpec | undefined {
+    const i = this.specIdx[lane];
+    return i >= 0 ? frame.lanes[i] : undefined;
+  }
+
+  /**
+   * Receptors. The meter is the renderer's biofeedback claim, so it is drawn from the pure state
+   * model in receptor.ts and the two situations at a full meter are drawn as *different things*:
+   *
+   *   armed  → lane colour, liquid fill against `thresholdFraction`, meniscus, halo growing with
+   *            the meter, a beat pulse on the ring, and a white-hot fill at the trigger point.
+   *   locked → the lane has already fired and cannot fire again until the value falls below
+   *            `thresholdFraction * rearmFraction`. Dead grey drained fill, NO hot gradient, NO
+   *            halo at all, grey ring, a bright re-arm line across the ring and a downward chevron
+   *            that says "lower to reset". A patient holding at end range sees the light go out and
+   *            a target to come back down to — not a lit receptor that is quietly scoring nothing.
+   */
+  private drawReceptors(ctx: Ctx2D, frame: RenderFrame, dt: number, beatPulse: number): void {
     const g = this.geom;
     // The receptor meter is biofeedback: it must fill against the same threshold the engine fires
     // on (Difficulty.thresholdFraction, per session, from calibration). Falling back to 0.5 without
@@ -857,68 +1018,120 @@ export class Highway {
       }
     }
     const threshold = clamp(frame.thresholdFraction ?? 0.5, 0.05, 1);
+    const rearm = clamp(frame.rearmFraction ?? DEFAULT_REARM_FRACTION, 0.05, 0.99);
+    const st = this.stNow;
+    const still = this.opts.reducedMotion;
     const r = g.receptorRadius;
     const ry = r * GEM_ASPECT;
-    const glowSprite = this.sprites.glow('#ffffff', 64);
+    const look = this.look;
     for (let lane = 0; lane < g.laneCount; lane++) {
-      const ls = frame.laneStates[lane];
-      const value = ls ? clamp(ls.value, 0, 1.5) : 0;
-      const armed = ls ? ls.armed : true;
-      const tracking = ls ? ls.tracking !== false : true;
+      receptorLookInto(look, this.laneState(frame, lane), threshold, rearm);
       const color = laneColor(this.palette, lane);
+      const lockColor = this.palette.miss;
       const x = laneX(g, lane, 0);
       const y = g.strikeY;
-      // Fill fraction relative to threshold: 1 means "would trigger".
-      const fill = clamp(value / threshold, 0, 1);
-      // Smooth the glow so it breathes instead of flickering with camera noise.
-      const target = tracking ? fill * fill : 0;
-      const prevGlow = Number.isFinite(this.laneGlow[lane]) ? this.laneGlow[lane] : 0;
-      this.laneGlow[lane] = prevGlow + (target - prevGlow) * clamp(dt * 14, 0, 1);
-      const glowLevel = this.laneGlow[lane];
-      const pulse = armed ? 1 + (this.opts.reducedMotion ? 0 : 0.035 * Math.sin(beat * Math.PI * 2)) : 0.94;
-      const alphaBase = tracking ? 1 : 0.4;
+      const fill = look.fill;
+      const alphaBase = look.tracking ? 1 : 0.4;
 
-      // Halo behind the receptor grows with the meter.
-      if (glowSprite && glowLevel > 0.02) {
-        ctx.globalCompositeOperation = 'lighter';
-        ctx.globalAlpha = glowLevel * 0.9 * alphaBase;
-        const laneGlowSprite = this.sprites.glow(color.glow, 64) ?? glowSprite;
-        const gs = (r * (2.2 + glowLevel * 1.4)) / 64;
-        blit(ctx, laneGlowSprite, x, y, gs);
-        ctx.globalAlpha = 1;
-        ctx.globalCompositeOperation = 'source-over';
+      // Re-arm edge: the instant the lane can fire again gets a visible pop, because that is the
+      // instant the patient's next rep starts counting.
+      const armedNow = !look.locked && look.tracking ? 1 : 0;
+      if (armedNow && !this.laneArmed[lane]) this.laneRearmT0[lane] = st;
+      this.laneArmed[lane] = armedNow;
+      const popAge = st - this.laneRearmT0[lane];
+      const popK = popAge >= 0 && popAge < REARM_POP_SEC ? Math.pow(1 - popAge / REARM_POP_SEC, 2) : 0;
+
+      // Smoothed halo. `glowTarget` is 0 whenever the lane cannot fire, so the halo drains away
+      // over ~0.2 s when the lane locks out — the light going out is the cue.
+      const prevGlow = Number.isFinite(this.laneGlow[lane]) ? this.laneGlow[lane] : 0;
+      this.laneGlow[lane] = prevGlow + (look.glowTarget - prevGlow) * clamp(dt * 14, 0, 1);
+      const glowLevel = this.laneGlow[lane];
+
+      // Ring scale: a real (≈9 %) beat pulse while the lane is live, a hard 12 % shrink while it is
+      // locked out, plus the re-arm pop. The old 3.5 % wobble was sub-pixel and was not tied to
+      // arming at all.
+      let pulse = look.locked ? 0.88 : 1 + (still ? 0 : 0.09 * beatPulse);
+      if (!still) pulse += 0.22 * popK;
+
+      // Halo behind the receptor grows with the meter (live lanes only).
+      if (glowLevel > 0.02) {
+        const laneGlowSprite = this.sprites.glow(color.glow, 64);
+        if (laneGlowSprite) {
+          ctx.globalCompositeOperation = 'lighter';
+          ctx.globalAlpha = clamp(glowLevel * 0.9 * alphaBase + popK * 0.35, 0, 1);
+          blit(ctx, laneGlowSprite, x, y, (r * (2.2 + glowLevel * 1.4)) / 64);
+          ctx.globalAlpha = 1;
+          ctx.globalCompositeOperation = 'source-over';
+        }
       }
 
-      // Meter fill: liquid rising inside the ring.
+      // Meter fill: liquid rising inside the ring. Same geometry locked or live (the height is the
+      // patient's actual value — that stays honest); the *material* is what changes.
       if (fill > 0.01) {
         ctx.save();
         ctx.beginPath();
         ctx.ellipse(x, y, r * 0.92 * pulse, ry * 0.9 * pulse, 0, 0, Math.PI * 2);
         ctx.clip();
         const top = y + ry - fill * ry * 2;
-        const hot = fill >= 0.999;
-        ctx.fillStyle = this.grad(hot ? METER_HOT_KEYS[lane] : METER_KEYS[lane], () => {
-          const grad = ctx.createLinearGradient(0, y - ry, 0, y + ry);
-          grad.addColorStop(0, withAlpha(hot ? color.bright : color.base, hot ? 0.95 : 0.55));
-          grad.addColorStop(1, withAlpha(color.dark, 0.85));
-          return grad;
-        });
-        ctx.globalAlpha = alphaBase;
+        const hot = look.willFire;
+        ctx.fillStyle = look.locked
+          ? this.grad(METER_LOCK_KEY, () => {
+              const grad = ctx.createLinearGradient(0, y - ry, 0, y + ry);
+              grad.addColorStop(0, withAlpha(lockColor.base, 0.30));
+              grad.addColorStop(1, withAlpha(lockColor.dark, 0.55));
+              return grad;
+            })
+          : this.grad(hot ? METER_HOT_KEYS[lane] : METER_KEYS[lane], () => {
+              const grad = ctx.createLinearGradient(0, y - ry, 0, y + ry);
+              grad.addColorStop(0, withAlpha(hot ? color.bright : color.base, hot ? 0.95 : 0.55));
+              grad.addColorStop(1, withAlpha(color.dark, 0.85));
+              return grad;
+            });
+        ctx.globalAlpha = look.locked ? alphaBase * 0.75 : alphaBase;
         ctx.fillRect(x - r, top, r * 2, y + ry - top + 1);
-        // Meniscus highlight
-        ctx.fillStyle = color.bright;
-        ctx.globalAlpha = 0.7 * alphaBase;
-        ctx.fillRect(x - r, top - 1, r * 2, Math.max(1, 2 * this.u));
+        // Meniscus highlight — live lanes only: a bright line at the top of the fill reads as
+        // "here is your level, it counts", which is the one thing a locked lane must not say.
+        if (!look.locked) {
+          ctx.fillStyle = color.bright;
+          ctx.globalAlpha = 0.7 * alphaBase;
+          ctx.fillRect(x - r, top - 1, r * 2, Math.max(1, 2 * this.u));
+        }
         ctx.globalAlpha = 1;
         ctx.restore();
       }
 
-      // Ring sprite
-      const spr = this.sprites.receptor(color, r);
-      ctx.globalAlpha = alphaBase * (armed ? 1 : 0.7);
+      if (look.locked) {
+        // Re-arm line: where the value has to come back down to. Drawn as three dashes across the
+        // ring so it reads as a target line rather than as part of the fill.
+        const yReset = y + ry - look.resetLevel * ry * 2;
+        const dashW = (r * 1.7) / 5;
+        ctx.fillStyle = LOCK_HINT_COLOR;
+        ctx.globalAlpha = clamp(0.72 + 0.28 * look.resetProgress, 0, 1) * alphaBase;
+        for (let k = 0; k < 3; k++) {
+          ctx.fillRect(x - r * 0.85 + k * dashW * 2, yReset - Math.max(1, this.u), dashW, Math.max(2, 2 * this.u));
+        }
+        // "Lower to reset" chevron, pointing down, fading out as the value approaches the line.
+        const chev = r * 0.34;
+        const cy = y - ry * 0.28 + chev * 0.5 * look.resetProgress;
+        ctx.globalAlpha = clamp(1 - 0.45 * look.resetProgress, 0, 1) * alphaBase;
+        ctx.strokeStyle = LOCK_HINT_COLOR;
+        ctx.lineWidth = Math.max(2, r * 0.13);
+        ctx.lineCap = 'round';
+        ctx.beginPath();
+        ctx.moveTo(x - chev, cy - chev * 0.5);
+        ctx.lineTo(x, cy + chev * 0.5);
+        ctx.lineTo(x + chev, cy - chev * 0.5);
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+      }
+
+      // Ring sprite. Locked lanes get the dead grey ring, not a 30 %-dimmed coloured one.
+      const ringColor = look.locked ? lockColor : color;
+      const spr = this.sprites.receptor(ringColor, r);
+      ctx.globalAlpha = clamp(alphaBase * (look.locked ? 0.6 : 1) + popK * 0.4, 0, 1);
       if (spr) blit(ctx, spr, x, y, pulse);
       else {
-        ctx.strokeStyle = color.base;
+        ctx.strokeStyle = ringColor.base;
         ctx.lineWidth = Math.max(2, r * 0.16);
         ctx.beginPath();
         ctx.ellipse(x, y, r * pulse, ry * pulse, 0, 0, Math.PI * 2);
@@ -926,7 +1139,23 @@ export class Highway {
       }
       ctx.globalAlpha = 1;
 
-      if (!tracking) {
+      // "This will score": an inner rim lit in the lane colour, drawn only while the lane would
+      // actually fire. The receptor's own button face darkens the meter fill behind it, so without
+      // this the difference between "nearly there" and "at the trigger point" was carried by the
+      // halo alone. It pulses with the beat, which is what "pulses when armed" has to look like.
+      if (look.willFire) {
+        ctx.globalCompositeOperation = 'lighter';
+        ctx.globalAlpha = clamp((0.5 + 0.35 * (still ? 0.4 : beatPulse)) * alphaBase, 0, 1);
+        ctx.strokeStyle = color.bright;
+        ctx.lineWidth = Math.max(2, r * 0.13);
+        ctx.beginPath();
+        ctx.ellipse(x, y, r * 0.68 * pulse, ry * 0.68 * pulse, 0, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+        ctx.globalCompositeOperation = 'source-over';
+      }
+
+      if (!look.tracking) {
         this.text.draw(ctx, '?', x, y, this.style('receptorQ'), 1, 0.85);
       }
     }
@@ -947,10 +1176,15 @@ export class Highway {
       if (n.lane < 0 || n.lane >= g.laneCount) continue;
       const d = depthOf(g, n.time, st);
       if (n.state === 'miss') {
-        // Missed gems are culled by fizzle time, not depth (they decelerate while dying, see below).
+        // Missed gems are culled by fizzle time, not by live depth (they decelerate while dying,
+        // see below) — but a fizzle is only *started* for a gem that is still on the board. A
+        // missed note left in `frame.notes` forever used to re-register every time the de-dupe
+        // ledger pruned it (~3 s) and redraw five frames of a cue far below the canvas: invisible,
+        // but a repeating no-op that inflated `stats.notesDrawn` for the rest of the song.
         if (d > g.maxDepth) continue;
         let seenAt = this.missT0.get(n.id);
         if (seenAt === undefined) {
+          if (d < g.minDepth) continue;
           // Defensive: processHits registers the fizzle clock for every miss it sees, so this only
           // fires for a miss handed to us long after its note time (outside the judgment window).
           seenAt = st;
@@ -966,7 +1200,7 @@ export class Highway {
     for (let i = 0; i < buf.length; i++) {
       const n = buf[i];
       const d = depthOf(g, n.time, st);
-      const p = project(g, n.lane, d);
+      const p = projectInto(g, n.lane, d, this.proj);
       const missed = n.state === 'miss';
       const color = missed ? this.palette.miss : laneColor(this.palette, n.lane);
       let alpha = 1;
@@ -983,11 +1217,15 @@ export class Highway {
         const ySeen = yAt(g, dSeen);
         y = ySeen + (p.y - ySeen) * 0.35 + k * g.gemRadiusNear * 0.4;
         alpha = (1 - k) * 0.75;
+        // ...and never below the bottom edge: the whole point of the fizzle is that the patient
+        // sees the note die. See `missCueY`.
+
         // Shrink from the size it had when the miss was declared. Below the strike line the
         // perspective tail *magnifies* gems, so scaling the live radius made a dying gem the
         // biggest thing on the board — the opposite of a fizzle.
         const rSeen = g.gemRadiusNear * scaleAt(g, dSeen);
         radius = (rSeen + (p.radius - rSeen) * 0.35) * (1 - k * 0.5);
+        y = this.missCueY(y, radius);
       } else if (d < 0) {
         // Pending gem past the line: keep full colour (a late hit may still land) but dim gently
         // toward the bottom so it reads as "getting away".
@@ -1013,6 +1251,19 @@ export class Highway {
     return drawn;
   }
 
+  /**
+   * Keep a miss cue (dying gem, puff) fully inside the canvas.
+   *
+   * The engine declares a miss at `note.time + goodMs + grace` — up to 280 ms past the line — and
+   * with the default geometry a gem of that age is still entirely on screen (`gemVisibleTailSec`
+   * ≥ 300 ms at every tested resolution, asserted in geometry.test.ts). This clamp is the backstop
+   * for tuned options and short canvases: a cue drawn half below the bottom edge is not a cue, and
+   * "it was issued" is not the same as "the patient saw it".
+   */
+  private missCueY(y: number, radius: number): number {
+    return Math.min(y, this.height - radius * GEM_ASPECT - MISS_CUE_MARGIN_U * this.u);
+  }
+
   // ---------------------------------------------------------------------------------------------
   // Hit processing → particles, flashes, popups
   // ---------------------------------------------------------------------------------------------
@@ -1032,27 +1283,35 @@ export class Highway {
     this.laneFlashT0[lane] = st;
     if (judgment === 'miss') {
       this.laneFlashKind[lane] = 2;
-      // Grey puff where the gem currently is, so the fizzle is attached to the gem rather than to
-      // the receptor. Count scales with effectIntensity but never to zero — the puff plus the red
-      // lane tint plus the greying gem are the three miss cues and none of them may go missing.
+      // Grey smoke where the gem is, so the fizzle is attached to the gem rather than to the
+      // receptor — clamped on screen like the gem itself. Count scales with effectIntensity but
+      // never to zero: the puff, the red lane tint and the greying gem are the three miss cues and
+      // none of them may go missing.
+      //
+      // PARTICLE_SMOKE, not PARTICLE_SPARK: sparks are drawn additively, and additive grey is
+      // white — six overlapping `lighter` glows at the gem position produced a bright ~150 px
+      // smudge clipped by the bottom edge, which reads as a rendering fault rather than a note
+      // dying. Smoke composites normally over the asphalt and *darkens* as it spreads.
       const d = depthOf(g, noteTime, st);
-      const p = project(g, lane, clamp(d, g.minDepth, 1));
-      const puffs = Math.max(2, Math.round(6 * eff));
+      const p = projectInto(g, lane, clamp(d, g.minDepth, 1), this.proj);
+      const py = this.missCueY(p.y, p.radius);
+      const puffs = Math.max(2, Math.round(4 * eff));
       for (let k = 0; k < puffs; k++) {
-        const ang = -Math.PI / 2 + (this.rng() - 0.5) * 2.4;
-        const speed = p.radius * (1.5 + this.rng() * 2);
+        const ang = -Math.PI / 2 + (this.rng() - 0.5) * 1.8;
+        const speed = p.radius * (0.5 + this.rng() * 0.9);
         this.particles.emit({
-          x: p.x + (this.rng() - 0.5) * p.radius,
-          y: p.y,
+          x: p.x + (this.rng() - 0.5) * p.radius * 0.8,
+          y: py,
           vx: Math.cos(ang) * speed,
           vy: Math.sin(ang) * speed,
-          life: 0.35 + this.rng() * 0.2,
-          size: p.radius * 0.35,
-          endSize: p.radius * 0.9,
+          life: 0.3 + this.rng() * 0.18,
+          size: p.radius * 0.5,
+          endSize: p.radius * 0.78,
           color: MISS_COLOR_INDEX,
-          alpha: 0.35,
-          drag: 2,
-          kind: PARTICLE_SPARK,
+          alpha: 0.5,
+          drag: 3,
+          gravity: p.radius * 1.6,
+          kind: PARTICLE_SMOKE,
         });
       }
       if (!this.opts.showMissPopup) return;
@@ -1254,6 +1513,36 @@ export class Highway {
         ctx.stroke();
       }
     }
+    // Smoke last, and *not* additively (see PARTICLE_SMOKE): a dying note has to look like it is
+    // going out, which additive compositing cannot express — the more smoke, the brighter it got.
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = 'source-over';
+    for (let ci = 0; ci < seenN; ci++) {
+      const cidx = seen[ci];
+      let any = false;
+      for (let i = 0; i < n; i++) {
+        if (pool.color[i] === cidx && pool.kind[i] === PARTICLE_SMOKE) {
+          any = true;
+          break;
+        }
+      }
+      if (!any) continue;
+      const col = this.particleColor(cidx);
+      const smokeSprite = this.sprites.glow(col.base, 32);
+      for (let i = 0; i < n; i++) {
+        if (pool.color[i] !== cidx || pool.kind[i] !== PARTICLE_SMOKE) continue;
+        const size = pool.sizeAt(i);
+        if (size <= 0.2) continue;
+        ctx.globalAlpha = pool.alphaAt(i) * 0.8;
+        if (smokeSprite) blit(ctx, smokeSprite, pool.x[i], pool.y[i], (size * 2.2) / 32);
+        else {
+          ctx.fillStyle = col.base;
+          ctx.beginPath();
+          ctx.arc(pool.x[i], pool.y[i], size, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+    }
     ctx.globalAlpha = 1;
     ctx.globalCompositeOperation = 'source-over';
   }
@@ -1292,6 +1581,23 @@ export class Highway {
   private styleCache = new Map<string, TextStyle>();
   private styleU = -1;
   private styleLaneW = -1;
+  /** Fitted HUD strings (0 = title, 1 = attribution) — refitted only when the text or room changes. */
+  private hudSrc: string[] = ['', ''];
+  private hudFit: string[] = ['', ''];
+  private hudRoom: number[] = [-1, -1];
+
+  /**
+   * Ellipsize a HUD string to `room` px, caching the result: `TextCache.fit` measures, so it is a
+   * cold path and must not run every frame for a title that never changes.
+   */
+  private fitHud(slot: number, text: string, style: TextStyle, room: number): string {
+    if (this.hudSrc[slot] !== text || this.hudRoom[slot] !== room) {
+      this.hudSrc[slot] = text;
+      this.hudRoom[slot] = room;
+      this.hudFit[slot] = this.text.fit(text, style, room);
+    }
+    return this.hudFit[slot];
+  }
 
   private style(name: string): TextStyle {
     if (this.styleU !== this.u || this.styleLaneW !== this.geom.laneWidthNear) {
@@ -1302,45 +1608,50 @@ export class Highway {
     let s = this.styleCache.get(name);
     if (s) return s;
     const u = this.u;
-    const px = (n: number) => Math.round(n * u);
+    // Every HUD size has a floor. `u` bottoms out at 0.35, so an unfloored `Math.round(12 * u)`
+    // rendered the attribution at 4 px and 'SCORE' / 'ROCK' / 'COMBO' at 5 px on a 400x800 canvas.
+    // Attribution is a CC-BY licence obligation (docs/ARCHITECTURE.md), not decoration, and a rock
+    // meter nobody can read is not a clinical safety control either.
+    const px = (n: number, min = 11) => Math.max(min, Math.round(n * u));
     switch (name) {
       // Popup text is deliberately small (Clone Hero scale, not a splash screen): it sits just
       // above the fret, inside the note approach path, so it must not be a billboard.
       case 'popupPerfect':
-        s = { font: `italic 900 ${px(22)}px ${FONT}`, color: JUDGMENT_STYLE.perfect.color, stroke: JUDGMENT_STYLE.perfect.stroke, strokeWidth: px(2), glow: JUDGMENT_STYLE.perfect.glow, glowBlur: px(9) };
+        s = { font: `italic 900 ${px(22, 14)}px ${FONT}`, color: JUDGMENT_STYLE.perfect.color, stroke: JUDGMENT_STYLE.perfect.stroke, strokeWidth: px(2, 1), glow: JUDGMENT_STYLE.perfect.glow, glowBlur: px(9, 3) };
         break;
       case 'popupGood':
-        s = { font: `italic 900 ${px(22)}px ${FONT}`, color: JUDGMENT_STYLE.good.color, stroke: JUDGMENT_STYLE.good.stroke, strokeWidth: px(2), glow: JUDGMENT_STYLE.good.glow, glowBlur: px(9) };
+        s = { font: `italic 900 ${px(22, 14)}px ${FONT}`, color: JUDGMENT_STYLE.good.color, stroke: JUDGMENT_STYLE.good.stroke, strokeWidth: px(2, 1), glow: JUDGMENT_STYLE.good.glow, glowBlur: px(9, 3) };
         break;
       case 'popupMiss':
-        s = { font: `italic 700 ${px(17)}px ${FONT}`, color: JUDGMENT_STYLE.miss.color, stroke: JUDGMENT_STYLE.miss.stroke, strokeWidth: px(2), glow: JUDGMENT_STYLE.miss.glow, glowBlur: px(5) };
+        s = { font: `italic 700 ${px(17, 12)}px ${FONT}`, color: JUDGMENT_STYLE.miss.color, stroke: JUDGMENT_STYLE.miss.stroke, strokeWidth: px(2, 1), glow: JUDGMENT_STYLE.miss.glow, glowBlur: px(5, 2) };
         break;
       case 'combo':
-        s = { font: `italic 900 ${px(56)}px ${FONT}`, color: '#ffffff', stroke: 'rgba(0,0,0,0.6)', strokeWidth: px(3), glow: '#8fb4ff', glowBlur: px(16) };
+        s = { font: `italic 900 ${px(56, 26)}px ${FONT}`, color: '#ffffff', stroke: 'rgba(0,0,0,0.6)', strokeWidth: px(3, 1), glow: '#8fb4ff', glowBlur: px(16, 5) };
         break;
       case 'comboLabel':
-        s = { font: `700 ${px(15)}px ${FONT}`, color: UI_COLORS.textDim, stroke: 'rgba(0,0,0,0.5)', strokeWidth: px(2) };
+        s = { font: `700 ${px(15, 11)}px ${FONT}`, color: UI_COLORS.textDim, stroke: 'rgba(0,0,0,0.5)', strokeWidth: px(2, 1) };
         break;
       case 'hudLabel':
-        s = { font: `700 ${px(14)}px ${FONT}`, color: UI_COLORS.textDim };
+        s = { font: `700 ${px(14, 11)}px ${FONT}`, color: UI_COLORS.textDim };
         break;
       case 'score':
-        s = { font: `800 ${px(36)}px ${FONT}`, color: UI_COLORS.text, glow: '#7fa0ff', glowBlur: px(10) };
+        s = { font: `800 ${px(36, 22)}px ${FONT}`, color: UI_COLORS.text, glow: '#7fa0ff', glowBlur: px(10, 4) };
         break;
       case 'title':
-        s = { font: `700 ${px(20)}px ${FONT}`, color: UI_COLORS.text };
+        s = { font: `700 ${px(20, 13)}px ${FONT}`, color: UI_COLORS.text };
         break;
       case 'attribution':
-        s = { font: `400 ${px(12)}px ${FONT}`, color: UI_COLORS.textDim };
+        // CC-BY attribution: never smaller than 11 px, whatever the canvas.
+        s = { font: `400 ${px(12, 11)}px ${FONT}`, color: UI_COLORS.textDim };
         break;
       case 'mult':
-        s = { font: `italic 900 ${px(30)}px ${FONT}`, color: '#ffffff', stroke: 'rgba(0,0,0,0.5)', strokeWidth: px(2) };
+        s = { font: `italic 900 ${px(30, 16)}px ${FONT}`, color: '#ffffff', stroke: 'rgba(0,0,0,0.5)', strokeWidth: px(2, 1) };
         break;
       case 'receptorQ':
-        s = { font: `900 ${px(20)}px ${FONT}`, color: '#ffffff', stroke: '#000000', strokeWidth: px(2) };
+        s = { font: `900 ${px(20, 13)}px ${FONT}`, color: '#ffffff', stroke: '#000000', strokeWidth: px(2, 1) };
         break;
       case 'stats':
-        s = { font: `${px(12)}px ui-monospace, Menlo, Consolas, monospace`, color: '#9cffb0' };
+        s = { font: `${px(12, 10)}px ui-monospace, Menlo, Consolas, monospace`, color: '#9cffb0' };
         break;
       default: {
         // laneLabel:<hex>
@@ -1359,6 +1670,15 @@ export class Highway {
    * judgment popups never draw through it. When the side panel is too narrow (portrait / 4 lanes
    * on a narrow canvas) it moves to the top centre above the horizon.
    */
+  /** `String(combo)` without a per-frame allocation (the value only changes on a hit). */
+  private comboString(combo: number): string {
+    if (combo !== this.comboStrN) {
+      this.comboStrN = combo;
+      this.comboStr = String(combo);
+    }
+    return this.comboStr;
+  }
+
   private drawCombo(ctx: Ctx2D, frame: RenderFrame, st: number): void {
     const g = this.geom;
     const u = this.u;
@@ -1386,7 +1706,7 @@ export class Highway {
       const scale = (1 + bounce * 0.35) * (1 + heat * 0.2);
       // Per-character sprites: the combo value changes constantly, so a whole-string sprite would
       // rasterize (and cache) a new ~350 KB canvas on every increment.
-      this.text.drawChars(ctx, String(combo), x, y, this.style('combo'), scale, 0.95);
+      this.text.drawChars(ctx, this.comboString(combo), x, y, this.style('combo'), scale, 0.95);
       this.text.draw(ctx, 'COMBO', x, y + labelDy, this.style('comboLabel'), 1, 0.9);
     } else {
       const age = st - this.comboBreakT0;
@@ -1394,7 +1714,7 @@ export class Highway {
         // Combo break: brief shake-out.
         const k = 1 - age / 0.5;
         const dx = still ? 0 : Math.sin(age * 60) * 6 * u * k;
-        this.text.drawChars(ctx, String(this.lastComboShown), x + dx, y, this.style('combo'), 1, k * 0.5);
+        this.text.drawChars(ctx, this.comboString(this.lastComboShown), x + dx, y, this.style('combo'), 1, k * 0.5);
       }
     }
     if (combo >= 2) this.lastComboShown = combo;
@@ -1414,12 +1734,30 @@ export class Highway {
     if (Math.abs(target - this.displayScore) < 0.5) this.displayScore = target;
     else this.displayScore += (target - this.displayScore) * clamp(dt * 9, 0, 1);
     const scoreStyle = this.style('score');
-    this.text.draw(ctx, 'SCORE', W - pad, pad + 8 * u, this.style('hudLabel'), 1, 1, 'right');
-    this.digits.draw(ctx, this.displayScore, W - pad, pad + 38 * u, scoreStyle, 6, this.dpr);
+    const labelStyle = this.style('hudLabel');
+    // Lay the top HUD out from the *actual* font sizes, not from `u`: the minimum legible sizes
+    // (see `style()`) bind on a small canvas, and a layout scaled by `u` alone then ran the score
+    // digits straight through the 'SCORE' label.
+    const labelPx = fontPx(labelStyle.font);
+    const scorePx = fontPx(scoreStyle.font);
+    this.text.draw(ctx, 'SCORE', W - pad, pad + labelPx * 0.5, labelStyle, 1, 1, 'right');
+    this.digits.draw(ctx, this.displayScore, W - pad, pad + labelPx + scorePx * 0.7, scoreStyle, 6, this.dpr);
 
-    // Song title / attribution (top-left)
-    if (frame.songTitle) this.text.draw(ctx, frame.songTitle, pad, pad + 10 * u, this.style('title'), 1, 1, 'left');
-    if (frame.attribution) this.text.draw(ctx, frame.attribution, pad, pad + 32 * u, this.style('attribution'), 1, 1, 'left');
+    // Song title / attribution (top-left), fitted to the space left of the score readout so a long
+    // CC-BY attribution string is ellipsized instead of running underneath the score.
+    // 6 digits at ~0.62 em each, plus half an em of gutter so a fitted attribution never abuts the
+    // score block.
+    const textRoom = Math.max(60 * u, W - pad * 2 - scorePx * 4.9);
+    const titleStyle = this.style('title');
+    const titlePx = fontPx(titleStyle.font);
+    const titleY = pad + titlePx * 0.62;
+    if (frame.songTitle) {
+      this.text.draw(ctx, this.fitHud(0, frame.songTitle, titleStyle, textRoom), pad, titleY, titleStyle, 1, 1, 'left');
+    }
+    if (frame.attribution) {
+      const aStyle = this.style('attribution');
+      this.text.draw(ctx, this.fitHud(1, frame.attribution, aStyle, textRoom), pad, titleY + titlePx * 0.62 + fontPx(aStyle.font) * 0.72, aStyle, 1, 1, 'left');
+    }
 
     // Rock meter (left, arc gauge)
     const health = clamp(frame.health, 0, 1);
@@ -1470,8 +1808,11 @@ export class Highway {
     // Label in the arc's bottom gap.
     this.text.draw(ctx, 'ROCK', gx, gy + gaugeR * 0.95, this.style('hudLabel'), 1, 0.9);
 
-    // Multiplier badge under the gauge
-    const mult = Math.max(1, Math.floor(frame.multiplier));
+    // Multiplier badge under the gauge. A non-finite multiplier is a *missing* value: without the
+    // guard `Math.floor(NaN)` made `mult !== lastMultiplier` true on every frame (the pop timer
+    // restarted forever, freezing the badge at its 1.4x overshoot) and indexed BADGE_KEYS with
+    // `undefined`, which then became a gradient-cache key.
+    const mult = Number.isFinite(frame.multiplier) ? clamp(Math.floor(frame.multiplier), 1, 99) : 1;
     if (mult !== this.lastMultiplier) {
       this.multiplierPopT0 = this.stNow;
       this.lastMultiplier = mult;
@@ -1490,7 +1831,7 @@ export class Highway {
     ctx.fill();
     ctx.globalAlpha = 1;
     ctx.globalCompositeOperation = 'source-over';
-    ctx.fillStyle = this.grad(BADGE_KEYS[Math.min(mult, 4) - 1], () => {
+    ctx.fillStyle = this.grad(BADGE_KEYS[clamp(mult, 1, 4) - 1], () => {
       const bg = ctx.createLinearGradient(0, by, 0, by + gaugeR * 0.75);
       bg.addColorStop(0, tier.color);
       bg.addColorStop(1, mixHex(tier.color, '#000000', 0.45));
@@ -1541,7 +1882,7 @@ export class Highway {
     let ok = this.labelText.length === g.laneCount && this.labelU === this.u && this.labelLaneW === g.laneWidthNear;
     if (ok) {
       for (let lane = 0; lane < g.laneCount; lane++) {
-        const spec = frame.lanes[lane];
+        const spec = this.laneSpec(frame, lane);
         if (!spec || this.labelMovement[lane] !== spec.movement || this.labelSide[lane] !== spec.side) {
           ok = false;
           break;
@@ -1556,7 +1897,7 @@ export class Highway {
     this.labelSide.length = 0;
     let widest = 0;
     for (let lane = 0; lane < g.laneCount; lane++) {
-      const spec = frame.lanes[lane];
+      const spec = this.laneSpec(frame, lane);
       const raw = spec ? movementLabel(spec.movement, spec.side) : '';
       this.labelText.push(raw);
       this.labelMovement.push(spec ? spec.movement : '');
@@ -1583,7 +1924,7 @@ export class Highway {
     for (let lane = 0; lane < g.laneCount; lane++) {
       const label = this.labelText[lane];
       if (!label) continue;
-      const ls = frame.laneStates[lane];
+      const ls = this.laneState(frame, lane);
       const tracking = ls ? ls.tracking !== false : true;
       const x = laneX(g, lane, -0.02);
       const row = this.labelStagger ? lane % 2 : 0;

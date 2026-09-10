@@ -1,11 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { HitEvent, LaneSpec } from '../engine/types';
-import { Highway, POPUP_MAX_RISE_FRAC, makeFrame } from './Highway';
+import { DEFAULT_HIGHWAY_OPTIONS, Highway, MISS_CUE_MARGIN_U, POPUP_MAX_RISE_FRAC, makeFrame } from './Highway';
 import { createMockCanvas, mockCanvasFactory, type MockCanvas } from './canvasMock';
 import { runDemo } from './demo';
 import { laneX, roadEdgeX, visibleTailSec } from './geometry';
 import { TextCache, type Ctx2D } from './text';
-import type { RenderFrame, RenderNote } from './types';
+import type { CanvasLike, RenderFrame, RenderNote } from './types';
 
 const LANES: LaneSpec[] = [
   { index: 0, movement: 'seated_march', side: 'left' },
@@ -38,7 +38,7 @@ describe('Highway construction / resize', () => {
     expect(canvas.height).toBe(1000);
     expect(hw.geometry.width).toBe(1000);
     expect(hw.geometry.height).toBe(500);
-    expect(hw.geometry.strikeY).toBeCloseTo(0.82 * 500);
+    expect(hw.geometry.strikeY).toBeCloseTo(DEFAULT_HIGHWAY_OPTIONS.strikeY * 500);
   });
 
   it('reads clientWidth/clientHeight when no size given', () => {
@@ -1074,6 +1074,510 @@ describe('lane labels fit their lanes', () => {
         expect(s.x1, `${w}x${h}`).toBeLessThan(w + 1);
         expect(s.y, `${w}x${h}`).toBeLessThan(h);
       }
+    }
+  });
+});
+
+// -------------------------------------------------------------------------------------------------
+// Receptor honesty: the meter must mean exactly what the input engine means.
+// -------------------------------------------------------------------------------------------------
+
+/** Additive sprite blits centred on a receptor — i.e. the "this lane is live" halo. */
+function haloBlits(canvas: MockCanvas, hw: Highway): number {
+  const g = hw.geometry;
+  let n = 0;
+  canvas.ctx.calls.forEach((c, i) => {
+    if (c.name !== 'drawImage' || c.args.length !== 5) return;
+    const dx = c.args[1] as number;
+    const dy = c.args[2] as number;
+    const dw = c.args[3] as number;
+    const dh = c.args[4] as number;
+    if (Math.abs(dy + dh / 2 - g.strikeY) > 1) return;
+    if (canvas.ctx.propBefore(i, 'globalCompositeOperation') !== 'lighter') return;
+    for (let lane = 0; lane < g.laneCount; lane++) if (Math.abs(dx + dw / 2 - laneX(g, lane, 0)) < 1) n++;
+  });
+  return n;
+}
+
+const serialize = (canvas: MockCanvas): string[] => canvas.ctx.calls.map((c) => `${c.name}(${JSON.stringify(c.args.map((a) => (typeof a === 'number' ? Math.round(a * 100) / 100 : typeof a === 'object' ? 'obj' : a)))})`);
+
+/** Multiset symmetric difference between two recorded frames. */
+function callDiff(a: string[], b: string[]): number {
+  const counts = new Map<string, number>();
+  for (const k of a) counts.set(k, (counts.get(k) ?? 0) + 1);
+  for (const k of b) counts.set(k, (counts.get(k) ?? 0) - 1);
+  let d = 0;
+  for (const v of counts.values()) d += Math.abs(v);
+  return d;
+}
+
+describe('receptor tells the truth about whether the lane can fire', () => {
+  const VALUE = 0.75;
+  const THRESH = 0.6;
+  const states = (armed: boolean): RenderFrame['laneStates'] => LANES.map((l) => ({ lane: l.index, value: VALUE, armed, tracking: true }));
+  /** Draw enough frames for the smoothed halo to settle, then record exactly one more. */
+  const settled = (armed: boolean): { canvas: MockCanvas; hw: Highway; scratch: MockCanvas[] } => {
+    const s = setup(1280, 720);
+    s.hw.resize(1280, 720, 1);
+    for (let i = 0; i < 30; i++) {
+      s.hw.draw(makeFrame({ lanes: LANES, songTime: 1 + i * 0.016, laneStates: states(armed), thresholdFraction: THRESH, beatPhase: 0.5 }));
+    }
+    s.canvas.ctx.reset();
+    s.hw.draw(makeFrame({ lanes: LANES, songTime: 1.5, laneStates: states(armed), thresholdFraction: THRESH, beatPhase: 0.5 }));
+    return s;
+  };
+
+  it('gives a lane held past threshold but not re-armed a categorically different receptor', () => {
+    // The patient is holding at end range: value 0.75 against a 0.6 threshold, but the lane has
+    // already fired and cannot fire again until the value drops below 0.6 * 0.6 = 0.36. Showing
+    // them a lit, "hot", haloed receptor for the whole hold is the lie this test exists to prevent.
+    const live = settled(true);
+    const held = settled(false);
+
+    // 1. The halo — "you are at / near the trigger point" — is present live and gone entirely.
+    expect(haloBlits(live.canvas, live.hw)).toBe(4);
+    expect(haloBlits(held.canvas, held.hw)).toBe(0);
+
+    // 2. The locked lane gets its own cues: a re-arm line and a "lower to reset" chevron.
+    const hint = (c: MockCanvas): number =>
+      c.ctx.calls.filter((k) => (k.name === 'set:fillStyle' || k.name === 'set:strokeStyle') && k.args[0] === '#ffcf5a').length;
+    expect(hint(held.canvas)).toBeGreaterThanOrEqual(4 * 2); // per lane: dashes + chevron
+    expect(hint(live.canvas)).toBe(0);
+
+    // 3. The ring itself is rasterized in the dead grey miss palette, not the lane colour.
+    const greyRing = (scratch: MockCanvas[]): boolean =>
+      scratch.some((c) => c.ctx.calls.some((k) => k.name === 'set:strokeStyle' && k.args[0] === '#55565e'));
+    expect(greyRing(held.scratch)).toBe(true);
+    expect(greyRing(live.scratch)).toBe(false);
+
+    // 4. And the frames genuinely differ: the old implementation differed by 3 calls out of 252
+    //    (a clip ellipse, one globalAlpha and the ring blit size), i.e. a 30 % dim of the outline.
+    const diff = callDiff(serialize(live.canvas), serialize(held.canvas));
+    expect(diff).toBeGreaterThan(40);
+  });
+
+  it('drains the halo when a lane locks out mid-hold and pops it back on re-arm', () => {
+    const { canvas, hw } = setup(1280, 720);
+    hw.resize(1280, 720, 1);
+    const at = (t: number, armed: boolean, value = VALUE): void => {
+      hw.draw(makeFrame({ lanes: LANES, songTime: t, laneStates: states(armed).map((s) => ({ ...s, value })), thresholdFraction: THRESH }));
+    };
+    for (let i = 0; i < 30; i++) at(1 + i * 0.016, true);
+    canvas.ctx.reset();
+    at(1.5, true);
+    expect(haloBlits(canvas, hw)).toBe(4);
+    // Lane fires → unarmed. The halo drains over a few frames rather than snapping, but it goes.
+    for (let i = 0; i < 30; i++) at(1.52 + i * 0.016, false);
+    canvas.ctx.reset();
+    at(2.02, false);
+    expect(haloBlits(canvas, hw)).toBe(0);
+    // Patient lowers past the re-arm line → armed again, and the meter lights up again.
+    for (let i = 0; i < 30; i++) at(2.04 + i * 0.016, true);
+    canvas.ctx.reset();
+    at(2.54, true);
+    expect(haloBlits(canvas, hw)).toBe(4);
+  });
+
+  it('only a lane that would actually fire gets the "full" read', () => {
+    // The halo grows with the meter and is the "you are at the trigger point" signal, so it must
+    // scale with the value while armed — and be absent entirely while the lane cannot fire.
+    expect(settledHalo(0.75, true).size).toBeGreaterThan(settledHalo(0.3, true).size);
+    expect(settledHalo(0.75, true).alpha).toBeGreaterThan(settledHalo(0.3, true).alpha);
+    expect(settledHalo(0.3, true).count).toBe(4);
+    expect(settledHalo(0.75, false).count).toBe(0);
+    expect(settledHalo(0.3, false).count).toBe(0);
+    // Lost tracking is also "cannot fire": no halo either.
+    expect(settledHalo(0.9, true, false).count).toBe(0);
+  });
+
+  /** Halo blit count / diameter / alpha after the smoothing settles, for one lane state. */
+  function settledHalo(value: number, armed: boolean, tracking = true): { count: number; size: number; alpha: number } {
+    const { canvas, hw } = setup(1280, 720);
+    hw.resize(1280, 720, 1);
+    const ls = LANES.map((l) => ({ lane: l.index, value, armed, tracking }));
+    for (let i = 0; i < 30; i++) hw.draw(makeFrame({ lanes: LANES, songTime: 1 + i * 0.016, laneStates: ls, thresholdFraction: THRESH }));
+    canvas.ctx.reset();
+    hw.draw(makeFrame({ lanes: LANES, songTime: 1.5, laneStates: ls, thresholdFraction: THRESH }));
+    const g = hw.geometry;
+    let size = 0;
+    let alpha = 0;
+    canvas.ctx.calls.forEach((c, i) => {
+      if (c.name !== 'drawImage' || c.args.length !== 5) return;
+      const dx = c.args[1] as number;
+      const dy = c.args[2] as number;
+      const dw = c.args[3] as number;
+      const dh = c.args[4] as number;
+      if (Math.abs(dy + dh / 2 - g.strikeY) > 1) return;
+      if (canvas.ctx.propBefore(i, 'globalCompositeOperation') !== 'lighter') return;
+      if (Math.abs(dx + dw / 2 - laneX(g, 0, 0)) > 1) return;
+      size = Math.max(size, dw);
+      alpha = Math.max(alpha, canvas.ctx.propBefore(i, 'globalAlpha') as number);
+    });
+    return { count: haloBlits(canvas, hw), size, alpha };
+  }
+
+  it('honours a session-specific rearmFraction for the re-arm line', () => {
+    const lineY = (rearmFraction: number | undefined): number => {
+      const { canvas, hw } = setup(1280, 720);
+      hw.resize(1280, 720, 1);
+      const f = makeFrame({
+        lanes: LANES,
+        songTime: 1,
+        laneStates: LANES.map((l) => ({ lane: l.index, value: 0.75, armed: false })),
+        thresholdFraction: THRESH,
+        ...(rearmFraction === undefined ? {} : { rearmFraction }),
+      });
+      hw.draw(f);
+      // First dash of the first lane's re-arm line.
+      const i = canvas.ctx.calls.findIndex((c) => c.name === 'set:fillStyle' && c.args[0] === '#ffcf5a');
+      expect(i).toBeGreaterThan(-1);
+      const dash = canvas.ctx.calls.slice(i).find((c) => c.name === 'fillRect');
+      return (dash as { args: number[] }).args[1];
+    };
+    // A lower re-arm fraction means the patient must come further down: the line sits lower in the
+    // ring, i.e. at a *larger* y.
+    expect(lineY(0.3)).toBeGreaterThan(lineY(0.6));
+    expect(lineY(undefined)).toBeCloseTo(lineY(0.6), 6);
+  });
+});
+
+// -------------------------------------------------------------------------------------------------
+// Judgment cues land on screen; decoration never becomes the loudest thing.
+// -------------------------------------------------------------------------------------------------
+
+/** A canvas factory with no 2D context: forces every sprite path into its plain-ctx fallback. */
+const noSpriteFactory = (w: number, h: number): CanvasLike => ({ width: w, height: h, getContext: () => null });
+
+/** Gem discs drawn below the strike line (the sprite-less fallback draws them as ellipses). */
+function gemDiscs(canvas: MockCanvas, hw: Highway): Array<{ cy: number; ry: number }> {
+  const g = hw.geometry;
+  return canvas.ctx.calls
+    .filter((c) => c.name === 'ellipse' && (c.args[1] as number) > g.strikeY + 1)
+    .map((c) => ({ cy: c.args[1] as number, ry: c.args[3] as number }));
+}
+
+describe('the miss cue lands inside the canvas', () => {
+  it('keeps the whole dying gem on screen from the verdict through the fizzle, at every resolution', () => {
+    // The engine declares a miss at note.time + goodMs (180) + grace (100) = +280 ms. Previously
+    // the gem's centre was 707/720 at that instant with a 74 px radius — 59 % of the gem inside the
+    // canvas, and its centre crossed the bottom edge 45 ms later. "notesDrawn === 1" said nothing
+    // about that, so this test measures the drawn disc.
+    for (const [w, h] of [
+      [1280, 720],
+      [1920, 1080],
+      [720, 1280],
+      [400, 800],
+      [1366, 768],
+    ]) {
+      for (const laneCount of [2, 3, 4]) {
+        const canvas = createMockCanvas(w, h);
+        const hw = new Highway(canvas, { createCanvas: noSpriteFactory });
+        hw.resize(w, h, 1);
+        const lanes = LANES.slice(0, laneCount);
+        const noteTime = 10;
+        const lane = laneCount - 1;
+        hw.draw(makeFrame({ lanes, songTime: noteTime - 1 }));
+        const missEv: HitEvent[] = [{ noteId: 1, lane, judgment: 'miss', deltaMs: 180, time: noteTime + 0.18 }];
+        const missed: RenderNote = { id: 1, lane, time: noteTime, state: 'miss', judgment: 'miss' };
+        for (const dt of [0.28, 0.34, 0.45, 0.6, 0.69]) {
+          canvas.ctx.reset();
+          hw.draw(makeFrame({ lanes, songTime: noteTime + dt, notes: [missed], recentHits: dt === 0.28 ? missEv : [] }));
+          const discs = gemDiscs(canvas, hw);
+          expect(discs.length, `${w}x${h} lanes=${laneCount} +${dt}s`).toBe(1);
+          const u = Math.min(2.5, Math.max(0.35, Math.min(w / 1280, h / 720)));
+          expect(discs[0].cy + discs[0].ry, `${w}x${h} lanes=${laneCount} +${dt}s bottom edge`).toBeLessThanOrEqual(h - MISS_CUE_MARGIN_U * u + 0.001);
+          expect(discs[0].cy - discs[0].ry, `${w}x${h} lanes=${laneCount} +${dt}s top edge`).toBeGreaterThan(0);
+        }
+      }
+    }
+  });
+
+  it('holds a pending gem fully on screen until the miss verdict can arrive', () => {
+    for (const [w, h] of [
+      [1280, 720],
+      [1920, 1080],
+      [720, 1280],
+    ]) {
+      const canvas = createMockCanvas(w, h);
+      const hw = new Highway(canvas, { createCanvas: noSpriteFactory });
+      hw.resize(w, h, 1);
+      const pending: RenderNote = { id: 1, lane: 0, time: 10, state: 'pending' };
+      for (const dtMs of [30, 100, 200, 280]) {
+        canvas.ctx.reset();
+        hw.draw(makeFrame({ lanes: LANES, songTime: 10 + dtMs / 1000, notes: [pending] }));
+        const discs = gemDiscs(canvas, hw);
+        expect(discs.length, `${w}x${h} +${dtMs}ms`).toBe(1);
+        expect(discs[0].cy + discs[0].ry, `${w}x${h} +${dtMs}ms`).toBeLessThanOrEqual(h);
+      }
+    }
+  });
+
+  it('draws the miss puff as smoke over the road, never as an additive white smudge', () => {
+    // showLabels off so the only things drawn below the receptors are the puff particles.
+    const { canvas, hw } = setup(1280, 720, { showLabels: false });
+    hw.resize(1280, 720, 1);
+    const g = hw.geometry;
+    hw.draw(makeFrame({ lanes: LANES, songTime: 1 }));
+    const miss: HitEvent[] = [{ noteId: 7, lane: 1, judgment: 'miss', deltaMs: 180, time: 1.18 }];
+    hw.draw(makeFrame({ lanes: LANES, songTime: 1.28, recentHits: miss }));
+    canvas.ctx.reset();
+    hw.draw(makeFrame({ lanes: LANES, songTime: 1.32 }));
+    expect(hw.getStats().particles).toBeGreaterThan(0);
+    let additiveBelowLine = 0;
+    let normalBelowLine = 0;
+    let maxSmokeAlpha = 0;
+    canvas.ctx.calls.forEach((c, i) => {
+      if (c.name !== 'drawImage' || c.args.length !== 5) return;
+      const dy = c.args[2] as number;
+      const dh = c.args[4] as number;
+      if (dy + dh / 2 < g.strikeY + g.receptorRadius) return; // above / at the receptors
+      if (canvas.ctx.propBefore(i, 'globalCompositeOperation') === 'lighter') additiveBelowLine++;
+      else {
+        normalBelowLine++;
+        maxSmokeAlpha = Math.max(maxSmokeAlpha, canvas.ctx.propBefore(i, 'globalAlpha') as number);
+      }
+    });
+    expect(additiveBelowLine).toBe(0);
+    expect(normalBelowLine).toBeGreaterThan(0);
+    expect(maxSmokeAlpha).toBeLessThan(0.5);
+  });
+
+  it('does not resurrect a stale missed note forever', () => {
+    // A missed note left in frame.notes for the rest of the song used to be re-registered every
+    // time the de-dupe ledger pruned it (~3 s) and redrawn, invisibly, below the canvas.
+    const { hw } = setup(1280, 720);
+    hw.resize(1280, 720, 1);
+    const missed: RenderNote = { id: 4, lane: 2, time: 5, state: 'miss', judgment: 'miss' };
+    hw.draw(makeFrame({ lanes: LANES, songTime: 5, notes: [missed] }));
+    let drawnAfterFizzle = 0;
+    for (let t = 5.6; t < 16; t += 0.05) {
+      hw.draw(makeFrame({ lanes: LANES, songTime: t, notes: [missed] }));
+      drawnAfterFizzle += hw.getStats().notesDrawn;
+    }
+    expect(drawnAfterFizzle).toBe(0);
+  });
+});
+
+describe('runtime controls are real controls, not decoration', () => {
+  it('setOptions only rebuilds what changed (a therapist slider must not thrash the renderer)', () => {
+    const { hw, scratch } = setup(1280, 720);
+    hw.resize(1280, 720, 1);
+    hw.draw(makeFrame({ lanes: LANES, songTime: 1, combo: 5, score: 100, songTitle: 'x', attribution: 'y' }));
+    const before = scratch.length;
+    for (let i = 0; i < 20; i++) {
+      hw.setOptions({ effectIntensity: i / 20 });
+      hw.draw(makeFrame({ lanes: LANES, songTime: 1 + i * 0.016, combo: 5, score: 100, songTitle: 'x', attribution: 'y' }));
+    }
+    // Was ~12 fresh scratch canvases per call (full-screen background + 2 star tiles + re-baked
+    // sprites and text) — 242 for this loop.
+    expect(scratch.length - before).toBeLessThanOrEqual(4);
+    // reducedMotion / showLabels / showStats / maxParticles-unchanged are equally free.
+    const before2 = scratch.length;
+    for (let i = 0; i < 10; i++) {
+      hw.setOptions({ reducedMotion: i % 2 === 0, showLabels: true, showMissPopup: i % 2 === 0 });
+      hw.draw(makeFrame({ lanes: LANES, songTime: 2 + i * 0.016 }));
+    }
+    expect(scratch.length - before2).toBeLessThanOrEqual(4);
+  });
+
+  it('still rebuilds when the palette or the geometry actually changes', () => {
+    const { hw, scratch } = setup(1280, 720);
+    hw.resize(1280, 720, 1);
+    hw.draw(makeFrame({ lanes: LANES, songTime: 1 }));
+    const beforeGeom = scratch.length;
+    hw.setOptions({ strikeY: 0.7 });
+    expect(hw.geometry.strikeY).toBeCloseTo(0.7 * 720);
+    expect(scratch.length).toBeGreaterThan(beforeGeom); // background re-baked at the new horizon
+    const beforePalette = scratch.length;
+    hw.setOptions({ highContrast: true });
+    hw.draw(makeFrame({ lanes: LANES, songTime: 1.02 }));
+    expect(scratch.length).toBeGreaterThan(beforePalette); // sprites re-rasterized in the new palette
+    // And the particle budget still applies immediately.
+    hw.setOptions({ maxParticles: 40 });
+    for (let i = 0; i < 6; i++) {
+      hw.draw(
+        makeFrame({
+          lanes: LANES,
+          songTime: 2 + i * 0.016,
+          recentHits: [{ noteId: 100 + i, lane: i % 4, judgment: 'perfect', deltaMs: 2, time: 2 + i * 0.016 }],
+        }),
+      );
+    }
+    expect(hw.getStats().particles).toBeLessThanOrEqual(40);
+  });
+
+  it('keeps every HUD string legible on a small canvas (attribution is a licence obligation)', () => {
+    const { canvas, hw, scratch } = setup(400, 800);
+    hw.resize(400, 800, 1);
+    canvas.ctx.reset();
+    hw.draw(
+      makeFrame({
+        lanes: LANES,
+        songTime: 1,
+        combo: 12,
+        score: 4200,
+        multiplier: 2,
+        songTitle: 'Some Song',
+        attribution: '"Some Song" by Some Artist (ccmixter.org) is licensed under CC BY 4.0',
+      }),
+    );
+    // Every rasterized string in the frame, with the font size it was drawn at.
+    const drawn: Array<{ text: string; px: number }> = [];
+    for (const c of canvas.ctx.calls) {
+      if (c.name !== 'drawImage') continue;
+      const src = c.args[0] as MockCanvas;
+      if (!scratch.includes(src)) continue;
+      const t = src.ctx.calls.find((k) => k.name === 'fillText');
+      const f = src.ctx.calls.find((k) => k.name === 'set:font');
+      if (!t || !f) continue;
+      const m = /(\d+(?:\.\d+)?)px/.exec(String(f.args[0]));
+      if (m) drawn.push({ text: String(t.args[0]), px: Number(m[1]) });
+    }
+    expect(drawn.length).toBeGreaterThan(3);
+    for (const d of drawn) expect(d.px, `"${d.text}" at ${d.px}px`).toBeGreaterThanOrEqual(11);
+    // The long attribution is ellipsized rather than run under the score readout.
+    const attr = drawn.find((d) => d.text.startsWith('"Some Song" by'));
+    expect(attr).toBeDefined();
+    expect((attr as { text: string }).text.endsWith('…')).toBe(true);
+    expect((attr as { text: string }).text.length * 8).toBeLessThanOrEqual(400);
+  });
+});
+
+describe('degenerate frame values are treated as missing, not as extremes', () => {
+  /** Alpha in force for the wide edge-rail glow stroke (lineWidth 9 at u = 1). */
+  function railGlowAlpha(canvas: MockCanvas): number {
+    const i = canvas.ctx.calls.findIndex((c) => c.name === 'set:lineWidth' && Math.abs((c.args[0] as number) - 9) < 1e-6);
+    expect(i).toBeGreaterThan(-1);
+    return canvas.ctx.propBefore(i + 1, 'globalAlpha') as number;
+  }
+  const frameAt = (beatPhase: number, opts: Record<string, unknown> = {}): { canvas: MockCanvas; alpha: number; calls: string[] } => {
+    const { canvas, hw } = setup(1280, 720, opts);
+    hw.resize(1280, 720, 1);
+    hw.draw(makeFrame({ lanes: LANES, songTime: 1, beatPhase }));
+    canvas.ctx.reset();
+    hw.draw(makeFrame({ lanes: LANES, songTime: 1.016, beatPhase }));
+    return { canvas, alpha: railGlowAlpha(canvas), calls: serialize(canvas) };
+  };
+
+  it('a non-finite beatPhase goes flat instead of pinning every pulse at maximum', () => {
+    const onBeat = frameAt(0); // pow(1-0, 3) = 1 → maximum pulse
+    const offBeat = frameAt(0.5);
+    const missing = frameAt(Number.NaN);
+    // The bug: clamp(NaN) === 0 === the on-beat value, so a NaN clock rendered a permanent downbeat.
+    expect(callDiff(missing.calls, onBeat.calls)).toBeGreaterThan(0);
+    expect(missing.alpha).toBeLessThan(onBeat.alpha);
+    expect(missing.alpha).toBeGreaterThan(offBeat.alpha);
+    // "Missing" renders exactly like reduced motion's steady mid pulse, in one place for the whole frame.
+    expect(missing.alpha).toBeCloseTo(frameAt(0, { reducedMotion: true }).alpha, 9);
+    expect(missing.alpha).toBeCloseTo(frameAt(0.5, { reducedMotion: true }).alpha, 9);
+  });
+
+  it('a non-finite multiplier holds tier 1 instead of freezing the badge mid-pop', () => {
+    const badge = (multiplier: number): number[] => {
+      const { canvas, hw } = setup(1280, 720);
+      hw.resize(1280, 720, 1);
+      for (let i = 0; i < 40; i++) hw.draw(makeFrame({ lanes: LANES, songTime: 1 + i * 0.016, multiplier }));
+      canvas.ctx.reset();
+      hw.draw(makeFrame({ lanes: LANES, songTime: 2, multiplier }));
+      // roundRectPath is used only for the multiplier badge (glow slab + badge body).
+      return canvas.ctx.calls.filter((c) => c.name === 'quadraticCurveTo').flatMap((c) => c.args as number[]);
+    };
+    const sane = badge(1);
+    expect(sane.length).toBeGreaterThan(0);
+    // With Math.floor(NaN) the badge sat at its 1.4x overshoot forever and BADGE_KEYS[NaN] became
+    // an `undefined` gradient-cache key.
+    expect(badge(Number.NaN)).toEqual(sane);
+    expect(badge(Number.POSITIVE_INFINITY)).toEqual(sane);
+    // Sanity: the metric does respond to the pop, so the equality above has teeth — a multiplier
+    // that really changes restarts the badge pop and the badge is momentarily bigger.
+    const { canvas, hw } = setup(1280, 720);
+    hw.resize(1280, 720, 1);
+    for (let i = 0; i < 40; i++) hw.draw(makeFrame({ lanes: LANES, songTime: 1 + i * 0.016, multiplier: 1 }));
+    canvas.ctx.reset();
+    hw.draw(makeFrame({ lanes: LANES, songTime: 2, multiplier: 2 }));
+    const popped = canvas.ctx.calls.filter((c) => c.name === 'quadraticCurveTo').flatMap((c) => c.args as number[]);
+    expect(popped).not.toEqual(sane);
+  });
+});
+
+describe('lanes are matched by identity, not by array position', () => {
+  const THRESH = 1;
+  /** Meter fill top edge per lane x, read off the receptor meter fillRects. */
+  function meterTops(canvas: MockCanvas, hw: Highway): number[] {
+    const g = hw.geometry;
+    const out = new Array<number>(g.laneCount).fill(Number.NaN);
+    for (const c of canvas.ctx.calls) {
+      if (c.name !== 'fillRect') continue;
+      const [x, y, w] = c.args as number[];
+      for (let lane = 0; lane < g.laneCount; lane++) {
+        // The meter fill spans the full ring width and starts at the value's height.
+        if (Math.abs(x + w / 2 - laneX(g, lane, 0)) < 0.5 && Math.abs(w - g.receptorRadius * 2) < 0.5 && Number.isNaN(out[lane])) out[lane] = y;
+      }
+    }
+    return out;
+  }
+  const values = [0.2, 0.45, 0.7, 0.95];
+  const draw = (laneStates: RenderFrame['laneStates']): { canvas: MockCanvas; hw: Highway } => {
+    const { canvas, hw } = setup(1280, 720);
+    hw.resize(1280, 720, 1);
+    hw.draw(makeFrame({ lanes: LANES, songTime: 1, laneStates, thresholdFraction: THRESH }));
+    canvas.ctx.reset();
+    hw.draw(makeFrame({ lanes: LANES, songTime: 1.016, laneStates, thresholdFraction: THRESH }));
+    return { canvas, hw };
+  };
+
+  it('reads RenderLaneState.lane so getLaneStates() may arrive in any order', () => {
+    const ordered = LANES.map((l) => ({ lane: l.index, value: values[l.index], armed: true, tracking: true }));
+    const shuffled = [ordered[2], ordered[0], ordered[3], ordered[1]];
+    const a = draw(ordered);
+    const b = draw(shuffled);
+    expect(meterTops(b.canvas, b.hw)).toEqual(meterTops(a.canvas, a.hw));
+    // Sanity: the four lanes really do read differently, so the comparison has teeth.
+    expect(new Set(meterTops(a.canvas, a.hw)).size).toBe(4);
+    // Without the ids, array position is all there is — and it maps the meters differently.
+    const untagged = shuffled.map((s) => ({ value: s.value, armed: s.armed, tracking: s.tracking }));
+    const c = draw(untagged);
+    expect(meterTops(c.canvas, c.hw)).not.toEqual(meterTops(a.canvas, a.hw));
+  });
+
+  it('reads LaneSpec.index for the movement labels', () => {
+    const labelAt = (lanes: LaneSpec[]): Array<{ x: number; text: string }> => {
+      const { canvas, hw, scratch } = setup(1280, 720);
+      hw.resize(1280, 720, 1);
+      canvas.ctx.reset();
+      hw.draw(makeFrame({ lanes, songTime: 1 }));
+      const g = hw.geometry;
+      const out: Array<{ x: number; text: string }> = [];
+      for (const c of canvas.ctx.calls) {
+        if (c.name !== 'drawImage') continue;
+        const src = c.args[0] as MockCanvas;
+        if (!scratch.includes(src)) continue;
+        const t = src.ctx.calls.find((k) => k.name === 'fillText');
+        if (!t || !/^[LR] /.test(String(t.args[0]))) continue;
+        const a = c.args as [unknown, number, number, number, number];
+        const cx = a[1] + a[3] / 2;
+        let lane = 0;
+        for (let i = 0; i < g.laneCount; i++) if (Math.abs(cx - laneX(g, i, -0.02)) < Math.abs(cx - laneX(g, lane, -0.02))) lane = i;
+        out.push({ x: lane, text: String(t.args[0]) });
+      }
+      return out.sort((p, q) => p.x - q.x);
+    };
+    const inOrder = labelAt(LANES);
+    const reordered = labelAt([LANES[3], LANES[1], LANES[2], LANES[0]]);
+    expect(reordered).toEqual(inOrder);
+  });
+
+  it('warns once when the lane ids cannot be trusted, and falls back to array position', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      const { hw } = setup(1280, 720);
+      hw.resize(1280, 720, 1);
+      const bad = LANES.map((l) => ({ lane: 9 - l.index, value: 0.5, armed: true }));
+      for (let i = 0; i < 5; i++) hw.draw(makeFrame({ lanes: LANES, songTime: 1 + i * 0.016, laneStates: bad, thresholdFraction: 1 }));
+      const laneWarnings = warn.mock.calls.filter((c) => String(c[0]).includes('do not cover lanes'));
+      expect(laneWarnings.length).toBe(1);
+    } finally {
+      warn.mockRestore();
     }
   });
 });

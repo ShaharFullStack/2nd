@@ -400,3 +400,88 @@ describe('VisionInput getLaneStates aliasing', () => {
     input.stop();
   });
 });
+
+describe('VisionInput does not pay for what it cannot use', () => {
+  it('driveLoop:false with no injected detector builds NO detector (no model download, no GPU context)', async () => {
+    // There is no loop to drive it and, historically, no accessor to reach it: a calibration/preview
+    // screen feeding frames itself paid a 6-8 MB model load and held a MediaPipe task for nothing.
+    const clock = new FakeClock();
+    const input = new VisionInput({
+      mode: 'leg', lanes, calibrations: [cal], thresholdFraction: 0.65, audioContext: clock, driveLoop: false,
+    });
+    await input.start(); // would throw / hang if it tried to reach the real MediaPipe assets
+    expect(input.isRunning()).toBe(true);
+    expect(input.getDetector()).toBeNull();
+    expect(input.getStatus().delegate).toBeNull();
+    // ... and the injected-frames path still works end to end.
+    input.processDetection({ tMs: 0, pose: seatedPose({ kneeLift: 0 }), hands: [] }, 0);
+    input.processDetection({ tMs: 0, pose: seatedPose({ kneeLift: 0.95 }), hands: [] }, 0.1);
+    input.processDetection({ tMs: 0, pose: seatedPose({ kneeLift: 0.95 }), hands: [] }, 0.13);
+    expect(input.getLaneStates()[0].value).toBeGreaterThan(0.6);
+    input.stop();
+  });
+
+  it('an INJECTED detector is still honoured with driveLoop:false and is reachable', async () => {
+    const det = makeDetector();
+    const input = makeInput({ detector: () => Promise.resolve(det), driveLoop: false });
+    await input.start();
+    expect(input.getDetector()).toBe(det);
+    input.stop();
+    expect(det.closed).toBe(true); // factory-created => owned => closed
+  });
+
+  it('getStatus() is memoized per frame like getLaneStates(), but still ages the frame clock', async () => {
+    let now = 0;
+    const input = makeInput({ detector: () => Promise.resolve(makeDetector()), driveLoop: false, nowMs: () => now, staleFrameSec: 0.5 });
+    await input.start();
+    input.processDetection({ tMs: 0, pose: seatedPose({ kneeLift: 0 }), hands: [] }, 0);
+    const a = input.getStatus();
+    expect(input.getStatus()).toBe(a); // a 60 Hz HUD polling twice per frame allocates nothing
+    expect(input.getLaneStates()).toBe(input.getLaneStates());
+    // A new frame invalidates it.
+    input.processDetection({ tMs: 0, pose: seatedPose({ kneeLift: 0 }), hands: [] }, 1 / 30);
+    const b = input.getStatus();
+    expect(b).not.toBe(a);
+    // The frame age keeps counting between frames, so a wedged camera does not freeze at 0 ms...
+    now = 300;
+    const c = input.getStatus();
+    expect(c.frameAgeSec).toBeCloseTo(0.3, 2);
+    // ... and the stall verdict still flips with no new frame at all.
+    now = 900;
+    expect(input.getStatus().reason).toBe('stalled');
+    input.stop();
+  });
+
+  it('lowering the threshold mid-song awards no free hit (the trigger re-checks its arming)', async () => {
+    const input = makeInput({ detector: () => Promise.resolve(makeDetector()), driveLoop: false, smoothing: { kind: 'none' } });
+    const events: unknown[] = [];
+    input.onEvent((e) => events.push(e));
+    await input.start();
+    // Knee held steady at ~40% of ROM: armed under threshold 0.8 (re-arm 0.48), motionless.
+    for (let i = 0; i < 20; i++) input.processDetection({ tMs: 0, pose: seatedPose({ kneeLift: 0.4 }), hands: [] }, i / 30);
+    input.setThresholdFraction(0.3);
+    for (let i = 20; i < 40; i++) input.processDetection({ tMs: 0, pose: seatedPose({ kneeLift: 0.4 }), hands: [] }, i / 30);
+    expect(events).toHaveLength(0); // zero movement, zero hits
+    // A real movement from rest still scores under the new, easier threshold.
+    input.processDetection({ tMs: 0, pose: seatedPose({ kneeLift: 0 }), hands: [] }, 40 / 30);
+    input.processDetection({ tMs: 0, pose: seatedPose({ kneeLift: 0.5 }), hands: [] }, 41 / 30);
+    expect(events).toHaveLength(1);
+    input.stop();
+  });
+
+  it('surfaces the calibration provenance a therapist would otherwise never see', async () => {
+    const shaky: RomCalibration = {
+      ...cal,
+      rest: { still: false, spread: (cal.max - cal.min) * 0.05, drift: 0, durationSec: 10, samples: 300 },
+      capturedAt: 1000,
+      posture: 'seated_leg',
+    };
+    const input = makeInput({ detector: () => Promise.resolve(makeDetector()), driveLoop: false });
+    await input.start();
+    expect(input.setCalibration(0, shaky)).toBe(true); // usable: it is a WARNING, not a refusal
+    const st = input.getStatus();
+    expect(st.invalidCalibrationLanes).toEqual([]);
+    expect(st.warnings?.join(' ')).toMatch(/resting position|never steady/i);
+    input.stop();
+  });
+});

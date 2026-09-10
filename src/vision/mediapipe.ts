@@ -6,14 +6,27 @@
  *
  * HANDEDNESS / MIRROR CONVENTION
  * ------------------------------
- * getUserMedia delivers the raw (un-mirrored) sensor image: the patient's RIGHT hand appears on the
- * image LEFT (small x). The UI usually mirrors the preview with CSS `scaleX(-1)`; that does not affect
- * the landmarks. MediaPipe's handedness label assumes the input image IS mirrored (selfie-flipped), so
- * on a raw stream the label is inverted: label "Left" == patient's right hand.
- *   mirrored = false (default, raw stream fed to the detector): patient side = opposite of the label.
- *   mirrored = true  (frames were horizontally flipped BEFORE detection): patient side = label.
- * `pickHand` also falls back to position (raw: patient's right hand is the one with the smaller x)
- * when labels are missing/ambiguous.
+ * `mirrored` means ONE thing: the frames handed to the detector were horizontally flipped before
+ * detection. It is NOT about the preview — the UI usually mirrors that with CSS `scaleX(-1)`, which does
+ * not touch the landmarks and does not make `mirrored` true. It has TWO consequences, in two different
+ * places, and both matter:
+ *
+ * 1. HANDS (here). getUserMedia delivers the raw (un-mirrored) sensor image: the patient's RIGHT hand
+ *    appears on the image LEFT (small x). MediaPipe's handedness label assumes the input image IS
+ *    mirrored (selfie-flipped), so on a RAW stream the label is inverted: label "Left" == patient's
+ *    right hand.
+ *      mirrored = false (default, raw stream fed to the detector): patient side = opposite of the label.
+ *      mirrored = true  (frames flipped BEFORE detection): patient side = label.
+ *    `pickHand` also falls back to position (raw: patient's right hand is the one with the smaller x)
+ *    when labels are missing/ambiguous.
+ *
+ * 2. POSE (src/vision/features.ts). The Pose model has no such assumption — it labels the anatomy it
+ *    sees. A mirrored human is an ordinary human to it, so on flipped frames the patient's LEFT leg is
+ *    reported in the RIGHT_* landmark indices. `poseSideIndices(side, mirrored)` swaps them, and every
+ *    leg extractor goes through it; the SIGNED lateral feature (hip_abduction) additionally flips its
+ *    outward direction, because image x itself reversed. Note the two models therefore behave
+ *    OPPOSITELY on a raw stream (hand labels inverted, pose labels correct) — that asymmetry is real,
+ *    documented MediaPipe behaviour, not a bug in either place.
  */
 import type { Mode, Side } from '../engine/types.ts';
 import type { Landmark } from './landmarks.ts';
@@ -291,9 +304,42 @@ export interface PickHandOptions {
    * wrist_extension requires, which makes that lockout likely rather than hypothetical. VisionInput
    * turns this on automatically when all its lanes share one side.
    * It never applies with two hands in frame: there the position rule is meaningful and is used instead.
+   *
+   * It is NOT a blank cheque: the lone hand must still be WEAKLY CONSISTENT with `side` (see
+   * `ambiguousLabelScore`). The danger a unilateral session still has is not lane-to-lane theft, it is
+   * the UNAFFECTED hand wandering into frame and driving the affected limb's lane — which inflates
+   * exactly the rep count and ROM trend the therapist is treating from.
    */
   acceptLoneHand?: boolean;
+  /**
+   * Score at or below which a handedness label carries NO information (default 0.55). MediaPipe reports
+   * the winning class probability, so a score near 0.5 is a coin flip and the label may as well be
+   * absent — that is the case `acceptLoneHand` exists for. Above it the label is weak but not noise, and
+   * a lone hand labelled the OTHER side is refused rather than scored as the prescribed limb.
+   */
+  ambiguousLabelScore?: number;
 }
+
+/** How `pickHandResult` arrived at its answer — VisionInput reports the weak cases to the therapist. */
+export type HandPickSource =
+  /** A confident, mirror-corrected handedness label of the requested side. */
+  | 'label'
+  /** Two hands in frame: assigned by image position (labels absent, unusable, or both the same). */
+  | 'position'
+  /** The lone hand in a unilateral session, accepted on a label too weak to identify it. See below. */
+  | 'lone_unlabelled'
+  /** No hand could be assigned to this side. */
+  | 'none';
+
+export interface HandPick {
+  hand: HandDetection | null;
+  source: HandPickSource;
+}
+
+/** Default `PickHandOptions.ambiguousLabelScore`: at or below this a handedness label is a coin flip. */
+export const DEFAULT_AMBIGUOUS_LABEL_SCORE = 0.55;
+
+const NO_HAND: HandPick = Object.freeze({ hand: null, source: 'none' }) as HandPick;
 
 /**
  * Pick the detected hand belonging to the patient's `side`.
@@ -313,27 +359,49 @@ export interface PickHandOptions {
  * `opts.acceptLoneHand` is the documented escape hatch for a unilateral session.
  */
 export function pickHand(hands: readonly HandDetection[], side: Side, mirrored = false, opts: PickHandOptions = {}): HandDetection | null {
-  if (hands.length === 0) return null;
+  return pickHandResult(hands, side, mirrored, opts).hand;
+}
+
+/**
+ * `pickHand` plus HOW the hand was chosen, so a caller can tell the therapist when a lane is being
+ * driven by a hand nobody could identify (`source: 'lone_unlabelled'`).
+ */
+export function pickHandResult(hands: readonly HandDetection[], side: Side, mirrored = false, opts: PickHandOptions = {}): HandPick {
+  if (hands.length === 0) return NO_HAND;
   const minLabelScore = opts.minLabelScore ?? 0.6;
+  const ambiguousScore = opts.ambiguousLabelScore ?? DEFAULT_AMBIGUOUS_LABEL_SCORE;
   const other: Side = side === 'left' ? 'right' : 'left';
   const labelOf = (h: HandDetection) => (h.score >= minLabelScore ? labelToPatientSide(h.label, mirrored) : null);
   // Unilateral escape hatch: one hand in frame, no lane on the other side to protect.
-  if (hands.length === 1 && opts.acceptLoneHand) return labelOf(hands[0]) === other ? null : hands[0];
+  if (hands.length === 1 && opts.acceptLoneHand) {
+    const h = hands[0];
+    const confident = labelOf(h);
+    if (confident === side) return { hand: h, source: 'label' };
+    if (confident === other) return NO_HAND;
+    // No CONFIDENT label. Fall back to the raw one anyway: the escape hatch exists because the score
+    // sags in the postures this app asks for, not because the label becomes wrong. It is refused only
+    // when it still points weakly at the OTHER hand — a lone hand that the classifier calls "Left" at
+    // 0.59 is far more likely to be the patient's unaffected hand drifting into frame than the affected
+    // one it is being asked to score. Only a genuine coin flip (<= ambiguousLabelScore) is accepted, and
+    // then the caller is told the hand is unidentified.
+    if (h.score > ambiguousScore && labelToPatientSide(h.label, mirrored) === other) return NO_HAND;
+    return { hand: h, source: 'lone_unlabelled' };
+  }
   const mine = hands.filter((h) => labelOf(h) === side);
-  if (mine.length === 1) return mine[0];
+  if (mine.length === 1) return { hand: mine[0], source: 'label' };
   let candidates = mine.length > 1 ? mine : hands.filter((h) => labelOf(h) !== other);
   // Every hand labelled the other side: with two hands the labels are unreliable (MediaPipe often
   // gives both the same label) => assign by position; a single hand of the other side is not ours.
   if (candidates.length === 0 && hands.length >= 2) candidates = hands.slice();
-  if (candidates.length === 0) return null;
+  if (candidates.length === 0) return NO_HAND;
   // Only one hand in the frame and no confident label: unassignable (see above).
-  if (hands.length === 1) return labelOf(hands[0]) === side ? hands[0] : null;
-  if (candidates.length === 1) return candidates[0];
+  if (hands.length === 1) return labelOf(hands[0]) === side ? { hand: hands[0], source: 'label' } : NO_HAND;
+  if (candidates.length === 1) return { hand: candidates[0], source: 'position' };
   // Positional assignment.
   const byX = candidates.slice().sort((a, b) => a.landmarks[0].x - b.landmarks[0].x);
   const rightIsSmallX = !mirrored;
   const wantSmallX = side === 'right' ? rightIsSmallX : !rightIsSmallX;
-  return wantSmallX ? byX[0] : byX[byX.length - 1];
+  return { hand: wantSmallX ? byX[0] : byX[byX.length - 1], source: 'position' };
 }
 
 /* ---------------- camera ---------------- */
@@ -525,6 +593,16 @@ export class DetectLoop {
   private readonly detector: LandmarkDetector;
   private readonly onResult: DetectionCallback;
   private handle = 0;
+  /**
+   * How the pending callback was scheduled, so stop() can actually cancel IT.
+   *
+   * The rAF branch falls back to setTimeout when requestAnimationFrame does not exist — and the old
+   * stop() only ever called cancelAnimationFrame, guarded by `typeof cancelAnimationFrame === 'function'`,
+   * which is false in exactly the environment that took the fallback. The `if (!this.running) return`
+   * guard kept the stray callback harmless, but one timer kept firing per stopped loop for the life of
+   * the page.
+   */
+  private pending: 'none' | 'rvfc' | 'raf' | 'timeout' = 'none';
   private usingRvfc = false;
   private running = false;
   private lastMediaTime = -1;
@@ -569,14 +647,18 @@ export class DetectLoop {
 
   stop(): void {
     this.running = false;
-    if (this.usingRvfc) this.video.cancelVideoFrameCallback(this.handle);
-    else if (typeof cancelAnimationFrame === 'function') cancelAnimationFrame(this.handle);
+    // Cancel with the SAME mechanism that scheduled the pending callback.
+    if (this.pending === 'rvfc') this.video.cancelVideoFrameCallback?.(this.handle);
+    else if (this.pending === 'raf' && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(this.handle);
+    else if (this.pending === 'timeout') clearTimeout(this.handle);
+    this.pending = 'none';
     this.handle = 0;
   }
 
   private schedule(): void {
     if (!this.running) return;
     if (this.usingRvfc) {
+      this.pending = 'rvfc';
       this.handle = this.video.requestVideoFrameCallback((now, meta) => {
         // A callback dispatched BEFORE stop() still fires after it. Without this guard it would call
         // detector.detect() on a MediaPipe task VisionInput.stop() has already close()d, and calling
@@ -591,7 +673,9 @@ export class DetectLoop {
         }
       });
     } else {
-      const raf = typeof requestAnimationFrame === 'function' ? requestAnimationFrame : (cb: FrameRequestCallback) => setTimeout(() => cb(performance.now()), 16) as unknown as number;
+      const hasRaf = typeof requestAnimationFrame === 'function';
+      const raf = hasRaf ? requestAnimationFrame : (cb: FrameRequestCallback) => setTimeout(() => cb(performance.now()), 16) as unknown as number;
+      this.pending = hasRaf ? 'raf' : 'timeout';
       this.handle = raf((now) => {
         if (!this.running) return; // same post-stop() guard as above
         try {

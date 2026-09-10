@@ -24,8 +24,17 @@
  * the panel geometry exact).
  *
  * Because x offsets and radius still scale with (y - vpY) the road edges stay perfectly straight
- * (no kink at the line); only the vertical speed changes. With the default pastLineSpeed a gem
- * stays on screen ≥ 400 ms past the line at 720p / 1080p / portrait.
+ * (no kink at the line); only the vertical speed changes.
+ *
+ * Two different "still visible" questions matter and there are two functions for them:
+ *   - `visibleTailSec` / `minDepth` — how long a gem is *drawn* (its centre may be up to two gem
+ *     radii below the bottom edge; used for culling and for the road/panel extent, which must run
+ *     off the bottom of the canvas).
+ *   - `gemVisibleTailSec` / `fullyVisibleDepth` — how long a gem is *entirely inside the canvas*.
+ *     This is the one a judgment cue must be measured against: the engine declares a miss up to
+ *     note.time + goodMs + grace ≈ 280 ms after the note time, and a miss cue half-way off the
+ *     bottom edge is not a cue. With the default strikeY / pastLineSpeed this is ≥ 300 ms at
+ *     720p, 1080p, portrait and ultrawide (see geometry.test.ts).
  */
 
 export interface GeometryOptions {
@@ -80,11 +89,14 @@ export interface HighwayGeometry {
 export const DEFAULT_GEOMETRY_OPTIONS: GeometryOptions = {
   approachSec: 1.6,
   horizonY: 0.35,
-  strikeY: 0.82,
+  strikeY: 0.78,
   farScale: 0.28,
   roadWidth: 0.46,
-  pastLineSpeed: 0.42,
+  pastLineSpeed: 0.34,
 };
+
+/** Gem aspect: gems are slightly squashed ellipses viewed from above, GH-style. */
+export const GEM_ASPECT = 0.72;
 
 /**
  * Gem radius as a fraction of lane width. Clone Hero / GH frets fill most of their lane
@@ -218,6 +230,33 @@ export function visibleTailSec(g: HighwayGeometry): number {
   return -g.minDepth * g.approachSec;
 }
 
+/** Depth at which the perspective scale is `s` (inverse of `scaleAt`). */
+export function depthAtScale(g: HighwayGeometry, s: number): number {
+  return depthAtY(g, g.vpY + (g.strikeY - g.vpY) * s);
+}
+
+/**
+ * Depth (negative, below the strike line) at which a near-radius gem's lower edge touches the
+ * bottom of the canvas, i.e. the last depth at which the *whole* gem is still on screen.
+ * `margin` (px) keeps it that much clear of the edge.
+ */
+export function fullyVisibleDepth(g: HighwayGeometry, margin = 0): number {
+  const denom = g.strikeY - g.vpY + g.gemRadiusNear * GEM_ASPECT;
+  if (!(denom > 0)) return g.minDepth;
+  const s = (g.height - margin - g.vpY) / denom;
+  if (!(s > 0)) return 0;
+  if (s <= 1) return depthAtScale(g, s); // already off screen at (or above) the strike line
+  return Math.max(depthAtScale(g, s), g.minDepth);
+}
+
+/**
+ * Seconds a gem stays *entirely inside the canvas* after crossing the strike line. The miss
+ * verdict lands at up to note.time + 280 ms, so this must stay comfortably above that.
+ */
+export function gemVisibleTailSec(g: HighwayGeometry, margin = 0): number {
+  return -fullyVisibleDepth(g, margin) * g.approachSec;
+}
+
 /** Lane centre x at depth d. Lane 0 is leftmost. */
 export function laneX(g: HighwayGeometry, lane: number, d: number): number {
   const offsetNear = -g.nearHalfWidth + g.laneWidthNear * (lane + 0.5);
@@ -242,15 +281,22 @@ export interface Projected {
   radius: number;
 }
 
-/** Project a note (lane, depth) to screen. */
-export function project(g: HighwayGeometry, lane: number, d: number): Projected {
+/**
+ * Project a note (lane, depth) into an existing `Projected` — the allocation-free form, used once
+ * per visible note per frame by the renderer's hot path. Returns `out`.
+ */
+export function projectInto(g: HighwayGeometry, lane: number, d: number, out: Projected): Projected {
   const s = scaleAt(g, d);
-  return {
-    x: g.vpX + (-g.nearHalfWidth + g.laneWidthNear * (lane + 0.5)) * s,
-    y: g.vpY + (g.strikeY - g.vpY) * s,
-    scale: s,
-    radius: g.gemRadiusNear * s,
-  };
+  out.x = g.vpX + (-g.nearHalfWidth + g.laneWidthNear * (lane + 0.5)) * s;
+  out.y = g.vpY + (g.strikeY - g.vpY) * s;
+  out.scale = s;
+  out.radius = g.gemRadiusNear * s;
+  return out;
+}
+
+/** Project a note (lane, depth) to screen. Allocates; use `projectInto` on the hot path. */
+export function project(g: HighwayGeometry, lane: number, d: number): Projected {
+  return projectInto(g, lane, d, { x: 0, y: 0, scale: 1, radius: 0 });
 }
 
 /** Whether a note at depth d should be drawn at all. */

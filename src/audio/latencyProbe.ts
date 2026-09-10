@@ -30,8 +30,17 @@
  *  - every non-'ok' diagnosis carries a concrete remedy; when the remedy is a slower metronome,
  *    `suggestedBpm` is the tempo to re-run at, so the screen can offer one button.
  *
- * Usage: `await mixer.resumeContext()` (user gesture) → `probe.start()` → feed every input via
- * `probe.recordInput(e.ctxTime)` → when `probe.isComplete()` call `probe.finish()`.
+ * Usage: `await mixer.resumeContext()` (user gesture) → `probe = mixer.createLatencyProbe()` →
+ * `probe.start()` → feed every input via `probe.recordInput(e.ctxTime)` → when `probe.isComplete()`
+ * call `probe.finish()`.
+ *
+ * ROUTING (same warning as `Sfx`): build the probe with `mixer.createLatencyProbe()`, not
+ * `new LatencyProbe(ctx)`. The bare constructor defaults `destination` to `ctx.destination`, which
+ * bypasses the mixer's master gain and limiter — nothing else sounds during calibration so it will
+ * not clip, but a raw 0.6-peak square click is audibly louder than the game mix (which lands at a
+ * ~0.91 ceiling only after the 0.8 master gain and the limiter), and the loudness jump on the way
+ * into Play is exactly the kind of surprise a rehab patient should not get. `createLatencyProbe()`
+ * puts the metronome on `mixer.sfxBus`, i.e. inside the same headroom budget as the cues.
  */
 
 import {

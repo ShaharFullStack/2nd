@@ -668,13 +668,130 @@ describe('StemMixer', () => {
     vi.advanceTimersByTime(2100);
     expect(mixer.state).toBe('ready');
     expect(ctx.sources.every((s) => s.stopped)).toBe(true);
-    // an explicit start/length is honoured and a transport call cancels the timer
+    // an explicit start/length is honoured and a transport call cancels the timer; pause() ends a
+    // preview (a preview is not a session) and puts the transport back where it was
     ctx.currentTime = 5;
     mixer.playPreview(4, 1, 6);
     expect(ctx.sources[ctx.sources.length - 1].started?.offset).toBe(6);
-    mixer.pause();
+    expect(mixer.isPreviewing).toBe(true);
+    expect(mixer.pause()).toBeNull();
     vi.advanceTimersByTime(5000);
-    expect(mixer.state).toBe('paused');
+    expect(mixer.state).toBe('ready');
+    expect(mixer.isPreviewing).toBe(false);
+    expect(mixer.songTime()).toBe(0);
+  });
+
+  // ---------------------------------------------------------------- transport composition
+  // The sequence a real song-select produces must never move the song position behind the
+  // caller's back: every one of these used to (or could) start the prescribed chart mid-song.
+
+  it('select → preview → Start begins the session at song time 0, in lockstep with the engine clock', async () => {
+    const { ctx, mixer } = setup();
+    await mixer.loadSong(manifest, '/songs');
+    vi.useFakeTimers();
+    ctx.currentTime = 1;
+    mixer.playPreview(4, 0.5); // previewStart = 3 s
+    expect(mixer.isPreviewing).toBe(true);
+    expect(ctx.sources.at(-1)?.started?.offset).toBe(3);
+
+    // the therapist hits Start while the preview is still running
+    ctx.currentTime = 2;
+    const start = mixer.play();
+    expect(mixer.isPreviewing).toBe(false);
+    expect(mixer.state).toBe('playing');
+    // every stem starts from the TOP of the song, not from previewStart
+    for (const s of ctx.sources.slice(-3)) expect(s.started).toEqual({ when: start, offset: 0 });
+    expect(mixer.songTime(start)).toBeCloseTo(0, 12);
+    expect(mixer.getSongStartCtxTime()).toBeCloseTo(start, 12);
+
+    // the documented start sequence puts the engine clock on the same song time
+    const clock = new SongClock({ get currentTime() { return ctx.currentTime; } });
+    clock.start(mixer.getSongStartCtxTime());
+    ctx.currentTime = start + 2.5;
+    expect(clock.songTime()).toBeCloseTo(mixer.songTime(), 9);
+
+    // and the abandoned preview's auto-stop timer cannot stop the session that replaced it
+    vi.advanceTimersByTime(10_000);
+    expect(mixer.state).toBe('playing');
+  });
+
+  it('a preview restores the position it interrupted — including a paused session', async () => {
+    const { ctx, mixer } = setup();
+    await mixer.loadSong(manifest, '/songs');
+    vi.useFakeTimers();
+    ctx.currentTime = 0;
+    mixer.play();
+    ctx.currentTime = 4.03;
+    mixer.pause();
+    expect(mixer.songTime()).toBeCloseTo(4, 9);
+
+    mixer.playPreview(2, 0.5); // audition another spot of the same song
+    expect(mixer.isPreviewing).toBe(true);
+    vi.advanceTimersByTime(2100); // the preview's own timer ends it
+    expect(mixer.state).toBe('ready');
+    expect(mixer.isPreviewing).toBe(false);
+    expect(mixer.songTime()).toBeCloseTo(4, 9); // back at the pause point, not at previewStart
+
+    ctx.currentTime = 10;
+    const resumed = mixer.play();
+    expect(ctx.sources.at(-1)?.started?.offset).toBeCloseTo(4, 9);
+    expect(mixer.songTime(resumed)).toBeCloseTo(4, 9);
+  });
+
+  it('a preview inside a preview keeps the original return point, and an explicit position wins', async () => {
+    const { ctx, mixer } = setup();
+    await mixer.loadSong(manifest, '/songs');
+    vi.useFakeTimers();
+    mixer.playPreview(2, 0.5, 3);
+    ctx.currentTime = 0.5;
+    mixer.playPreview(2, 0.5, 6); // the patient clicks the next song
+    expect(mixer.isPreviewing).toBe(true);
+    expect(ctx.sources.at(-1)?.started?.offset).toBe(6);
+    expect(mixer.play(undefined, 5)).toBeGreaterThan(0); // explicit position beats the return point
+    expect(mixer.isPreviewing).toBe(false);
+    expect(ctx.sources.at(-1)?.started?.offset).toBe(5);
+
+    // seek() also ends the preview (its position is explicit) and stop() goes to 0
+    mixer.playPreview(2, 0.5, 6);
+    mixer.seek(1);
+    expect(mixer.isPreviewing).toBe(false);
+    expect(ctx.sources.at(-1)?.started?.offset).toBe(1);
+    mixer.playPreview(2, 0.5, 6);
+    mixer.stop();
+    expect(mixer.isPreviewing).toBe(false);
+    expect(mixer.songTime()).toBe(0);
+  });
+
+  it('play() while already playing is a no-op: it cannot rewind a running session', async () => {
+    const { ctx, mixer } = setup();
+    await mixer.loadSong(manifest, '/songs');
+    ctx.currentTime = 0;
+    const start = mixer.play();
+    const sourceCount = ctx.sources.length;
+    ctx.currentTime = 5;
+    const again = mixer.play(); // a state-unaware Play button, 5 s into the song
+    expect(again).toBe(start);
+    expect(ctx.sources.length).toBe(sourceCount); // nothing was rescheduled → no ~108 ms gap
+    expect(ctx.sources.every((s) => !s.stopped)).toBe(true);
+    expect(mixer.songTime()).toBeCloseTo(5 - start, 9);
+    expect(mixer.getSongStartCtxTime()).toBeCloseTo(start, 12);
+
+    // an explicit ctx time DOES restart — from the current position, never from 0
+    const at = ctx.currentTime + 0.5;
+    const restarted = mixer.play(at);
+    expect(restarted).toBeCloseTo(at, 9);
+    expect(ctx.sources.at(-1)?.started?.offset).toBeCloseTo(5 - start, 6);
+    expect(mixer.songTime(at)).toBeCloseTo(5 - start, 6);
+  });
+
+  it('createLatencyProbe routes the metronome through the sfx bus, not straight to the destination', async () => {
+    const { ctx, mixer } = setup();
+    await mixer.loadSong(manifest, '/songs');
+    const before = ctx.gains.length;
+    mixer.createLatencyProbe({ bpm: 100 });
+    const probeOut = ctx.gains[before]; // the probe's own output gain
+    expect(probeOut.connections).toContain(mixer.sfxBus as unknown as FakeNode);
+    expect(probeOut.connections).not.toContain(ctx.destination);
   });
 
   it('reports byte progress from a streamed body with Content-Length and honours an abort', async () => {

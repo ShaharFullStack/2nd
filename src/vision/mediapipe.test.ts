@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { DetectLoop, createDetector, labelToPatientSide, openCamera, pickHand, resetMediaPipeCache, waitForVideoReady } from './mediapipe.ts';
+import { DetectLoop, createDetector, labelToPatientSide, openCamera, pickHand, pickHandResult, resetMediaPipeCache, waitForVideoReady } from './mediapipe.ts';
 import type { DetectionResult, HandDetection, LandmarkDetector } from './mediapipe.ts';
 import { handPose } from './fixtures.ts';
 
@@ -75,6 +75,33 @@ describe('handedness convention', () => {
     expect(pickHand([hand('Right', 0.95, 0.5)], 'left', false, { minLabelScore: 0.99 })).toBeNull();
   });
 
+  it('the lone-hand escape hatch still refuses a hand that weakly points at the OTHER side', () => {
+    // The danger in a unilateral session is not lane-to-lane theft (there is no second lane) — it is the
+    // UNAFFECTED hand drifting into frame and driving the affected limb's lane, inflating exactly the
+    // rep count and ROM trend the therapist is treating from. A 0.59 label is below minLabelScore but is
+    // not noise, so it is believed enough to REFUSE the wrong side.
+    const leaning = [hand('Right', 0.59, 0.5)]; // "Right" on a raw stream = the patient's LEFT hand
+    expect(pickHand(leaning, 'right', false, { acceptLoneHand: true })).toBeNull();
+    expect(pickHand(leaning, 'left', false, { acceptLoneHand: true })).toBe(leaning[0]);
+    // A genuine coin flip carries no information and is still accepted (that is what the hatch is for),
+    // but the caller is told the hand is unidentified so it can warn the therapist.
+    const coinFlip = [hand('Right', 0.52, 0.5)];
+    expect(pickHandResult(coinFlip, 'right', false, { acceptLoneHand: true })).toEqual({ hand: coinFlip[0], source: 'lone_unlabelled' });
+    expect(pickHandResult(coinFlip, 'left', false, { acceptLoneHand: true }).source).toBe('lone_unlabelled');
+    // A confidently labelled lone hand is reported as identified, not as a fallback.
+    expect(pickHandResult([hand('Right', 0.95, 0.5)], 'left', false, { acceptLoneHand: true }).source).toBe('label');
+    expect(pickHandResult([hand('Right', 0.95, 0.5)], 'right', false, { acceptLoneHand: true })).toEqual({ hand: null, source: 'none' });
+    // The coin-flip bar is tunable for a session whose lighting makes the classifier chronically unsure.
+    expect(pickHand(leaning, 'right', false, { acceptLoneHand: true, ambiguousLabelScore: 0.7 })).toBe(leaning[0]);
+  });
+
+  it('pickHandResult names how two-handed frames were resolved', () => {
+    const pair = [hand('', 0, 0.3), hand('', 0, 0.7)];
+    expect(pickHandResult(pair, 'right', false).source).toBe('position');
+    expect(pickHandResult([hand('Left', 0.95, 0.3), hand('Right', 0.95, 0.7)], 'right', false).source).toBe('label');
+    expect(pickHandResult([], 'right', false).source).toBe('none');
+  });
+
   it('pickHand with a single hand', () => {
     const only = [hand('Left', 0.9, 0.5)];
     expect(pickHand(only, 'right', false)).toBe(only[0]);
@@ -100,6 +127,33 @@ describe('handedness convention', () => {
 });
 
 describe('DetectLoop', () => {
+  it('stop() cancels the setTimeout fallback when there is no requestAnimationFrame', () => {
+    // The environment that TAKES the fallback is exactly the one where cancelAnimationFrame does not
+    // exist either, so the old stop() cancelled nothing and one timer kept firing per stopped loop.
+    const g = globalThis as unknown as { requestAnimationFrame?: unknown; cancelAnimationFrame?: unknown };
+    const raf = g.requestAnimationFrame;
+    const caf = g.cancelAnimationFrame;
+    delete g.requestAnimationFrame;
+    delete g.cancelAnimationFrame;
+    vi.useFakeTimers();
+    try {
+      const video = { currentTime: 0, readyState: 4 } as unknown as HTMLVideoElement;
+      const detect = vi.fn((_f: unknown, ts: number): DetectionResult => ({ tMs: ts, pose: null, hands: [] }));
+      const detector: LandmarkDetector = { mode: 'leg', delegate: 'CPU', detect, close: vi.fn() };
+      const loop = new DetectLoop(video, detector, () => {});
+      loop.start();
+      expect(vi.getTimerCount()).toBe(1);
+      loop.stop();
+      expect(vi.getTimerCount()).toBe(0); // the timer is GONE, not merely inert
+      vi.advanceTimersByTime(5000);
+      expect(detect).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+      if (raf) g.requestAnimationFrame = raf;
+      if (caf) g.cancelAnimationFrame = caf;
+    }
+  });
+
   it('drives the detector with requestVideoFrameCallback and reports stats', () => {
     const callbacks: Array<(now: number, meta: { captureTime?: number }) => void> = [];
     const video = {

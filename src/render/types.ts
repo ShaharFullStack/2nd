@@ -21,12 +21,25 @@ export interface RenderNote {
 
 /**
  * Per-lane live movement meter. Structurally compatible with `LaneState` from src/input/types.ts,
- * so `inputSource.getLaneStates()` can be passed straight through (the extra `lane` field is ignored).
+ * so `inputSource.getLaneStates()` can be passed straight through.
  */
 export interface RenderLaneState {
+  /**
+   * Which lane this meter belongs to. **Read when present** (that is what `LaneState.lane` is for):
+   * the renderer indexes meters by this value, so `getLaneStates()` may arrive in any order. Only
+   * when it is absent everywhere does the renderer fall back to array position — and a `lane` that
+   * is out of range or duplicated warns once on the console rather than silently attaching a
+   * patient's knee meter to another lane's receptor.
+   */
+  lane?: number;
   /** Normalized movement value 0..1 of calibrated ROM. */
   value: number;
-  /** True when the lane can fire again (hysteresis re-armed). */
+  /**
+   * Hysteresis re-arm flag, straight from the input engine: false means the lane has already fired
+   * and **cannot fire again** until its value falls below `thresholdFraction * rearmFraction`.
+   * The receptor renders this as a categorically different state (drained grey meter, no halo, a
+   * re-arm line and a "lower to reset" chevron) — never as a dimmed version of a live receptor.
+   */
   armed: boolean;
   /** False when the tracker lost the limb / hand. Defaults to true when absent. */
   tracking?: boolean;
@@ -42,9 +55,13 @@ export interface RenderFrame {
   songTime: number;
   /** Notes to consider drawing. Off-screen ones are culled by the renderer; pass a window of ±approachSec. */
   notes: RenderNote[];
-  /** Lane definitions (2..4). Index in this array == lane index. */
+  /**
+   * Lane definitions (2..4). `LaneSpec.index` is read when the specs carry a full 0..n-1 set, so a
+   * therapist config in any order still labels the right lane; otherwise array position is used
+   * (and an out-of-range / duplicated `index` warns once).
+   */
   lanes: LaneSpec[];
-  /** Live movement meters, one per lane (same order as `lanes`). */
+  /** Live movement meters, one per lane — matched by `RenderLaneState.lane` when present. */
   laneStates: RenderLaneState[];
   combo: number;
   /** Score multiplier tier (1..4+). */
@@ -72,6 +89,13 @@ export interface RenderFrame {
    * with no note firing, or a note firing at a half-full ring).
    */
   thresholdFraction?: number;
+  /**
+   * Hysteresis re-arm fraction: after a lane fires it cannot fire again until its value falls below
+   * `thresholdFraction * rearmFraction`. Defaults to `DEFAULT_REARM_FRACTION` (0.6), the value in
+   * the architecture contract. The receptor draws its re-arm line here, so pass the session's real
+   * value if it is ever tuned.
+   */
+  rearmFraction?: number;
 }
 
 /** Tunables for the highway renderer. All optional; see DEFAULT_HIGHWAY_OPTIONS. */
@@ -89,7 +113,11 @@ export interface HighwayOptions {
   /**
    * Screen-space scroll speed below the strike line relative to the speed at the line (0.2..1).
    * Lower keeps gems visible longer past the line so the engine's late miss verdict
-   * (note time + goodMs + grace, up to ~280 ms) still lands on a visible gem. Default 0.42 ≈ ≥600 ms at 720p/1080p, ≥420 ms portrait. The speed eases into the tail over ~0.13 s so a gem crossing the receptor never visibly brakes.
+   * (note time + goodMs + grace, up to ~280 ms) still lands on a gem that is *entirely* on screen.
+   * The default 0.34, with the default `strikeY` 0.78, keeps the whole gem inside the canvas for
+   * ≥ 300 ms past the line at 720p / 1080p / portrait / ultrawide (`gemVisibleTailSec`, asserted in
+   * geometry.test.ts). The speed eases into the tail over ~0.13 s so a gem crossing the receptor
+   * never visibly brakes.
    */
   pastLineSpeed: number;
   /** Use the rehab-friendly high-contrast palette instead of Guitar Hero colors. */

@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import type { Movement, Side } from '../engine/types.ts';
-import { RomCalibrator, normalizeFeature, percentile, isCalibrationValid } from './calibration.ts';
+import {
+  CALIBRATION_STALE_MS, MIN_ROM_SNR, RomCalibrator, calibrationProblem, calibrationWarnings,
+  isCalibrationValid, normalizeFeature, percentile, requiredRom,
+} from './calibration.ts';
+import type { RomCalibration } from './calibration.ts';
 import { captureCompensationBaseline, extractFeature } from './features.ts';
 import { handPose, repSequence, seatedPose, seatedRest } from './fixtures.ts';
 import type { Landmark } from './landmarks.ts';
@@ -63,8 +67,9 @@ describe('RomCalibrator', () => {
   });
 
   it('reports insufficient_range when reps are tiny, and allows manual override', () => {
-    const cal = new RomCalibrator('knee_extension');
-    for (const { t, amount } of repSequence({ reps: 3, amplitude: 0.12 })) {
+    // prominence lowered so the peak detector sees the tiny reps at all; the RANGE is what is judged.
+    const cal = new RomCalibrator('knee_extension', { prominence: 2 });
+    for (const { t, amount } of repSequence({ reps: 3, amplitude: 0.05 })) {
       cal.push(extractFeature('knee_extension', seatedPose({ kneeExtension: amount }), 'left'), t);
     }
     expect(cal.getPhase()).toBe('done');
@@ -73,16 +78,18 @@ describe('RomCalibrator', () => {
     const st = cal.getStatus();
     expect(st.message).toMatch(/bigger movement|adjust/i);
     expect(st.repsDetected).toBeGreaterThanOrEqual(1);
+    // A clean, still rest window relaxes the absolute floor to half the nominal minRom - and no further.
+    expect(cal.requiredRange()).toBeCloseTo(10, 6);
     // therapist nudges max up until the range is acceptable
     const prov = cal.getProvisional()!;
     cal.setRange(null, prov.min + 40);
     expect(cal.getError()).toBeNull();
     expect(cal.getResult()!.max).toBeCloseTo(prov.min + 40);
-    cal.nudge(0, -35);
+    cal.nudge(0, -33);
     expect(cal.getError()).toBe('insufficient_range');
-    cal.nudge(-5, 0);
+    cal.nudge(-1, 0);
     expect(cal.getError()).toBe('insufficient_range');
-    cal.nudge(-10, 0);
+    cal.nudge(-4, 0);
     expect(cal.getError()).toBeNull();
   });
 
@@ -355,5 +362,227 @@ describe('calibration -> play consistency through the shared LanePipeline', () =
     expect(ankle.push(seatedPose({ toeLift: 1, heelLift: 1 }), 0).compensation).toBeNull();
     ankle.setCompensationBaseline(captureCompensationBaseline('ankle_dorsiflexion', seatedRest(), 'left'));
     expect(ankle.push(seatedPose({ toeLift: 1, heelLift: 1 }), 1 / 30).compensation?.flagged).toBe(true);
+  });
+});
+
+describe('LanePipeline smoothing does not carry state across a blackout', () => {
+  const cal = { min: 0, max: 0.28, samples: 1 };
+  it('the first frame after a long gap reports where the patient IS, not a blend with the old limb position', () => {
+    const p = new LanePipeline({ movement: 'seated_march', side: 'left', calibration: cal, maxGapSec: 0.5 });
+    for (let i = 0; i < 10; i++) p.push(seatedPose({ kneeLift: 1 }), i / 30);
+    const raised = p.last.value;
+    expect(raised).toBeGreaterThan(0.9);
+    // Camera wedges for 10 s; the patient lowers the leg meanwhile.
+    const after = p.push(seatedPose({ kneeLift: 0 }), 10);
+    expect(after.value).toBeLessThan(0.02);
+    // Exactly the value an untouched pipeline reports for the same pose (i.e. no memory of the gap).
+    const fresh = new LanePipeline({ movement: 'seated_march', side: 'left', calibration: cal });
+    expect(after.value).toBeCloseTo(fresh.push(seatedPose({ kneeLift: 0 }), 0).value, 9);
+  });
+
+  it('still smooths across a normal frame interval and across a SHORT dropout', () => {
+    const p = new LanePipeline({ movement: 'seated_march', side: 'left', calibration: cal, maxGapSec: 0.5 });
+    for (let i = 0; i < 10; i++) p.push(seatedPose({ kneeLift: 1 }), i / 30);
+    p.push(null, 10 / 30); // one dropped frame: the filter keeps its memory
+    const next = p.push(seatedPose({ kneeLift: 0 }), 11 / 30);
+    const unsmoothed = (lift: number) =>
+      new LanePipeline({ movement: 'seated_march', side: 'left', calibration: cal }).push(seatedPose({ kneeLift: lift }), 0).smoothed!;
+    // Still averaging with the raised leg (EMA alpha 0.5): between the two raw levels, not at either.
+    expect(next.smoothed!).toBeGreaterThan(unsmoothed(0) + 0.05);
+    expect(next.smoothed!).toBeLessThan(unsmoothed(1));
+  });
+});
+
+
+describe('the rest window is MEASURED, not assumed (the zero every value is normalized from)', () => {
+  /** Feed `sec` seconds of a rest baseline, then 3 clean reps of the given amplitude. */
+  const run = (opts: { jitter?: (t: number) => number; restSec: number; peak: number; cal?: RomCalibrator }) => {
+    const cal = opts.cal ?? new RomCalibrator('seated_march');
+    const base = 0.5;
+    const jitter = opts.jitter ?? (() => 0);
+    let t = 0;
+    for (; t < opts.restSec; t += 1 / 30) cal.push(base + jitter(t), t);
+    for (let r = 0; r < 3 && cal.getPhase() === 'move'; r++) {
+      for (let i = 0; i <= 30; i++, t += 1 / 30) cal.push(base + opts.peak * 0.5 * (1 - Math.cos((2 * Math.PI * i) / 30)), t);
+    }
+    return cal;
+  };
+
+  it('records restStill:false for a window that never settled, instead of claiming it was still', () => {
+    // 11 s of rest oscillating +/-0.06 - half of seated_march's entire minimum ROM. The rest phase
+    // auto-advances on restTimeoutSec; it used to report restStill:true afterwards and hand back a
+    // calibration indistinguishable from a clean one.
+    const cal = run({ jitter: (t) => 0.06 * Math.sin(t * 5), restSec: 11, peak: 0.9 });
+    expect(cal.getPhase()).toBe('done');
+    const st = cal.getStatus();
+    expect(st.restStill).toBe(false);
+    expect(st.rest!.still).toBe(false);
+    expect(st.rest!.spread).toBeGreaterThan(0.05);
+    expect(st.warnings!.join(' ')).toMatch(/never settled|resting position/i);
+  });
+
+  it('rejects a range that cannot be told apart from its own noisy zero, and says why', () => {
+    const cal = run({ jitter: (t) => 0.06 * Math.sin(t * 5), restSec: 11, peak: 0.25 });
+    const spread = cal.getRestQuality()!.spread;
+    // The range (0.25, twice the nominal minRom) is wide in absolute terms but under MIN_ROM_SNR x
+    // the rest noise its own zero is buried in.
+    expect(cal.requiredRange()).toBeCloseTo(spread * MIN_ROM_SNR, 6);
+    expect(cal.requiredRange()).toBeGreaterThan(0.12);
+    expect(cal.getError()).toBe('insufficient_range');
+    expect(cal.getResult()).toBeNull();
+    // The guidance names the real cause: "move more" is the wrong instruction here.
+    expect(cal.getStatus().message).toMatch(/resting position/i);
+  });
+
+  it('admits a clean SMALL range that the fixed absolute floor used to refuse', () => {
+    // Hemiparetic patient: seated_march ROM 0.11 against the nominal 0.12 floor, rest rock steady.
+    const cal = run({ restSec: 2.5, peak: 0.11, cal: new RomCalibrator('seated_march', { prominence: 0.02 }) });
+    expect(cal.getPhase()).toBe('done');
+    expect(cal.getRestQuality()!.still).toBe(true);
+    expect(cal.requiredRange()).toBeCloseTo(0.06, 6); // half the nominal minRom, no lower
+    const res = cal.getResult()!;
+    expect(res.max - res.min).toBeGreaterThan(0.1);
+    expect(res.max - res.min).toBeLessThan(0.12);
+    expect(isCalibrationValid(res, 'seated_march')).toBe(true);
+    expect(calibrationProblem(res, 'seated_march')).toBeNull();
+  });
+
+  it('carries the rest window, capture time and posture with the calibration', () => {
+    const cal = run({ restSec: 2.5, peak: 0.9, cal: new RomCalibrator('seated_march', { now: () => 1_000_000, sessionId: 's-42' }) });
+    const res = cal.getResult()!;
+    expect(res.capturedAt).toBe(1_000_000);
+    expect(res.posture).toBe('seated_leg');
+    expect(res.sessionId).toBe('s-42');
+    expect(res.rest).toMatchObject({ still: true, samples: expect.any(Number) });
+    expect(res.movement).toBe('seated_march');
+  });
+});
+
+describe('calibration provenance is checkable', () => {
+  const base: RomCalibration = { min: 0, max: 0.5, samples: 100, movement: 'seated_march', posture: 'seated_leg' };
+
+  it('refuses a range measured for a DIFFERENT movement (different unit entirely)', () => {
+    const kneeDegrees: RomCalibration = { min: 100, max: 160, samples: 100, movement: 'knee_extension' };
+    expect(isCalibrationValid(kneeDegrees, 'knee_extension')).toBe(true);
+    expect(isCalibrationValid(kneeDegrees, 'seated_march')).toBe(false);
+    expect(calibrationProblem(kneeDegrees, 'seated_march')).toMatch(/knee extension/i);
+  });
+
+  it('warns about a stale calibration instead of silently normalizing with it', () => {
+    const now = 10 * CALIBRATION_STALE_MS;
+    expect(calibrationWarnings({ ...base, capturedAt: now - 60_000 }, 'seated_march', now)).toEqual([]);
+    const stale = calibrationWarnings({ ...base, capturedAt: now - 3 * CALIBRATION_STALE_MS }, 'seated_march', now);
+    expect(stale.join(' ')).toMatch(/measured .* ago/i);
+    // Still VALID (a therapist may reuse it deliberately) - the point is that it is visible.
+    expect(isCalibrationValid({ ...base, capturedAt: now - 3 * CALIBRATION_STALE_MS }, 'seated_march')).toBe(true);
+  });
+
+  it('warns about an unsteady zero and a hand-set range', () => {
+    const noisy = calibrationWarnings({ ...base, max: 1.5, rest: { still: false, spread: 0.09, drift: 0.01, durationSec: 10, samples: 300 } }, 'seated_march');
+    expect(noisy.join(' ')).toMatch(/never steady|0% may sit inside/i);
+    expect(calibrationWarnings({ ...base, manual: true }, 'seated_march').join(' ')).toMatch(/set by hand/i);
+  });
+
+  it('requiredRom is the absolute floor without a rest measurement (legacy calibrations unchanged)', () => {
+    expect(requiredRom('seated_march')).toBe(0.12);
+    expect(requiredRom('seated_march', { still: true, spread: 0, drift: 0, durationSec: 2, samples: 60 })).toBe(0.06);
+    expect(requiredRom('seated_march', { still: false, spread: 0, drift: 0, durationSec: 2, samples: 60 })).toBe(0.12);
+    expect(requiredRom('seated_march', { still: true, spread: 0.1, drift: 0, durationSec: 2, samples: 60 })).toBeCloseTo(0.3, 9);
+  });
+});
+
+/**
+ * A 'no_reps' failure has two completely different causes and only one used to be reported. The
+ * therapist reads this message and acts on it, so it has to name the one that happened.
+ */
+describe('RomCalibrator no_reps guidance', () => {
+  it('names the RANGE when the movement is real but smaller than a rep has to be', () => {
+    // knee_extension: minRom 20 deg => prominence 10 deg. This patient has 8 deg of active range.
+    const cal = new RomCalibrator('knee_extension', { moveTimeoutSec: 3, autoAdvance: false });
+    for (let i = 0; i < 60; i++) cal.push(90, i / 30);
+    cal.beginMove();
+    let t = 2;
+    for (let rep = 0; rep < 4; rep++) {
+      for (let i = 0; i < 30; i++, t += 1 / 30) cal.push(90 + 8 * Math.sin((i / 30) * Math.PI), t);
+    }
+    for (let i = 0; i < 40; i++, t += 1 / 30) cal.push(90, t);
+    expect(cal.getError()).toBe('no_reps');
+    const msg = cal.getStatus().message;
+    expect(msg).toMatch(/largest movement seen was/i);
+    expect(msg).toMatch(/8\.0°/); // what they actually managed
+    expect(msg).toMatch(/10\.0°/); // what a rep has to span
+    expect(msg).not.toMatch(/whole limb is visible/i); // NOT a camera problem
+    // …and the therapist has a real range to start from.
+    expect(cal.getProvisional()!.max).toBeGreaterThan(cal.getProvisional()!.min);
+  });
+
+  it('names the RETURN when the limb rises far enough but never comes back down', () => {
+    const cal = new RomCalibrator('knee_extension', { moveTimeoutSec: 3, autoAdvance: false });
+    for (let i = 0; i < 60; i++) cal.push(90, i / 30);
+    cal.beginMove();
+    let t = 2;
+    for (let i = 0; i < 150; i++, t += 1 / 30) cal.push(90 + i * 0.4, t); // a slow ramp, never returning
+    expect(cal.getError()).toBe('no_reps');
+    const msg = cal.getStatus().message;
+    expect(msg).toMatch(/never returned toward the resting position/i);
+    expect(msg).toMatch(/come back down by 10\.0°/);
+  });
+
+  it('still blames visibility when literally nothing moved', () => {
+    const cal = new RomCalibrator('finger_spread', { moveTimeoutSec: 5 });
+    for (let t = 0; t < 8; t += 1 / 30) cal.push(30, t);
+    expect(cal.getError()).toBe('no_reps');
+    expect(cal.getStatus().message).toMatch(/No movement was detected at all/i);
+  });
+});
+
+describe('LanePipeline carries the measurement identity it was built with', () => {
+  it('reports its mirror convention, fingertip and visibility gate', () => {
+    const p = new LanePipeline({ movement: 'finger_opposition', side: 'left', featureOptions: { mirrored: true, fingertip: 'pinky', minVisibility: 0.8 } });
+    expect(p.getMirrored()).toBe(true);
+    expect(p.getFingertip()).toBe('pinky');
+    expect(p.getMinVisibility()).toBe(0.8);
+    expect(p.getFeatureOptions()).toMatchObject({ mirrored: true, fingertip: 'pinky', minVisibility: 0.8 });
+    const q = new LanePipeline({ movement: 'seated_march', side: 'left' });
+    expect(q.getMirrored()).toBe(false); // the default IS a convention, not "unset"
+    expect(q.getFingertip()).toBe('index');
+  });
+
+  it('re-pointing at the other limb drops the filter state and the last sample', () => {
+    const p = new LanePipeline({ movement: 'seated_march', side: 'left', calibration: { min: 0, max: 1, samples: 1 } });
+    p.push(seatedPose({ kneeLift: 1, side: 'left' }), 0);
+    expect(p.last.tracking).toBe(true);
+    p.setMirrored(true); // now reading the RIGHT_* landmark slots: the old smoothed value described the other leg
+    expect(p.getMirrored()).toBe(true);
+    expect(p.last.tracking).toBe(false);
+    expect(p.last.value).toBe(0);
+  });
+
+  it('knows whether its compensation is actually being measured', () => {
+    const none = new LanePipeline({ movement: 'knee_extension', side: 'left' });
+    expect(none.getCompensationKind()).toBeNull();
+    expect(none.isCompensationMonitored()).toBe(false);
+    const ankle = new LanePipeline({ movement: 'ankle_dorsiflexion', side: 'left' });
+    expect(ankle.getCompensationKind()).toBe('heel_lift');
+    expect(ankle.isCompensationMonitored()).toBe(false); // monitors one, has no baseline: NOT measured
+    ankle.setCompensationBaseline(captureCompensationBaseline('ankle_dorsiflexion', seatedRest(), 'left'));
+    expect(ankle.isCompensationMonitored()).toBe(true);
+    // A calibration whose rest hold never saw the heel leaves the baseline null: still not measured.
+    ankle.setCompensationBaseline(undefined);
+    ankle.setCalibration({ min: 88, max: 128, samples: 1, movement: 'ankle_dorsiflexion', compensationBaseline: null });
+    expect(ankle.isCompensationMonitored()).toBe(false);
+  });
+});
+
+describe('finger_opposition calibrations carry the fingertip they were measured on', () => {
+  it('warns when a lane opposes a non-default fingertip against a range that records none', () => {
+    const legacy: RomCalibration = { min: 0, max: 1, samples: 1, movement: 'finger_opposition' };
+    expect(calibrationWarnings(legacy, 'finger_opposition')).toEqual([]);
+    expect(calibrationWarnings(legacy, 'finger_opposition', Date.now(), { fingertip: 'index' })).toEqual([]);
+    const w = calibrationWarnings(legacy, 'finger_opposition', Date.now(), { fingertip: 'ring' });
+    expect(w).toHaveLength(1);
+    expect(w[0]).toMatch(/ring/);
+    // Recorded and matching: nothing to say.
+    expect(calibrationWarnings({ ...legacy, fingertip: 'ring' }, 'finger_opposition', Date.now(), { fingertip: 'ring' })).toEqual([]);
   });
 });

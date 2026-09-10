@@ -8,6 +8,7 @@ export {
   STATE_JUDGMENT_EARLY_SEC,
   STATE_JUDGMENT_LATE_SEC,
   POPUP_MAX_RISE_FRAC,
+  MISS_CUE_MARGIN_U,
 } from './Highway';
 export type { RenderFrame, RenderNote, RenderLaneState, NoteVisualState, HighwayOptions, RenderStats, CanvasLike } from './types';
 export {
@@ -25,10 +26,15 @@ export {
   beatLineTimes,
   fillBeatLines,
   visibleTailSec,
+  gemVisibleTailSec,
+  fullyVisibleDepth,
+  depthAtScale,
+  projectInto,
   roadWidthFactor,
   MAX_BEAT_LINES,
   DEFAULT_GEOMETRY_OPTIONS,
   GEM_LANE_FRACTION,
+  GEM_ASPECT,
   GEM_HEIGHT_CAP,
   RECEPTOR_GEM_RATIO,
   ROAD_HEIGHT_CAP,
@@ -36,11 +42,11 @@ export {
   clamp,
 } from './geometry';
 export type { HighwayGeometry, GeometryOptions, Projected } from './geometry';
-export { ParticlePool, emitHitBurst, makeRng, PARTICLE_SPARK, PARTICLE_RING, PARTICLE_STREAK } from './particles';
+export { ParticlePool, emitHitBurst, makeRng, PARTICLE_SPARK, PARTICLE_RING, PARTICLE_STREAK, PARTICLE_SMOKE } from './particles';
 export type { EmitOptions, ParticleKind } from './particles';
 export { TextCache, DigitRoller, defaultCanvasFactory, fontPx, measureInk } from './text';
 export type { TextStyle, TextSprite, CanvasFactory, Ctx2D, InkBox } from './text';
-export { SpriteCache, blit, GEM_ASPECT, GEM_BUCKETS } from './sprites';
+export { SpriteCache, blit, GEM_BUCKETS } from './sprites';
 export type { Sprite } from './sprites';
 export {
   GH_PALETTE,
@@ -57,5 +63,7 @@ export {
   hexToRgb,
 } from './palette';
 export type { LaneColor, LanePalette } from './palette';
-export { runDemo, buildDemoChart } from './demo';
+export { receptorLook, receptorLookInto, DEFAULT_REARM_FRACTION } from './receptor';
+export type { ReceptorLook, LaneStateLike } from './receptor';
+export { runDemo, buildDemoChart, mountDemoIfRequested, DEMO_QUERY } from './demo';
 export type { DemoOptions, DemoHandle } from './demo';

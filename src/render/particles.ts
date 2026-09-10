@@ -3,10 +3,17 @@
  * emit() writes into free slots, update() compacts by swapping dead particles to the tail.
  */
 
-export type ParticleKind = 0 | 1 | 2;
+export type ParticleKind = 0 | 1 | 2 | 3;
 export const PARTICLE_SPARK: ParticleKind = 0; // small glowing dot, gravity, fades
 export const PARTICLE_RING: ParticleKind = 1; // expanding ring shockwave
 export const PARTICLE_STREAK: ParticleKind = 2; // elongated spark along its velocity
+/**
+ * Soft puff drawn with *normal* compositing (every other kind is additive). Additive grey is
+ * white: a miss puff drawn with `lighter` came out as a pale bright smudge, i.e. the brightest
+ * thing on the board at the exact moment the note died. Smoke composites over the asphalt instead,
+ * so a dead note looks dead.
+ */
+export const PARTICLE_SMOKE: ParticleKind = 3;
 
 export interface EmitOptions {
   x: number;

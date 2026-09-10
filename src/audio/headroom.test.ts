@@ -58,9 +58,9 @@ const ids = (JSON.parse(fs.readFileSync(path.join(songsDir, 'index.json'), 'utf8
 const boost = dbToGain(DEFAULT_DUCK_OPTIONS.streakBoostDb);
 
 /** Measured summed peaks quoted in the StemMixer module comment. */
-const EXPECTED: Record<string, { summed: number; boosted: number }> = {
-  'demo-groove': { summed: 2.05, boosted: 2.28 },
-  'demo-sunrise': { summed: 1.99, boosted: 2.23 },
+const EXPECTED: Record<string, { summed: number; boosted: number; intoLimiter: number }> = {
+  'demo-groove': { summed: 2.075, boosted: 2.303, intoLimiter: 2.338 },
+  'demo-sunrise': { summed: 1.975, boosted: 2.219, intoLimiter: 2.271 },
 };
 
 /** SFX at the top of the slider: the worst case a viewer can actually produce. */
@@ -119,7 +119,9 @@ describe('master headroom against the shipped demo stems', () => {
       // with the limiter: its modelled output (static curve + make-up gain) must stay below 1.0
       expect(limiterOutputPeak(worst * DEFAULT_MASTER_GAIN.limiter)).toBeLessThan(0.95);
       // and the quoted peak into the limiter
-      expect(worst * DEFAULT_MASTER_GAIN.limiter).toBeCloseTo(id === 'demo-groove' ? 2.32 : 2.28, 2);
+      expect(worst * DEFAULT_MASTER_GAIN.limiter).toBeCloseTo(EXPECTED[id].intoLimiter, 2);
+      // and the ~0.91 ceiling the module comment quotes
+      expect(limiterOutputPeak(worst * DEFAULT_MASTER_GAIN.limiter)).toBeCloseTo(0.915, 2);
     });
 
     it(`${id}: the player stem is the loudest element (its ducking is the main feedback cue)`, () => {

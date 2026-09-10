@@ -1,14 +1,13 @@
 /**
  * Standalone visual test for the highway renderer — no engine, no audio, no React.
  *
- * Integrator: mount at route `?demo=highway`, e.g. in main.tsx before rendering React:
+ * Integrator: this is one line in main.tsx, before React mounts —
  *
- *   if (new URLSearchParams(location.search).get('demo') === 'highway') {
- *     const canvas = document.createElement('canvas');
- *     Object.assign(canvas.style, { position: 'fixed', inset: '0', width: '100vw', height: '100vh' });
- *     document.body.appendChild(canvas);
- *     import('./render/demo').then((m) => m.runDemo(canvas));
- *   } else { ...render React... }
+ *   import { mountDemoIfRequested } from './render/demo';
+ *   if (!mountDemoIfRequested()) { ...render React as usual... }
+ *
+ * `mountDemoIfRequested()` returns true (and takes over the page with a full-viewport canvas) when
+ * the URL carries `?demo=highway`, and false otherwise, so the guard is the whole integration.
  *
  * (`node src/render/pixel-check.mjs` renders this demo in headless Chromium and saves a screenshot
  * of it as `demo-gameplay.png`, alongside its pixel assertions.)
@@ -22,6 +21,7 @@
 import type { HitEvent, LaneSpec } from '../engine/types';
 import { Highway } from './Highway';
 import { makeRng } from './particles';
+import { DEFAULT_REARM_FRACTION } from './receptor';
 import type { CanvasLike, HighwayOptions, RenderFrame, RenderLaneState, RenderNote } from './types';
 
 export interface DemoOptions extends Partial<HighwayOptions> {
@@ -56,6 +56,10 @@ interface DemoNote extends RenderNote {
 /** Engine-equivalent miss timing (easy difficulty: goodMs 180 + DEFAULT_MISS_GRACE_MS 100). */
 const DEMO_GOOD_MS = 180;
 const DEMO_MISS_GRACE_MS = 100;
+/** Trigger threshold the demo's synthetic movement is judged against (a plausible easy setting). */
+const DEMO_THRESHOLD = 0.6;
+/** URL query that mounts the demo: `?demo=highway`. */
+export const DEMO_QUERY = 'highway';
 
 const DEMO_LANES: LaneSpec[] = [
   { index: 0, movement: 'seated_march', side: 'left' },
@@ -129,7 +133,9 @@ export function runDemo(canvas: CanvasLike, options: DemoOptions = {}): DemoHand
   const windowSec = highway.geometry.approachSec + 0.6;
   const visible: DemoNote[] = [];
   const recent: HitEvent[] = [];
-  const laneStates: RenderLaneState[] = lanes.map(() => ({ value: 0, armed: true, tracking: true }));
+  // `lane` is set on purpose: the renderer matches meters to lanes by it, and the demo is the
+  // reference for how a frame should be built.
+  const laneStates: RenderLaneState[] = lanes.map((l) => ({ lane: l.index, value: 0, armed: true, tracking: true }));
   const judged = new Set<number>();
   /**
    * Events held back by one frame. Every third note is judged the way many integrators actually
@@ -147,6 +153,7 @@ export function runDemo(canvas: CanvasLike, options: DemoOptions = {}): DemoHand
     recent.length = 0;
     deferred.length = 0;
     for (const n of chart) n.state = 'pending';
+    for (const ls of laneStates) ls.armed = true;
     combo = 0;
     score = 0;
     health = 0.6;
@@ -197,7 +204,6 @@ export function runDemo(canvas: CanvasLike, options: DemoOptions = {}): DemoHand
     // Lane meters: a bump that rises toward each upcoming note and falls after; noise while idle.
     for (let l = 0; l < laneCount; l++) {
       let v = 0.08 + 0.04 * Math.sin(songTime * 2.1 + l);
-      let armed = true;
       for (const n of visible) {
         if (n.lane !== l) continue;
         const hitAt = n.time + n.deltaMs / 1000;
@@ -208,11 +214,26 @@ export function runDemo(canvas: CanvasLike, options: DemoOptions = {}): DemoHand
         } else if (dtn > -0.45 && dtn < 0.5) {
           const shape = dtn < 0 ? 1 + dtn / 0.45 : 1 - dtn / 0.5;
           v = Math.max(v, 0.95 * shape * shape + (dtn >= 0 && dtn < 0.1 ? 0.15 : 0));
-          if (dtn >= 0 && dtn < 0.35) armed = false;
         }
       }
-      laneStates[l].value = Math.min(1, v);
-      laneStates[l].armed = armed;
+      // Every 12 s, lane 0's "patient" reaches end range and *holds it there* for ~2 s — the single
+      // most common thing a real patient does, and the case the receptor has to be honest about:
+      // the lane fires once on the way up and then cannot fire again until the value comes back
+      // down past the re-arm line, so the receptor must stop reading "ready" for the whole hold.
+      if (l === 0) {
+        const h = songTime % 12;
+        if (h > 6 && h < 9.2) {
+          const up = Math.min(1, (h - 6) / 0.45);
+          const down = h > 8.6 ? Math.max(0, 1 - (h - 8.6) / 0.6) : 1;
+          v = Math.max(v, 0.1 + 0.88 * up * down);
+        }
+      }
+      const value = Math.min(1, v);
+      // Hysteresis exactly as the vision trigger detector does it (docs/ARCHITECTURE.md): fire on
+      // the rising edge above threshold, re-arm only below threshold * rearmFraction.
+      if (laneStates[l].armed && value >= DEMO_THRESHOLD) laneStates[l].armed = false;
+      else if (!laneStates[l].armed && value < DEMO_THRESHOLD * DEFAULT_REARM_FRACTION) laneStates[l].armed = true;
+      laneStates[l].value = value;
       laneStates[l].tracking = !(l === laneCount - 1 && songTime % 40 > 34 && songTime % 40 < 38);
     }
 
@@ -232,7 +253,8 @@ export function runDemo(canvas: CanvasLike, options: DemoOptions = {}): DemoHand
       songTitle: 'Highway Demo (synthetic)',
       attribution: '120 BPM scripted chart — render module self-test',
       energy: 0.35 + 0.35 * Math.pow(1 - (((songTime / beat) % 1) + 1) % 1, 2),
-      thresholdFraction: 0.6,
+      thresholdFraction: DEMO_THRESHOLD,
+      rearmFraction: DEFAULT_REARM_FRACTION,
     };
   };
 
@@ -281,4 +303,31 @@ export function runDemo(canvas: CanvasLike, options: DemoOptions = {}): DemoHand
       if (removeResize) removeResize();
     },
   };
+}
+
+/**
+ * Mount the demo when the page URL asks for it (`?demo=highway`). Returns true when it took over
+ * the page, so `main.tsx` needs exactly one guard:
+ *
+ *   if (!mountDemoIfRequested()) { ...render React... }
+ *
+ * A full-viewport canvas is appended to `document.body` (or `parent`, if given) and `runDemo`
+ * drives it. Safe to call in a non-browser environment: it returns false.
+ */
+export function mountDemoIfRequested(parent?: HTMLElement, options: DemoOptions = {}): boolean {
+  if (typeof document === 'undefined' || typeof location === 'undefined') return false;
+  let requested = false;
+  try {
+    requested = new URLSearchParams(location.search).get('demo') === DEMO_QUERY;
+  } catch {
+    requested = false;
+  }
+  if (!requested) return false;
+  const host = parent ?? document.body;
+  const canvas = document.createElement('canvas');
+  Object.assign(canvas.style, { position: 'fixed', inset: '0', width: '100vw', height: '100vh', display: 'block' });
+  document.documentElement.style.background = '#05060c';
+  host.appendChild(canvas);
+  runDemo(canvas, options);
+  return true;
 }

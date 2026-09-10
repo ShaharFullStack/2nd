@@ -13,12 +13,37 @@
  * identical filter and thresholdFraction of ROM is reachable at tempo.
  */
 import type { Movement } from '../engine/types.ts';
-import { MOVEMENT_INFO, baselineFromSamples } from './features.ts';
-import type { CompensationBaseline, CompensationSample } from './features.ts';
+import { DEFAULT_FINGERTIP, MOVEMENT_INFO, POSTURE_INFO, baselineFromSamples } from './features.ts';
+import type { CompensationBaseline, CompensationSample, MovementPosture } from './features.ts';
 import { clamp01 } from './landmarks.ts';
+import type { Fingertip } from './landmarks.ts';
 import { median, percentile } from './stats.ts';
 
 export { median, percentile };
+
+/**
+ * What the rest window that produced `min` actually looked like.
+ *
+ * `min` is the ZERO the whole session is normalized from, and until this existed the fact that it might
+ * be the median of a swinging baseline was ERASED rather than recorded: the rest phase auto-advances
+ * after `restTimeoutSec` whether or not the patient ever held still, and the status then claimed
+ * `restStill: true` because that flag only ever meant "still, right now, during the rest phase". Eleven
+ * seconds of rest oscillating by half of seated_march's entire minimum ROM produced a calibration
+ * indistinguishable from a clean one. It is now measured, carried with the calibration, and used:
+ * `spread` is the noise floor the range has to stand out from (see requiredRom).
+ */
+export interface RestQuality {
+  /** True when the window was accepted because it was STILL; false when the rest phase timed out. */
+  still: boolean;
+  /** 10th..90th percentile spread of the rest window (feature units) — the noise `min` sits in. */
+  spread: number;
+  /** Second-half median minus first-half median (feature units): baseline drift across the window. */
+  drift: number;
+  /** Seconds of rest actually observed in the window. */
+  durationSec: number;
+  /** Feature samples in the window. */
+  samples: number;
+}
 
 export interface RomCalibration {
   /** Feature value at rest. */
@@ -34,6 +59,99 @@ export interface RomCalibration {
   compensationBaseline?: CompensationBaseline | null;
   /** True when a therapist adjusted the range by hand (nudge/setRange) rather than it being measured. */
   manual?: boolean;
+  /** Quality of the rest window `min` came from (absent for a hand-built / legacy calibration). */
+  rest?: RestQuality | null;
+  /** Date.now() when the calibration was captured — provenance, so a stale one can be spotted. */
+  capturedAt?: number;
+  /**
+   * The posture the patient was in when it was captured (derived from the movement). A wrist_extension
+   * range measured with the hand over the table edge normalizes nothing meaningful in a palm-to-camera
+   * session, and without this the Setup screen could not tell.
+   */
+  posture?: MovementPosture;
+  /**
+   * finger_opposition ONLY: which fingertip was opposed while the range was measured.
+   *
+   * The therapist may choose the fingertip (docs/ARCHITECTURE.md:77) and the feature is
+   * `1 - tip-to-thumb distance / palm size` for THAT tip, so an index range and a pinky range are ranges
+   * of DIFFERENT QUANTITIES: a hand that can pinch its index to the thumb reaches ~1.0, while the same
+   * hand pinching the (shorter, further) pinky peaks well below the index range's max. Playing one
+   * against the other silently normalizes the wrong thing — a full pinch that reads 0.51 against a 0.65
+   * threshold, i.e. a lane that cannot score all song with nothing to explain it. Recorded here so
+   * `calibrationProblem` can refuse the pairing, exactly as it refuses a range measured for another
+   * movement. Absent on a legacy/hand-built calibration, which is reported as a warning, not a refusal.
+   */
+  fingertip?: Fingertip;
+  /** Session it was captured in, when the caller supplies one (localStorage history / therapist notes). */
+  sessionId?: string;
+}
+
+/**
+ * What the LANE is configured to measure right now, for the checks that compare a stored calibration
+ * against the session about to use it. Only the options that change WHICH QUANTITY is measured belong
+ * here (see FeatureOptions): a visibility gate or an aspect correction does not make a range wrong.
+ */
+export interface CalibrationContext {
+  /** finger_opposition: the fingertip this lane opposes in play (default DEFAULT_FINGERTIP). */
+  fingertip?: Fingertip;
+}
+
+/**
+ * The fingertip mismatch between a stored calibration and the lane about to use it, or null when there
+ * is none (not a finger_opposition calibration, no fingertip recorded, or the two agree).
+ */
+export function fingertipMismatch(cal: CalibrationRange | null | undefined, movement: Movement, ctx?: CalibrationContext): { calibrated: Fingertip; playing: Fingertip } | null {
+  if (!cal || movement !== 'finger_opposition' || cal.fingertip === undefined) return null;
+  const playing = ctx?.fingertip ?? DEFAULT_FINGERTIP;
+  return cal.fingertip === playing ? null : { calibrated: cal.fingertip, playing };
+}
+
+/**
+ * How many times the rest-window noise the calibrated range must span.
+ *
+ * WHY 3, AND WHY THIS EXISTS AT ALL. `minRom` is a fixed absolute constant with no relation to the noise
+ * it is guarding against. On the automatic path the stillness guard bounds the rest spread at
+ * `stillnessFraction` (0.35) of minRom, which INCIDENTALLY bounds the signal-to-noise ratio at ~1/0.35 ≈
+ * 3 — but nothing bounds it after a rest timeout, or through setManualRange()/getProvisional(). This
+ * makes that incidental ~3 explicit and applies it everywhere, which cuts both ways:
+ *   - a hemiparetic patient with a SMALL BUT PERFECTLY CLEAN range (seated_march ROM 0.11 against the
+ *     0.12 floor) is no longer told "Not enough movement was detected" and rescued by hand — a still
+ *     rest window earns them a floor of half the nominal minRom;
+ *   - a NOISY WIDE range (rest swinging ±0.06, i.e. a spread of ~0.11) is rejected even at a range of
+ *     0.3, because 0.3 is less than 3× the noise its own zero is buried in.
+ * At 3 the still-window auto path is unchanged (3 × 0.35 × minRom ≈ minRom); only the unbounded paths
+ * and the clean small-ROM patient move.
+ */
+export const MIN_ROM_SNR = 3;
+
+/**
+ * The absolute floor never drops below this fraction of the movement's nominal minRom, however clean the
+ * rest window is: at some point a range is too small to be a movement rather than a measurement, and the
+ * feature's own quantization (landmark jitter of a fraction of a pixel) is not modelled by `spread`.
+ */
+export const SMALL_ROM_FLOOR_FRACTION = 0.5;
+
+/**
+ * A calibration older than this (6 h) is reported as stale: the camera has been moved, the chair is at a
+ * different distance, the patient is sitting differently. It is a WARNING, not a refusal — a therapist
+ * re-using this morning's range on purpose is legitimate — but it must be visible on the Setup screen.
+ */
+export const CALIBRATION_STALE_MS = 6 * 60 * 60 * 1000;
+
+/** The (min, max) part of a calibration plus whatever provenance is available to judge it. */
+export type CalibrationRange = Pick<RomCalibration, 'min' | 'max'> & Partial<RomCalibration>;
+
+/**
+ * The range this movement actually has to span for a calibration to be usable: the larger of the
+ * absolute floor and MIN_ROM_SNR times the measured rest noise. With no rest measurement (a legacy or
+ * hand-built calibration) it is exactly the movement's nominal minRom, as before.
+ */
+export function requiredRom(movement: Movement, rest?: RestQuality | null): number {
+  const nominal = MOVEMENT_INFO[movement].minRom;
+  if (!rest || !Number.isFinite(rest.spread) || rest.spread < 0) return nominal;
+  // A window that was never still gets NO relaxation of the absolute floor - only the SNR tightening.
+  const floor = rest.still ? nominal * SMALL_ROM_FLOOR_FRACTION : nominal;
+  return Math.max(floor, rest.spread * MIN_ROM_SNR);
 }
 
 export type CalibrationPhase = 'rest' | 'move' | 'done';
@@ -43,8 +161,17 @@ export interface CalibrationStatus {
   phase: CalibrationPhase;
   /** 0..1 progress of the rest hold. */
   restProgress: number;
-  /** False while the rest window is not still enough to be used (message says "hold still"). */
+  /**
+   * During 'rest': whether the trailing window is still enough to be used. AFTER the rest phase: whether
+   * the window that actually produced `min` was still — FALSE when the phase auto-advanced on
+   * `restTimeoutSec` with the patient never settling. It used to read `true` in that case, which erased
+   * the single most important caveat about the session's zero.
+   */
   restStill: boolean;
+  /** The rest window `min` came from (live window while in 'rest'), or null before any rest sample. */
+  rest?: RestQuality | null;
+  /** Non-fatal concerns a therapist screen should show (unsteady zero, drift, manual range). */
+  warnings?: string[];
   /** Reps detected so far in the move phase. */
   repsDetected: number;
   repsRequired: number;
@@ -95,6 +222,16 @@ export interface CalibratorOptions {
   autoAdvance?: boolean;
   /** Maximum seconds in the move phase before giving up with 'no_reps' (default 30). */
   moveTimeoutSec?: number;
+  /**
+   * finger_opposition: the fingertip being opposed while this range is measured (default 'index').
+   * Stamped on the produced RomCalibration so a session that plays a DIFFERENT fingertip is refused
+   * instead of silently normalizing one quantity by another's range (see fingertipMismatch).
+   */
+  fingertip?: Fingertip;
+  /** Wall clock for the calibration's `capturedAt` provenance (default Date.now). Injectable for tests. */
+  now?: () => number;
+  /** Session id stamped on the produced calibration (provenance for the localStorage history). */
+  sessionId?: string;
 }
 
 /** What the calibrator consumes per frame (LanePipeline's LaneSample satisfies this). */
@@ -135,26 +272,82 @@ export function normalizeFeatureRaw(cal: Pick<RomCalibration, 'min' | 'max'>, fe
  * hand tremor scores. Every consumer that turns a feature into a SCORE must run this first; VisionInput
  * does, and refuses to play a lane that fails (see VisionInput.getInvalidCalibrationLanes).
  */
-export function isCalibrationValid(cal: Pick<RomCalibration, 'min' | 'max'> | null | undefined, movement?: Movement): boolean {
+export function isCalibrationValid(cal: CalibrationRange | null | undefined, movement?: Movement, ctx?: CalibrationContext): boolean {
   if (!cal || !Number.isFinite(cal.min) || !Number.isFinite(cal.max)) return false;
-  const minRom = movement ? MOVEMENT_INFO[movement].minRom : 1e-6;
-  return cal.max - cal.min >= minRom;
+  if (!movement) return cal.max - cal.min >= 1e-6;
+  if (cal.movement && cal.movement !== movement) return false; // measured for a different movement/unit
+  if (fingertipMismatch(cal, movement, ctx)) return false; // measured opposing a different fingertip
+  return cal.max - cal.min >= requiredRom(movement, cal.rest);
 }
 
 /** Why a calibration was rejected (null = usable). Suitable for a therapist-facing message. */
-export function calibrationProblem(cal: Pick<RomCalibration, 'min' | 'max'> | null | undefined, movement: Movement): string | null {
+export function calibrationProblem(cal: CalibrationRange | null | undefined, movement: Movement, ctx?: CalibrationContext): string | null {
   if (!cal) return null;
   if (!Number.isFinite(cal.min) || !Number.isFinite(cal.max)) return 'the range is not a number';
   const info = MOVEMENT_INFO[movement];
+  const tip = fingertipMismatch(cal, movement, ctx);
+  if (tip) {
+    // Same class of error as a range measured for another movement: the two numbers are ranges of
+    // different quantities, so normalizing one with the other is not a degraded measurement.
+    return `it was measured opposing the ${tip.calibrated} finger, but this lane opposes the ${tip.playing} finger`;
+  }
+  if (cal.movement && cal.movement !== movement) {
+    // Ranges are in the MOVEMENT'S OWN unit (degrees vs frame-height ratio): normalizing one movement's
+    // feature by another's range is not a degraded measurement, it is a different quantity.
+    return `it was measured for ${MOVEMENT_INFO[cal.movement].label.toLowerCase()}, not ${info.label.toLowerCase()}`;
+  }
   const rom = cal.max - cal.min;
-  if (rom >= info.minRom) return null;
+  const needed = requiredRom(movement, cal.rest);
+  if (rom >= needed) return null;
   // Keep a tiny range legible: "0%" reads as a formatting bug, "0.1%" reads as the actual problem.
   const fmt = (v: number) => {
     if (info.unit === 'deg') return `${v < 1 ? v.toFixed(1) : v.toFixed(0)}°`;
     const pct = v * 100;
     return `${pct > 0 && pct < 1 ? pct.toFixed(1) : pct.toFixed(0)}%`;
   };
-  return `the calibrated range is only ${fmt(rom)}, below the ${fmt(info.minRom)} minimum for ${info.label.toLowerCase()}`;
+  const base = `the calibrated range is only ${fmt(rom)}, below the ${fmt(needed)} minimum for ${info.label.toLowerCase()}`;
+  // When the floor was RAISED by a noisy rest window, say so: "do a bigger movement" is the wrong
+  // instruction when the real problem is that the resting position never stopped moving.
+  if (cal.rest && needed > info.minRom * 1.001) {
+    return `${base} — the resting position was drifting by ${fmt(cal.rest.spread)}, so the movement cannot be told apart from it. Re-do the rest hold with the limb supported and still`;
+  }
+  return base;
+}
+
+/**
+ * Non-fatal concerns about an otherwise usable calibration: things a therapist screen must SAY rather
+ * than a reason to refuse the lane. Range validity is checked by isCalibrationValid; this covers the
+ * provenance that used to be invisible — an unsteady zero, a drifting baseline, a range typed in by
+ * hand, and a calibration arriving from localStorage hours (or months) later, captured in a posture
+ * nobody has re-checked.
+ */
+export function calibrationWarnings(cal: CalibrationRange | null | undefined, movement: Movement, now: number = Date.now(), ctx?: CalibrationContext): string[] {
+  if (!cal) return [];
+  const info = MOVEMENT_INFO[movement];
+  const out: string[] = [];
+  // A finger_opposition range with no fingertip recorded is only worth mentioning when the lane is NOT
+  // playing the default: the older calibrations that lack the field were all measured on the index.
+  if (movement === 'finger_opposition' && cal.fingertip === undefined && (ctx?.fingertip ?? DEFAULT_FINGERTIP) !== DEFAULT_FINGERTIP) {
+    out.push(`This range does not record which fingertip it was measured with, and this lane opposes the ${ctx?.fingertip} finger. If it was measured on another finger, re-run the calibration.`);
+  }
+  const fmt = (v: number) => (info.unit === 'deg' ? `${Math.abs(v).toFixed(1)}°` : `${(Math.abs(v) * 100).toFixed(1)}%`);
+  const rest = cal.rest;
+  if (rest && !rest.still) {
+    out.push(`The resting position was never steady while the zero was measured (it moved by ${fmt(rest.spread)} over ${rest.durationSec.toFixed(1)}s), so 0% may sit inside the movement. Re-do the rest hold.`);
+  }
+  if (rest && rest.still && Math.abs(rest.drift) > info.minRom * 0.2) {
+    out.push(`The resting position drifted by ${fmt(rest.drift)} during the hold; the zero may be off by about that much.`);
+  }
+  if (cal.manual) out.push('The range was set by hand rather than measured, so it has not been checked against the patient\'s movement.');
+  if (typeof cal.capturedAt === 'number' && Number.isFinite(cal.capturedAt)) {
+    const ageMs = now - cal.capturedAt;
+    if (ageMs > CALIBRATION_STALE_MS) {
+      const hours = ageMs / 3600000;
+      const age = hours >= 48 ? `${Math.round(hours / 24)} days` : `${Math.round(hours)} hours`;
+      out.push(`This range was measured ${age} ago (${POSTURE_INFO[cal.posture ?? info.posture].label.toLowerCase()}). If the camera or the chair has moved since, re-run the calibration.`);
+    }
+  }
+  return out;
 }
 
 export class RomCalibrator {
@@ -170,6 +363,10 @@ export class RomCalibrator {
   readonly peakPercentile: number;
   readonly autoAdvance: boolean;
   readonly moveTimeoutSec: number;
+  readonly sessionId: string | undefined;
+  /** finger_opposition only: the fingertip this range is being measured on. */
+  readonly fingertip: Fingertip | undefined;
+  private readonly nowMs: () => number;
 
   private phase: CalibrationPhase = 'rest';
   private error: CalibrationError | null = null;
@@ -183,6 +380,8 @@ export class RomCalibrator {
   private restEnd = NaN;
   private restTotal = 0;
   private restStill = false;
+  /** The rest window that actually produced `min`, captured when the rest phase ended. */
+  private restAtAdvance: RestQuality | null = null;
   private moveStart = NaN;
   private moveSamples = 0;
   private min: number | null = null;
@@ -193,6 +392,10 @@ export class RomCalibrator {
   /** Highest feature seen in the move phase, so a 'no_reps' lane still offers a starting range. */
   private moveMax = -Infinity;
   // peak detection
+  /** Largest rise above a trough seen in the move phase (diagnostic for a 'no_reps' failure). */
+  private bestRise = 0;
+  /** Largest fall from a candidate peak seen while rising (same). */
+  private bestFall = 0;
   private trough = Infinity;
   private candidate = -Infinity;
   private rising = false;
@@ -210,6 +413,9 @@ export class RomCalibrator {
     this.peakPercentile = opts.peakPercentile ?? 0.9;
     this.autoAdvance = opts.autoAdvance ?? true;
     this.moveTimeoutSec = opts.moveTimeoutSec ?? 30;
+    this.nowMs = opts.now ?? (() => Date.now());
+    this.sessionId = opts.sessionId;
+    this.fingertip = movement === 'finger_opposition' ? opts.fingertip ?? DEFAULT_FINGERTIP : undefined;
   }
 
   getPhase(): CalibrationPhase {
@@ -307,6 +513,45 @@ export class RomCalibrator {
     return drift <= this.minRom * this.restDriftFraction;
   }
 
+  /** 10th..90th percentile spread of the current rest window (0 with fewer than 2 samples). */
+  restSpread(): number {
+    if (this.restSamples.length < 2) return 0;
+    return percentile(this.restSamples, 0.9) - percentile(this.restSamples, 0.1);
+  }
+
+  /**
+   * Quality of the rest window as it stands right now (during 'rest'), or of the window that produced
+   * `min` (afterwards). null before any rest sample exists.
+   */
+  getRestQuality(): RestQuality | null {
+    return this.phase === 'rest' ? this.currentRestQuality() : this.restAtAdvance;
+  }
+
+  private currentRestQuality(): RestQuality | null {
+    if (this.restSamples.length === 0) return null;
+    const first = this.restTimes[0];
+    const last = this.restTimes[this.restTimes.length - 1];
+    return {
+      still: this.restStill,
+      spread: this.restSpread(),
+      drift: this.restDrift(),
+      durationSec: Number.isFinite(last - first) ? last - first : 0,
+      samples: this.restSamples.length,
+    };
+  }
+
+  /**
+   * The range this calibration must span to be accepted: the absolute floor (`minRom`, halved when the
+   * rest window was genuinely still) or MIN_ROM_SNR times the rest noise, whichever is larger. Same rule
+   * as the module-level requiredRom(), but honouring a `minRom` override passed to this calibrator.
+   */
+  requiredRange(): number {
+    const rest = this.restAtAdvance;
+    if (!rest || !Number.isFinite(rest.spread) || rest.spread < 0) return this.minRom;
+    const floor = rest.still ? this.minRom * SMALL_ROM_FLOOR_FRACTION : this.minRom;
+    return Math.max(floor, rest.spread * MIN_ROM_SNR);
+  }
+
   /** Drift of the rest window (second-half median minus first-half median), for a calibration screen. */
   restDrift(): number {
     const half = this.restSamples.length >> 1;
@@ -317,6 +562,8 @@ export class RomCalibrator {
   /** Manually end the rest phase (e.g. therapist pressed "Next"). Requires at least one rest sample. */
   beginMove(): boolean {
     if (this.phase !== 'rest' || this.restSamples.length === 0) return false;
+    // Capture what the window LOOKED LIKE before leaving the phase, whether it settled or timed out.
+    this.restAtAdvance = this.currentRestQuality();
     this.min = median(this.restSamples);
     this.baseline = baselineFromSamples(this.restComp);
     this.phase = 'move';
@@ -327,6 +574,8 @@ export class RomCalibrator {
     this.trough = this.min;
     this.candidate = -Infinity;
     this.rising = false;
+    this.bestRise = 0;
+    this.bestFall = 0;
     this.error = null;
     return true;
   }
@@ -334,12 +583,16 @@ export class RomCalibrator {
   private detectPeak(v: number): void {
     if (!this.rising) {
       if (v < this.trough) this.trough = v;
+      // The biggest rise-from-a-trough seen so far: exactly the quantity the next line tests, kept so a
+      // 'no_reps' failure can say WHY (see noRepsMessage) instead of blaming visibility.
+      if (v - this.trough > this.bestRise) this.bestRise = v - this.trough;
       if (v - this.trough >= this.prominence) {
         this.rising = true;
         this.candidate = v;
       }
     } else {
       if (v > this.candidate) this.candidate = v;
+      if (this.candidate - v > this.bestFall) this.bestFall = this.candidate - v;
       if (this.candidate - v >= this.prominence) {
         this.peaks.push(this.candidate);
         this.rising = false;
@@ -360,7 +613,7 @@ export class RomCalibrator {
       return this.phase;
     }
     this.max = percentile(this.peaks, this.peakPercentile);
-    this.error = this.max - (this.min as number) < this.minRom ? 'insufficient_range' : null;
+    this.error = this.max - (this.min as number) < this.requiredRange() ? 'insufficient_range' : null;
     this.phase = 'done';
     return this.phase;
   }
@@ -396,6 +649,7 @@ export class RomCalibrator {
     this.restEnd = NaN;
     this.restTotal = 0;
     this.restStill = false;
+    this.restAtAdvance = null;
     this.moveStart = NaN;
     this.moveSamples = 0;
     this.moveMax = -Infinity;
@@ -437,12 +691,12 @@ export class RomCalibrator {
   private reconcile(): void {
     if (this.min !== null && this.max !== null && this.max < this.min + 1e-6) this.max = this.min + 1e-6;
     if (this.phase === 'done' && this.min !== null && this.max !== null) {
-      this.error = this.max - this.min < this.minRom ? 'insufficient_range' : null;
+      this.error = this.max - this.min < this.requiredRange() ? 'insufficient_range' : null;
     }
   }
 
   private build(min: number, max: number): RomCalibration {
-    return {
+    const cal: RomCalibration = {
       min,
       max,
       samples: this.restTotal + this.moveSamples,
@@ -450,7 +704,13 @@ export class RomCalibrator {
       movement: this.movement,
       compensationBaseline: this.baseline,
       manual: this.manualAdjusted,
+      rest: this.restAtAdvance,
+      capturedAt: this.nowMs(),
+      posture: MOVEMENT_INFO[this.movement].posture,
     };
+    if (this.sessionId !== undefined) cal.sessionId = this.sessionId;
+    if (this.fingertip !== undefined) cal.fingertip = this.fingertip;
+    return cal;
   }
 
   /** Final calibration, or null while not done / errored. */
@@ -467,8 +727,9 @@ export class RomCalibrator {
    * The rest-phase compensation baseline collected so far is kept.
    */
   setManualRange(min: number, max: number): void {
-    if (this.phase === 'rest' && this.restSamples.length > 0 && this.baseline === null) {
-      this.baseline = baselineFromSamples(this.restComp);
+    if (this.phase === 'rest' && this.restSamples.length > 0) {
+      if (this.baseline === null) this.baseline = baselineFromSamples(this.restComp);
+      if (this.restAtAdvance === null) this.restAtAdvance = this.currentRestQuality();
     }
     this.min = min;
     this.max = max;
@@ -532,15 +793,31 @@ export class RomCalibrator {
       message = full && !this.restStill ? `${info.restInstruction} Hold still…` : info.restInstruction;
     } else if (this.phase === 'move') message = `${info.calibrationInstruction} (${this.peaks.length}/${this.repsRequired})`;
     else if (this.error === 'insufficient_range') {
-      message = `Not enough movement was detected (${this.formatRom()}). Try a bigger movement, move closer to the camera, or let the therapist adjust the range manually.`;
+      // When the floor was RAISED by a noisy rest window, "do a bigger movement" is the wrong
+      // instruction: the range is fine, it is the zero it is measured from that will not hold still.
+      const noisyRest = this.restAtAdvance !== null && this.requiredRange() > this.minRom * 1.001;
+      message = noisyRest
+        ? `The movement could not be told apart from the resting position, which was itself moving by ${this.formatValue(this.restAtAdvance!.spread)} (${this.formatRom()}). Support the limb, hold still, and calibrate again.`
+        : `Not enough movement was detected (${this.formatRom()}). Try a bigger movement, move closer to the camera, or let the therapist adjust the range manually.`;
     } else if (this.error === 'no_reps') {
-      message = 'No repetitions were detected. Make sure the whole limb is visible and try again.';
+      message = this.noRepsMessage();
     } else message = this.manualAdjusted ? 'Range set manually by the therapist.' : 'Calibration complete.';
     const min = this.phase === 'rest' ? (this.restSamples.length > 0 ? median(this.restSamples) : null) : this.min;
+    const rest = this.getRestQuality();
+    // The rest window that produced `min` is reported as it WAS, not as the phase would like it to be:
+    // an auto-advance on restTimeoutSec leaves this false for the rest of the calibration.
+    const restStill = this.phase === 'rest' ? this.restStill : rest?.still ?? false;
+    const warnings: string[] = [];
+    if (this.phase !== 'rest' && rest && !rest.still) {
+      warnings.push(`The resting position never settled (it moved by ${this.formatValue(rest.spread)} over ${rest.durationSec.toFixed(1)}s), so 0% may sit inside the movement. Re-do the rest hold if you can.`);
+    }
+    if (this.manualAdjusted) warnings.push('The range was set by hand rather than measured.');
     return {
       phase: this.phase,
       restProgress: this.restProgress(),
-      restStill: this.phase !== 'rest' || this.restStill,
+      restStill,
+      rest,
+      warnings,
       repsDetected: this.peaks.length,
       repsRequired: this.repsRequired,
       min,
@@ -551,9 +828,40 @@ export class RomCalibrator {
     };
   }
 
+  /**
+   * Why no repetition was detected — the RANGE reason, when that is what it is.
+   *
+   * The peak rule needs a rise AND a fall of `prominence` (half the movement's minimum ROM). A patient
+   * whose active range is below that floor — 8° of knee extension against a 10° prominence — produces
+   * zero peaks, and the old message ("Make sure the whole limb is visible and try again") sent the
+   * therapist to fix the CAMERA for a problem in the PATIENT's range. It is the one failure the
+   * therapist can act on immediately, by setting the range by hand (`setManualRange`, offered from
+   * `getProvisional`) or by prescribing an easier movement, and it was the one the message hid.
+   * The visibility wording is kept for the case it actually describes: nothing was seen moving at all.
+   */
+  private noRepsMessage(): string {
+    const need = this.formatValue(this.prominence);
+    // Nothing ever rose above its own trough: the signal was flat (or absent) for the whole move phase.
+    if (!(this.bestRise > 0)) {
+      return 'No movement was detected at all. Make sure the whole limb is visible and try again.';
+    }
+    if (this.bestRise < this.prominence) {
+      return `No repetitions were detected: the largest movement seen was ${this.formatValue(this.bestRise)}, and a repetition has to span at least ${need}. Try a bigger movement, or let the therapist set the range by hand.`;
+    }
+    // It rose far enough but never came back down: the limb is not returning to rest between reps.
+    return `No repetitions were detected: the movement reached ${this.formatValue(this.bestRise)} but never returned toward the resting position (it has to come back down by ${need}). Lower the limb fully between repetitions, or let the therapist set the range by hand.`;
+  }
+
+  private formatValue(v: number): string {
+    return MOVEMENT_INFO[this.movement].unit === 'deg' ? `${Math.abs(v).toFixed(1)}°` : `${(Math.abs(v) * 100).toFixed(1)}%`;
+  }
+
   private formatRom(): string {
     const info = MOVEMENT_INFO[this.movement];
     const rom = this.min !== null && this.max !== null ? this.max - this.min : 0;
-    return info.unit === 'deg' ? `${rom.toFixed(0)}° of ${this.minRom}° needed` : `${(rom * 100).toFixed(0)}% of ${(this.minRom * 100).toFixed(0)}% needed`;
+    const needed = this.requiredRange();
+    return info.unit === 'deg'
+      ? `${rom.toFixed(0)}° of ${needed.toFixed(0)}° needed`
+      : `${(rom * 100).toFixed(0)}% of ${(needed * 100).toFixed(0)}% needed`;
   }
 }

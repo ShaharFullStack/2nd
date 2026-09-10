@@ -11,6 +11,8 @@
  *   2. the strike line is uniformly bright across the whole board (no centre-hot ellipse)
  *   3. a hit lights up the receptor area (burst + flash) well above the idle frame
  *   4. a miss reddens its lane — including on the frame the note `state` flips, before any HitEvent
+ *   4b. a lane locked out by hysteresis reads as categorically different from a live one, and the
+ *       whole missed gem is still inside the canvas at the latest miss verdict (+280 ms)
  *   5. notes land exactly on the strike line at their note time, and a constant-BPM chart
  *      foreshortens correctly (measured gem spacing shrinks monotonically toward the horizon)
  *   6. 60 fps budget: mean frame time over a 600-frame run at 1920x1080
@@ -67,7 +69,7 @@ async function bundle() {
 /** Runs inside the page: draws scenes on a real canvas and measures pixels. */
 /* eslint-disable */
 function pageProbe(W, H) {
-  const { Highway, makeFrame, laneX, laneBoundaryX, roadEdgeX } = window.BR;
+  const { Highway, makeFrame, laneX, laneBoundaryX, roadEdgeX, depthOf, scaleAt, GEM_ASPECT } = window.BR;
   const LANES = [
     { index: 0, movement: 'seated_march', side: 'left' },
     { index: 1, movement: 'seated_march', side: 'right' },
@@ -201,6 +203,100 @@ function pageProbe(W, H) {
     };
     out.missRedGainStateFlip = redGain(a.data, b.data);
     out.missRedGainEventFrame = redGain(a2.data, c.data);
+  }
+
+  // --- 4b. the receptor tells the truth about whether the lane can fire ------------------------
+  // A patient holding at end range has a full meter and an *unarmed* lane: nothing they do scores
+  // until they lower past the re-arm line. The lit / hot / haloed receptor is reserved for lanes
+  // that would actually fire, so the two states must differ in pixels, not in call counts.
+  {
+    const t = 10;
+    // Lane 3 (blue in GH order) so the warm "lower to reset" hint colour cannot be confused with
+    // the lane's own colour.
+    const lane = 3;
+    const states = (armed) => LANES.map((l) => ({ lane: l.index, value: 0.75, armed, tracking: true }));
+    const settle = (armed, name) => {
+      const frames = [];
+      for (let i = 0; i < 30; i++) frames.push(base(t + i * 0.016, { laneStates: states(armed), thresholdFraction: 0.6 }));
+      return scene(frames, name);
+    };
+    const live = settle(true, 'receptor-armed');
+    const held = settle(false, 'receptor-locked');
+    const g = live.hw.geometry;
+    const cx = laneX(g, lane, 0);
+    const box = { x0: Math.round(cx - g.receptorRadius), x1: Math.round(cx + g.receptorRadius), y0: Math.round(g.strikeY - g.receptorRadius), y1: Math.round(g.strikeY + g.receptorRadius) };
+    const stats = (data) => {
+      let luma = 0;
+      let chroma = 0;
+      let hint = 0;
+      let n = 0;
+      for (let y = box.y0; y <= box.y1; y++) {
+        for (let x = box.x0; x <= box.x1; x++) {
+          const p = px(data, x, y);
+          luma += lum(p);
+          chroma += Math.max(p[0], p[1], p[2]) - Math.min(p[0], p[1], p[2]);
+          // The "lower to reset" hint colour (#ffcf5a) after alpha-blending onto the dark road:
+          // warm yellow — bright red channel, green well below it, blue far below that.
+          if (p[0] > 150 && p[0] - p[2] > 70 && p[0] - p[1] > 15 && p[0] - p[1] < 120) hint++;
+          n++;
+        }
+      }
+      return { luma: luma / n, chroma: chroma / n, hint };
+    };
+    const a = stats(live.data);
+    const b = stats(held.data);
+    out.receptorLumaArmed = a.luma;
+    out.receptorLumaLocked = b.luma;
+    out.receptorChromaArmed = a.chroma;
+    out.receptorChromaLocked = b.chroma;
+    out.receptorHintArmed = a.hint;
+    out.receptorHintLocked = b.hint;
+  }
+
+  // --- 4c. the miss cue is fully inside the canvas at the latest possible verdict ---------------
+  // The engine declares a miss at note.time + goodMs (180) + grace (100). Diffing against a frame
+  // that has the same miss *event* (so the same puff) but no gem isolates the dying gem's pixels.
+  {
+    const t = 10;
+    const lane = 0;
+    const missed = { id: 21, lane, time: t, state: 'miss', judgment: 'miss' };
+    const ev = [{ noteId: 21, lane, judgment: 'miss', deltaMs: 180, time: t + 0.18 }];
+    const ref = scene([base(t - 0.1), base(t + 0.28, { recentHits: ev })], null);
+    const test = scene([base(t - 0.1), base(t + 0.28, { notes: [missed], recentHits: ev })], 'miss-verdict');
+    const g = test.hw.geometry;
+    const cx = laneX(g, lane, 0);
+    let top = -1;
+    let bottom = -1;
+    let widest = 0;
+    let widestRow = -1;
+    const half = Math.ceil(g.laneWidthNear);
+    for (let y = Math.round(g.strikeY); y < H; y++) {
+      let first = -1;
+      let last = -1;
+      for (let x = Math.max(0, Math.round(cx - half)); x <= Math.min(W - 1, cx + half); x++) {
+        // Signed, like the chart-gem measurement: the gem *body* is brighter than the road it
+        // covers. (Its soft drop shadow is drawn ~0.35 r further down and may be clipped by the
+        // bottom edge in the last frames of the fizzle; the gem itself may not be.)
+        if (lum(px(test.data, x, y)) - lum(px(ref.data, x, y)) > 20) {
+          if (first < 0) first = x;
+          last = x;
+        }
+      }
+      if (first < 0) continue;
+      if (top < 0) top = y;
+      bottom = y;
+      if (last - first + 1 > widest) {
+        widest = last - first + 1;
+        widestRow = y;
+      }
+    }
+    const d = depthOf(g, t, t + 0.28);
+    out.missGemTop = top;
+    out.missGemBottom = bottom;
+    out.missGemCentreRow = widestRow;
+    out.missGemExpectedHeight = 2 * g.gemRadiusNear * scaleAt(g, d) * GEM_ASPECT;
+    out.missGemHeight = bottom - top + 1;
+    out.canvasH = H;
   }
 
   // --- 5. notes land on the line, and perspective foreshortens a constant-BPM chart -------------
@@ -455,6 +551,10 @@ function pageProbe(W, H) {
         combo: 4,
         multiplier: 2,
         thresholdFraction: 0.5,
+        songTitle: 'Rehab Groove',
+        // A real ccMixter CC-BY line: it must stay legible (≥ 11 px) and be ellipsized rather than
+        // run under the score readout on a 400 px-wide canvas.
+        attribution: '"Rehab Groove" by Some Artist (ccmixter.org) is licensed under CC BY 4.0',
         notes: [0.15, 0.6, 1.1].map((dt, i) => ({ id: 70 + i, lane: (i + 1) % 4, time: t + dt, state: 'pending' })),
       });
     hw.draw(f(2));
@@ -503,6 +603,24 @@ try {
   check('a hit visibly lights its lane', out.hitLumaGain > 6, `+${out.hitLumaGain.toFixed(1)} mean luma`);
   check('a miss reddens its lane on the state-flip frame (no HitEvent yet)', out.missRedGainStateFlip > 3, `+${out.missRedGainStateFlip.toFixed(2)} R-B`);
   check('a miss is still red when the HitEvent lands a frame later', out.missRedGainEventFrame > 3, `+${out.missRedGainEventFrame.toFixed(2)} R-B`);
+  check(
+    'a locked-out receptor is visibly not a live one (hysteresis is not a 30 % dim)',
+    out.receptorLumaLocked < out.receptorLumaArmed * 0.8 && out.receptorChromaLocked < out.receptorChromaArmed * 0.7,
+    `luma ${out.receptorLumaArmed.toFixed(1)} → ${out.receptorLumaLocked.toFixed(1)} (${((1 - out.receptorLumaLocked / out.receptorLumaArmed) * 100).toFixed(0)}% darker), chroma ${out.receptorChromaArmed.toFixed(1)} → ${out.receptorChromaLocked.toFixed(1)}`,
+  );
+  check(
+    'a locked-out receptor shows the "lower to reset" line/chevron, and a live one never does',
+    out.receptorHintLocked > 20 && out.receptorHintArmed === 0,
+    `hint pixels: locked ${out.receptorHintLocked}, armed ${out.receptorHintArmed}`,
+  );
+  check(
+    'the whole missed gem is on screen at the latest miss verdict (+280 ms)',
+    out.missGemBottom > 0 &&
+      out.missGemBottom <= out.canvasH - 2 &&
+      out.missGemCentreRow + out.missGemExpectedHeight / 2 <= out.canvasH - 2 &&
+      out.missGemHeight >= out.missGemExpectedHeight * 0.7,
+    `gem rows ${out.missGemTop}..${out.missGemBottom} of ${out.canvasH}, centre ${out.missGemCentreRow} + half-height ${(out.missGemExpectedHeight / 2).toFixed(0)} = ${(out.missGemCentreRow + out.missGemExpectedHeight / 2).toFixed(0)}; lit core ${out.missGemHeight} px of a ${out.missGemExpectedHeight.toFixed(0)} px gem (the dying gem is drawn at 75 % alpha, so its rim falls under the detection threshold)`,
+  );
   check('every chart gem is rasterized', out.noteYMeasured.every((v) => Number.isFinite(v)), `rows ${out.noteYMeasured.join(', ')}`);
   check('gems land exactly where the projection says (≤ 3 px, incl. the one on the strike line)', out.noteYMaxErr <= 3, `max err ${out.noteYMaxErr.toFixed(2)} px vs expected ${out.noteYExpected.join(', ')}`);
   check('perspective foreshortening: one beat spans less screen the further away it is', out.gapsShrinkWithDepth && out.gapRatio > 1.8, `gaps ${out.gaps.join(', ')} px, near/far ${out.gapRatio.toFixed(2)}×`);

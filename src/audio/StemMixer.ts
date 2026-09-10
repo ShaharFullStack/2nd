@@ -20,8 +20,17 @@
  *   pause()  → ctx time of the pause point
  *   resume() → resolves with the ctx time at which audio restarts (after ctx.resume())
  * If the engine's own SongClock is used as well, drive it with these values
- * (`engine.start(mixer.play(at), from)`, `engine.pause(mixer.pause())`,
- * `engine.resume(await mixer.resume())`) and the two clocks agree exactly.
+ * (`engine.start(mixer.getSongStartCtxTime())` after any play/seek — the ctx time of song time 0,
+ * correct from every position; `engine.pause(mixer.pause())`; `engine.resume(await mixer.resume())`)
+ * and the two clocks agree exactly. pause/resume hand the clock over at the pause point; the audio
+ * itself overlaps by the 8 ms stop fade (see `pause()`), so the handoff is exact to within
+ * STOP_FADE_SEC of *sound*, not of clock.
+ *
+ * Transport composition — the sequence a real UI produces (select → preview → start → pause →
+ * resume → seek → results) never changes the song position behind the caller's back. `play()`
+ * takes a position only from an explicit argument, a preview return point, or the paused/stopped
+ * position; it is a no-op while already playing, and a preview is a temporary segment that is
+ * unwound when it ends (`playPreview`, `isPreviewing`).
  *
  * The song↔ctx mapping (`ctxTimeForSongTime` / `ctxTimeToSongTime`) is exact and invertible in
  * EVERY transport state, not only while playing: the ctx time of song time 0 is stored when a
@@ -41,15 +50,24 @@
  * WAVs and from the SFX specs `Sfx` actually schedules, and asserted there to two decimals, so a
  * regeneration that moves them fails the suite instead of leaving this comment wrong.
  *
- * Worst realistic sum at the destination = four stems summed sample-wise (2.05 groove /
- * 1.99 sunrise), with the +2 dB streak boost on the player stem (2.28 / 2.23), plus the loudest
+ * Memory floor (a clinic tablet also holds the MediaPipe wasm runtime and the pose model):
+ * `loadSong` downloads the stems in parallel, so the raw bodies peak together at the total
+ * download size (34 MB for demo-groove at 44.1 kHz); `decodeAudioData` detaches each ArrayBuffer
+ * as it decodes it, so the raw copy of a stem does not stack with its decoded buffer, but the
+ * decoded set does: 4 stems × 97 s × Float32 AT THE CONTEXT RATE (decodeAudioData always resamples
+ * to it) ≈ 74 MB on a 48 kHz context — which a `--rate 22050` build does NOT reduce, it only
+ * halves the download. Budget ~110 MB peak for a 4-stem, 97 s song. Fewer or shorter stems is the
+ * only real lever; see public/songs/ccmixter-README.md.
+ *
+ * Worst realistic sum at the destination = four stems summed sample-wise (2.08 groove /
+ * 1.98 sunrise), with the +2 dB streak boost on the player stem (2.30 / 2.22), plus the loudest
  * SFX cue at the top of the slider (the hit tick, 0.62 — SFX ride on `sfxBus`, which joins the
- * master bus, so they are inside the budget rather than clipping past it). Worst case: 2.90.
- *  - without the limiter the master default is 0.32, so 2.90 × 0.32 = 0.93 never hard-clips;
+ * master bus, so they are inside the budget rather than clipping past it). Worst case: 2.92.
+ *  - without the limiter the master default is 0.32, so 2.92 × 0.32 = 0.94 never hard-clips;
  *  - with the limiter (DynamicsCompressorNode, threshold −3 dB, ratio 20, knee 0, 1 ms attack,
  *    50 ms release — a limiter, not a program compressor, which would release when the player
  *    stem is ducked and swell the other stems) the master default is 0.8: the peak into the
- *    limiter is 2.32 (+7.3 dBFS); Chromium/WebKit/Gecko's kernel catches it with its ~6 ms
+ *    limiter is 2.34 (+7.4 dBFS); Chromium/WebKit/Gecko's kernel catches it with its ~6 ms
  *    look-ahead and applies an automatic make-up gain of (1/curve(0 dB))^0.6 ≈ +1.7 dB
  *    (`limiterOutputPeak` models this), for an output ceiling of ≈0.91. A limiter with this
  *    threshold only reaches 0 dBFS for inputs ≥ +20 dBFS.
@@ -60,6 +78,7 @@ import { stemUrl } from './manifest';
 import type { SongTimeSource } from '../input/types';
 import { DuckController, MIN_GAIN, SmoothGain, rampValueAt, scheduleRamp, type DuckOptions, type RampState } from './ducking';
 import { Sfx, type SfxLevels } from './sfx';
+import { LatencyProbe, type LatencyProbeOptions } from './latencyProbe';
 
 export type MixerState = 'idle' | 'loading' | 'ready' | 'playing' | 'paused' | 'ended';
 
@@ -316,6 +335,14 @@ export class StemMixer implements SongTimeSource {
   private loadGeneration = 0;
   private loadAbort: AbortController | null = null;
   private previewTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * Song position the transport had before the current song-select preview, or null when no
+   * preview is running. A preview is a TEMPORARY segment: it must never leave the transport
+   * parked at `previewStart`, or "preview a song, then press Start" would begin the prescribed
+   * session 20 s in while the engine clock starts at song time 0. Every path that ends a preview
+   * without naming a new position restores this (see `endPreview`).
+   */
+  private previewReturnSec: number | null = null;
   private retireTimers = new Map<ReturnType<typeof setTimeout>, () => void>();
   private endedListeners = new Set<() => void>();
 
@@ -449,6 +476,7 @@ export class StemMixer implements SongTimeSource {
       this.stemOrder.push(spec.id);
     }
     this.offsetSec = 0;
+    this.previewReturnSec = null;
     this.songStartCtx = this.ctx.currentTime;
     this.setPlayerStem(manifest.playerStem); // validated above; state flips only once it succeeded
     this.mixerState = 'ready';
@@ -458,6 +486,7 @@ export class StemMixer implements SongTimeSource {
   unload(): void {
     this.loadGeneration++;
     if (this.loadAbort) { this.loadAbort.abort(); this.loadAbort = null; }
+    this.previewReturnSec = null;
     this.clearPreviewTimer();
     const wasPlaying = this.stopSources();
     const old = [...this.stems.values()];
@@ -477,15 +506,27 @@ export class StemMixer implements SongTimeSource {
 
   /**
    * Start every stem at the same ctx time (sample-accurate). `atCtxTime` defaults to
-   * now + startLead; `fromSongTime` defaults to the current position (0 after load/stop,
-   * the pause point after pause). Returns the ctx time at which audio actually starts (verified
-   * against the audio thread, see the module comment) — so `engine.start(mixer.play())` always
-   * starts the engine clock on a song that is really sounding.
+   * now + startLead. Returns the ctx time at which audio actually starts (verified against the
+   * audio thread, see the module comment).
    *
-   * play() therefore never returns silently: an implicit position at/after the end of the song
-   * (the song ended, or `seek()` was clamped to the end) restarts from 0, and an explicit
-   * `fromSongTime` past the end is a programming error and throws `RangeError` — use
-   * `seek(getDuration())` if you mean "jump to the end".
+   * **Position** (`fromSongTime`) — play() NEVER silently inherits a position it was not given,
+   * because every such inheritance is a whole session judged against the wrong part of the song:
+   *  - explicit `fromSongTime` always wins;
+   *  - while a song-select PREVIEW is running, an implicit play() abandons the preview and starts
+   *    from the position the transport had before it (normally 0) — "preview, then press Start"
+   *    starts the prescribed chart at the beginning, not 20 s in;
+   *  - while genuinely playing, an implicit play() with no `atCtxTime` is a NO-OP (a state-unaware
+   *    Play button cannot rewind a running session, nor punch an ~108 ms gap in it); it returns
+   *    the ctx time the current segment started at. Use `seek(0)` to restart, `pause()` to stop;
+   *  - otherwise it is the current position: 0 after load/stop, the pause point after pause.
+   *
+   * An implicit position at/after the end of the song (the song ended, or `seek()` was clamped to
+   * the end) restarts from 0; an explicit `fromSongTime` past the end is a programming error and
+   * throws `RangeError` — use `seek(getDuration())` if you mean "jump to the end".
+   *
+   * To drive an external clock from any position, use the ctx time of song time 0 rather than the
+   * return value: `engine.start(mixer.getSongStartCtxTime())` is correct after every transport
+   * call (the two agree exactly when playing from 0, which is why the short form works there).
    */
   play(atCtxTime?: number, fromSongTime?: number): number {
     if (this.stems.size === 0) throw new Error('StemMixer.play(): no song loaded');
@@ -496,9 +537,20 @@ export class StemMixer implements SongTimeSource {
         throw new RangeError(`StemMixer.play(): fromSongTime ${fromSongTime.toFixed(3)} s is at/after the end of "${this.currentManifest?.id ?? 'song'}" (${duration.toFixed(3)} s)`);
       }
     }
+    // Resolve the position BEFORE anything is torn down (songTime() needs the live segment).
+    const previewReturn = this.previewReturnSec;
+    let resolved = fromSongTime;
+    if (resolved === undefined) {
+      if (previewReturn !== null) resolved = previewReturn;
+      else if (this.mixerState === 'playing') {
+        if (atCtxTime === undefined) return this.startCtxTime; // already playing: leave it alone
+        resolved = Math.max(this.offsetSec, this.songTime());   // restart at the current position
+      }
+    }
+    this.previewReturnSec = null;
     this.clearPreviewTimer();
     const wasAudible = this.stopSources();
-    if (fromSongTime !== undefined) this.offsetSec = fromSongTime;
+    if (resolved !== undefined) this.offsetSec = resolved;
     this.offsetSec = Math.max(0, this.offsetSec);
     // 'ended', or a position parked at the end by seek(): start over rather than start silent
     if (duration > 0 && this.offsetSec >= duration) this.offsetSec = 0;
@@ -539,14 +591,22 @@ export class StemMixer implements SongTimeSource {
 
   /**
    * Pause (click-free fade, then the sources stop). Returns the ctx time of the pause point, i.e.
-   * the value to hand to an external clock's `pause(ctxTime)`. Returns null when not playing.
+   * the value to hand to an external clock's `pause(ctxTime)`. Returns null when not playing, and
+   * null while a song-select preview is running: a preview is not a session, so pause() ENDS it
+   * (state → 'ready' at the pre-preview position) rather than parking the transport inside it.
    *
    * `songStartCtx` is deliberately NOT touched: while paused, `ctxTimeForSongTime()` keeps mapping
    * on the segment that was running, so a not-yet-delivered input stamped before the pause still
    * resolves to the ctx time it really happened at (engine SongClock semantics).
+   *
+   * Sample-continuity of pause/resume is exact to within `STOP_FADE_SEC`, not to the sample: the
+   * pause point is `ctx.currentTime`, while the sources keep sounding (fading to MIN_GAIN) for
+   * 8 ms after it, so `resume()` replays those 8 ms — under a fade, and one MediaPipe frame is
+   * four times longer. Judgment is unaffected: the mapping resumes at the pause point.
    */
   pause(): number | null {
     if (this.mixerState !== 'playing') return null;
+    if (this.previewReturnSec !== null) { this.endPreview(); return null; }
     const now = this.ctx.currentTime;
     // clamp: negative while waiting for a scheduled start, never past the end
     this.offsetSec = Math.max(0, Math.min(this.songTime(now), this.getDuration()));
@@ -577,10 +637,21 @@ export class StemMixer implements SongTimeSource {
   /**
    * Jump to `songTime` (clamped to [0, duration]). While playing the sources are faded out and
    * restarted, and the ctx time at which audio resumes at the new position is returned — re-base
-   * an external clock with `start(ctxTime, songTime)`. Returns null when no audio was (re)started:
-   * not playing, or seeking to the very end, which ends the song (state 'ended', listeners fire).
+   * an external clock with `start(ctxTime, songTime)` (or, simpler, `start(getSongStartCtxTime())`).
+   * Returns null when no audio was (re)started: not playing, or seeking to the very end, which
+   * ends the song (state 'ended', listeners fire).
+   *
+   * COST while playing: the seek goes through the full click-free restart path, so the patient
+   * hears ~108 ms of silence — the 8 ms stop fade plus the `startLeadSec` (default 100 ms) that
+   * protects the new start from a main-thread stall. A scrubber or a "jump back 10 s" button will
+   * feel like a small hiccup, not a glitch; shorten it per-mixer with `startLeadSec` if the app
+   * never blocks the main thread for that long. Seeking while paused/ready costs nothing.
+   *
+   * A running song-select preview is ended by a seek (the new position is explicit, so it is kept,
+   * and playback continues without the preview's auto-stop).
    */
   seek(songTime: number): number | null {
+    this.previewReturnSec = null; // an explicit position always wins over a preview's return point
     const duration = this.getDuration();
     const t = Math.max(0, Math.min(songTime, duration));
     if (this.mixerState === 'playing') {
@@ -603,6 +674,7 @@ export class StemMixer implements SongTimeSource {
   }
 
   stop(): void {
+    this.previewReturnSec = null; // explicit position (0) — nothing to restore
     this.clearPreviewTimer();
     const wasAudible = this.stopSources();
     const now = this.ctx.currentTime;
@@ -617,6 +689,12 @@ export class StemMixer implements SongTimeSource {
    * Song-select preview: play `durationSec` from `fromSongTime` (default manifest.previewStart)
    * with a fade-out over the last `fadeSec`, then stop. Any transport call cancels it.
    * Returns the ctx start time.
+   *
+   * A preview NEVER moves the transport: the position the mixer had before it (normally 0, or the
+   * pause point of a paused session) is restored when the preview ends — by its own timer, by
+   * `pause()`, or by the implicit `play()` of a Start button — so the song-select flow
+   * "select → preview → Start" begins the session at song time 0. Only an explicit position
+   * (`play(_, t)`, `seek(t)`, `stop()`) overrides it. `isPreviewing` exposes the state.
    */
   playPreview(durationSec: number = DEFAULT_PREVIEW_SEC, fadeSec: number = DEFAULT_PREVIEW_FADE_SEC, fromSongTime?: number): number {
     const requested = fromSongTime ?? this.currentManifest?.previewStart ?? 0;
@@ -624,8 +702,14 @@ export class StemMixer implements SongTimeSource {
     // a previewStart past the end (or a longer manifest than the stems) previews from the top
     // rather than throwing out of play()
     const from = Number.isFinite(requested) && requested > 0 && (duration <= 0 || requested < duration) ? requested : 0;
+    // Remember where the transport really is (a preview started from inside a preview keeps the
+    // original position, not the previous preview's start).
+    const previewReturn = this.previewReturnSec ?? (this.mixerState === 'playing'
+      ? Math.max(0, Math.min(this.songTime(), duration))
+      : this.offsetSec);
     const startAt = this.play(undefined, from);
-    if (this.mixerState !== 'playing') return startAt;
+    if (this.mixerState !== 'playing') return startAt; // nothing to preview (empty/zero-length song)
+    this.previewReturnSec = previewReturn;
     const remaining = Math.max(0, this.getDuration() - this.offsetSec);
     const len = Math.min(Math.max(0, durationSec), remaining);
     const endAt = startAt + len;
@@ -638,10 +722,13 @@ export class StemMixer implements SongTimeSource {
     const gen = this.playGeneration;
     this.previewTimer = setTimeout(() => {
       this.previewTimer = null;
-      if (gen === this.playGeneration && this.mixerState === 'playing') this.stop();
+      if (gen === this.playGeneration && this.mixerState === 'playing') this.endPreview();
     }, Math.max(0, (endAt - this.ctx.currentTime) * 1000));
     return startAt;
   }
+
+  /** True while `playPreview()` is running (the transport position is held aside, see there). */
+  get isPreviewing(): boolean { return this.previewReturnSec !== null; }
 
   onEnded(cb: () => void): () => void {
     this.endedListeners.add(cb);
@@ -741,6 +828,17 @@ export class StemMixer implements SongTimeSource {
    */
   createSfx(volume?: number, levels?: Partial<SfxLevels>): Sfx {
     return new Sfx(this.ctx, this.sfxBus, volume, levels);
+  }
+
+  /**
+   * Latency-calibration metronome routed through this mixer's `sfxBus` (so the calibration screen
+   * and the game are on the same master gain and limiter). Prefer this over `new LatencyProbe(ctx)`,
+   * whose default destination is `ctx.destination`: a raw 0.6 square click is materially louder
+   * than the game mix (~0.91 ceiling after 0.8 master + limiter), and the patient — who is about
+   * to have their reaction time measured — should not meet a loudness jump between the two screens.
+   */
+  createLatencyProbe(options: LatencyProbeOptions = {}): LatencyProbe {
+    return new LatencyProbe(this.ctx, { ...options, destination: options.destination ?? this.sfxBus });
   }
 
   // ------------------------------------------------------------------ teardown
@@ -872,7 +970,27 @@ export class StemMixer implements SongTimeSource {
     if (this.previewTimer !== null) { clearTimeout(this.previewTimer); this.previewTimer = null; }
   }
 
+  /**
+   * Stop a running preview and put the transport back where it was before it (state 'ready').
+   * Same click-free path as stop(); the only difference is the restored position.
+   */
+  private endPreview(): void {
+    const back = this.previewReturnSec ?? 0;
+    this.previewReturnSec = null;
+    this.clearPreviewTimer();
+    const wasAudible = this.stopSources();
+    const now = this.ctx.currentTime;
+    this.offsetSec = Math.max(0, Math.min(back, this.getDuration()));
+    this.startCtxTime = now;
+    this.songStartCtx = now - this.offsetSec;
+    if (this.stems.size > 0) this.mixerState = 'ready';
+    this.duckController?.reset(now, wasAudible ? STOP_FADE_SEC : 0);
+  }
+
   private finishPlayback(): void {
+    // A preview that ran into the end of the song has not ended the SONG: restore the transport
+    // and stay 'ready' instead of firing the session's ended listeners (→ Results screen).
+    if (this.previewReturnSec !== null) { this.clearSources(); this.endPreview(); return; }
     this.offsetSec = this.getDuration();
     this.mixerState = 'ended';
     this.clearPreviewTimer();

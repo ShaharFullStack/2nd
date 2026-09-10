@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
-  attributionText, attributionParts, loadManifest, loadSongCatalog, loadSongEntry, loadSongIndex,
-  manifestUrl, parseManifest, stemExists, stemUrl, stepTimeSec, type SongManifest, type FetchLike,
+  assertChartOnGrid, attributionText, attributionParts, findOffGridTimes, isSafeStemPath, loadManifest,
+  loadSongCatalog, loadSongEntry, loadSongIndex, manifestUrl, parseManifest, stemExists, stemUrl,
+  stepTimeSec, type SongManifest, type FetchLike,
 } from './manifest';
 
 const valid = {
@@ -45,6 +46,32 @@ describe('parseManifest', () => {
     expect(() => parseManifest({ ...valid, playerStem: 'vocals' })).toThrow(/playerStem "vocals"/);
     expect(() => parseManifest({ ...valid, stems: [valid.stems[0], valid.stems[0]] })).toThrow(/unique/);
   });
+  it('rejects out-of-range numbers that would break playback rather than only wrong types', () => {
+    expect(() => parseManifest({ ...valid, durationSec: 0 })).toThrow(/"durationSec"/);
+    expect(() => parseManifest({ ...valid, durationSec: -5 })).toThrow(/"durationSec"/);
+    expect(() => parseManifest({ ...valid, offset: -0.2 })).toThrow(/"offset"/);
+    expect(() => parseManifest({ ...valid, previewStart: -1 })).toThrow(/"previewStart"/);
+    expect(() => parseManifest({ ...valid, bpm: 0 })).toThrow(/"bpm"/);
+    expect(parseManifest({ ...valid, offset: 0 }).offset).toBe(0); // 0 is legal for all of them
+  });
+
+  it('refuses a stem path that escapes the song directory (a pasted third-party manifest)', () => {
+    // scripts/fetch-stems.mjs hardens the same case on disk (assertSafeRelativePath); this is the
+    // browser half — stemUrl() concatenates `file` straight into the URL it fetches.
+    for (const file of ['../../../secrets.wav', 'stems/../../x.wav', '/etc/passwd', 'C:\\x.wav',
+      '\\\\server\\share\\x.wav', 'https://evil.example/x.wav', 'data:audio/wav;base64,AAA']) {
+      expect(isSafeStemPath(file)).toBe(false);
+      expect(() => parseManifest({ ...valid, stems: [{ id: 'drums', file }], playerStem: 'drums' }))
+        .toThrow(/inside the song directory/);
+    }
+    for (const file of ['stems/drums.wav', 'drums.wav', './stems/a b.wav', 'stems/sub/dir/x.wav']) {
+      expect(isSafeStemPath(file)).toBe(true);
+    }
+    // and the safe path is what stemUrl() uses
+    const m = parseManifest(valid);
+    expect(stemUrl('/songs', m, m.stems[0])).toBe('/songs/demo-groove/stems/drums.wav');
+  });
+
   it('validates remoteStems entries', () => {
     expect(() => parseManifest({ ...valid, remoteStems: [{ id: 'drums' }] })).toThrow(/remoteStems\[0\]/);
     expect(parseManifest({ ...valid, remoteStems: [{ id: 'drums', url: 'https://x/y.wav' }] }).remoteStems).toHaveLength(1);
@@ -52,13 +79,41 @@ describe('parseManifest', () => {
 });
 
 describe('swing / grid', () => {
-  it('parses swing, drops 0/absent and clamps out-of-range values', () => {
+  it('parses swing, drops 0/absent and REJECTS an out-of-range one', () => {
     expect(parseManifest(valid).swing).toBeUndefined();
     expect(parseManifest({ ...valid, swing: 0 }).swing).toBeUndefined();
     expect(parseManifest({ ...valid, swing: 1 / 3 }).swing).toBeCloseTo(1 / 3, 12);
-    expect(parseManifest({ ...valid, swing: 5 }).swing).toBe(0.9);
-    expect(parseManifest({ ...valid, swing: -1 }).swing).toBe(0);
-    expect(parseManifest({ ...valid, swing: 'a lot' }).swing).toBeUndefined();
+    // a wrong swing desynchronises every odd 16th of the chart from the audio, so a present-but-
+    // nonsensical value fails loudly rather than being clamped into something plausible
+    expect(() => parseManifest({ ...valid, swing: 5 })).toThrow(/"swing"/);
+    expect(() => parseManifest({ ...valid, swing: -1 })).toThrow(/"swing"/);
+    expect(() => parseManifest({ ...valid, swing: 'a lot' })).toThrow(/"swing"/);
+  });
+
+  it('findOffGridTimes catches a chart built on a straight grid for a swung song', () => {
+    const swung = parseManifest({ ...valid, bpm: 100, offset: 0.4, swing: 1 / 3 });
+    const steps = Array.from({ length: 64 }, (_, i) => i);
+
+    // the right way: times taken from the song's own grid
+    const good = steps.map((s) => stepTimeSec(swung, s));
+    expect(findOffGridTimes(swung, good)).toEqual([]);
+    expect(findOffGridTimes(swung, good.map((time) => ({ time })))).toEqual([]); // Chart.notes shape
+    expect(() => assertChartOnGrid(swung, good)).not.toThrow();
+
+    // the plausible-looking way a chart generator gets it wrong
+    const naive = steps.map((s) => swung.offset + (s * (60 / swung.bpm)) / 4);
+    const bad = findOffGridTimes(swung, naive);
+    expect(bad).toHaveLength(32); // every odd 16th
+    expect(bad.every((b) => b.step % 2 === 1)).toBe(true);
+    expect(bad[0].deltaMs).toBeCloseTo(-50, 6); // a third of a 16th at 100 BPM
+    expect(() => assertChartOnGrid(swung, naive)).toThrow(/off the song grid.*stepTimeSec/s);
+
+    // a straight song accepts the same naive grid, and off-grid notes are still caught
+    const straight = parseManifest({ ...valid, bpm: 100, offset: 0.4 });
+    expect(findOffGridTimes(straight, naive)).toEqual([]);
+    expect(findOffGridTimes(straight, [0.4 + 0.02])).toHaveLength(1);
+    expect(findOffGridTimes(straight, [0.4 + 0.004])).toEqual([]); // inside the 5 ms tolerance
+    expect(findOffGridTimes(straight, [NaN])).toHaveLength(1);
   });
 
   it('stepTimeSec places notes on the audio grid, swinging odd 16ths only', () => {

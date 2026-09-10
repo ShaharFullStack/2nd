@@ -4,8 +4,8 @@
  * The seated figure faces the camera; parameters are 0 (rest) .. 1 (full movement).
  */
 import type { Side } from '../engine/types.ts';
-import { HAND, HAND_LANDMARK_COUNT, POSE, POSE_LANDMARK_COUNT } from './landmarks.ts';
-import type { Landmark } from './landmarks.ts';
+import { FINGERTIP_INDEX, HAND, HAND_LANDMARK_COUNT, POSE, POSE_LANDMARK_COUNT, POSE_MIRROR_INDEX } from './landmarks.ts';
+import type { Fingertip, Landmark } from './landmarks.ts';
 
 /**
  * Re-normalize landmarks captured in a frame of aspect `fromAspect` (width/height) into a frame of
@@ -23,6 +23,40 @@ import type { Landmark } from './landmarks.ts';
 export function reNormalizeAspect(landmarks: readonly Landmark[], fromAspect: number, toAspect: number): Landmark[] {
   const k = fromAspect / toAspect;
   return landmarks.map((l) => ({ x: 0.5 + (l.x - 0.5) * k, y: l.y, z: l.z * k, visibility: l.visibility }));
+}
+
+/**
+ * What a detection of the SAME pose looks like when the frames were horizontally flipped BEFORE being
+ * given to the detector (`mirrored: true`).
+ *
+ * TWO things happen, and a test that does only the first cannot catch the bug that matters:
+ *  1. the coordinates flip: x -> 1 - x (and z, which MediaPipe scales like x, keeps its sign — depth is
+ *     unaffected by a horizontal flip);
+ *  2. THE LABELS SWAP: a mirrored human is a perfectly ordinary human to the model, so it labels the
+ *     apparent anatomy and the patient's LEFT leg comes back in the RIGHT_* slots (POSE_MIRROR_INDEX).
+ * Applying (1) without (2) produces a frame no camera can ever deliver, and asserting on it only proves
+ * the sign convention while the limb-selection bug passes untouched.
+ */
+export function mirrorPoseLandmarks(pose: readonly Landmark[]): Landmark[] {
+  const out: Landmark[] = new Array(pose.length);
+  for (let i = 0; i < pose.length; i++) {
+    const src = pose[POSE_MIRROR_INDEX[i] ?? i] ?? pose[i];
+    out[i] = { x: 1 - src.x, y: src.y, z: src.z, visibility: src.visibility };
+  }
+  return out;
+}
+
+/**
+ * The same for metric WORLD landmarks: they share the Pose labelling, so the labels swap identically;
+ * the coordinates are hip-centred metres, so x negates about 0 instead of about the frame centre.
+ */
+export function mirrorPoseWorldLandmarks(pose: readonly Landmark[]): Landmark[] {
+  const out: Landmark[] = new Array(pose.length);
+  for (let i = 0; i < pose.length; i++) {
+    const src = pose[POSE_MIRROR_INDEX[i] ?? i] ?? pose[i];
+    out[i] = { x: -src.x, y: src.y, z: src.z, visibility: src.visibility };
+  }
+  return out;
 }
 
 /** Translate every landmark (a chair scoot / camera bump: the whole scene shifts, the patient does not move). */
@@ -45,7 +79,11 @@ export interface SeatedPoseParams {
   abduction?: number;
   /** Heel lifted off the floor 0..1 (compensation). */
   heelLift?: number;
-  /** Lateral trunk lean 0..1 (compensation, ~0..30°). */
+  /**
+   * Lateral trunk lean, ~0..30 degrees at 0..1. NEGATIVE values lean the OTHER way, which is what a
+   * patient with a resting lateral list does when they hike the opposite hip: the trunk swings through
+   * vertical rather than deeper into the list.
+   */
   trunkLean?: number;
   /** Which leg the parameters apply to (default 'left'); the other leg stays at rest. */
   side?: Side;
@@ -138,8 +176,14 @@ export interface HandParams {
   wristExtension?: number;
   /** Translate the whole hand up (forearm lift, a compensation — NOT wrist extension) 0..1. */
   wristRaise?: number;
-  /** Thumb-index pinch 0..1 (1 = touching). */
+  /** Thumb-to-fingertip pinch 0..1 (1 = touching `pinchTarget`). */
   pinch?: number;
+  /**
+   * Which fingertip the thumb pinches toward (default 'index'). The therapist can prescribe any of them
+   * (RomCalibration.fingertip / FeatureOptions.fingertip), and a range measured on one is not a range
+   * for another — so the fixture has to be able to produce the movement that was actually prescribed.
+   */
+  pinchTarget?: Fingertip;
   /** Finger spread 0..1 (0 = fingers together, 1 = wide). */
   spread?: number;
   /** Uniform scale (distance to the camera); default 1. */
@@ -197,9 +241,9 @@ export function handPose(params: HandParams = {}): Landmark[] {
     local[dip] = { u: mu + du * ext * 0.75, v: mcpV + dv * ext * 0.75, n: curl * 0.7 };
     local[tip] = { u: mu + du * ext, v: mcpV + dv * ext, n: curl };
   }
-  // Thumb: from the wrist out to the index side; pinch moves the tip to the index tip.
+  // Thumb: from the wrist out to the index side; pinch moves the tip onto the target fingertip.
   const thumbOpen = { u: -0.14 * s, v: 0.12 * s, n: 0 };
-  const idxTip = local[HAND.INDEX_TIP];
+  const idxTip = local[FINGERTIP_INDEX[params.pinchTarget ?? 'index']];
   const tipU = thumbOpen.u + (idxTip.u - thumbOpen.u) * pinch;
   const tipV = thumbOpen.v + (idxTip.v - thumbOpen.v) * pinch;
   const tipN = thumbOpen.n + (idxTip.n - thumbOpen.n) * pinch;
