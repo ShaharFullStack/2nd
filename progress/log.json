@@ -1,5 +1,5 @@
 {
- "updated": "2026-09-11T14:51Z",
+ "updated": "2026-09-11T22:51Z",
  "pieces": {
   "engine": {
    "round": 5,
@@ -32,9 +32,9 @@
    "note": "Therapist screens passed clinical-usability critic at 9/10: song preview, per-finger choice for opposition, latency hand-over to the next se"
   },
   "review": {
-   "round": 2,
-   "status": "round 3",
-   "note": "Second four-lens review: all four verified every one of the nine earlier blockers actually fixed, by measurement rather than by claim — came"
+   "round": 3,
+   "status": "2 of 4 would ship",
+   "note": "Third four-lens review: 2 of 4 would now ship, up from 0 of 4. The patient reviewer: 'the best this app has been, and for the first time it "
   },
   "identity": {
    "round": 2,
@@ -210,6 +210,13 @@
    "piece": "review",
    "kind": "info",
    "text": "Second four-lens review: all four verified every one of the nine earlier blockers actually fixed, by measurement rather than by claim — camera released, per-lane ducking, no failure alarm, honest abandoned-session records, patient identity throughout. Each then found a narrower next tier: no pay-off at the end of a song, a headline range that celebrates the unaffected side, tables that clip silently at tablet width, a dose figure computed per lane but labelled per limb. Now in round three."
+  },
+  {
+   "time": "2026-09-11T22:51Z",
+   "piece": "review",
+   "kind": "info",
+   "text": "Third four-lens review: 2 of 4 would now ship, up from 0 of 4. The patient reviewer: 'the best this app has been, and for the first time it feels like something I would actually want to play tomorrow.' The song now ends with a payoff that leads with movements performed; comparisons against an abandoned session are labelled; tracking quality qualifies the figures it should; time to the first note is 4.1 s, down from 38.7 s. The two holdouts block on narrow, specific things — a 'saved' badge that prints whether or not the write succeeded, a calibration carrying no record of how well it was measured.",
+   "image": "shots/highway-final.png"
   }
  ]
 }
