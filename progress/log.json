@@ -1,5 +1,5 @@
 {
- "updated": "2026-09-10T21:25Z",
+ "updated": "2026-09-11T01:45Z",
  "pieces": {
   "engine": {
    "round": 5,
@@ -9,22 +9,27 @@
   "audio": {
    "round": 4,
    "status": "passed 8.5/10",
-   "note": "PASSED round 4, score 8.5/10. StemMixer is now the single clock (SongTimeSource), pause/resume sample-accurate, latency probe delegates to t"
+   "note": "Stem ducking verified end to end in a real browser (npm run critic:audio): player stem 1.0 while hitting, 0.05 after misses, back to 1.0 on "
   },
   "vision": {
-   "round": 5,
-   "status": "round 6",
-   "note": "Round 5, score 8.5. Filter moved to normalized units, race-safe camera lifecycle, level-vs-edge trigger bug fixed. Open: pinned-lane watchdo"
+   "round": 2,
+   "status": "passed 8.5/10",
+   "note": "Calibration hand-over passed a fresh critic at 8.5/10: a range measured under one camera convention or fingertip can no longer be silently r"
   },
   "render": {
-   "round": 4,
-   "status": "round 5",
-   "note": "Round 4, score 8. Miss visuals now readable at real engine timing, score odometer fixed. Open: receptor ring must read full exactly when the"
+   "round": 5,
+   "status": "round 6",
+   "note": "Receptor biofeedback at 8/10 after 5 rounds — still looping. Open: the picture-in-picture lane meters do not latch the goal state the way th"
   },
   "highway": {
    "round": 3,
    "status": "won blind A/B",
    "note": "Blind round 3: all three judges ranked our three frames ABOVE both shipped reference games, and every judge put one of ours first. Road now "
+  },
+  "therapist": {
+   "round": 4,
+   "status": "passed 9/10",
+   "note": "Therapist screens passed clinical-usability critic at 9/10: song preview, per-finger choice for opposition, latency hand-over to the next se"
   }
  },
  "entries": [
@@ -136,6 +141,30 @@
    "kind": "pass",
    "text": "Blind round 3: all three judges ranked our three frames ABOVE both shipped reference games, and every judge put one of ours first. Road now fills the frame, 8 gems of read-ahead, beat/bar ladder, gems land on the receptors, crowd and stage lighting. Round 1 ours 2.56 vs refs 1.17; round 3 ours ~1.0 vs refs ~3.5.",
    "image": "shots/highway-round3.png"
+  },
+  {
+   "time": "2026-09-11T01:45Z",
+   "piece": "vision",
+   "kind": "pass",
+   "text": "Calibration hand-over passed a fresh critic at 8.5/10: a range measured under one camera convention or fingertip can no longer be silently reused for a different lane; the refusal now reaches the therapist on the calibration screen with an actionable reason."
+  },
+  {
+   "time": "2026-09-11T01:45Z",
+   "piece": "therapist",
+   "kind": "pass",
+   "text": "Therapist screens passed clinical-usability critic at 9/10: song preview, per-finger choice for opposition, latency hand-over to the next session, ROM trends across visits, and a real camera-failure screen."
+  },
+  {
+   "time": "2026-09-11T01:45Z",
+   "piece": "audio",
+   "kind": "pass",
+   "text": "Stem ducking verified end to end in a real browser (npm run critic:audio): player stem 1.0 while hitting, 0.05 after misses, back to 1.0 on the next hit, other stems unmoved."
+  },
+  {
+   "time": "2026-09-11T01:45Z",
+   "piece": "render",
+   "kind": "info",
+   "text": "Receptor biofeedback at 8/10 after 5 rounds — still looping. Open: the picture-in-picture lane meters do not latch the goal state the way the receptor does, so the two meters disagree at the moment of crossing."
   }
  ]
 }
