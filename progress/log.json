@@ -1,5 +1,5 @@
 {
- "updated": "2026-09-11T13:06Z",
+ "updated": "2026-09-11T14:51Z",
  "pieces": {
   "engine": {
    "round": 5,
@@ -32,9 +32,9 @@
    "note": "Therapist screens passed clinical-usability critic at 9/10: song preview, per-finger choice for opposition, latency hand-over to the next se"
   },
   "review": {
-   "round": 1,
-   "status": "blockers open",
-   "note": "Final review by four independent lenses (patient, therapist, clinical-safety, engineer). All four said they would not ship, and all four ind"
+   "round": 2,
+   "status": "round 3",
+   "note": "Second four-lens review: all four verified every one of the nine earlier blockers actually fixed, by measurement rather than by claim — came"
   },
   "identity": {
    "round": 2,
@@ -204,6 +204,12 @@
    "piece": "fairness",
    "kind": "info",
    "text": "Ducking is now proportionate and per lane: a weak limb's misses dip the instrument instead of silencing what the strong limb is earning. Round 1 critic found the ROM nudge API built but not wired to the buttons a therapist presses — now fixed and back in review."
+  },
+  {
+   "time": "2026-09-11T14:51Z",
+   "piece": "review",
+   "kind": "info",
+   "text": "Second four-lens review: all four verified every one of the nine earlier blockers actually fixed, by measurement rather than by claim — camera released, per-lane ducking, no failure alarm, honest abandoned-session records, patient identity throughout. Each then found a narrower next tier: no pay-off at the end of a song, a headline range that celebrates the unaffected side, tables that clip silently at tablet width, a dose figure computed per lane but labelled per limb. Now in round three."
   }
  ]
 }
