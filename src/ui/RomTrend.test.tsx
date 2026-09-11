@@ -379,3 +379,52 @@ describe('the card, the chart and the caption describe the same sessions', () =>
     expect(card.textContent).not.toContain('39 movements performed');
   });
 });
+
+/**
+ * THE PER-MOVEMENT LIST IS A TABLE IN A NARROW CARD, AND IT SAYS SO.
+ *
+ * Measured at 1024x768 on the History screen, this list laid out at 537 px inside a 435 px wrapper:
+ * "Accuracy" was cut mid-word and REPS — the count Results and History were both rebuilt to lead
+ * with — was entirely off the right-hand edge, with no scrollbar, no cue and no arrows. It was a
+ * bare `.table-wrap`; it is now the same `ScrollTable` the Results tables use, and its columns are
+ * ordered the way theirs are: when, then the work, then the range, then the grade.
+ */
+describe('the session-by-session list is reachable and ordered like the other screens', () => {
+  it('puts the rep count immediately after the date, ahead of every scoring column', () => {
+    render(<RomTrend history={IMPROVING} patientId={PATIENT} />);
+    const heads = [...screen.getByTestId('trend-knee_extension:left').querySelectorAll('.trend-points thead th')].map(
+      (th) => th.textContent?.trim(),
+    );
+    expect(heads[0]).toBe('Session');
+    expect(heads[1]).toBe('Reps');
+    expect(heads.indexOf('Accuracy')).toBeGreaterThan(heads.indexOf('Reps'));
+    expect(heads.indexOf('ROM')).toBeGreaterThan(heads.indexOf('Reps'));
+  });
+
+  it('is a ScrollTable, so any width it does not fit in is announced rather than silently clipped', () => {
+    render(<RomTrend history={IMPROVING} patientId={PATIENT} />);
+    const card = screen.getByTestId('trend-knee_extension:left');
+    const wrap = card.querySelector('[data-testid="trend-points-table-knee_extension:left"]');
+    expect(wrap).not.toBeNull();
+    expect(wrap?.classList.contains('table-wrap')).toBe(true);
+    // jsdom lays everything out at zero width, so the cue itself cannot be asserted here; what is
+    // asserted is that the table is wired to the component that measures the overflow and draws the
+    // cue plus its two full-size arrows (see Results.tsx `ScrollTable`, and
+    // critic/verify-ending-and-headline.mjs, which measures clientWidth against scrollWidth in a
+    // real browser at 1024x768).
+    expect(wrap?.parentElement?.className).toContain('stack');
+  });
+
+  it('still lists every session, including the ones the card set aside', () => {
+    const mixed = [
+      session('d', 4_000_000, [lane({ romMean: 0.74 })]),
+      { ...session('c', 3_000_000, [lane({ romMean: 0.2, reps: 3 })]), completed: false, endReason: 'quit' as const },
+      session('b', 2_000_000, [lane({ romMean: 0.64 })]),
+      session('a', 1_000_000, [lane({ romMean: 0.52 })]),
+    ];
+    render(<RomTrend history={mixed} patientId={PATIENT} />);
+    const rows = [...screen.getByTestId('trend-knee_extension:left').querySelectorAll('.trend-points tbody tr')];
+    expect(rows.length).toBe(4);
+    expect(rows.some((r) => (r.textContent ?? '').includes('stopped by therapist'))).toBe(true);
+  });
+});

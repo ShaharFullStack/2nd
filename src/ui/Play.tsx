@@ -120,6 +120,13 @@ const PIP_METERS_HEIGHT = 62;
  */
 const PIP_VIDEO_MIN = 96;
 /**
+ * The legend's floor: two lines plus its padding. It is the item this panel spends FIRST (it is
+ * static text, read once, while the meters and the thumbnail are live), but "spent" should mean
+ * "scrolls in a small box", not "renders as a strip of padding with no words in it" — so it keeps two
+ * lines wherever the panel can afford them AFTER the meters, the thumbnail and the warnings.
+ */
+const PIP_NOTE_MIN = 44;
+/**
  * The panel height assumed when there is no renderer box yet (fallback geometry only). Chosen so the
  * warning cap works out at the 180 px this screen used before the box existed.
  */
@@ -139,16 +146,21 @@ const PIP_FALLBACK_PANEL = 462;
  *      warnings above it are about FRAMING, and this is the only way to fix framing mid-song;
  *   3. the WARNINGS get at most 45 % of that room and never more than what is left after (2), and
  *      scroll inside it with a count pinned on top;
- *   4. the LEGEND — static text, read once — gets the remainder and scrolls (`.pip-note`).
+ *   4. the LEGEND — static text, read once — gets the remainder and scrolls (`.pip-note`), keeping
+ *      two lines (`PIP_NOTE_MIN`) only out of what is left after the other three.
  *
- * THE INVARIANT: `alertsMaxHeight + videoMinPx + PIP_METERS_HEIGHT <= panel`, at every panel height,
- * so no reservation can push the meters out of the bottom of a box with `overflow: hidden`.
+ * THE INVARIANT: `alertsMaxHeight + videoMinPx + noteMinPx + PIP_METERS_HEIGHT <= panel`, at every
+ * panel height, so no reservation can push the meters out of a box with `overflow: hidden`.
  *
  * `panelMaxHeight` is `OverlayPanelBox.maxHeight` — the room between the panel's bottom edge and the
  * top of the canvas. `null`, or a box too small to hold the meters (a canvas not laid out yet reports
  * 0), is not a measurement of this panel and falls back rather than resolving every term to zero.
  */
-export function pipPanelBudget(panelMaxHeight: number | null): { alertsMaxHeight: number; videoMinPx: number } {
+export function pipPanelBudget(panelMaxHeight: number | null): {
+  alertsMaxHeight: number;
+  videoMinPx: number;
+  noteMinPx: number;
+} {
   const panel =
     panelMaxHeight !== null && Number.isFinite(panelMaxHeight) && panelMaxHeight > PIP_METERS_HEIGHT
       ? Math.round(panelMaxHeight)
@@ -156,7 +168,8 @@ export function pipPanelBudget(panelMaxHeight: number | null): { alertsMaxHeight
   const room = Math.max(0, panel - PIP_METERS_HEIGHT);
   const videoMinPx = Math.min(PIP_VIDEO_MIN, Math.max(0, Math.round(room * 0.4)));
   const alertsMaxHeight = Math.max(0, Math.min(Math.max(56, Math.round(room * 0.45)), room - videoMinPx));
-  return { alertsMaxHeight, videoMinPx };
+  const noteMinPx = Math.max(0, Math.min(PIP_NOTE_MIN, room - videoMinPx - alertsMaxHeight));
+  return { alertsMaxHeight, videoMinPx, noteMinPx };
 }
 
 /**
@@ -859,7 +872,7 @@ export default function PlayScreen() {
   if (phase === 'camera') return <CameraFallback error={cameraError} onRetry={retryCamera} retries={attempt} />;
 
   const countdown = hud?.countdown ?? 0;
-  const { alertsMaxHeight, videoMinPx: pipVideoMin } = pipPanelBudget(pipBox ? pipBox.maxHeight : null);
+  const { alertsMaxHeight, videoMinPx: pipVideoMin, noteMinPx: pipNoteMin } = pipPanelBudget(pipBox ? pipBox.maxHeight : null);
   const pipStyle = {
     ...(pipBox
       ? {
@@ -873,6 +886,7 @@ export default function PlayScreen() {
     // against a parent whose height is only a max-height resolves to nothing — the exact bug that
     // made the old `max-height: 46%` warning cap a no-op.
     '--pip-video-min': `${pipVideoMin}px`,
+    '--pip-note-min': `${pipNoteMin}px`,
   } as CSSProperties;
 
   return (

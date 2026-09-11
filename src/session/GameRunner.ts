@@ -222,8 +222,31 @@ const RECENT_HIT_SEC = 1.2;
 /** Never play more than one miss cue in this window, however many notes expire at once. */
 const MISS_CUE_COOLDOWN_SEC = 0.15;
 const DEFAULT_COUNTDOWN_SEC = 3;
-/** Song seconds of silence after the last note before the results screen. */
-const OUTRO_SEC = 1.5;
+/**
+ * Song seconds between the LAST NOTE'S WINDOW CLOSING and the song-end sequence starting.
+ *
+ * This used to be a flat 1.5 s of silence, and it is the gap the patient described: "the chart ends,
+ * there is 1.5 s of empty highway, and I am cut straight to a grid". A shipped rhythm game starts
+ * its payoff within about a note of the chart running out, and there was never anything happening in
+ * that second and a half — the last gem has been judged, nothing more can be, and the board is empty.
+ *
+ * What the tail actually has to cover is two things, so it is derived from them rather than guessed:
+ * the last note cannot be judged after its own GOOD window has closed (`outroSecFor`), and its hit
+ * or miss effect needs a few frames on screen before the curtain comes down. That comes out around
+ * 0.65 s on the default windows — roughly one note at 120 bpm — instead of 1.5 s of nothing.
+ */
+const OUTRO_TAIL_SEC = 0.5;
+
+/**
+ * The song seconds after the last note before the ending may start: the widest GOOD window in force
+ * (no note can be judged later than that) plus `OUTRO_TAIL_SEC` for the last gem's own effect.
+ */
+export function outroSecFor(windows: TimingWindows | TimingWindows[]): number {
+  const all = Array.isArray(windows) ? windows : [windows];
+  let widestMs = 0;
+  for (const w of all) widestMs = Math.max(widestMs, w.goodMs);
+  return widestMs / 1000 + OUTRO_TAIL_SEC;
+}
 
 /**
  * The page-lifecycle facts the runner acts on, as an interface so a test can be the page.
@@ -307,6 +330,8 @@ export class GameRunner {
    * reads off it would be wrong by that much.
    */
   private chartEndSongTime: number | null = null;
+  /** Song seconds after the last note before the ending starts (see `outroSecFor`). */
+  private readonly outroSec: number;
   /** Listener teardown for the "anything at all skips the ending" handlers. */
   private finaleSkipOff: Array<() => void> = [];
   /** Wall ms at the previous finale frame, so the sequence advances on real elapsed time. */
@@ -331,6 +356,7 @@ export class GameRunner {
     this.nowMs = options.nowMs ?? (() => (typeof performance !== 'undefined' ? performance.now() : Date.now()));
     this.schedule = options.schedule ?? defaultSchedule;
     this.lifecycle = options.lifecycle === undefined ? browserLifecycle() : options.lifecycle;
+    this.outroSec = outroSecFor(options.windows);
 
     this.engine = new RhythmEngine({
       chart: options.chart,
@@ -549,10 +575,15 @@ export class GameRunner {
     }
   }
 
-  private endSongTime(): number {
+  /** The song time at which the chart is over and the ending may start. */
+  chartEndsAt(): number {
     const notes = this.chart.notes;
     const lastNote = notes.length > 0 ? notes[notes.length - 1].time : 0;
-    return Math.min(this.chart.durationSec, Math.max(lastNote + OUTRO_SEC, OUTRO_SEC));
+    return Math.min(this.chart.durationSec, Math.max(lastNote + this.outroSec, this.outroSec));
+  }
+
+  private endSongTime(): number {
+    return this.chartEndsAt();
   }
 
   /**

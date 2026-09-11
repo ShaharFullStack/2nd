@@ -116,7 +116,8 @@ describe('the PIP panel while an input-layer warning is up', () => {
     expect(cap).toMatch(/^\d+px$/);
     const panel = Number.parseInt((pip as HTMLElement).style.maxHeight, 10);
     const floor = Number.parseInt((pip as HTMLElement).style.getPropertyValue('--pip-video-min'), 10);
-    expect(Number.parseInt(cap, 10) + floor + PIP_METERS_HEIGHT).toBeLessThanOrEqual(panel);
+    const noteFloor = Number.parseInt((pip as HTMLElement).style.getPropertyValue('--pip-note-min'), 10);
+    expect(Number.parseInt(cap, 10) + floor + noteFloor + PIP_METERS_HEIGHT).toBeLessThanOrEqual(panel);
     // And the thumbnail's floor is handed to the stylesheet as pixels, from the same budget.
     expect((pip as HTMLElement).style.getPropertyValue('--pip-video-min')).toMatch(/^\d+px$/);
 
@@ -141,6 +142,8 @@ describe('the PIP panel while an input-layer warning is up', () => {
     // to fix mid-song.
     expect(ruleBody('.pip-note')).toMatch(/flex:\s*0 200 auto/);
     expect(ruleBody('.pip-note')).toMatch(/overflow-y:\s*auto/);
+    // …and it never becomes a strip of padding with no words in it: two lines, out of what is left.
+    expect(ruleBody('.pip-note')).toMatch(/min-height:\s*var\(--pip-note-min/);
     // The thumbnail shrinks like everyone else but holds a PIXEL floor handed down from Play.tsx.
     expect(ruleBody('.pip-video')).toMatch(/flex:\s*1 1 auto/);
     expect(ruleBody('.pip-video')).toMatch(/min-height:\s*var\(--pip-video-min/);
@@ -161,26 +164,29 @@ describe('the panel spends its height on the live gauges before the static legen
   // The panel heights the renderer reported at 1024x600, 1024x768, 1280x800 and 1920x1080.
   for (const panel of [371, 505, 558, 742]) {
     it(`reserves the thumbnail and never over-promises in a ${panel} px panel`, () => {
-      const { alertsMaxHeight, videoMinPx } = pipPanelBudget(panel);
+      const { alertsMaxHeight, videoMinPx, noteMinPx } = pipPanelBudget(panel);
       // The thumbnail gets a real floor…
       expect(videoMinPx).toBe(96);
       // …the warning still gets a usable block…
       expect(alertsMaxHeight).toBeGreaterThan(100);
-      // …and the three reserved items always fit, so the meters cannot be clipped out of the bottom.
-      expect(alertsMaxHeight + videoMinPx + PIP_METERS_HEIGHT).toBeLessThanOrEqual(panel);
+      // …the legend keeps two lines to scroll in, rather than a strip of padding with no words…
+      expect(noteMinPx).toBe(44);
+      // …and the reservations always fit, so the meters cannot be clipped out of the bottom.
+      expect(alertsMaxHeight + videoMinPx + noteMinPx + PIP_METERS_HEIGHT).toBeLessThanOrEqual(panel);
     });
   }
 
   it('never reserves more than a panel holds, at any height', () => {
     for (let panel = 63; panel <= 1200; panel++) {
-      const { alertsMaxHeight, videoMinPx } = pipPanelBudget(panel);
-      expect(alertsMaxHeight + videoMinPx + PIP_METERS_HEIGHT).toBeLessThanOrEqual(panel);
+      const { alertsMaxHeight, videoMinPx, noteMinPx } = pipPanelBudget(panel);
+      expect(alertsMaxHeight + videoMinPx + noteMinPx + PIP_METERS_HEIGHT).toBeLessThanOrEqual(panel);
       expect(videoMinPx).toBeGreaterThanOrEqual(0);
+      expect(noteMinPx).toBeGreaterThanOrEqual(0);
       expect(alertsMaxHeight).toBeGreaterThanOrEqual(0);
     }
   });
 
   it('falls back to a sane split when no box has been measured yet', () => {
-    expect(pipPanelBudget(null)).toEqual({ alertsMaxHeight: 180, videoMinPx: 96 });
+    expect(pipPanelBudget(null)).toEqual({ alertsMaxHeight: 180, videoMinPx: 96, noteMinPx: 44 });
   });
 });

@@ -51,6 +51,7 @@ import type { SessionResult } from '../session/types.ts';
 import { trackingMix } from '../session/tracking.ts';
 import { DeltaBadge, SessionBars, Sparkline, shortDate } from './common.tsx';
 import { ScopeNote } from './ScopeNote.tsx';
+import { ScrollTable } from './Results.tsx';
 
 const WINDOWS = [4, 8, 16];
 
@@ -292,15 +293,30 @@ function TrendCard({ trend }: { trend: MovementTrend }) {
           Session by session ({trend.points.length}
           {excluded.length > 0 ? `, including the ${excluded.length} set aside above` : ''})
         </summary>
-        <div className="table-wrap">
+        {/*
+          A WIDE TABLE INSIDE A NARROW CARD, SAYING SO. Measured at 1024x768 this list laid out at
+          537 px inside a 435 px wrapper: "Accuracy" was cut mid-word and REPS — the count this whole
+          redesign promotes to the headline — was entirely off the right-hand edge, with no
+          scrollbar, no cue and no arrows. It is a bare `.table-wrap` no longer; it is the same
+          `ScrollTable` Results uses, which measures the overflow, names the columns that are off
+          screen and gives them two 44 px buttons that really move the scroller.
+
+          And the columns are ordered the way Results and History order theirs: WHEN, then the work
+          the patient did, then the range, then the grade. Reps sitting last was how it came to be
+          the column that fell off.
+        */}
+        <ScrollTable
+          offscreen={absMeasured > 0 ? 'the peak and accuracy columns' : 'the accuracy column'}
+          testId={`trend-points-table-${trend.key}`}
+        >
           <table className="table">
             <thead>
               <tr>
                 <th>Session</th>
+                <th>Reps</th>
                 <th>ROM</th>
                 {absMeasured > 0 && <th title={absoluteTitle(unit)}>{absoluteColumn(unit)}</th>}
                 <th>Accuracy</th>
-                <th>Reps</th>
               </tr>
             </thead>
             <tbody>
@@ -314,6 +330,7 @@ function TrendCard({ trend }: { trend: MovementTrend }) {
                       {p.recalibrated && <span className="badge badge-warn">re-calibrated</span>}
                       {!p.completed && <span className="badge badge-warn">{endReasonLabel(p.endReason)}</span>}
                     </td>
+                    <td className="mono">{p.reps}</td>
                     {/* "not measured", never 0 %. */}
                     <td className="mono">{p.rom === null ? <span className="dim">not measured</span> : formatPercent(p.rom)}</td>
                     {absMeasured > 0 && (
@@ -322,12 +339,11 @@ function TrendCard({ trend }: { trend: MovementTrend }) {
                       </td>
                     )}
                     <td className="mono">{formatPercent(p.accuracy)}</td>
-                    <td className="mono">{p.reps}</td>
                   </tr>
                 ))}
             </tbody>
           </table>
-        </div>
+        </ScrollTable>
       </details>
 
       {/* WHAT WAS SET ASIDE, AND WHERE IT WENT. A run the patient left after nine reps is real work

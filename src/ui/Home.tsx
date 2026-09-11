@@ -3,9 +3,9 @@ import { isPersistenceAvailable } from '../state/persist.ts';
 import { runtime } from '../session/runtime.ts';
 import { Screen, Toast } from './common.tsx';
 import PatientBanner from './PatientBanner.tsx';
-import { formatDate, formatDuration, formatPercent } from '../session/results.ts';
+import { MeasurementNote } from './ScopeNote.tsx';
+import { formatDate, formatDuration, formatPercent, laneRangeSummaries } from '../session/results.ts';
 import { formatFeature } from '../vision/calibration.ts';
-import { MOVEMENT_INFO } from '../vision/features.ts';
 
 const persistent = isPersistenceAvailable();
 
@@ -23,22 +23,21 @@ export default function Home() {
   // those are different people, and the second one belongs to nobody in particular.
   const last = activePatientId ? (history.find((r) => r.patientId === activePatientId) ?? null) : null;
   const patientSessions = activePatientId ? history.filter((r) => r.patientId === activePatientId).length : 0;
-  /** The best single rep of the last session, in the movement's own units — the work, not a grade. */
-  const lastBest: string | null = (() => {
-    if (!last) return null;
-    let best: { text: string; frac: number } | null = null;
-    for (const l of last.lanes) {
-      if (l.romSamples <= 0 || l.romBest === null) continue;
-      const unit = MOVEMENT_INFO[l.movement].unit;
-      const abs =
-        l.calibratedMin !== null && l.calibratedMax !== null
-          ? l.calibratedMin + l.romBest * (l.calibratedMax - l.calibratedMin)
-          : null;
-      const text = abs !== null && Number.isFinite(abs) ? formatFeature(abs, unit) : formatPercent(l.romBest);
-      if (best === null || l.romBest > best.frac) best = { text, frac: l.romBest };
-    }
-    return best?.text ?? null;
-  })();
+  /**
+   * LAST SESSION'S RANGE, PER MOVEMENT, WITH THE MOVEMENT NAMED. Never a maximum across lanes.
+   *
+   * This card used to print one figure — `max(romBest)` over every lane — under the word "Best
+   * range", with no movement anywhere near it. A hemiparetic prescription deliberately mixes the
+   * affected limb with an unaffected one, so a maximum across lanes is the STRONG side by
+   * construction: seeded with a real record (affected Left seated march 0.31 of its own 0.10–0.42
+   * range; unaffected Right knee extension 65°), this card read "Best range 65°" — the right knee,
+   * on the screen the patient reads before every single session. That is the exact defect the
+   * Results headline was rebuilt to remove (see `laneRangeSummaries`), and a fix that contradicts
+   * itself one screen later is not a fix. So this screen uses the SAME function Results does: every
+   * prescribed movement, in prescription order, each against its OWN calibrated range, named.
+   */
+  const lastRanges = last ? laneRangeSummaries(last.lanes) : [];
+  const lastMeasured = lastRanges.filter((r) => r.measured);
 
   /**
    * A session cannot start until the app knows whose it is.
@@ -155,16 +154,39 @@ export default function Home() {
                 they reached. The score and stars remain in the clinical detail on Results and in the
                 exported record, where a clinician reads them.
               */}
-              <div className="row">
-                <div className="stack" style={{ gap: 2 }}>
-                  <div className="eyebrow">Movements performed</div>
-                  <div className="big-number mono">{last.reps}</div>
-                </div>
-                <div className="grow" />
-                <div className="stack" style={{ gap: 2, textAlign: 'right' }}>
-                  <div className="eyebrow">Best range</div>
-                  <div className="big-number mono">{lastBest ?? '—'}</div>
-                </div>
+              <div className="stack" style={{ gap: 2 }}>
+                <div className="eyebrow">Movements performed</div>
+                <div className="big-number mono">{last.reps}</div>
+              </div>
+              <div className="stack" style={{ gap: 6 }} data-testid="home-last-ranges">
+                <div className="eyebrow">Range reached, movement by movement</div>
+                {lastMeasured.length === 0 ? (
+                  <span className="dim">No range was measured in that session.</span>
+                ) : (
+                  lastRanges.map((r) => (
+                    <div
+                      key={r.lane}
+                      className="row"
+                      style={{ gap: 10, alignItems: 'baseline' }}
+                      data-testid={`home-last-range-${r.lane}`}
+                    >
+                      <span style={{ minWidth: 0, flex: '1 1 auto' }}>{r.movementName}</span>
+                      <span className="mono" style={{ fontWeight: 800, fontSize: '1.15rem', whiteSpace: 'nowrap' }}>
+                        {!r.measured ? '—' : r.best === null ? formatPercent(r.bestFraction) : formatFeature(r.best, r.unit)}
+                      </span>
+                      <span className="dim" style={{ whiteSpace: 'nowrap' }}>
+                        {r.measured ? `${formatPercent(r.bestFraction)} of its own range` : 'not measured'}
+                      </span>
+                    </div>
+                  ))
+                )}
+                {/* THE UNITS ARE NEVER COMPARED ACROSS MOVEMENTS: a knee angle in degrees and a
+                    body-scaled march ratio are different quantities, and the percentage beside each
+                    figure is out of THAT movement's own calibrated range. */}
+                <span className="dim">
+                  Each figure is that movement's best rep against the range calibrated for it that day. Different
+                  movements are never compared with each other.
+                </span>
               </div>
               <div className="muted">
                 {last.songTitle} · {last.mode === 'leg' ? 'Leg' : 'Hand'} · {last.difficulty}
@@ -173,6 +195,21 @@ export default function Home() {
                 {formatDate(last.startedAt)} · {formatDuration(last.durationSec)}
                 {last.laneRestSec === undefined ? '' : ` · paced at ${last.laneRestSec.toFixed(1)} s between reps`}
               </div>
+              {/*
+                THE SCOPE STATEMENT AND THE CONDITIONS, ON THE FIRST SCREEN THAT SHOWS A DEGREE.
+                This card is the screen a therapist reads between patients and the one the patient
+                reads before every session, and it prints a joint angle in the movement's own units —
+                the same derived figure Results prints. It carried no statement of what those figures
+                are and no word about how well the camera tracked the session they came from, so a
+                range measured at 11 fps with the limb usable two thirds of the time read here as a
+                clean number. The rule is that the caveat travels with the FIGURE, not with the
+                screen it happened to be designed on.
+              */}
+              <MeasurementNote
+                tracking={last.tracking}
+                inputMode={last.inputMode}
+                testId="home-measurement-note"
+              />
               <button className="btn" onClick={() => goto('history')}>
                 See all {patientSessions} session{patientSessions === 1 ? '' : 's'}
               </button>

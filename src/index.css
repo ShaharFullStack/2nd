@@ -396,7 +396,7 @@ table.table tr:hover td { background: rgba(255, 255, 255, 0.03); }
 /* Shrink factor 200 against the thumbnail's 1: the LEGEND is what a squeezed panel spends. It is
    static text, it is read once, and it scrolls inside whatever it is left with — while the thumbnail
    and the meters are live readings the two people in the room are acting on. */
-.pip-note { padding: 6px 10px 10px; font-size: 0.82rem; color: var(--dim); flex: 0 200 auto; min-height: 0; overflow-y: auto; }
+.pip-note { padding: 6px 10px 10px; font-size: 0.82rem; color: var(--dim); flex: 0 200 auto; min-height: var(--pip-note-min, 0px); overflow-y: auto; }
 /* Live input-layer warnings (src/ui/Play.tsx): the reason a lane's receptor has gone to "no
    reading", in words, for the therapist.
    THE PATIENT KEEPS THE METERS WHILE A WARNING IS UP. This block used to be `flex: 0 0 auto` with

@@ -7,6 +7,7 @@ import type { ReplayEvent } from '../input/ReplayInput.ts';
 import { createMockCanvas, mockCanvasFactory } from '../render/canvasMock.ts';
 import type { StemMixer } from '../audio/StemMixer.ts';
 import { FINALE_SEC, FINALE_SKIP_GUARD_SEC } from '../render/Highway.ts';
+import type { FinaleSpec } from '../render/Highway.ts';
 import { GameRunner, sessionAchievement } from './GameRunner.ts';
 import type { PageLifecycle, RunSummary } from './GameRunner.ts';
 
@@ -576,6 +577,54 @@ describe('the song ends with a payoff, not a cut', () => {
     gone.runner.dispose();
     expect(gone.summaries[0].endReason).toBe('chart');
     expect(gone.summaries[0].completed).toBe(true);
+  });
+
+  /**
+   * THE CARD LEADS WITH THE WORK, because `Highway` draws `stats[0]` as its hero figure.
+   *
+   * The runner is the only thing that knows what this session was, so it is the only thing that can
+   * decide what the biggest number on the ending is. It is the rep count — the same quantity Results
+   * and History were both corrected to lead with — and never the score.
+   */
+  it('hands the renderer the rep count as the hero figure, not the score', async () => {
+    const h = await setup(notes, hitAll);
+    let spec: FinaleSpec | null = null;
+    const real = h.runner.highway.startFinale.bind(h.runner.highway);
+    h.runner.highway.startFinale = (s: FinaleSpec) => {
+      spec = spec ?? s;
+      real(s);
+    };
+    h.advance(4.2);
+    const seen = spec as FinaleSpec | null;
+    expect(seen).not.toBeNull();
+    const card = seen as FinaleSpec;
+    expect(card.stats[0].label).toBe('MOVEMENTS');
+    expect(Number(card.stats[0].value)).toBe(h.runner.hud().reps);
+    // The score is present (the patient watched it all song) but it is not a stat column and it is
+    // certainly not the first one.
+    expect(card.stats.map((x) => x.label)).not.toContain('SCORE');
+    expect(card.achievement).not.toMatch(/star|score|grade|rank/i);
+  });
+
+  /**
+   * THE ENDING MAY NOT COST THE PATIENT A REP. Whatever the sequence does on screen, the record
+   * handed to the report is the run that finished — the same counts, whether it plays out or a
+   * therapist taps through it.
+   */
+  it('reports the same reps whether the ending runs out or is skipped', async () => {
+    const played = await setup(notes, hitAll);
+    played.advance(4.2);
+    const atChartEnd = played.runner.hud().reps;
+    expect(atChartEnd).toBeGreaterThan(0);
+    played.advance(4.2 + FINALE_SEC + 0.3);
+    expect(played.summaries[0].results.reps).toBe(atChartEnd);
+    expect(played.summaries[0].completed).toBe(true);
+
+    const skipped = await setup(notes, hitAll);
+    skipped.advance(4.2 + FINALE_SKIP_GUARD_SEC + 0.1);
+    expect(skipped.runner.skipFinale()).toBe(true);
+    expect(skipped.summaries[0].results.reps).toBe(atChartEnd);
+    expect(skipped.summaries[0].completed).toBe(true);
   });
 
   /** Nothing can be judged once the chart has run out, so the receptors say so. */

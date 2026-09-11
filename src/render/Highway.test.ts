@@ -4636,6 +4636,66 @@ describe('the song-end sequence', () => {
     expect(calm.hw.finaleConfettiCount()).toBe(0);
   });
 
+  /**
+   * THE TYPE SCALE IS THE ORDERING, and it was the wrong way round.
+   *
+   * The card used to draw a 58 px glowing gold score over a 19 px sentence, so on the session this
+   * screen matters most for — 142 movements, six notes answered, nought points — the biggest thing
+   * after the banner was a gold "0". Results and History were both corrected to lead with the work
+   * and fold the grade away; this asserts the highway agrees with them.
+   */
+  it('draws the work bigger than the grade: hero > sentence > score', () => {
+    // Reduced motion, so neither odometer rolls: each figure is only ever drawn at its final value
+    // and no digit of one can be mistaken for a digit the other counted through.
+    const { hw, scratch } = setup(1280, 720, { reducedMotion: true });
+    hw.resize(1280, 720, 1);
+    hw.startFinale({
+      ...SPEC,
+      score: 5300,
+      stats: [{ value: '77', label: 'MOVEMENTS' }, { value: '6/189', label: 'NOTES ANSWERED' }],
+      achievement: 'Seventy-seven movements performed',
+    });
+    run(hw, FINALE_SEC + 0.2);
+    /**
+     * The font size of the sprite that rasterises EXACTLY this string and nothing else — the HUD's
+     * score odometer keeps all ten digits on one strip, and matching that would read the HUD's type
+     * scale instead of the card's.
+     */
+    const fontPx = (text: string): number => {
+      let px = 0;
+      for (const c of scratch) {
+        const drawn = c.ctx.calls.filter((k) => k.name === 'fillText');
+        if (drawn.length === 0 || !drawn.every((k) => k.args[0] === text)) continue;
+        const m = /(\d+(?:\.\d+)?)px/.exec(String(c.ctx.props.font));
+        if (m) px = Math.max(px, Number(m[1]));
+      }
+      return px;
+    };
+    const hero = fontPx('7');
+    const sentence = fontPx('Seventy-seven movements performed');
+    const score = fontPx('3');
+    expect(hero).toBeGreaterThan(0);
+    expect(sentence).toBeGreaterThan(0);
+    expect(score).toBeGreaterThan(0);
+    // The count of movements performed is the biggest figure on the card...
+    expect(hero).toBeGreaterThan(sentence);
+    expect(hero).toBeGreaterThan(score * 2);
+    // ...and the one warm sentence outranks the points.
+    expect(sentence).toBeGreaterThan(score);
+  });
+
+  /** The odometer is still SEEN to settle — it just does it last, and small. */
+  it('finishes rolling the score with the card still on screen', () => {
+    const { hw, scratch } = setup();
+    hw.resize(1280, 720, 1);
+    hw.startFinale({ ...SPEC, score: 5300 });
+    // 1.2 s before the sequence ends, the score has already reached its final value.
+    run(hw, FINALE_SEC - 1.2);
+    const digits = (text: string) => scratch.some((c) => c.ctx.calls.some((k) => k.name === 'fillText' && k.args[0] === text));
+    expect(digits('3')).toBe(true);
+    expect(hw.finaleDone()).toBe(false);
+  });
+
   it('draws at the small end of the supported canvas without throwing', () => {
     const { hw, scratch } = setup(1024, 768);
     hw.resize(1024, 768, 1);

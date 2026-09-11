@@ -238,6 +238,7 @@ export function Sparkline({
   color = '#35d6ff',
   label,
   band,
+  flagged,
   format = (v: number) => `${Math.round(v * 100)}%`,
 }: {
   values: (number | null)[];
@@ -253,8 +254,17 @@ export function Sparkline({
   label: string;
   /** Optional dotted reference level (e.g. 100 % of the calibrated range), in `values` units. */
   band?: number;
+  /**
+   * POINTS THAT WERE NOT MEASURED UNDER THE SAME CONDITIONS AS THE REST — ringed, not hidden.
+   *
+   * A trend is the one view where a change in the equipment and a change in the patient look
+   * identical, so a session measured on a degraded camera stream may not be drawn as the same kind
+   * of dot as one measured on a clean one. Same length as `values`; omitted = nothing to flag.
+   */
+  flagged?: readonly boolean[];
   format?: (v: number) => string;
 }) {
+  const isFlagged = (i: number) => flagged !== undefined && flagged.length === values.length && flagged[i] === true;
   const host = useRef<HTMLDivElement>(null);
   // Per-INSTANCE, not derived from `label`: two cards with the same series name used to emit the same
   // SVG id, and both areas then painted from whichever gradient the document defined first.
@@ -352,9 +362,20 @@ export function Sparkline({
           ),
         )}
 
-        {/* Every session gets a tick on the baseline, at its real date. */}
+        {/* Every session gets a tick on the baseline, at its real date. A session measured on a
+            degraded (or unrecorded) camera stream gets a TALLER AMBER tick, so it is locatable in
+            time even when its own value was never measured and no point was drawn for it. */}
         {values.map((_, i) => (
-          <line key={i} x1={x(i)} x2={x(i)} y1={height - padB} y2={height - padB + 4} stroke="#3a465f" strokeWidth={1.5} />
+          <line
+            key={i}
+            x1={x(i)}
+            x2={x(i)}
+            y1={height - padB}
+            y2={height - padB + (isFlagged(i) ? 9 : 4)}
+            stroke={isFlagged(i) ? '#ffb020' : '#3a465f'}
+            strokeWidth={isFlagged(i) ? 2.5 : 1.5}
+            data-flagged={isFlagged(i) ? 'true' : undefined}
+          />
         ))}
 
         {/* First and last session DATED on the axis. On a tablet there is no hover, so without this a
@@ -375,11 +396,26 @@ export function Sparkline({
         ))}
         {lastIndex >= 0 && <circle cx={x(lastIndex)} cy={y(values[lastIndex] as number)} r={6} fill={color} stroke="#0d1220" strokeWidth={2.5} />}
 
+        {/* THE RING THAT SAYS "THIS POINT WAS MEASURED DIFFERENTLY". Drawn over the marker so it
+            survives the big end-of-series dot, in the same amber as the tick below it. */}
+        {runs.flatMap((r) => r).filter((p) => isFlagged(p.i)).map((p) => (
+          <circle
+            key={`flag-${p.i}`}
+            cx={x(p.i)}
+            cy={y(p.v)}
+            r={8}
+            fill="none"
+            stroke="#ffb020"
+            strokeWidth={2.5}
+            data-testid={`spark-flag-${p.i}`}
+          />
+        ))}
+
         {/* Per-point readout for the pointer devices that have one; the dated table under the card is
             the version a tablet can use. */}
         {runs.flatMap((r) => r).map((p) => (
           <circle key={`hit-${p.i}`} cx={x(p.i)} cy={y(p.v)} r={12} fill="transparent">
-            <title>{`${at && at.length === n ? `${shortDate(at[p.i])} · ` : ''}${format(p.v)}`}</title>
+            <title>{`${at && at.length === n ? `${shortDate(at[p.i])} · ` : ''}${format(p.v)}${isFlagged(p.i) ? ' · degraded or unrecorded camera stream' : ''}`}</title>
           </circle>
         ))}
       </svg>

@@ -175,9 +175,15 @@ export interface FinaleSpec {
   title: string;
   /** Usually the song title, so the payoff names what was just played. */
   subtitle?: string;
-  /** The final score. The odometer rolls up to it and stops there. */
+  /** The final score. The odometer rolls up to it and stops there — LAST, and small. */
   score: number;
-  /** Up to `FINALE_MAX_STATS` counts from the session, in reading order. */
+  /**
+   * Up to `FINALE_MAX_STATS` counts from the session, in reading order.
+   *
+   * `stats[0]` IS THE CARD'S HERO FIGURE — the biggest thing on the screen after the banner. The
+   * caller puts the work there (movements performed); the score is drawn at a quarter of its size,
+   * below the sentence, because this screen belongs to a rehab session and not to a scoreboard.
+   */
   stats: FinaleStat[];
   /** ONE sentence about what this patient did today. Never a grade, never conditional on scoring. */
   achievement: string;
@@ -194,19 +200,23 @@ export interface FinaleSpec {
  * that a therapist who does nothing is not kept waiting: it ends itself. Anyone in a hurry skips it
  * with a tap or any key after `FINALE_SKIP_GUARD_SEC`.
  */
-export const FINALE_SEC = 5.8;
+export const FINALE_SEC = 6.6;
 export const FINALE_SKIP_GUARD_SEC = 0.6;
-/** Most stat columns the row can hold at the narrowest supported canvas. */
+/** Most stat columns the row can hold at the narrowest supported canvas (the hero is stats[0]). */
 export const FINALE_MAX_STATS = 4;
 const FINALE_CURTAIN_SEC = 0.5;
 const FINALE_CURTAIN_ALPHA = 0.88;
 const FINALE_TITLE_AT = 0.35;
-const FINALE_SCORE_AT = 0.95;
-const FINALE_SCORE_ROLL_SEC = 1.5;
+/** The hero figure — movements performed — counts up first, because it is what the session was. */
+const FINALE_HERO_AT = 0.95;
+const FINALE_HERO_ROLL_SEC = 1.1;
 const FINALE_STATS_AT = 1.95;
 const FINALE_STAT_STEP_SEC = 0.18;
-const FINALE_ACHIEVEMENT_AT = 2.95;
-const FINALE_HINT_AT = 3.7;
+const FINALE_ACHIEVEMENT_AT = 2.6;
+/** The score settles LAST and smallest — seen to arrive, never the thing the card is about. */
+const FINALE_SCORE_AT = 3.2;
+const FINALE_SCORE_ROLL_SEC = 1.4;
+const FINALE_HINT_AT = 3.9;
 /** The crowd throws the patient's own lane colours for this long. */
 const FINALE_CONFETTI_SEC = 3.2;
 /** Pieces per second at full `effectIntensity`. */
@@ -3079,8 +3089,19 @@ export class Highway {
       case 'finaleSub':
         s = { font: `600 ${px(17, 12)}px ${FONT}`, color: UI_COLORS.textDim };
         break;
+      // THE TYPE SCALE IS THE ORDERING. Results and History were both corrected to lead with the
+      // work and fold the grade away; this card contradicted them, drawing a 58 px glowing gold
+      // score over a 19 px sentence — so on a worst-case session the biggest thing on the screen
+      // after the banner was a gold "0". The hero is now the count of movements performed, the warm
+      // sentence is second, and the score is a quarter of the hero's size at the bottom of the card.
+      case 'finaleHero':
+        s = { font: `900 ${px(62, 32)}px ${FONT}`, color: '#ffffff', stroke: 'rgba(0,0,0,0.5)', strokeWidth: px(3, 1), glow: '#8fb4ff', glowBlur: px(18, 6) };
+        break;
+      case 'finaleHeroLabel':
+        s = { font: `800 ${px(15, 11)}px ${FONT}`, color: UI_COLORS.text };
+        break;
       case 'finaleScore':
-        s = { font: `900 ${px(58, 30)}px ${FONT}`, color: '#ffd84a', stroke: 'rgba(0,0,0,0.5)', strokeWidth: px(3, 1), glow: '#ff9d00', glowBlur: px(16, 5) };
+        s = { font: `800 ${px(24, 15)}px ${FONT}`, color: '#ffd84a' };
         break;
       case 'finaleStat':
         s = { font: `800 ${px(28, 17)}px ${FONT}`, color: UI_COLORS.text, stroke: 'rgba(0,0,0,0.5)', strokeWidth: px(2, 1) };
@@ -3089,7 +3110,7 @@ export class Highway {
         s = { font: `700 ${px(12, 11)}px ${FONT}`, color: UI_COLORS.textDim };
         break;
       case 'finaleAchievement':
-        s = { font: `800 ${px(19, 13)}px ${FONT}`, color: '#ffd84a' };
+        s = { font: `800 ${px(27, 15)}px ${FONT}`, color: '#ffd84a' };
         break;
       case 'finaleNote':
         s = { font: `500 ${px(14, 11)}px ${FONT}`, color: UI_COLORS.textDim };
@@ -3582,21 +3603,26 @@ export class Highway {
    * rhythm game pays the player off at the end of a song, and this one has more reason to than most
    * — the run IS the therapy session, and the last thing the patient sees of it was nothing at all.
    *
-   * Four beats, in the order a player expects them:
+   * The beats, in the order a player expects them — and in the order a REHAB session ranks them:
    *   0.0 s  the board dims behind a curtain while the last gem finishes falling, and the lanes
    *          throw their own colours up over the strike line (the crowd).
    *   0.35 s the title lands.
-   *   0.95 s the score rolls up to where it finished — the odometer SETTLING, which is the beat the
-   *          old ending cut off mid-climb.
-   *   2.5 s  this session's own counts arrive one at a time, then the one sentence about what the
-   *          patient did today, then the hint that anything at all moves on.
+   *   0.95 s the HERO figure counts up — `stats[0]`, which the caller fills with movements
+   *          performed. This is the odometer the patient watches settle, and it is the count of
+   *          what they did rather than the grade they got for it.
+   *   1.95 s the session's other counts arrive one at a time along a row.
+   *   2.6 s  the one warm sentence about today lands on its ribbon, second-largest on the card.
+   *   3.2 s  the SCORE rolls up, last and a bit over a third the hero's size, and settles at 4.6 s
+   *          with two full seconds of the card still on screen.
+   *   3.9 s  the hint that anything at all moves on.
    *
    * AND IT HAS TO BE WARM TO SOMEBODY WHO SCORED BADLY. Nothing here is a grade: there is no
    * pass/fail, no rank, no "you needed 40 % for a star". The score is stated because the patient
-   * watched it all song and is owed the end of that animation; the sentence beside it is about
-   * movements performed, which is the thing a rehab session actually asks for and which a patient
-   * who hit six notes out of two hundred still did hundreds of. `FinaleSpec.achievement` is written
-   * by the caller for exactly that reason — the renderer never invents praise it cannot support.
+   * watched it all song and is owed the end of that animation — but it used to be 58 px of glowing
+   * gold over a 19 px sentence, so on a session with six notes answered the biggest thing on the
+   * card after the banner was a gold "0". Results and History were both corrected to lead with the
+   * work and fold the grade away; this screen now agrees with them. `FinaleSpec.achievement` is
+   * written by the caller — the renderer never invents praise it cannot support.
    */
   private drawFinale(ctx: Ctx2D, dt: number): void {
     const spec = this.finale;
@@ -3633,12 +3659,18 @@ export class Highway {
      * card at 1024x768, where the gems behind it are proportionally larger.
      */
     const stats = spec.stats.slice(0, FINALE_MAX_STATS);
-    const hasStats = stats.length > 0;
+    /** `stats[0]` is the hero; the rest share one row under it. */
+    const hero = stats.length > 0 ? stats[0] : null;
+    const rowStats = stats.slice(1);
+    const hasRow = rowStats.length > 0;
     const hasAchievement = spec.achievement.length > 0;
+    const hasNote = hasAchievement && !!spec.achievementNote;
     const panelW = Math.min(W - 40 * u, 700 * u);
+    // Every block's height, in the same numbers the cursor below advances by, so the panel is
+    // exactly as tall as what is drawn in it at any canvas size.
     const panelH = Math.min(
       H - 40 * u,
-      (176 + (hasStats ? 92 : 0) + (hasAchievement ? 92 : 0) + (spec.achievementNote ? 22 : 0)) * u,
+      (134 + (hero ? 86 : 0) + (hasRow ? 84 : 0) + (hasAchievement ? 76 + (hasNote ? 22 : 0) : 0) + 74) * u,
     );
     const top = Math.max(20 * u, (H - panelH) / 2 - 10 * u);
     const panelIn = clamp(t / FINALE_CURTAIN_SEC, 0, 1);
@@ -3677,31 +3709,48 @@ export class Highway {
         );
       }
     }
-    y += 78 * u;
+    // 88, not 78: at 1280 the subtitle's descenders sat 5 px above the hero figure's cap height.
+    y += 88 * u;
 
-    // The score, settling. This is the animation the old ending cut off: the odometer was still
-    // climbing when the screen changed.
-    const scoreIn = appear(FINALE_SCORE_AT, 0.2);
-    if (scoreIn > 0) {
-      const roll = calm ? 1 : easeOutCubic(clamp((t - FINALE_SCORE_AT) / FINALE_SCORE_ROLL_SEC, 0, 1));
-      this.text.drawChars(ctx, formatThousands(Math.round(spec.score * roll)), cx, y, this.style('finaleScore'), 1, scoreIn);
-      // 42, not 34: at 1920 the score is drawn at 87 px and its descenders reached the caption.
-      this.text.draw(ctx, 'POINTS THIS SESSION', cx, y + 42 * u, this.style('finaleStatLabel'), 1, scoreIn * 0.85);
-    }
-    y += 74 * u;
-
-    // The session's own counts, arriving one at a time along one row.
-    if (hasStats) {
-      const colW = Math.min((panelW - 24 * u) / stats.length, 200 * u);
-      y += 30 * u;
-      for (let i = 0; i < stats.length; i++) {
-        const a = appear(FINALE_STATS_AT + i * FINALE_STAT_STEP_SEC, 0.22);
-        if (a <= 0) continue;
-        const x = cx + (i - (stats.length - 1) / 2) * colW;
-        this.text.drawChars(ctx, stats[i].value, x, y, this.style('finaleStat'), 1, a);
+    // THE HERO: what the patient DID. It counts up the way the score used to, because a count of
+    // movements is the number this session is about — and on the run that matters most here (six
+    // notes answered out of a hundred and eighty-nine) it is the only large figure on the card that
+    // is worth anything at all.
+    if (hero) {
+      const heroIn = appear(FINALE_HERO_AT, 0.22);
+      if (heroIn > 0) {
+        const n = Number(hero.value);
+        const roll =
+          calm || !Number.isFinite(n)
+            ? 1
+            : easeOutCubic(clamp((t - FINALE_HERO_AT) / FINALE_HERO_ROLL_SEC, 0, 1));
+        const shown = Number.isFinite(n) ? formatThousands(Math.round(n * roll)) : hero.value;
+        this.text.drawChars(ctx, shown, cx, y, this.style('finaleHero'), 1, heroIn);
         this.text.draw(
           ctx,
-          this.fitFinale(1 + i, stats[i].label, this.style('finaleStatLabel'), colW - 10 * u),
+          this.fitFinale(1, hero.label, this.style('finaleHeroLabel'), panelW - 48 * u),
+          cx,
+          y + 32 * u,
+          this.style('finaleHeroLabel'),
+          1,
+          heroIn * 0.95,
+        );
+      }
+      y += 86 * u;
+    }
+
+    // The session's other counts, arriving one at a time along one row under the hero.
+    if (hasRow) {
+      const colW = Math.min((panelW - 24 * u) / rowStats.length, 200 * u);
+      y += 26 * u;
+      for (let i = 0; i < rowStats.length; i++) {
+        const a = appear(FINALE_STATS_AT + i * FINALE_STAT_STEP_SEC, 0.22);
+        if (a <= 0) continue;
+        const x = cx + (i - (rowStats.length - 1) / 2) * colW;
+        this.text.drawChars(ctx, rowStats[i].value, x, y, this.style('finaleStat'), 1, a);
+        this.text.draw(
+          ctx,
+          this.fitFinale(2 + i, rowStats[i].label, this.style('finaleStatLabel'), colW - 10 * u),
           x,
           y + 24 * u,
           this.style('finaleStatLabel'),
@@ -3709,41 +3758,56 @@ export class Highway {
           a * 0.85,
         );
       }
-      y += 62 * u;
+      y += 58 * u;
     }
 
     // The one sentence about what this patient did today, on its own ribbon so it reads as the
     // point of the screen rather than as a caption under the score.
-    const achIn = appear(FINALE_ACHIEVEMENT_AT, 0.32);
-    if (achIn > 0 && hasAchievement) {
-      const style = this.style('finaleAchievement');
-      const room = panelW - 40 * u;
-      const label = this.fitFinale(1 + FINALE_MAX_STATS, spec.achievement, style, room - 44 * u);
-      y += 30 * u;
-      const h = 42 * u;
-      const wRibbon = Math.min(room, this.text.measure(label, style) + 44 * u);
-      ctx.globalAlpha = achIn * 0.9;
-      ctx.fillStyle = FINALE_RIBBON_FILL;
-      roundRectPath(ctx, cx - wRibbon / 2, y - h / 2, wRibbon, h, h / 2);
-      ctx.fill();
-      ctx.globalAlpha = achIn;
-      ctx.strokeStyle = FINALE_RIBBON_LINE;
-      ctx.lineWidth = Math.max(1, 1.5 * u);
-      ctx.stroke();
-      ctx.globalAlpha = 1;
-      this.text.draw(ctx, label, cx, y, style, 1, achIn);
-      if (spec.achievementNote) {
-        this.text.draw(
-          ctx,
-          this.fitFinale(2 + FINALE_MAX_STATS, spec.achievementNote, this.style('finaleNote'), room),
-          cx,
-          y + h * 0.78,
-          this.style('finaleNote'),
-          1,
-          achIn * 0.85,
-        );
+    if (hasAchievement) {
+      const achIn = appear(FINALE_ACHIEVEMENT_AT, 0.32);
+      y += 24 * u;
+      if (achIn > 0) {
+        const style = this.style('finaleAchievement');
+        const room = panelW - 40 * u;
+        const label = this.fitFinale(1 + FINALE_MAX_STATS, spec.achievement, style, room - 44 * u);
+        const h = 50 * u;
+        const wRibbon = Math.min(room, this.text.measure(label, style) + 44 * u);
+        ctx.globalAlpha = achIn * 0.9;
+        ctx.fillStyle = FINALE_RIBBON_FILL;
+        roundRectPath(ctx, cx - wRibbon / 2, y - h / 2, wRibbon, h, h / 2);
+        ctx.fill();
+        ctx.globalAlpha = achIn;
+        ctx.strokeStyle = FINALE_RIBBON_LINE;
+        ctx.lineWidth = Math.max(1, 1.5 * u);
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+        this.text.draw(ctx, label, cx, y, style, 1, achIn);
+        if (spec.achievementNote) {
+          this.text.draw(
+            ctx,
+            this.fitFinale(2 + FINALE_MAX_STATS, spec.achievementNote, this.style('finaleNote'), room),
+            cx,
+            y + h * 0.72,
+            this.style('finaleNote'),
+            1,
+            achIn * 0.85,
+          );
+        }
       }
+      y += 52 * u + (hasNote ? 22 * u : 0);
     }
+
+    // THE SCORE, LAST AND SMALL — but still SEEN TO SETTLE. The patient watched this odometer climb
+    // for ninety-seven seconds and is owed the end of that animation; what they are not owed is a
+    // grade three times the size of the sentence about their own work. It rolls up after the
+    // sentence has landed and finishes with well over a second of the card still on screen.
+    const scoreIn = appear(FINALE_SCORE_AT, 0.2);
+    if (scoreIn > 0) {
+      const roll = calm ? 1 : easeOutCubic(clamp((t - FINALE_SCORE_AT) / FINALE_SCORE_ROLL_SEC, 0, 1));
+      this.text.draw(ctx, 'POINTS THIS SESSION', cx, y + 26 * u, this.style('finaleStatLabel'), 1, scoreIn * 0.85);
+      this.text.drawChars(ctx, formatThousands(Math.round(spec.score * roll)), cx, y + 48 * u, this.style('finaleScore'), 1, scoreIn);
+    }
+    y += 74 * u;
 
     // "Anything at all moves on." Only once the skip really works, so the screen never invites a
     // tap it is about to ignore.
