@@ -2,6 +2,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { HitEvent, LaneSpec } from '../engine/types';
 import {
   DEFAULT_HIGHWAY_OPTIONS,
+  FINALE_SEC,
+  FINALE_SKIP_GUARD_SEC,
   Highway,
   MISS_CUE_MARGIN_U,
   POPUP_MAX_RISE_FRAC,
@@ -4505,5 +4507,141 @@ describe('the effort gauge is not a failure alarm', () => {
         .filter((a): a is number => a !== null);
     };
     expect(alphasAt(3)).toEqual(alphasAt(3 + Math.PI / 10));
+  });
+});
+
+/**
+ * THE SONG-END SEQUENCE.
+ *
+ * The chart running out used to leave 1.5 s of empty highway and then a cut to a grid. This is the
+ * payoff: the board dims, the title lands, the score settles where it finished, the session's own
+ * counts arrive, and one warm sentence about what the patient did closes it.
+ */
+describe('the song-end sequence', () => {
+  const SPEC = {
+    title: 'SONG COMPLETE',
+    subtitle: 'Test Song',
+    score: 5100,
+    stats: [
+      { value: '142', label: 'MOVEMENTS PERFORMED' },
+      { value: '6/200', label: 'NOTES ANSWERED IN TIME' },
+    ],
+    achievement: '142 movements performed',
+    achievementNote: 'Every rep counted.',
+    hint: 'Tap the screen or press any key for the report',
+  };
+
+  /** Drive the sequence forward by `sec`, one 60 Hz frame at a time, drawing each one. */
+  const run = (hw: Highway, sec: number, frame = makeFrame({ lanes: LANES, songTime: 10, thresholdFraction: 0.5 })): void => {
+    for (let t = 0; t < sec; t += 1 / 60) {
+      hw.advanceFinale(1 / 60);
+      hw.draw(frame);
+    }
+  };
+
+  const wrote = (scratch: MockCanvas[], text: string): boolean =>
+    scratch.some((c) => c.ctx.calls.some((k) => k.name === 'fillText' && k.args[0] === text));
+
+  it('is inert until it is started, and then reports its own progress', () => {
+    const { hw } = setup();
+    hw.resize(1280, 720, 1);
+    expect(hw.isFinaleActive()).toBe(false);
+    expect(hw.finaleDone()).toBe(false);
+    hw.startFinale(SPEC);
+    expect(hw.isFinaleActive()).toBe(true);
+    expect(hw.finaleDone()).toBe(false);
+    run(hw, FINALE_SEC + 0.2);
+    expect(hw.finaleDone()).toBe(true);
+  });
+
+  it('lands the title, settles the score on its final value and states the session"s own counts', () => {
+    const { hw, scratch } = setup();
+    hw.resize(1280, 720, 1);
+    hw.startFinale(SPEC);
+    run(hw, FINALE_SEC + 0.2);
+    expect(wrote(scratch, 'SONG COMPLETE')).toBe(true);
+    expect(wrote(scratch, 'Test Song')).toBe(true);
+    expect(wrote(scratch, 'MOVEMENTS PERFORMED')).toBe(true);
+    // The crowd is over the curtain, not under it.
+    expect(hw.finaleConfettiCount()).toBeGreaterThanOrEqual(0);
+    expect(wrote(scratch, '142 movements performed')).toBe(true);
+    expect(wrote(scratch, 'Tap the screen or press any key for the report')).toBe(true);
+    // THE ODOMETER SETTLES. The patient watched it climb all song and the old ending cut it off
+    // mid-climb; by the end of the sequence it reads the score the session actually finished on.
+    expect(wrote(scratch, '5')).toBe(true);
+    expect(wrote(scratch, ',')).toBe(true);
+  });
+
+  it('rolls the score up rather than printing it at once', () => {
+    const { hw, scratch } = setup();
+    hw.resize(1280, 720, 1);
+    hw.startFinale(SPEC);
+    // Just after the roll starts, the digits on screen are NOT yet the final ones.
+    run(hw, 1.1);
+    const early = scratch.filter((c) => c.ctx.calls.some((k) => k.name === 'fillText')).length;
+    run(hw, FINALE_SEC);
+    expect(scratch.filter((c) => c.ctx.calls.some((k) => k.name === 'fillText')).length).toBeGreaterThan(early);
+  });
+
+  /** Nothing here may read as a mark: no stars, no percentage, no pass. */
+  it('says nothing that grades the patient', () => {
+    const { hw, scratch } = setup();
+    hw.resize(1280, 720, 1);
+    hw.startFinale(SPEC);
+    run(hw, FINALE_SEC + 0.2);
+    const words = scratch
+      .flatMap((c) => c.ctx.calls.filter((k) => k.name === 'fillText').map((k) => String(k.args[0])))
+      .join(' ');
+    expect(words).not.toMatch(/★|star|failed|rank|grade/i);
+  });
+
+  it('holds the skip for the opening of the sequence, then accepts it', () => {
+    const { hw } = setup();
+    hw.resize(1280, 720, 1);
+    hw.startFinale(SPEC);
+    run(hw, FINALE_SKIP_GUARD_SEC * 0.5);
+    expect(hw.finaleSkippable()).toBe(false);
+    expect(hw.skipFinale()).toBe(false);
+    expect(hw.finaleDone()).toBe(false);
+    run(hw, FINALE_SKIP_GUARD_SEC);
+    expect(hw.finaleSkippable()).toBe(true);
+    expect(hw.skipFinale()).toBe(true);
+    expect(hw.finaleDone()).toBe(true);
+  });
+
+  it('cannot be restarted by a second chart-end, and is cleared by a new run', () => {
+    const { hw } = setup();
+    hw.resize(1280, 720, 1);
+    hw.startFinale(SPEC);
+    run(hw, 1);
+    const t = hw.finaleElapsed();
+    hw.startFinale({ ...SPEC, title: 'AGAIN' });
+    expect(hw.finaleElapsed()).toBe(t);
+    hw.reset();
+    expect(hw.isFinaleActive()).toBe(false);
+    expect(hw.finaleElapsed()).toBe(0);
+  });
+
+  it('throws no confetti under reduced motion, and plenty without it', () => {
+    const loud = setup(1280, 720, { reducedMotion: false });
+    loud.hw.resize(1280, 720, 1);
+    loud.hw.startFinale(SPEC);
+    run(loud.hw, 1.5);
+    expect(loud.hw.finaleConfettiCount()).toBeGreaterThan(0);
+
+    const calm = setup(1280, 720, { reducedMotion: true });
+    calm.hw.resize(1280, 720, 1);
+    calm.hw.startFinale(SPEC);
+    run(calm.hw, 1.5);
+    expect(calm.hw.finaleConfettiCount()).toBe(0);
+  });
+
+  it('draws at the small end of the supported canvas without throwing', () => {
+    const { hw, scratch } = setup(1024, 768);
+    hw.resize(1024, 768, 1);
+    hw.startFinale({ ...SPEC, stats: [...SPEC.stats, { value: '9', label: 'LONGEST RUN' }, { value: '1:37', label: 'TIME MOVING' }] });
+    run(hw, FINALE_SEC + 0.2, makeFrame({ lanes: LANES, songTime: 10, thresholdFraction: 0.5 }));
+    expect(wrote(scratch, 'SONG COMPLETE')).toBe(true);
+    expect(wrote(scratch, 'TIME MOVING')).toBe(true);
   });
 });

@@ -17,7 +17,7 @@ import type { InputMode, Patient, SessionConfig, SessionResult } from '../sessio
 import { DEVICE_TEST_PATIENT_ID, UNASSIGNED_PATIENT_ID } from '../session/types.ts';
 import type { CalibrationsByPatient } from './patients.ts';
 import { deviceTestPatient, makePatient, migrateToPatients, normalizePatientName, unassignedPatient, validatePatients } from './patients.ts';
-import { createListSync, createMapSync, onExternalChange, readJson, writeJson } from './persist.ts';
+import { createListSync, createMapSync, onExternalChange, readJson, storageKey, writeJson } from './persist.ts';
 
 export type Screen =
   | 'home'
@@ -86,8 +86,70 @@ const CONFIG_KEY = 'lastConfig';
 const CALIBRATION_KEY = 'calibrations';
 /** The patient list. Its ABSENCE is what tells the loader this device predates patient identity. */
 const PATIENTS_KEY = 'patients';
-/** The patient the next session will be recorded against, or absent when nobody has been chosen. */
+/**
+ * The patient the next session will be recorded against, or absent when nobody has been chosen.
+ *
+ * PER TAB, NOT PER DEVICE. This used to be one localStorage slot, rewritten on every select, add,
+ * rename and delete — so a therapist who opened a second tab to look something up, and picked a
+ * patient there to read their history, moved the slot the FIRST tab would record against on its next
+ * reload. The patient list is shared (it is a record); who is in the chair is not — it is this tab's
+ * session.
+ *
+ * So the selection lives in `sessionStorage`, which is scoped to the tab and survives its reloads.
+ * The localStorage slot of the same name is kept as a HINT ONLY: the last patient chosen anywhere on
+ * this device, used to seed a tab that has never chosen one (and by the seeded fixtures the critics
+ * write). A tab that starts on the hint says so (`activePatientNotice`) rather than presenting
+ * another tab's choice as its own.
+ */
 const ACTIVE_PATIENT_KEY = 'activePatient';
+
+/**
+ * The per-tab half of `ACTIVE_PATIENT_KEY`. Wrapped like every other storage access: a tablet in
+ * private mode or with site data blocked throws on `sessionStorage` itself, and losing the selection
+ * must never be a reason to lose the session in progress.
+ */
+function tabStorage(): Storage | null {
+  try {
+    if (typeof sessionStorage === 'undefined') return null;
+    return sessionStorage;
+  } catch {
+    return null;
+  }
+}
+
+function readTabActivePatient(): string | null {
+  const s = tabStorage();
+  if (!s) return null;
+  try {
+    const raw = s.getItem(storageKey(ACTIVE_PATIENT_KEY));
+    if (raw === null) return null;
+    const parsed: unknown = JSON.parse(raw);
+    return typeof parsed === 'string' && parsed.length > 0 ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Record the selection: this TAB's slot (authoritative for this tab) and the device hint (the seed a
+ * brand-new tab may start from). Returns false when neither could be written, which is what raises
+ * `persistenceFailed`.
+ */
+function writeActivePatient(id: string | null): boolean {
+  const s = tabStorage();
+  let tabOk = false;
+  try {
+    if (s) {
+      if (id === null) s.removeItem(storageKey(ACTIVE_PATIENT_KEY));
+      else s.setItem(storageKey(ACTIVE_PATIENT_KEY), JSON.stringify(id));
+      tabOk = true;
+    }
+  } catch {
+    tabOk = false;
+  }
+  const deviceOk = writeJson(ACTIVE_PATIENT_KEY, id);
+  return tabOk || deviceOk;
+}
 /**
  * How many sessions the retention limit has already deleted, per patient.
  *
@@ -315,6 +377,18 @@ export interface AppState {
    * guessing is the exact failure this identity work exists to prevent.
    */
   activePatientId: string | null;
+  /**
+   * A sentence for the therapist when the patient in this tab's chair was NOT put there by this tab:
+   * seeded from the device hint when the tab opened, or renamed/deleted in another tab since. Null
+   * when the selection is this tab's own and nothing has happened to it elsewhere.
+   *
+   * The selection itself is per tab (see `ACTIVE_PATIENT_KEY`) and no other tab can move it. This is
+   * the other half of that rule: what another tab DID change — the shared patient record — is said
+   * out loud instead of appearing as a name that quietly turned into a different one.
+   */
+  activePatientNotice: string | null;
+  /** The therapist has read `activePatientNotice`; it is this tab's selection now. */
+  acknowledgeActivePatient: () => void;
   /** Sessions already deleted by the retention limit, per patient — what the record is missing. */
   historyDropped: Record<string, number>;
   /** Screen the user came from, so Back on a leaf screen is not a guess. */
@@ -437,7 +511,9 @@ const persistedConfig = readJson<Partial<SessionConfig>>(CONFIG_KEY, {}, validat
 // one place allowed to decide what that means. Validation of the ranges themselves happens after.
 const rawCalibrations = readJson<unknown>(CALIBRATION_KEY, {});
 const persistedPatients = readJson<Patient[]>(PATIENTS_KEY, [], validatePatients);
-const persistedActivePatient = readJson<string | null>(ACTIVE_PATIENT_KEY, null, (raw) =>
+/** This TAB's own selection (sessionStorage), and the device-wide HINT it falls back to. */
+const tabActivePatient = readTabActivePatient();
+const deviceActivePatientHint = readJson<string | null>(ACTIVE_PATIENT_KEY, null, (raw) =>
   typeof raw === 'string' && raw.length > 0 ? raw : null,
 );
 function validateDropped(raw: unknown): Record<string, number> | null {
@@ -464,8 +540,20 @@ const migration = migrateToPatients(rawHistory, rawCalibrations, persistedPatien
 const persistedHistory = migration.history;
 const persistedCalibrations = validateCalibrationsByPatient(migration.calibrations);
 const initialPatients = migration.patients;
-// A stored selection that no longer names a real patient is not a selection.
-const initialActivePatient = initialPatients.some((p) => p.id === persistedActivePatient) ? persistedActivePatient : null;
+// A stored selection that no longer names a real patient is not a selection — of either kind. This
+// tab's own choice wins whenever it still names somebody; the device hint is what a tab that has
+// never chosen (or whose patient has been deleted since) starts from.
+const isReal = (id: string | null): boolean => id !== null && initialPatients.some((p) => p.id === id);
+const initialTabPatient = isReal(tabActivePatient) ? tabActivePatient : null;
+const initialHintPatient = isReal(deviceActivePatientHint) ? deviceActivePatientHint : null;
+const initialActivePatient = initialTabPatient ?? initialHintPatient;
+/**
+ * True when this tab did NOT choose the patient it starts on — it was seeded from the device hint
+ * (another tab's choice, or this device's last one before the tab was opened). The UI says so and
+ * asks the therapist to confirm; silently presenting someone else's choice as this tab's is the
+ * whole failure this split exists to prevent.
+ */
+const initialActiveInherited = initialActivePatient !== null && initialTabPatient === null;
 
 /**
  * THE SHARED COLLECTIONS, AND WHY THEY ARE NOT WRITTEN WITH A BARE `writeJson` ANY MORE.
@@ -555,7 +643,11 @@ if (migration.migrated) {
   patientsSync.write(initialPatients);
   historySync.write(persistedHistory);
   calibrationSync.write(persistedCalibrations);
-  if (initialActivePatient !== persistedActivePatient) writeJson(ACTIVE_PATIENT_KEY, initialActivePatient);
+}
+
+// A slot that names nobody real is not a selection: clear it rather than offering it to the next tab.
+if (initialActivePatient === null && (tabActivePatient !== null || deviceActivePatientHint !== null)) {
+  writeActivePatient(null);
 }
 
 const initialMode: Mode = persistedConfig.mode ?? 'leg';
@@ -601,12 +693,19 @@ export const useStore = create<AppState>((set, get) => {
    * inside a `set` updater can put the merged list into state; callers outside one can ignore it (the
    * store adopts it here).
    *
-   * `activePatientId` is deliberately NOT reconciled: it is this tab's selection, not a shared record.
+   * The ACTIVE PATIENT is deliberately not written here. It is this tab's selection, not a shared
+   * record, and writing it on every add/rename/delete is exactly how a second tab used to move the
+   * slot the first tab would record against; `persistActivePatient` writes it, and only the two calls
+   * that actually change who is in the chair reach it.
    */
-  const persistPatients = (list: Patient[], activeId: string | null): Patient[] => {
+  const persistPatients = (list: Patient[]): Patient[] => {
     const { ok, merged, changed } = patientsSync.write(list);
-    if (!ok || !writeJson(ACTIVE_PATIENT_KEY, activeId)) set({ persistenceFailed: true });
+    if (!ok) set({ persistenceFailed: true });
     return changed ? merged : list;
+  };
+  /** Who is in THIS tab's chair (sessionStorage), plus the device hint a fresh tab may start from. */
+  const persistActivePatient = (id: string | null): void => {
+    if (!writeActivePatient(id)) set({ persistenceFailed: true });
   };
   const persistDropped = (d: Record<string, number>): Record<string, number> => droppedSync.write(d).merged;
   const persistConfig = (): void => {
@@ -618,6 +717,9 @@ export const useStore = create<AppState>((set, get) => {
     screen: 'home',
     patients: initialPatients,
     activePatientId: initialActivePatient,
+    activePatientNotice: initialActiveInherited
+      ? `This tab opened on the patient last chosen on this device. Check it is the person in front of you before you record a session against them.`
+      : null,
     historyDropped: persistedDropped,
     previousScreen: null,
     inputMode: 'camera',
@@ -647,6 +749,18 @@ export const useStore = create<AppState>((set, get) => {
     lastResult: null,
     persistenceFailed: false,
 
+    acknowledgeActivePatient: () =>
+      set((s) => {
+        if (s.activePatientNotice === null) return s;
+        // "It is the right patient" is a statement about a PERSON. When the selection names nobody in
+        // the list — the cross-tab delete below, or a slot left over from one — there is nothing to
+        // confirm, and clearing the sentence would remove the only account of what happened. The
+        // setup screen does not offer the button in that state; this is the same rule in the store,
+        // so no other caller can dismiss it either.
+        if (s.activePatientId !== null && !s.patients.some((p) => p.id === s.activePatientId)) return s;
+        return { activePatientNotice: null };
+      }),
+
     goto: (screen) => set((s) => (s.screen === screen ? s : { screen, previousScreen: s.screen })),
     setInputMode: (inputMode) => set({ inputMode }),
 
@@ -670,10 +784,13 @@ export const useStore = create<AppState>((set, get) => {
         const patient = s.patients.find((p) => p.id === id);
         if (!patient) return s;
         const saved = s.calibrationsByPatient[id] ?? {};
-        const patients = persistPatients(s.patients.map((p) => (p.id === id ? { ...p, lastUsedAt: Date.now() } : p)), id);
+        const patients = persistPatients(s.patients.map((p) => (p.id === id ? { ...p, lastUsedAt: Date.now() } : p)));
+        persistActivePatient(id);
         return {
           patients,
           activePatientId: id,
+          // Chosen HERE, by a human, just now: nothing left to warn about.
+          activePatientNotice: null,
           savedCalibrations: saved,
           calibrations: s.lanes.map((l) => saved[calibrationKey(l)] ?? null),
         };
@@ -687,7 +804,6 @@ export const useStore = create<AppState>((set, get) => {
         // the therapist has just answered the question the record was holding open.
         const patients = persistPatients(
           s.patients.map((p) => (p.id === id ? { ...p, name: clean, unassigned: undefined } : p)),
-          s.activePatientId,
         );
         return { patients };
       }),
@@ -702,10 +818,12 @@ export const useStore = create<AppState>((set, get) => {
       delete calibrationsByPatient[id];
       const activePatientId = s.activePatientId === id ? null : s.activePatientId;
       const stored = persistCalibrations(calibrationsByPatient);
+      if (activePatientId !== s.activePatientId) persistActivePatient(activePatientId);
       set({
-        patients: persistPatients(patients, activePatientId),
+        patients: persistPatients(patients),
         calibrationsByPatient: stored.merged,
         activePatientId,
+        activePatientNotice: activePatientId === s.activePatientId ? s.activePatientNotice : null,
         savedCalibrations: (activePatientId && stored.merged[activePatientId]) || {},
         calibrations: activePatientId === s.activePatientId ? s.calibrations : s.lanes.map(() => null),
         persistenceFailed: s.persistenceFailed || !stored.ok,
@@ -915,16 +1033,22 @@ export const useStore = create<AppState>((set, get) => {
       // history reading "not measured". Those runs go to the built-in device-test record — which is
       // exactly what patients.ts `deviceTestPatient` says they do, now enforced rather than asserted.
       const devInput = record.inputMode !== 'camera';
+      // AND: an id that names NOBODY IN THE LIST is not a filing either — it is a record nobody can
+      // reach. A patient deleted in another tab leaves exactly that id behind (see
+      // `adoptExternalRecords`), and a session filed under it is invisible in the patient list,
+      // unreachable from History and impossible to move. It goes where every other ownerless record
+      // goes: the unassigned bucket, where it is visible and can be re-filed onto a real patient.
+      const filed = !!record.patientId && s.patients.some((p) => p.id === record.patientId);
       const needsDeviceTest = devInput && !s.patients.some((p) => p.id === DEVICE_TEST_PATIENT_ID);
-      const needsUnassigned = !devInput && !record.patientId && !s.patients.some((p) => p.id === UNASSIGNED_PATIENT_ID);
+      const needsUnassigned = !devInput && !filed && !s.patients.some((p) => p.id === UNASSIGNED_PATIENT_ID);
       const r = devInput
         ? { ...record, patientId: DEVICE_TEST_PATIENT_ID, patientName: 'Device test (not a patient)' }
-        : record.patientId
+        : filed
           ? record
           : { ...record, patientId: UNASSIGNED_PATIENT_ID, patientName: record.patientName || 'Unassigned records' };
       if (needsDeviceTest || needsUnassigned) {
         const patients = [...s.patients, needsDeviceTest ? deviceTestPatient() : unassignedPatient()];
-        set({ patients: persistPatients(patients, s.activePatientId) });
+        set({ patients: persistPatients(patients) });
       }
       const all = [r, ...get().history];
       // The cap is PER PATIENT: one patient's twentieth session must not push another patient's
@@ -941,7 +1065,7 @@ export const useStore = create<AppState>((set, get) => {
       // list back out of the store: the unassigned fallback above may have just added to it.
       const after = get();
       const patients = after.patients.map((p) => (p.id === r.patientId ? { ...p, lastUsedAt: Date.now() } : p));
-      set({ patients: persistPatients(patients, after.activePatientId) });
+      set({ patients: persistPatients(patients) });
     },
 
     deleteResult: (id) => {
@@ -1011,7 +1135,10 @@ export const useStore = create<AppState>((set, get) => {
  * WHAT IS NOT ADOPTED, and why:
  *   - `activePatientId` / `calibrations`: the patient in the chair and the ranges the run in progress
  *     is being judged against belong to THIS tab's session. A therapist looking something up in a
- *     second tab must not re-point the session running in the first one.
+ *     second tab must not re-point the session running in the first one. ONE EXCEPTION, and it is not
+ *     a re-pointing: if the other tab DELETED that patient, the id names nobody, and holding it is
+ *     how a camera session gets filed against a record that is not in the list. The selection is
+ *     cleared (fail closed) and the deletion is stated.
  *   - `settings`, the last config, the latency offset: device preferences, last-write-wins, and
  *     changing scroll speed or judgment offset under a running session would be worse than stale.
  *   - `lastResult`: the results screen shows the run this tab just finished.
@@ -1022,7 +1149,37 @@ function adoptExternalRecords(name: string): void {
   if (name === HISTORY_KEY) {
     useStore.setState({ history: historySync.read() });
   } else if (name === PATIENTS_KEY) {
-    useStore.setState({ patients: patientsSync.read() });
+    const patients = patientsSync.read();
+    // WHAT THE OTHER TAB DID TO THE PERSON IN THIS TAB'S CHAIR, SAID OUT LOUD. The list is shared, so
+    // a rename or a delete made next door lands here — and it used to land as a name that had quietly
+    // become a different name, under a session about to be recorded. The selection itself never moves
+    // (that is this tab's), only the record it points at, and that change is now a sentence.
+    const active = s.activePatientId;
+    const before = active ? s.patients.find((p) => p.id === active) : null;
+    const after = active ? patients.find((p) => p.id === active) : null;
+    let activePatientNotice = s.activePatientNotice;
+    if (active && before && !after) {
+      activePatientNotice = `${before.name} was deleted in another tab. Choose who this session is for before recording it.`;
+      // AND THE SELECTION GOES WITH THE RECORD IT NAMED. Saying so was not enough: this tab was left
+      // holding an id that names nobody, which reads as "No patient selected" on every screen while
+      // still being truthy — the Start button stayed enabled and the camera session behind it was
+      // filed under the dead id, invisible in the patient list and unreachable from History. A slot
+      // that names nobody real is not a selection (the same rule this module applies at load), so it
+      // is cleared here, in the tab's storage too, and the ranges measured on the departed patient go
+      // with it exactly as they do on `selectPatient`. The sentence above is what survives.
+      writeActivePatient(null);
+      useStore.setState({
+        patients,
+        activePatientNotice,
+        activePatientId: null,
+        savedCalibrations: {},
+        calibrations: s.lanes.map(() => null),
+      });
+      return;
+    } else if (before && after && before.name !== after.name) {
+      activePatientNotice = `${before.name} was renamed to ${after.name} in another tab.`;
+    }
+    useStore.setState({ patients, activePatientNotice });
   } else if (name === CALIBRATION_KEY) {
     const calibrationsByPatient = calibrationSync.read() as CalibrationsByPatient;
     useStore.setState({

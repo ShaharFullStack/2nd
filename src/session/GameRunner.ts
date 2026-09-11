@@ -20,10 +20,18 @@ import type { ScoreResults } from '../engine/scoring.ts';
 import type { Chart, HitEvent, LaneSpec, Note, TimingWindows } from '../engine/types.ts';
 import type { CompensationKindName, InputSource, LaneInputEvent, LaneRepEvent, SongTimeSource } from '../input/types.ts';
 import { Highway } from '../render/Highway.ts';
+import type { FinaleSpec } from '../render/Highway.ts';
 import type { CanvasLike, HighwayOptions, RenderFrame, RenderNote } from '../render/types.ts';
+import { clinicalLaneName } from './results.ts';
 import type { SessionEndReason } from './types.ts';
 
-export type RunnerPhase = 'idle' | 'countdown' | 'playing' | 'paused' | 'ended';
+/**
+ * `'finale'` is the song-end sequence: the chart has run out, nothing more can be judged, and the
+ * board is paying the session off (see `Highway.startFinale`) before the report screen. It is a
+ * phase rather than a flag because everything that asks "is this run still going?" — the input
+ * path, the pause button, the receptor row's honesty flag — has to answer the same way about it.
+ */
+export type RunnerPhase = 'idle' | 'countdown' | 'playing' | 'paused' | 'finale' | 'ended';
 
 /**
  * WHY THE RUN STOPPED. Every one of these persists a RunSummary — the reps the patient actually
@@ -156,6 +164,59 @@ export interface GameRunnerOptions {
   nowMs?: () => number;
 }
 
+/** What `sessionAchievement` needs: the run's own totals, no history and no calibration. */
+export interface AchievementInput {
+  reps: number;
+  hits: number;
+  judged: number;
+  maxCombo: number;
+  /** Per lane: the clinical name and the best rep peak as a fraction of the calibrated range. */
+  lanes: { name: string; bestPeak: number | null }[];
+}
+
+/** The peak that counts as "you reached the whole range you calibrated today". */
+export const FULL_RANGE_FRACTION = 0.9;
+/** A run of notes worth naming out loud. */
+export const STREAK_WORTH_NAMING = 8;
+
+/**
+ * ONE TRUE, WARM SENTENCE ABOUT THIS SESSION — and its quieter second line.
+ *
+ * THE HARD CASE IS THE ONE THAT MATTERS. A patient four weeks post-stroke can finish a song having
+ * answered six notes out of two hundred, and this sentence is the last thing the game says to them.
+ * So nothing here is conditional on scoring well, nothing is a grade, and nothing is comparative:
+ * the ladder is ordered by what is most SPECIFIC to today, and its bottom rung — movements
+ * performed — is true of every session in which the patient moved at all, which is every session
+ * this screen is shown after. The only case with nothing to celebrate is the one where nothing was
+ * measured, and that is said plainly rather than dressed up.
+ */
+export function sessionAchievement(input: AchievementInput): { text: string; note?: string } {
+  const best = input.lanes.reduce<{ name: string; bestPeak: number } | null>(
+    (acc, l) => (l.bestPeak !== null && (acc === null || l.bestPeak > acc.bestPeak) ? { name: l.name, bestPeak: l.bestPeak } : acc),
+    null,
+  );
+  if (best && best.bestPeak >= FULL_RANGE_FRACTION) {
+    return {
+      text: `Full range reached — ${best.name}`,
+      note: `Best rep ${Math.round(best.bestPeak * 100)}% of the range you calibrated today.`,
+    };
+  }
+  if (input.reps > 0) {
+    const note =
+      input.maxCombo >= STREAK_WORTH_NAMING
+        ? `${input.maxCombo} notes answered in a row at your best.`
+        : 'Every rep counted, whether or not it landed on a note.';
+    return { text: `${input.reps} movements performed`, note };
+  }
+  if (input.judged > 0) {
+    return {
+      text: 'Session recorded',
+      note: 'No movement was measured this time — worth checking the camera and the ranges.',
+    };
+  }
+  return { text: 'Session recorded', note: undefined };
+}
+
 /** Seconds of judged notes kept in `recentHits` so the renderer can spawn their effects. */
 const RECENT_HIT_SEC = 1.2;
 /** Never play more than one miss cue in this window, however many notes expire at once. */
@@ -237,6 +298,19 @@ export class GameRunner {
   private laneReps: LaneRepStats[];
   private ended = false;
   private disposed = false;
+  /**
+   * Song time at the moment the CHART ran out, captured before the song-end sequence starts.
+   *
+   * The sequence keeps the loop (and the audio clock) running for several more seconds, and
+   * `RunSummary.songTime` becomes the stored session duration. Without this, every completed
+   * session would be filed six seconds longer than it was, and the reps-per-minute a therapist
+   * reads off it would be wrong by that much.
+   */
+  private chartEndSongTime: number | null = null;
+  /** Listener teardown for the "anything at all skips the ending" handlers. */
+  private finaleSkipOff: Array<() => void> = [];
+  /** Wall ms at the previous finale frame, so the sequence advances on real elapsed time. */
+  private finaleLastWallMs: number | null = null;
   private readonly lifecycle: PageLifecycle | null;
   /**
    * True while the run is paused BECAUSE THE PAGE WENT AWAY, as opposed to a therapist pause. Kept
@@ -357,7 +431,7 @@ export class GameRunner {
     if (typeof rep === 'function') {
       this.unsubscribe.push(rep.call(this.input, (e: LaneRepEvent) => this.onRep(e)));
     }
-    if (this.mixer) this.unsubscribe.push(this.mixer.onEnded(() => this.finish('chart')));
+    if (this.mixer) this.unsubscribe.push(this.mixer.onEnded(() => this.endOfChart()));
 
     // NOTHING PAUSED WHEN THE THERAPIST LOOKED AWAY. A backgrounded tab stops getting animation
     // frames while the AudioContext clock keeps running, so the song ran on without the board: on
@@ -382,7 +456,7 @@ export class GameRunner {
   }
 
   private onInput(e: LaneInputEvent): void {
-    if (this.phase === 'ended' || this.phase === 'idle') return;
+    if (this.phase === 'ended' || this.phase === 'idle' || this.phase === 'finale') return;
     const hit = this.engine.handleInput(e);
     if (!hit) return;
     this.pushRecent(hit);
@@ -462,13 +536,114 @@ export class GameRunner {
     this.draw(songTime);
     this.emitHud(false);
 
-    if (this.phase === 'playing' && songTime >= this.endSongTime()) this.finish('chart');
+    if (this.phase === 'playing' && songTime >= this.endSongTime()) this.endOfChart();
+    else if (this.phase === 'finale') {
+      // WALL TIME, NOT SONG TIME. The mixer has stopped by now, so the audio clock is no longer the
+      // thing the patient is watching; `nowMs` is the runner's own injectable wall clock, which is
+      // also what lets a test (and the critic harness) step the whole sequence deterministically.
+      const wall = this.nowMs();
+      const dt = this.finaleLastWallMs === null ? 0 : Math.max(0, wall - this.finaleLastWallMs) / 1000;
+      this.finaleLastWallMs = wall;
+      this.highway.advanceFinale(dt);
+      if (this.highway.finaleDone()) this.finish('chart');
+    }
   }
 
   private endSongTime(): number {
     const notes = this.chart.notes;
     const lastNote = notes.length > 0 ? notes[notes.length - 1].time : 0;
     return Math.min(this.chart.durationSec, Math.max(lastNote + OUTRO_SEC, OUTRO_SEC));
+  }
+
+  /**
+   * THE CHART HAS RUN OUT — AND THAT IS NOT THE SAME EVENT AS "SHOW THE REPORT".
+   *
+   * It used to be. The song's last note landed, 1.5 s of empty highway went by, and the screen cut
+   * to a results grid: a score odometer that had been climbing for 97 seconds simply stopped
+   * existing, mid-climb. Every shipped rhythm game pays the player off at the end of a song, and
+   * this one has more reason to than most — the run IS the rehab session. So the chart ending now
+   * starts the ending (`Highway.startFinale`), the loop keeps drawing it, and `step()` hands over to
+   * the report when it is done or when anybody skips it.
+   *
+   * Reached from both chart-end paths (the clock passing `endSongTime`, and the mixer reporting the
+   * song over), whichever fires first; the second is a no-op.
+   */
+  private endOfChart(): void {
+    if (this.ended || this.phase === 'finale' || this.phase === 'ended' || this.phase === 'idle') return;
+    this.chartEndSongTime = this.engine.songTime();
+    this.phase = 'finale';
+    this.finaleLastWallMs = null;
+    this.highway.startFinale(this.finaleSpec());
+    this.watchFinaleSkip();
+    this.emitHud(true);
+  }
+
+  /** Everything the ending says, built from this run alone. See `Highway.FinaleSpec`. */
+  private finaleSpec(): FinaleSpec {
+    const r = this.engine.getScoreResults();
+    const judged = r.hits + r.misses;
+    const achievement = sessionAchievement({
+      reps: r.reps,
+      hits: r.hits,
+      judged,
+      maxCombo: r.maxCombo,
+      lanes: this.lanes.map((spec, i) => {
+        const peaks = this.laneReps[i]?.peaks ?? [];
+        return { name: clinicalLaneName(spec), bestPeak: peaks.length > 0 ? Math.max(...peaks) : null };
+      }),
+    });
+    const seconds = Math.max(0, Math.round(this.chartEndSongTime ?? this.engine.songTime()));
+    return {
+      title: 'SONG COMPLETE',
+      subtitle: this.opts.songTitle,
+      score: r.score,
+      // THE WORK FIRST, exactly as the report does it: movements performed leads, and the score
+      // above is the animation the patient was owed the end of, not the verdict on the session.
+      stats: [
+        // Short enough to fit a quarter of the card at 1024x768 — a label the layout has to clip
+        // ("MOVEMENTS PERFOR…") is not a label.
+        { value: String(r.reps), label: 'MOVEMENTS' },
+        { value: `${r.hits}/${judged}`, label: 'NOTES ANSWERED' },
+        { value: String(r.maxCombo), label: 'LONGEST RUN' },
+        { value: `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`, label: 'TIME MOVING' },
+      ],
+      achievement: achievement.text,
+      ...(achievement.note === undefined ? {} : { achievementNote: achievement.note }),
+      hint: 'Tap the screen or press any key for the report',
+    };
+  }
+
+  /**
+   * ANYTHING AT ALL SKIPS IT — a tap anywhere, any key.
+   *
+   * There is no controller in this app and the patient's hands may be the thing being measured, so
+   * a "press A to continue" prompt has nobody to press it. The therapist standing beside the tablet
+   * taps the screen. `Highway.finaleSkippable` holds the first half second so the last note landing
+   * is not eaten by a palm still resting on the glass.
+   */
+  private watchFinaleSkip(): void {
+    if (typeof window === 'undefined' || this.finaleSkipOff.length > 0) return;
+    const skip = () => this.skipFinale();
+    for (const type of ['keydown', 'pointerdown', 'touchstart'] as const) {
+      window.addEventListener(type, skip, { passive: true });
+      this.finaleSkipOff.push(() => window.removeEventListener(type, skip));
+    }
+  }
+
+  private stopWatchingFinaleSkip(): void {
+    for (const off of this.finaleSkipOff) off();
+    this.finaleSkipOff = [];
+  }
+
+  /**
+   * Cut the song-end sequence short and go to the report. Returns false while the skip guard is
+   * still up (see `Highway.finaleSkippable`) or when no sequence is playing.
+   */
+  skipFinale(): boolean {
+    if (this.phase !== 'finale') return false;
+    if (!this.highway.skipFinale()) return false;
+    this.finish('chart');
+    return true;
   }
 
   private draw(songTime: number): void {
@@ -527,7 +702,8 @@ export class GameRunner {
     // not scored, not recorded), so on those frames the receptor row's live gauge would be promising
     // a rep that cannot happen. The renderer is told, and blanks the row to "no reading". See
     // `RenderFrame.inputSuspended`.
-    f.inputSuspended = this.phase === 'paused' || this.phase === 'idle' || this.phase === 'ended';
+    f.inputSuspended =
+      this.phase === 'paused' || this.phase === 'idle' || this.phase === 'ended' || this.phase === 'finale';
     this.highway.draw(f);
   }
 
@@ -609,7 +785,19 @@ export class GameRunner {
       return;
     }
     this.ended = true;
-    const songTime = this.engine.songTime();
+    this.stopWatchingFinaleSkip();
+    /**
+     * ONCE THE CHART HAS RUN OUT, THE RUN IS COMPLETE — whatever happens during the ending.
+     *
+     * The song-end sequence holds the runner open for a few more seconds, and anything that ends a
+     * run arrives here: "End & see results" tapped over the payoff, the screen being left, the tab
+     * closing. None of those un-finish a song that finished. Before the sequence existed this was
+     * not expressible, because the chart ending WAS the end of the run; now it has to be said, or a
+     * completed session filed itself as 'interrupted' for the crime of being walked away from
+     * during its own celebration. The stored duration is the chart's end, not the celebration's.
+     */
+    if (this.chartEndSongTime !== null) reason = 'chart';
+    const songTime = this.chartEndSongTime ?? this.engine.songTime();
     const completed = reason === 'chart';
     this.phase = 'ended';
     this.endedAt = Date.now();
@@ -666,6 +854,7 @@ export class GameRunner {
     }
     for (const u of this.unsubscribe) u();
     this.unsubscribe = [];
+    this.stopWatchingFinaleSkip();
     this.mixer?.stop();
     if (this.opts.stopInputOnDispose) this.input.stop();
     this.phase = 'ended';

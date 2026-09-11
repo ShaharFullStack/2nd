@@ -13,7 +13,8 @@
 // Signal chain per stem: synthesis (drums / bass / keys / lead) → a fixed Schroeder reverb send
 // on keys and lead only (`reverbWet`; drums and bass stay dry so the timing reference the patient
 // plays against keeps its transients) → RMS-matched mastering with a tanh soft clipper and a peak
-// ceiling (`master`) → optional anti-aliased downsample (`--rate`) → 16-bit PCM.
+// ceiling (`master`) → optional anti-aliased downsample (`--rate`) + a gain-only rebalance that
+// restores the mastered RMS ratios at the shipped rate (`rebalanceAfterResample`) → 16-bit PCM.
 //
 // Everything here is deterministic (seeded PRNG, no RNG in the reverb) so re-running produces
 // identical files.
@@ -771,22 +772,61 @@ export function resample(buf, fromRate, toRate) {
   return out;
 }
 
+/**
+ * THE BALANCE IS A PROPERTY OF THE MIX, NOT OF THE RENDER RATE.
+ *
+ * `master()` puts the stems where the mix wants them — the player stem (drums) on top by ~2 dB,
+ * because the whole mechanic is that ducking it makes the patient's instrument audibly vanish.
+ * The anti-alias lowpass of a `--rate` build then takes energy out of the stems UNEQUALLY: the
+ * synthesized bass, keys and lead hold ~100 % of their energy below 4.6 kHz and lose nothing at
+ * all, while the drums — the only broadband stem, and the player stem — lose the hi-hat band and
+ * with it 0.9–1.3 dB of RMS. Left alone, a 16 kHz build ships demo-sunrise with the drums only
+ * 0.67 dB above the bass: the mastering's decision quietly undone by the delivery format.
+ *
+ * So after resampling every stem is scaled by `worstLoss / ownLoss`, which restores the RMS
+ * RATIOS the mastering chose exactly. Every gain is ≤ 1 by construction (`worstLoss` is the
+ * smallest), so no peak can be raised into the clipper: the whole song lands `worstLoss` quieter
+ * (≈1 dB) with the mix intact, which the master bus has headroom for either way.
+ */
+export function rebalanceAfterResample(resampled, originals) {
+  const loss = {};
+  let worst = 1;
+  for (const [id, buf] of Object.entries(resampled)) {
+    const before = rmsOf(originals[id]);
+    const after = rmsOf(buf);
+    loss[id] = before > 0 ? after / before : 1;
+    if (loss[id] < worst) worst = loss[id];
+  }
+  const gains = {};
+  for (const [id, buf] of Object.entries(resampled)) {
+    const g = Math.min(1, worst / Math.max(loss[id], 1e-12));
+    gains[id] = g;
+    if (g !== 1) for (let i = 0; i < buf.length; i++) buf[i] *= g;
+  }
+  return gains;
+}
+
 export function writeSong(outRoot, songId, opts = {}) {
   const rate = opts.rate ?? SR;
   const { manifest, stems } = renderSong(songId, opts);
   const dir = path.join(outRoot, songId);
   fs.mkdirSync(path.join(dir, 'stems'), { recursive: true });
   const written = [];
-  for (const [id, buf] of Object.entries(stems)) {
+  const resampled = {};
+  for (const [id, buf] of Object.entries(stems)) resampled[id] = resample(buf, SR, rate);
+  if (rate !== SR) rebalanceAfterResample(resampled, stems);
+  for (const [id, buf] of Object.entries(resampled)) {
     const file = path.join(dir, 'stems', `${id}.wav`);
-    fs.writeFileSync(file, encodeWav16(resample(buf, SR, rate), rate));
+    fs.writeFileSync(file, encodeWav16(buf, rate));
     written.push(file);
   }
   manifest.generated.sampleRate = rate;
   const manifestPath = path.join(dir, 'song.json');
   fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
   written.push(manifestPath);
-  return { manifest, written, mastering: masteringReport(stems) };
+  // The report describes the FILES, not the intermediate render: at a reduced rate the lowpass and
+  // the rebalance above both move the numbers a therapist would hear.
+  return { manifest, written, mastering: masteringReport(resampled) };
 }
 
 function parseArgs(argv) {
@@ -801,7 +841,7 @@ function parseArgs(argv) {
       if (!Number.isFinite(args.rate) || args.rate < 8000 || args.rate > SR) throw new Error('--rate expects 8000..44100 Hz');
     } else if (a === '--help' || a === '-h') {
       console.log('usage: gen-demo-stems.mjs [--out dir] [--song id|all] [--bars N] [--rate hz]');
-      console.log('  --rate 22050  low-bandwidth build (half the bytes) for slow clinic Wi-Fi; default 44100');
+      console.log('  --rate 16000  what public/songs ships (2.75x fewer bytes than 44100); --rate 44100 for a full-bandwidth build');
       process.exit(0);
     } else throw new Error(`unknown argument ${a}`);
   }

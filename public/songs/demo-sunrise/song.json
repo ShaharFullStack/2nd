@@ -40,7 +40,7 @@
   "generated": {
     "script": "scripts/gen-demo-stems.mjs",
     "seed": 7301,
-    "sampleRate": 44100,
+    "sampleRate": 16000,
     "channels": 1,
     "bitDepth": 16
   }

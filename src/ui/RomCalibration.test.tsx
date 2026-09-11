@@ -213,6 +213,15 @@ describe('storage that is not storing is said out loud', () => {
  * three of the four digits a therapist can now prescribe. Measuring the wrong finger's range and
  * filing it under this one is worse than measuring nothing.
  */
+describe('the screen that first puts a range into degrees says what kind of number it is', () => {
+  it('carries the scope statement beside the calibrated ranges', async () => {
+    render(<RomCalibrationScreen />);
+    const note = await screen.findByTestId('rom-scope');
+    expect(note.textContent).toMatch(/movement game/i);
+    expect(note.textContent).toMatch(/not a measuring instrument/i);
+  });
+});
+
 describe('the instruction names the prescribed digit', () => {
   it('reads out the little finger for a pinky lane, not "the fingertip"', async () => {
     render(<RomCalibrationScreen />);

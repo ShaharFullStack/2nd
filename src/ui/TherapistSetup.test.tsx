@@ -34,6 +34,7 @@ const fake = {
     fake.previewing = null;
   }),
   previewingSongId: vi.fn(() => fake.previewing),
+  prefetchSong: vi.fn(() => undefined),
 };
 
 vi.mock('../session/runtime.ts', () => ({ runtime: fake }));
@@ -44,6 +45,7 @@ beforeEach(() => {
   fake.previewing = null;
   fake.previewSong.mockClear();
   fake.stopPreview.mockClear();
+  fake.prefetchSong.mockClear();
   localStorage.clear();
   useStore.setState({
     screen: 'setup',
@@ -64,6 +66,37 @@ beforeEach(() => {
 });
 
 afterEach(cleanup);
+
+describe('the song downloads before the patient is waiting for it', () => {
+  it('prefetches the prescribed song when the prescription is committed', async () => {
+    // Every byte of the song used to be fetched after Start, with the patient in position: 34 MB and
+    // 38.7 s to the first note on a throttled clinic link. A camera session goes camera check → ROM →
+    // latency first, which is minutes of work the download can happen inside.
+    render(<TherapistSetup />);
+    await screen.findByTestId('setup-start');
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('setup-start'));
+    });
+    expect(fake.prefetchSong).toHaveBeenCalledWith('demo-groove');
+  });
+
+  it('prefetches the SELECTED song once the choice has settled, not every song scrolled past', async () => {
+    vi.useFakeTimers();
+    try {
+      render(<TherapistSetup />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0); // the catalog resolves
+      });
+      expect(fake.prefetchSong).not.toHaveBeenCalled(); // not on the first paint
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1500);
+      });
+      expect(fake.prefetchSong).toHaveBeenCalledWith('demo-groove');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
 
 describe('song audition', () => {
   it('offers a Listen button per playable song and says where it plays from', async () => {
@@ -114,6 +147,7 @@ describe('song audition', () => {
       fireEvent.click(button);
     });
     fake.stopPreview.mockClear();
+  fake.prefetchSong.mockClear();
     await act(async () => {
       fireEvent.click(screen.getByTestId('setup-start'));
     });
@@ -125,6 +159,7 @@ describe('song audition', () => {
     const view = render(<TherapistSetup />);
     await screen.findByTestId('preview-demo-groove');
     fake.stopPreview.mockClear();
+  fake.prefetchSong.mockClear();
     view.unmount();
     expect(fake.stopPreview).toHaveBeenCalled();
   });
@@ -309,5 +344,62 @@ describe('the device-test record is not a patient', () => {
     render(<TherapistSetup />);
     expect(screen.getByTestId('setup-start').hasAttribute('disabled')).toBe(false);
     expect(screen.queryByTestId('setup-device-test-block')).toBeNull();
+  });
+});
+
+/**
+ * IDENTITY FAILS CLOSED ON THIS SCREEN, because it is the last one before a recording exists.
+ *
+ * Driven as two real tabs in one browser: tab 2 deleted the patient tab 1 had in the chair. Tab 1
+ * then showed "No patient selected" in red — and an ENABLED "Set up camera →", because the guard read
+ * `activePatientId === null` and the id was still there, just naming nobody. A camera session started
+ * from that button was filed under the dead id: invisible in the patient picker, unreachable from
+ * History (which offered no route to it), impossible to move. A warning banner beside an enabled
+ * Start is not failing closed; the question the button has to answer is whether there is a record to
+ * file this session against, and that is a lookup, not a null check.
+ */
+describe('a patient id that names nobody is no patient at all', () => {
+  const dangling = () =>
+    useStore.setState({
+      patients: [{ id: 'someone-else', name: 'Someone Else', createdAt: 1, lastUsedAt: 1 }],
+      activePatientId: 'p-deleted-in-another-tab',
+      activePatientNotice: 'Ann Reyes was deleted in another tab. Choose who this session is for before recording it.',
+      inputMode: 'camera',
+    });
+
+  it('disables the primary button whenever the app is saying "No patient selected"', () => {
+    dangling();
+    render(<TherapistSetup />);
+    // The two halves of the contradiction the review found, now agreeing.
+    expect(screen.getByTestId('patient-banner-none')).toBeTruthy();
+    expect(screen.getByTestId('setup-start').hasAttribute('disabled')).toBe(true);
+  });
+
+  it('disables the bottom Start too — both buttons read the one guard', () => {
+    dangling();
+    render(<TherapistSetup />);
+    const starts = screen.getAllByRole('button', { name: /set up camera/i });
+    expect(starts).toHaveLength(2);
+    for (const b of starts) expect(b.hasAttribute('disabled')).toBe(true);
+  });
+
+  it('does not offer to confirm a patient who is not there — only to choose one', () => {
+    dangling();
+    render(<TherapistSetup />);
+    expect(screen.getByTestId('active-patient-notice').textContent).toMatch(/deleted in another tab/i);
+    expect(screen.queryByTestId('active-patient-ack')).toBeNull();
+    expect(screen.getByTestId('active-patient-change')).toBeTruthy();
+  });
+
+  it('still offers "It is the right patient" when there IS one — a rename next door', () => {
+    useStore.setState({
+      patients: [{ id: 'p-test', name: 'Ann R. Reyes', createdAt: 1, lastUsedAt: 1 }],
+      activePatientId: 'p-test',
+      activePatientNotice: 'Ann Reyes was renamed to Ann R. Reyes in another tab.',
+      inputMode: 'camera',
+    });
+    render(<TherapistSetup />);
+    expect(screen.getByTestId('active-patient-ack')).toBeTruthy();
+    expect(screen.getByTestId('setup-start').hasAttribute('disabled')).toBe(false);
   });
 });

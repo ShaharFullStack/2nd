@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import type { CSSProperties } from 'react';
 import type { SongManifest } from '../audio/manifest.ts';
 import { DIFFICULTIES, windowsForLanes } from '../engine/difficulty.ts';
 import { AutoplayInput } from '../input/AutoplayInput.ts';
@@ -9,6 +10,7 @@ import { GameRunner } from '../session/GameRunner.ts';
 import type { HudSnapshot } from '../session/GameRunner.ts';
 import { SILENT_GRID, buildSessionChart, songGridOf } from '../session/chart.ts';
 import { buildSessionResult } from '../session/results.ts';
+import { TRACKING_SAMPLE_MS, TrackingRecorder } from '../session/tracking.ts';
 import { runtime } from '../session/runtime.ts';
 import { useStore } from '../state/store.ts';
 import {
@@ -103,6 +105,59 @@ const PIP_REARM_LINE = PIP_LOCK_CAP;
  * "lower to reset" chevron is cased.
  */
 const PIP_LINE_CASING = '0 0 0 1px rgba(3, 6, 14, 0.88)';
+/** `.pip-meters` height in index.css — reserved out of the panel before the warning is capped. */
+const PIP_METERS_HEIGHT = 62;
+/**
+ * THE THUMBNAIL'S FLOOR, in pixels, reserved out of the panel beside the meters.
+ *
+ * The live camera view is not decoration on this screen: most of the warnings that appear above it
+ * are about FRAMING and tracking ("out of frame", "only 11 fps", "no reading from this lane"), and
+ * the thumbnail is the only thing in the app that lets the therapist fix framing without stopping the
+ * song. With the warning block up it was measured at ZERO px on both clinic-tablet sizes — the panel
+ * spent its height on 240 px of static legend it then cut off mid-sentence. Static legend text is
+ * read once; the camera framing and the meters are live. So the meters are reserved first, the
+ * thumbnail second, and the legend takes whatever is left (it scrolls).
+ */
+const PIP_VIDEO_MIN = 96;
+/**
+ * The panel height assumed when there is no renderer box yet (fallback geometry only). Chosen so the
+ * warning cap works out at the 180 px this screen used before the box existed.
+ */
+const PIP_FALLBACK_PANEL = 462;
+
+/**
+ * THE PIP PANEL'S HEIGHT, SPENT IN THE ORDER THE TWO PEOPLE IN THE ROOM NEED IT.
+ *
+ * Four things share a clipped column and two of them are LIVE: the lane meters the patient steers by
+ * and the camera thumbnail the therapist frames by. The split is computed from the panel's own
+ * measured box rather than left to flex to discover, because the failure it replaces was exactly a
+ * cap flex could not enforce (`max-height: 46%` against a parent whose height is only a max-height
+ * resolves to nothing, so a pile of warnings pushed everything else out of the clipped panel).
+ *
+ *   1. the METERS keep `PIP_METERS_HEIGHT` and never give way (`.pip-meters { flex: none }`);
+ *   2. the THUMBNAIL keeps `PIP_VIDEO_MIN`, capped at 40 % of what the meters leave — most of the
+ *      warnings above it are about FRAMING, and this is the only way to fix framing mid-song;
+ *   3. the WARNINGS get at most 45 % of that room and never more than what is left after (2), and
+ *      scroll inside it with a count pinned on top;
+ *   4. the LEGEND — static text, read once — gets the remainder and scrolls (`.pip-note`).
+ *
+ * THE INVARIANT: `alertsMaxHeight + videoMinPx + PIP_METERS_HEIGHT <= panel`, at every panel height,
+ * so no reservation can push the meters out of the bottom of a box with `overflow: hidden`.
+ *
+ * `panelMaxHeight` is `OverlayPanelBox.maxHeight` — the room between the panel's bottom edge and the
+ * top of the canvas. `null`, or a box too small to hold the meters (a canvas not laid out yet reports
+ * 0), is not a measurement of this panel and falls back rather than resolving every term to zero.
+ */
+export function pipPanelBudget(panelMaxHeight: number | null): { alertsMaxHeight: number; videoMinPx: number } {
+  const panel =
+    panelMaxHeight !== null && Number.isFinite(panelMaxHeight) && panelMaxHeight > PIP_METERS_HEIGHT
+      ? Math.round(panelMaxHeight)
+      : PIP_FALLBACK_PANEL;
+  const room = Math.max(0, panel - PIP_METERS_HEIGHT);
+  const videoMinPx = Math.min(PIP_VIDEO_MIN, Math.max(0, Math.round(room * 0.4)));
+  const alertsMaxHeight = Math.max(0, Math.min(Math.max(56, Math.round(room * 0.45)), room - videoMinPx));
+  return { alertsMaxHeight, videoMinPx };
+}
 
 /**
  * Bar slot → index into `getLaneStates()`, resolved by `LaneState.lane` exactly the way the receptor
@@ -412,6 +467,17 @@ export default function PlayScreen() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const pipRef = useRef<HTMLDivElement>(null);
   const runnerRef = useRef<GameRunner | null>(null);
+  /**
+   * HOW WELL THE CAMERA TRACKED THIS RUN, accumulated while it happens.
+   *
+   * The record used to carry the measurements and nothing about the conditions they were taken in:
+   * a range from a 12 fps stream with the limb drifting out of frame and one from a clean 30 fps
+   * stream were the same number on the same trend. This samples the input layer's own health report
+   * (the poll that already drives the live warnings) and `buildSessionResult` stores the summary.
+   */
+  const trackingRef = useRef(new TrackingRecorder());
+  /** The runner's phase, for the sampler: conditions are recorded WHILE THE SONG PLAYS, not before it. */
+  const phaseRef = useRef<string>('idle');
 
   const [hud, setHud] = useState<HudSnapshot | null>(null);
   const [phase, setPhase] = useState<'loading' | 'running' | 'error' | 'blocked' | 'camera'>('loading');
@@ -523,6 +589,10 @@ export default function PlayScreen() {
     let lastKey = '';
     const poll = (): void => {
       const status = src.getStatus();
+      // The conditions the session's own figures are measured in, sampled from the same report the
+      // therapist is being shown. Only while the song is running: the seconds spent on the count-in
+      // (or paused, with the patient resting) are not the session's tracking quality.
+      if (phaseRef.current === 'playing') trackingRef.current.sample(status);
       const faults = faultedLanes(status);
       runnerRef.current?.highway.setLaneFaults(faults);
       const words = status.warnings ?? [];
@@ -532,7 +602,7 @@ export default function PlayScreen() {
       setLiveWarnings(words.slice());
     };
     poll();
-    const id = setInterval(poll, 500);
+    const id = setInterval(poll, TRACKING_SAMPLE_MS);
     return () => {
       clearInterval(id);
       runnerRef.current?.highway.setLaneFaults(null);
@@ -544,6 +614,10 @@ export default function PlayScreen() {
     let ownedInput: InputSource | null = null;
 
     const boot = async () => {
+      // A FRESH RECORD OF THE CONDITIONS FOR EVERY RUN — "Play again" on the same mounted screen must
+      // not file the second song's figures under the first song's tracking.
+      trackingRef.current = new TrackingRecorder();
+      phaseRef.current = 'idle';
       const st = useStore.getState();
       const config = st.config();
       const settings = st.settings;
@@ -672,6 +746,7 @@ export default function PlayScreen() {
         hudIntervalMs: 200,
         onHud: (h) => {
           setHud(h);
+          phaseRef.current = h.phase;
           setPaused(h.phase === 'paused');
         },
         /**
@@ -696,6 +771,9 @@ export default function PlayScreen() {
             inputMode: store.inputMode,
             latencyOffsetSec: inputMode === 'camera' ? store.latencyOffsetSec : 0,
             calibrations: store.calibrations,
+            // THE CONDITIONS THE MEASUREMENT WAS TAKEN IN. Null for a keyboard or autoplay run (no
+            // camera to describe, no samples taken), which the record stores as "not recorded".
+            tracking: trackingRef.current.summary(),
           });
           store.addResult(result);
           // NOT an unconditional `goto`. Only a run that ENDED WHILE THE SCREEN WAS ALIVE hands over
@@ -781,21 +859,21 @@ export default function PlayScreen() {
   if (phase === 'camera') return <CameraFallback error={cameraError} onRetry={retryCamera} retries={attempt} />;
 
   const countdown = hud?.countdown ?? 0;
-  /**
-   * The panel's box, from the renderer (see `pipBox`). `maxHeight` is the room between its bottom
-   * edge and the top of the canvas: `.pip` is a column flex box whose video is the only item
-   * allowed to shrink, so on a short landscape canvas the camera thumbnail loses a few rows rather
-   * than the lane meters or their legend being clipped — the legend is the mark that stops a violet
-   * cap needing a verbal gloss.
-   */
-  const pipStyle = pipBox
-    ? {
-        left: Math.round(pipBox.left),
-        bottom: Math.round(pipBox.bottom),
-        width: Math.round(pipBox.width),
-        maxHeight: Math.round(pipBox.maxHeight),
-      }
-    : undefined;
+  const { alertsMaxHeight, videoMinPx: pipVideoMin } = pipPanelBudget(pipBox ? pipBox.maxHeight : null);
+  const pipStyle = {
+    ...(pipBox
+      ? {
+          left: Math.round(pipBox.left),
+          bottom: Math.round(pipBox.bottom),
+          width: Math.round(pipBox.width),
+          maxHeight: Math.round(pipBox.maxHeight),
+        }
+      : {}),
+    // Read by `.pip-video { min-height: var(--pip-video-min) }`: a pixel floor, because a percentage
+    // against a parent whose height is only a max-height resolves to nothing — the exact bug that
+    // made the old `max-height: 46%` warning cap a no-op.
+    '--pip-video-min': `${pipVideoMin}px`,
+  } as CSSProperties;
 
   return (
     <div className="play-root">
@@ -835,7 +913,19 @@ export default function PlayScreen() {
                 looking at — above the thumbnail, because the thumbnail is the only thing here worth
                 less than a reason the session is not scoring. */}
             {liveWarnings.length > 0 && (
-              <div className="pip-alerts" data-testid="play-alerts" role="status">
+              <div
+                className="pip-alerts"
+                data-testid="play-alerts"
+                role="status"
+                style={{ maxHeight: alertsMaxHeight }}
+              >
+                {/* The count, pinned, because the block is now bounded: a sentence below the fold has
+                    to be a KNOWN unread one, not a hidden one. */}
+                {liveWarnings.length > 1 && (
+                  <p className="pip-alerts-count" data-testid="play-alerts-count">
+                    ⚠ {liveWarnings.length} input problems — scroll
+                  </p>
+                )}
                 {liveWarnings.map((w, i) => (
                   <p key={w} data-testid={`play-alert-${i}`}>
                     {w}

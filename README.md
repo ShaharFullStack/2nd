@@ -117,6 +117,40 @@ feeding the engine, and reads the live Web Audio gains to confirm the missing la
 instrument dips in proportion, that no other lane's instrument moves with it, and that the
 rest of the band keeps going.
 
+### Time to the first note
+
+The stems are the whole weight of a session, and they used to be fetched after the therapist
+pressed Start, with the patient already in position. Measured against the production build over
+a throttled 8 Mbit/s link with 40 ms latency (Home → Leg → Start, autoplay, cold cache):
+
+| | bytes after Start | Start → first note |
+| --- | --- | --- |
+| before | 34.2 MB | 38.7 s |
+| after — stems at 16 kHz | 12.4 MB | 17.0 s |
+| after — and the song prefetched while the prescription is written (20 s on Setup) | 0 MB | 4.1 s |
+
+Two changes, both measured the same way:
+
+1. **The committed demo stems are rendered at 16 kHz** (`node scripts/gen-demo-stems.mjs --rate
+   16000`) instead of 44.1 kHz — 12.4 MB instead of 34.2 MB for demo-groove. What that trades:
+   the anti-alias lowpass sits at 6.7 kHz, and the synthesized bass, keys and lead hold
+   100.00 %, 100.00 % and 99.97 % of their energy below it, so they are untouched; the drums —
+   the only broadband stem — lose the hi-hat air above it, 11 % of that stem's energy (0.9–1.3 dB
+   of RMS). The hats still read as hats and the kick/snare are unchanged; what is gone is the
+   shimmer. The generator re-matches the stems to each other AFTER resampling
+   (`rebalanceAfterResample`), so the mix the mastering chose — player stem 2 dB on top, which is
+   what makes the ducking cue audible — is identical at either rate. `--rate 44100` builds the
+   full-bandwidth version back.
+2. **The song downloads while the prescription is being written** (`runtime.prefetchSong`, called
+   from the Setup screen once the choice settles and again when Start is pressed). A camera
+   session then has a camera check and two calibrations to download inside, and the Play screen's
+   progress bar joins the load already running rather than starting a second one.
+
+The remaining lever is a compressed format, which this repo cannot reach: Node ships no
+Vorbis/Opus/MP3 encoder, no dependency may be added, and the ranged audition
+(`src/session/audition.ts`) slices linear-PCM WAV arithmetically — a compressed container would
+send every "Listen" press back to a full download.
+
 Measured on this build: 59 fps median with one dropped frame in 118, audio-to-render clock
 drift under 4 ms over 3 seconds, and — on a two-lane session on a four-stem song — lane 1
 on `drums`, lane 2 on `bass`, `keys` and `lead` playing throughout, and the missing lane's
@@ -130,3 +164,33 @@ the results screen are session telemetry for a clinician to interpret, not clini
 measurements. The engine deliberately never penalises extra movement — a patient with
 tremor or spasticity should not lose points for their symptoms — and a song can never be
 failed out of.
+
+**And it does not only say so here.** This paragraph used to be the only place the scope was
+stated, while the app itself presented joint angles, ranges, timing bias in milliseconds and
+six-week trends. The statement now lives with the numbers: one line (`SCOPE_STATEMENT`, in
+`src/session/results.ts`, rendered by `src/ui/ScopeNote.tsx`) under the range card on Results,
+on the History screen, under the per-movement trend, and on the ROM calibration screen where a
+range is first put into degrees — and in **every exported record**, as the first field of the
+JSON and a `SCOPE:` line in the readable text. It is never a dialog and there is nothing to
+dismiss: a therapist runs several sessions a day, and a modal is read once.
+
+### How well was it measured?
+
+A range measured from a 12 fps stream with the limb half out of frame is not the same number as
+one from a clean 30 fps stream, and until recently the record could not tell them apart. Every
+camera session now stores the conditions it was measured in (`SessionResult.tracking`, built by
+`src/session/tracking.ts` from the input layer's own health report, sampled twice a second while
+the song plays):
+
+* median and 10th-percentile processed frame rate, and the median inference time per frame;
+* the share of the session in which every prescribed lane had usable landmarks;
+* the inference backend (`CPU` means the machine had no graphics acceleration);
+* the commonest reason tracking was not OK.
+
+From that the screens state the uncertainty they can actually derive — never an invented error
+bar: **timing is resolved no finer than one camera frame** (33 ms at 30 fps, 83 ms at 12 fps),
+and **a range is the peak of the frames that arrived**, so it is a lower bound. Results and the
+session table grade each session `good` / `fair` / `poor`; the trend says how many of the
+sessions behind its lines were measured on a degraded stream, because a difference between two
+sessions measured differently is partly the equipment. A session with no tracking block (every
+record written before this existed) reads as *not recorded*, never as a clean stream.

@@ -109,10 +109,24 @@ export function clampLaneRestSec(sec: number): number {
   return Math.round(clamped * 1000) / 1000;
 }
 
-/** Reps per minute a pacing floor allows in one lane. */
+/** Reps per minute a pacing floor allows in ONE LANE — one movement, one side. */
 export function repsPerMinuteAt(restSec: number): number {
   const s = clampLaneRestSec(restSec);
   return 60 / s;
+}
+
+/**
+ * Reps per minute a pacing floor allows for ONE LIMB, which is not the same number.
+ *
+ * The floor is a per-LANE floor: it is the rest between two reps of the same movement. A limb
+ * carrying two lanes (the bilateral-ish prescription "left knee extension AND left ankle
+ * dorsiflexion", or two fingertips on one hand) can be asked for a rep in each of them inside that
+ * rest, so its ceiling is the lane ceiling times the number of lanes on it. Quoting the lane figure
+ * as the limb's understates what the limb is being asked for by exactly that factor.
+ */
+export function limbRepsPerMinuteAt(restSec: number, lanesOnLimb: number): number {
+  const n = Math.max(1, Math.floor(lanesOnLimb));
+  return repsPerMinuteAt(restSec) * n;
 }
 
 /**
@@ -130,16 +144,52 @@ export interface ChartDose {
   spanSec: number;
   /** Mean reps asked of one lane. */
   repsPerLane: number;
-  /** Reps per minute in the busiest lane — the rate ONE limb works at. */
+  /** Reps per minute in the busiest LANE — one movement on one side, not a limb's total. */
   repsPerMinPerLane: number;
+  /**
+   * The dose grouped by LIMB — the thing a therapist prescribes for — busiest first. With no
+   * grouping supplied each lane is its own limb, which is the one case where limb and lane agree.
+   */
+  perLimb: LimbDose[];
+  /** Reps asked of the busiest LIMB: the SUM of the lanes on it, not the biggest of them. */
+  repsPerBusiestLimb: number;
+  /** Reps per minute asked of the busiest limb — the rate ONE limb works at. */
+  repsPerMinPerLimb: number;
+  /** Lanes prescribed on the busiest limb (1 unless a limb carries more than one movement). */
+  lanesOnBusiestLimb: number;
   /** Reps per minute across every lane — the rate the patient works at. */
   totalRepsPerMin: number;
   /** Shortest gap between two notes in the same lane (seconds); Infinity when no lane has two. */
   minLaneGapSec: number;
 }
 
-/** Measure the dose of a chart (see `ChartDose`). Pure; safe to call from a render. */
-export function chartDose(chart: Pick<Chart, 'notes' | 'lanes'>): ChartDose {
+/**
+ * One limb's share of the dose.
+ *
+ * A LIMB IS NOT A LANE. The prescription "left knee extension + left ankle dorsiflexion" puts two
+ * lanes on one leg, and that leg is asked for the sum of both — the figure the Setup screen used to
+ * print as "reps per minute, each limb" was the busiest single LANE, which understates a two-lane
+ * limb by a factor of the lanes on it. That is the number a therapist doses from.
+ */
+export interface LimbDose {
+  /** Whatever key the caller grouped by — the app groups by side ('left' / 'right'). */
+  key: string;
+  /** Lane indices prescribed on this limb. */
+  laneIndices: number[];
+  /** Reps asked of this limb: the SUM of its lanes. */
+  reps: number;
+  /** Reps per minute asked of this limb, over the working span of the song. */
+  repsPerMin: number;
+}
+
+/**
+ * Measure the dose of a chart (see `ChartDose`). Pure; safe to call from a render.
+ *
+ * `limbOfLane[i]` names the limb lane `i` is prescribed on (the app passes `LaneSpec.side`), and is
+ * what turns a per-lane count into the per-limb dose. Omit it and every lane is treated as its own
+ * limb, which is true only when no two lanes share a side.
+ */
+export function chartDose(chart: Pick<Chart, 'notes' | 'lanes'>, limbOfLane?: readonly string[]): ChartDose {
   const lanes = Math.max(1, Math.floor(chart.lanes));
   const perLane = new Array<number>(lanes).fill(0);
   const lastTime = new Array<number>(lanes).fill(Number.NaN);
@@ -161,6 +211,18 @@ export function chartDose(chart: Pick<Chart, 'notes' | 'lanes'>): ChartDose {
   const spanSec = Number.isFinite(first) && last > first ? last - first : 0;
   const minutes = spanSec / 60;
   const busiest = perLane.reduce((a, b) => Math.max(a, b), 0);
+  // Grouped by limb, in first-lane order, then sorted by the work each limb is asked for.
+  const byLimb = new Map<string, LimbDose>();
+  for (let i = 0; i < lanes; i++) {
+    const key = limbOfLane?.[i] ?? `lane ${i + 1}`;
+    const entry = byLimb.get(key) ?? { key, laneIndices: [], reps: 0, repsPerMin: 0 };
+    entry.laneIndices.push(i);
+    entry.reps += perLane[i];
+    byLimb.set(key, entry);
+  }
+  const perLimb = [...byLimb.values()].map((l) => ({ ...l, repsPerMin: minutes > 0 ? l.reps / minutes : 0 }));
+  perLimb.sort((a, b) => b.reps - a.reps);
+  const busiestLimb = perLimb[0] ?? null;
   return {
     notes,
     lanes,
@@ -168,6 +230,10 @@ export function chartDose(chart: Pick<Chart, 'notes' | 'lanes'>): ChartDose {
     spanSec,
     repsPerLane: perLane.reduce((a, b) => a + b, 0) / lanes,
     repsPerMinPerLane: minutes > 0 ? busiest / minutes : 0,
+    perLimb,
+    repsPerBusiestLimb: busiestLimb?.reps ?? 0,
+    repsPerMinPerLimb: busiestLimb?.repsPerMin ?? 0,
+    lanesOnBusiestLimb: busiestLimb?.laneIndices.length ?? 0,
     totalRepsPerMin: minutes > 0 ? notes / minutes : 0,
     minLaneGapSec: minGap,
   };

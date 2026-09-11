@@ -375,23 +375,42 @@ table.table tr:hover td { background: rgba(255, 255, 255, 0.03); }
   background: rgba(8, 11, 20, 0.8);
   overflow: hidden;
   backdrop-filter: blur(6px);
-  /* The video is the only item that may give way when the panel is capped: the lane meters are the
-     biofeedback and the note under them is their legend. */
+  /* WHAT GIVES WAY FIRST, AND WHAT NEVER DOES. Two of the four things in this column are LIVE — the
+     lane meters the patient steers by and the camera thumbnail the therapist frames by — and one,
+     the legend, is static text read once. So the legend is what the panel spends when it runs out of
+     height (see `.pip-note`), the thumbnail holds a floor set from the panel's measured box
+     (Play.tsx `PIP_VIDEO_MIN` → `--pip-video-min`), and the meters never move. */
   display: flex;
   flex-direction: column;
 }
 .pip video { width: 100%; display: block; transform: scaleX(-1); background: #000; }
-.pip-video { display: block; line-height: 0; flex: 0 1 auto; min-height: 0; overflow: hidden; }
+/* The thumbnail fills the height it is given and letterboxes rather than cropping the patient out of
+   its own frame — this view is used to judge FRAMING, so what is at the edges has to be visible. */
+.pip-video video { height: 100%; object-fit: contain; }
+/* `min-height` is a PIXEL floor handed down from Play.tsx: at the sizes a clinic tablet runs, a
+   warning block used to take the thumbnail to 0 px for as long as it stood, and framing is exactly
+   what most of those warnings are about. The floor is capped at 40 % of the panel's room before it
+   is applied, so it can never push the meters out of a box that clips. */
+.pip-video { display: block; line-height: 0; flex: 1 1 auto; min-height: var(--pip-video-min, 0px); overflow: hidden; }
 .pip-meters { display: flex; gap: 8px; height: 62px; padding: 8px; align-items: stretch; flex: none; }
-.pip-note { padding: 6px 10px 10px; font-size: 0.82rem; color: var(--dim); flex: none; }
+/* Shrink factor 200 against the thumbnail's 1: the LEGEND is what a squeezed panel spends. It is
+   static text, it is read once, and it scrolls inside whatever it is left with — while the thumbnail
+   and the meters are live readings the two people in the room are acting on. */
+.pip-note { padding: 6px 10px 10px; font-size: 0.82rem; color: var(--dim); flex: 0 200 auto; min-height: 0; overflow-y: auto; }
 /* Live input-layer warnings (src/ui/Play.tsx): the reason a lane's receptor has gone to "no
-   reading", in words, for the therapist. Above the camera thumbnail and not shrinkable — the
-   thumbnail is the only thing in this panel worth less than a reason the session is not scoring —
-   but capped and scrollable so a pile-up of watchdog sentences cannot squeeze out the lane meters
-   underneath it. */
+   reading", in words, for the therapist.
+   THE PATIENT KEEPS THE METERS WHILE A WARNING IS UP. This block used to be `flex: 0 0 auto` with
+   `max-height: 46%` — and a percentage height against a parent whose own height is only a max-height
+   resolves to NOTHING, so the cap never applied: five watchdog sentences measured 752 px inside a
+   653 px panel and pushed the thumbnail, the lane meters AND their legend out of the clipped panel
+   for as long as the warning stood (measured at 1024×768, 1280×800 and 1920×1080). So: the cap is a
+   PIXEL cap computed from the panel's own measured box (Play.tsx `alertsMaxHeight`), this block may
+   shrink (`flex: 0 1 auto`) and scrolls inside whatever it gets, and it keeps a two-line floor so
+   the warning cannot vanish either. Both things the review asked for are structural now, not
+   dependent on how many sentences the input layer has to say. */
 .pip-alerts {
-  flex: 0 0 auto;
-  max-height: 46%;
+  flex: 0 1 auto;
+  min-height: 2.6em;
   overflow-y: auto;
   padding: 8px 10px;
   font-size: 0.8rem;
@@ -401,6 +420,16 @@ table.table tr:hover td { background: rgba(255, 255, 255, 0.03); }
   border-bottom: 1px solid var(--line);
 }
 .pip-alerts p { margin: 0 0 6px; }
+/* How many there are, so a scrolled-out sentence is a known unread one rather than a hidden one. */
+.pip-alerts .pip-alerts-count {
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  position: sticky;
+  top: -8px;
+  margin: -8px -10px 6px;
+  padding: 6px 10px;
+  background: rgba(96, 16, 26, 0.96);
+}
 .pip-alerts p:last-child { margin-bottom: 0; }
 
 .lower-third {

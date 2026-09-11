@@ -59,6 +59,7 @@ const fake = {
     fake.previewing = null;
   }),
   previewingSongId: vi.fn(() => fake.previewing),
+  prefetchSong: vi.fn(() => undefined),
 };
 
 vi.mock('../session/runtime.ts', () => ({ runtime: fake }));

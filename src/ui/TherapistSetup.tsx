@@ -9,13 +9,14 @@ import {
   chartDose,
   clampLaneRestSec,
   generateChartDetailed,
+  limbRepsPerMinuteAt,
   repsPerMinuteAt,
 } from '../charts/generate.ts';
 import { DIFFICULTIES, DIFFICULTY_NAMES, windowsFor } from '../engine/difficulty.ts';
 import { FINGERTIPS } from '../engine/types.ts';
 import type { DifficultyName, Fingertip, LaneSpec, Side } from '../engine/types.ts';
 import { SILENT_GRID, songGridOf } from '../session/chart.ts';
-import { formatDuration } from '../session/results.ts';
+import { formatDuration, limbLabel } from '../session/results.ts';
 import { runtime } from '../session/runtime.ts';
 import { MAX_LANES, MIN_LANES, laneFingertip, movementsFor, useStore } from '../state/store.ts';
 import { MOVEMENT_INFO, laneConflicts, movementInstructions } from '../vision/features.ts';
@@ -74,6 +75,9 @@ export default function TherapistSetup() {
   const seed = useStore((s) => s.seed);
   const laneRestSec = useStore((s) => s.laneRestSec);
   const setLaneRestSec = useStore((s) => s.setLaneRestSec);
+  /** Set when the patient in this tab's chair was not put there by this tab (see the banner below). */
+  const activePatientNotice = useStore((s) => s.activePatientNotice);
+  const acknowledgeActivePatient = useStore((s) => s.acknowledgeActivePatient);
 
   const [catalog, setCatalog] = useState<SongEntry[] | null>(null);
   const [catalogError, setCatalogError] = useState<string | null>(null);
@@ -92,6 +96,25 @@ export default function TherapistSetup() {
       alive = false;
     };
   }, [songId, setSong]);
+
+  /**
+   * THE SELECTED SONG DOWNLOADS WHILE THE PRESCRIPTION IS BEING WRITTEN.
+   *
+   * The stems are the whole weight of a session (12 MB for demo-groove, and 34 MB before they were
+   * regenerated at 16 kHz): fetched after Start, they are a progress bar the patient sits through.
+   * Nothing on this screen needs them, and by the time it is left the song is decided — so the load
+   * runs against the seconds the therapist spends choosing movements, difficulty and pacing.
+   *
+   * Settled selection only (a ~1.2 s pause after the last change), so flicking through the catalogue
+   * starts one download rather than four; `prefetchSong` itself declines while an audition is in
+   * flight and is idempotent per song, so this can fire as often as it likes.
+   */
+  useEffect(() => {
+    const entry = catalog?.find((e) => e.id === songId);
+    if (!entry || entry.status !== 'ready') return;
+    const id = setTimeout(() => runtime.prefetchSong(entry.id), 1200);
+    return () => clearTimeout(id);
+  }, [catalog, songId]);
 
   /**
    * Which audition request is the current one. Loading a song's stems is async, so two quick clicks
@@ -216,8 +239,19 @@ export default function TherapistSetup() {
   // No patient is as blocking as a lane conflict: this is the last screen before a recording, and a
   // session with nobody to record it against has nowhere honest to go.
   const activePatientId = useStore((s) => s.activePatientId);
-  const activePatient = useStore((s) => s.patients).find((p) => p.id === activePatientId) ?? null;
-  const noPatient = activePatientId === null;
+  const patients = useStore((s) => s.patients);
+  const activePatient = patients.find((p) => p.id === activePatientId) ?? null;
+  /**
+   * NO PATIENT MEANS NOBODY IN THE LIST, NOT "THE SLOT IS EMPTY".
+   *
+   * This used to read `activePatientId === null`, which misses the state a second tab creates: delete
+   * the patient next door and this tab is left holding an id that names nobody. The banner said "No
+   * patient selected" in red while THIS button stayed enabled, and the camera session behind it was
+   * filed under the dead id — invisible in the patient list, unreachable from History, unmoveable.
+   * The question the Start button has to answer is "is there a real record to file this against",
+   * and the only honest way to ask it is to look the id up.
+   */
+  const noPatient = activePatient === null;
   // The built-in device-test record is not a person. A keyboard/autoplay run belongs there; a CAMERA
   // run measures somebody's range of motion and must never be filed into a bucket shared by every
   // demo this tablet has ever run. Refused here exactly as a missing patient is.
@@ -243,11 +277,22 @@ export default function TherapistSetup() {
       const result = generateChartDetailed(grid, lanes.length, difficulty, seed, {
         minLaneSpacingSec: clampLaneRestSec(laneRestSec),
       });
-      return { ...chartDose(result.chart), warnings: result.warnings, silent: !selected?.manifest };
+      // GROUPED BY LIMB, because that is the unit the dose is prescribed in: a limb carrying two
+      // lanes is asked for the sum of both, and quoting one lane's figure as the limb's was wrong by
+      // the number of lanes on it.
+      return {
+        ...chartDose(result.chart, lanes.map((l) => l.side)),
+        warnings: result.warnings,
+        silent: !selected?.manifest,
+      };
     } catch {
       return null;
     }
-  }, [selected, lanes.length, difficulty, seed, laneRestSec]);
+  }, [selected, lanes, difficulty, seed, laneRestSec]);
+
+  /** The limb the pacing ceiling has to be quoted for: the one carrying the most lanes. */
+  const mostLanesOnALimb = dose ? Math.max(1, ...dose.perLimb.map((l) => l.laneIndices.length)) : 1;
+  const busiestLimb = dose?.perLimb[0] ?? null;
 
   /** Which stem each lane's misses dim (audio/ducking.ts) — the mix the patient will hear. */
   const mix = useMemo(() => {
@@ -277,6 +322,10 @@ export default function TherapistSetup() {
     // the therapist never hears the preview bleed into the count-in.
     stopPreview();
     void runtime.ensureAudio().catch(() => undefined);
+    // THE SONG STARTS DOWNLOADING HERE, not on the play screen with the patient already in position:
+    // a camera session goes camera check → ROM → latency before the first note, minutes in which the
+    // stems can arrive. Idempotent — pressing Start later joins this load rather than restarting it.
+    runtime.prefetchSong(songId);
     goto(inputMode === 'camera' ? 'camera' : 'play');
   };
 
@@ -296,6 +345,32 @@ export default function TherapistSetup() {
       {/* WHOSE SESSION THIS IS, on the screen where it is prescribed — the last place to catch a
           wrong patient before the record exists. */}
       <PatientBanner blocking />
+      {/* WHO PUT THIS PATIENT IN THE CHAIR. The selection is per TAB (state/store.ts
+          `ACTIVE_PATIENT_KEY`): no other tab can move it. What another tab CAN do is open this one on
+          the device's last choice, or rename/delete the patient underneath it — and that used to
+          happen as a name quietly becoming a different name on the screen where the session is
+          prescribed. It is a sentence now, and it stays until a human says it is the right person. */}
+      {activePatientNotice && (
+        <div className="toast" data-testid="active-patient-notice" role="status">
+          <div className="row" style={{ gap: 12 }}>
+            <span>{activePatientNotice}</span>
+            <div className="grow" />
+            {/* "It is the right patient" is a claim about a person, so it is only offered when there
+                IS one. After a cross-tab DELETE there is nothing to confirm — tapping it would assert
+                that a deleted record is the right patient and clear the only sentence saying so — and
+                the single remaining way out is to choose somebody. Same for a tab whose inherited
+                hint named nobody real. */}
+            {!noPatient && (
+              <button className="btn btn-ghost" onClick={acknowledgeActivePatient} data-testid="active-patient-ack">
+                It is the right patient
+              </button>
+            )}
+            <button className="btn btn-ghost" onClick={() => goto('patients')} data-testid="active-patient-change">
+              Choose patient
+            </button>
+          </div>
+        </div>
+      )}
       {deviceTestCamera && (
         <div className="toast toast-bad" data-testid="setup-device-test-block">
           <div className="row">
@@ -453,10 +528,21 @@ export default function TherapistSetup() {
                 <div className="big-number mono" data-testid="dose-reps-per-lane">{Math.round(dose.repsPerLane)}</div>
                 <div className="dim">{dose.notes} notes over {formatDuration(dose.spanSec)} of movement</div>
               </div>
+              {/* THE BUSIEST LIMB, WHICH IS THE SUM OF THE LANES ON IT. This tile used to print the
+                  busiest LANE under a "each limb" label: a prescription that puts two lanes on one
+                  limb (left knee extension AND left ankle dorsiflexion, two fingertips on one hand)
+                  asks that limb for both, so the figure a therapist doses from was half the truth. */}
               <div className="stack" style={{ gap: 4 }}>
-                <div className="eyebrow">Reps per minute, each limb</div>
-                <div className="big-number mono" data-testid="dose-reps-per-min">{Math.round(dose.repsPerMinPerLane)}</div>
-                <div className="dim">the rate ONE limb is asked to work at</div>
+                <div className="eyebrow">Reps per minute, busiest limb</div>
+                <div className="big-number mono" data-testid="dose-reps-per-min">{Math.round(dose.repsPerMinPerLimb)}</div>
+                <div className="dim" data-testid="dose-limb-note">
+                  {busiestLimb
+                    ? `the rate the ${limbLabel(busiestLimb.key, mode).toLowerCase()} is asked to work at` +
+                      (busiestLimb.laneIndices.length > 1
+                        ? ` — its ${busiestLimb.laneIndices.length} lanes added together`
+                        : '')
+                    : 'the rate ONE limb is asked to work at'}
+                </div>
               </div>
               <div className="stack" style={{ gap: 4 }}>
                 <div className="eyebrow">Reps per minute, whole body</div>
@@ -466,9 +552,27 @@ export default function TherapistSetup() {
             </div>
 
             <ul className="list-reset dim" style={{ display: 'flex', gap: 18, flexWrap: 'wrap' }}>
+              <li className="eyebrow">Per lane</li>
               {lanes.map((l, i) => (
                 <li key={i} data-testid={`dose-lane-${i}`}>
                   <b>{dose.perLane[i] ?? 0}</b> × {laneLabel(l)}
+                </li>
+              ))}
+            </ul>
+
+            {/* And the same reps totalled per LIMB — the line that makes the tile above checkable,
+                and the only place a two-lane limb's real workload is written down. */}
+            <ul
+              className="list-reset dim"
+              style={{ display: 'flex', gap: 18, flexWrap: 'wrap' }}
+              data-testid="dose-limbs"
+            >
+              <li className="eyebrow">Per limb</li>
+              {dose.perLimb.map((l) => (
+                <li key={l.key} data-testid={`dose-limb-${l.key}`}>
+                  <b>{l.reps}</b> reps for the {limbLabel(l.key, mode).toLowerCase()}
+                  {l.laneIndices.length > 1 ? ` (${l.laneIndices.length} lanes on it, added)` : ''} ·{' '}
+                  {Math.round(l.repsPerMin)} reps/min
                 </li>
               ))}
             </ul>
@@ -484,7 +588,7 @@ export default function TherapistSetup() {
 
         <div className="stack" style={{ gap: 6 }} data-testid="setup-pacing">
           <div className="row" style={{ gap: 12 }}>
-            <h4 style={{ margin: 0 }}>Pacing — rest between two reps of the SAME limb</h4>
+            <h4 style={{ margin: 0 }}>Pacing — rest between two reps of the SAME movement</h4>
             <div className="grow" />
             {/* ONE UNBREAKABLE GROUP. The stepper used to be five siblings of the heading's flex row,
                 so at 1024 px the "+" wrapped to a second line with "−" left behind at the far right,
@@ -530,7 +634,7 @@ export default function TherapistSetup() {
               </button>
               {/* The pacing AND the ceiling it implies, in one badge — the dose itself is the card above. */}
               <span className="badge" style={{ whiteSpace: 'nowrap' }} data-testid="pacing-value">
-                {laneRestSec.toFixed(1)} s · ≤{Math.round(repsPerMinuteAt(laneRestSec))} reps/min
+                {laneRestSec.toFixed(1)} s · ≤{Math.round(repsPerMinuteAt(laneRestSec))} reps/min per lane
               </span>
             </div>
           </div>
@@ -559,9 +663,19 @@ export default function TherapistSetup() {
           <span className="dim" data-testid="pacing-explainer">
             An impaired leg needs to come back to rest before the next rep — set this for the patient in front of you,
             not for the feel of the song. It is not part of the difficulty: changing the windows above does not move it.
-            At {laneRestSec.toFixed(1)} s no limb can be asked for more than {Math.round(repsPerMinuteAt(laneRestSec))}{' '}
-            reps/min; this song and difficulty actually deliver{' '}
-            <b>{dose === null ? '—' : Math.round(dose.repsPerMinPerLane)} reps/min per limb</b>, which is the dose above.
+            At {laneRestSec.toFixed(1)} s no LANE can be asked for more than{' '}
+            {Math.round(repsPerMinuteAt(laneRestSec))} reps/min.{' '}
+            {mostLanesOnALimb > 1
+              ? `This prescription puts ${mostLanesOnALimb} lanes on one limb, so that limb's ceiling is ${Math.round(
+                  limbRepsPerMinuteAt(laneRestSec, mostLanesOnALimb),
+                )} reps/min — the rest is between two reps of the same movement, not between two reps of the same limb. `
+              : 'One lane per limb here, so that is the limb ceiling too. '}
+            This song and difficulty actually deliver{' '}
+            <b>
+              {dose === null ? '—' : Math.round(dose.repsPerMinPerLimb)} reps/min for the{' '}
+              {busiestLimb ? limbLabel(busiestLimb.key, mode).toLowerCase() : 'busiest limb'}
+            </b>
+            , which is the dose above.
           </span>
           {dose && dose.warnings.some((w) => w.startsWith('note density reduced')) && (
             <span className="dim">

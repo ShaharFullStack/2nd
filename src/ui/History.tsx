@@ -17,6 +17,9 @@ import { buildPatientExport, endReasonLabel, formatDate, formatDuration, formatM
 import { labelIndex, patientUsage } from '../state/patients.ts';
 import { MAX_HISTORY, useStore } from '../state/store.ts';
 import { Screen, Stars, TopBar } from './common.tsx';
+import { ScopeNote } from './ScopeNote.tsx';
+import { TRACKING_NOT_RECORDED, trackingConditions, trackingGrade } from '../session/tracking.ts';
+import { ScrollTable } from './Results.tsx';
 import PatientBanner from './PatientBanner.tsx';
 import RomTrend from './RomTrend.tsx';
 import { copyToClipboard, saveTextFile } from './download.ts';
@@ -33,6 +36,17 @@ export default function HistoryScreen() {
   const [note, setNote] = useState<string | null>(null);
   /** The session whose "this is the wrong person" correction is open. */
   const [moving, setMoving] = useState<string | null>(null);
+  /**
+   * THE GRADE IS OPT-IN HERE, EXACTLY AS IT IS ON RESULTS.
+   *
+   * This table read WHEN | SESSION | SCORE | STARS | ACCURACY | REPS | …, so the entertainment grade
+   * on an impairment came before the count of work the patient did — the same ordering Results was
+   * corrected out of, contradicting it one screen later. The work now leads, and the five scoring
+   * columns (score, stars, accuracy, best combo, timing) are one tap away rather than in front of
+   * the patient's face. Folding them also takes ~380 px off the table, which is most of what used to
+   * push the per-movement column off a 1024-wide tablet.
+   */
+  const [showScoring, setShowScoring] = useState(false);
 
   const patient = patients.find((p) => p.id === activePatientId) ?? null;
   const labels = useMemo(() => labelIndex(patients, patientUsage(allHistory)), [patients, allHistory]);
@@ -91,6 +105,13 @@ export default function HistoryScreen() {
       />
 
       <PatientBanner />
+      {/*
+        THE SCOPE STATEMENT, ON THE SCREEN THAT TURNS SESSIONS INTO A TREND AND A FILE. This is where
+        a range in degrees is plotted across six weeks and where the exported record is produced; it
+        is exactly the screen a reader is most likely to mistake for a clinical instrument, and it
+        used to say nothing about what it is at all.
+      */}
+      <ScopeNote full testId="history-scope" />
       {note && (
         <div className="card" data-testid="history-note">
           <span className="muted">{note}</span>
@@ -121,21 +142,46 @@ export default function HistoryScreen() {
         <>
           <RomTrend history={allHistory} patientId={patient.id} />
 
-          <h3 style={{ marginBottom: 0 }}>Every session</h3>
-          <div className="card table-wrap">
+          <div className="row">
+            <h3 style={{ marginBottom: 0 }}>Every session</h3>
+            <div className="grow" />
+            <button
+              className="btn btn-sm"
+              aria-pressed={showScoring}
+              onClick={() => setShowScoring((v) => !v)}
+              data-testid="history-toggle-scoring"
+            >
+              {showScoring ? 'Hide scoring columns' : 'Show scoring columns'}
+            </button>
+          </div>
+          <div className="card">
+            <ScrollTable
+              offscreen={
+                showScoring
+                  ? 'the scoring columns — accuracy, score, stars, best combo and timing'
+                  : 'the length and the per-movement detail'
+              }
+              testId="history-table"
+            >
             <table className="table">
             <thead>
+              {/* WORK FIRST: what the patient did, then how long it took, then — only if asked for —
+                  how it scored. */}
               <tr>
                 <th>When</th>
                 <th>Session</th>
-                <th>Score</th>
-                <th>Stars</th>
-                <th>Accuracy</th>
-                <th>Reps</th>
-                <th>Combo</th>
-                <th>Timing</th>
+                <th>Movements performed</th>
+                <th>Range worked</th>
                 <th>Length</th>
-                <th>Movements</th>
+                {showScoring && (
+                  <>
+                    <th>Accuracy</th>
+                    <th>Score</th>
+                    <th>Stars</th>
+                    <th>Combo</th>
+                    <th>Timing</th>
+                  </>
+                )}
               </tr>
             </thead>
             <tbody>
@@ -216,13 +262,8 @@ export default function HistoryScreen() {
                       </span>
                     )}
                   </td>
-                  <td className="mono">{r.score.toLocaleString()}</td>
-                  <td>
-                    <Stars value={r.stars} />
-                  </td>
-                  <td className="mono">{formatPercent(r.accuracy)}</td>
                   <td className="mono">
-                    {r.reps}
+                    <b>{r.reps}</b>
                     {/* THE DOSE THE REPS WERE ASKED FOR. Pacing sets the rep count directly (0.4 s
                         gives ~4× the reps of 3.0 s on the same song), so a rep count compared down
                         this column without it is not a comparison. */}
@@ -230,9 +271,6 @@ export default function HistoryScreen() {
                       {r.laneRestSec === undefined ? 'pacing not recorded' : `at ${r.laneRestSec.toFixed(1)} s pacing`}
                     </div>
                   </td>
-                  <td className="mono">{r.maxCombo}</td>
-                  <td className="mono">{formatMs(r.timingBiasMs)}</td>
-                  <td className="mono">{formatDuration(r.durationSec)}</td>
                   <td>
                     {r.lanes.map((l) => (
                       <div key={l.lane} className="dim">
@@ -241,11 +279,50 @@ export default function HistoryScreen() {
                         {l.compensationMonitored && l.compensationFlags > 0 ? ` · ${l.compensationFlags} flagged` : ''}
                       </div>
                     ))}
+                    {/* HOW WELL THE CAMERA WAS TRACKING WHEN THOSE RANGES WERE MEASURED. Two rows of
+                        this column can differ by a factor of three in frame rate; without this the
+                        column reads as one comparable series of measurements, which is how a change
+                        in the equipment becomes a change in the patient. */}
+                    {r.inputMode === 'camera' && (
+                      <div className="dim" data-testid={`history-tracking-${r.id}`}>
+                        {r.tracking ? (
+                          <>
+                            <span
+                              className={
+                                trackingGrade(r.tracking) === 'good'
+                                  ? 'badge badge-ok'
+                                  : trackingGrade(r.tracking) === 'fair'
+                                    ? 'badge badge-warn'
+                                    : 'badge badge-bad'
+                              }
+                            >
+                              tracking {trackingGrade(r.tracking)}
+                            </span>{' '}
+                            {trackingConditions(r.tracking)}
+                          </>
+                        ) : (
+                          TRACKING_NOT_RECORDED
+                        )}
+                      </div>
+                    )}
                   </td>
+                  <td className="mono">{formatDuration(r.durationSec)}</td>
+                  {showScoring && (
+                    <>
+                      <td className="mono">{formatPercent(r.accuracy)}</td>
+                      <td className="mono">{r.score.toLocaleString()}</td>
+                      <td>
+                        <Stars value={r.stars} />
+                      </td>
+                      <td className="mono">{r.maxCombo}</td>
+                      <td className="mono">{formatMs(r.timingBiasMs)}</td>
+                    </>
+                  )}
                 </tr>
               ))}
             </tbody>
             </table>
+            </ScrollTable>
           </div>
 
           {/* WHAT THIS RECORD IS MISSING. A truncated record that does not say it is truncated is the

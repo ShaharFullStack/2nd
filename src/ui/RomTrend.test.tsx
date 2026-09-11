@@ -323,3 +323,59 @@ describe('RomTrend', () => {
     expect(card.textContent).toContain('no trend yet');
   });
 });
+
+/**
+ * ONE CARD, ONE SET OF SESSIONS.
+ *
+ * The headline ROM and the change badge came from the last COMPLETE session (trends.ts refuses to
+ * anchor a delta on a nine-rep walk-out); the chart plotted every point including the incomplete
+ * ones; and the caption under the cards said the gap between the dashed start line and the last
+ * point WAS the change. Three statements about three different sets of sessions.
+ */
+describe('the card, the chart and the caption describe the same sessions', () => {
+  const aborted = (id: string, at: number, rom: number): SessionResult => ({
+    ...session(id, at, [lane({ romMean: rom, reps: 3 })]),
+    completed: false,
+    endReason: 'quit',
+    reps: 3,
+  });
+
+  it('sets an aborted run aside, and says so, when there are two complete sessions to compare', () => {
+    const history = [aborted('d', 4_000_000, 0.2), ...IMPROVING];
+    render(<RomTrend history={history} patientId={PATIENT} />);
+    const card = screen.getByTestId('trend-knee_extension:left');
+    // The headline is the last COMPLETE session — and so is the last point of the line beside it.
+    expect(card.textContent).toContain('72%');
+    expect(card.textContent).toContain('+20 pts');
+    // The count on the badge is the set that is drawn, not the set that exists.
+    expect(card.textContent).toContain('3 camera sessions');
+    expect(screen.getByTestId('trend-incomplete-knee_extension:left').textContent).toContain('set aside');
+    const note = screen.getByTestId('trend-set-aside-knee_extension:left');
+    expect(note.textContent).toContain('not in the figures, the plots or the change badges');
+    // Nothing is hidden: the reps performed in it are stated and the run is listed underneath.
+    expect(note.textContent).toContain('3 movements');
+    expect(screen.getByTestId('trend-points-knee_extension:left').textContent).toContain('4');
+  });
+
+  it('plots the aborted run when it is all there is, and says THAT instead', () => {
+    const history = [aborted('b', 2_000_000, 0.2), session('a', 1_000_000, [lane({ romMean: 0.5 })])];
+    render(<RomTrend history={history} patientId={PATIENT} />);
+    const card = screen.getByTestId('trend-knee_extension:left');
+    expect(card.textContent).toContain('20%'); // the aborted run IS the latest figure now
+    expect(screen.queryByTestId('trend-set-aside-knee_extension:left')).toBeNull();
+    expect(screen.getByTestId('trend-incomplete-knee_extension:left').textContent).toContain('ended early');
+    expect(screen.getByTestId('trend-incomplete-knee_extension:left').textContent).not.toContain('set aside');
+    expect(screen.getByTestId('trend-incomplete-change-knee_extension:left').textContent).toContain(
+      'the figures, the plots and',
+    );
+  });
+
+  it('counts only the sessions it draws in the rep total on the card', () => {
+    const history = [aborted('d', 4_000_000, 0.2), ...IMPROVING];
+    render(<RomTrend history={history} patientId={PATIENT} />);
+    const card = screen.getByTestId('trend-knee_extension:left');
+    // 3 complete sessions x 12 reps; the aborted run's 3 are named separately, never folded in.
+    expect(card.textContent).toContain('36 movements performed');
+    expect(card.textContent).not.toContain('39 movements performed');
+  });
+});

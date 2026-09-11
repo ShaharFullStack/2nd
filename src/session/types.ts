@@ -167,6 +167,32 @@ export interface LaneResultSummary {
   compensationWorst: number | null;
 }
 
+/**
+ * HOW WELL THE CAMERA WAS TRACKING WHILE THIS SESSION'S NUMBERS WERE MEASURED.
+ *
+ * A range measured from a 12 fps stream with the limb half out of frame is not the same number as
+ * one from a clean 30 fps stream, and a record that cannot tell them apart cannot be trended. Every
+ * field is observed, never estimated (see session/tracking.ts for what is and is not claimed).
+ */
+export interface TrackingQuality {
+  /** Health-report samples this block is built from (one every `TRACKING_SAMPLE_MS` while playing). */
+  samples: number;
+  /** Median frames per second the detector actually processed. */
+  fpsMedian: number;
+  /** Tenth percentile of the same — what the worst stretches of the session looked like. */
+  fpsLow: number;
+  /** Median milliseconds the model needed per frame on this machine. */
+  inferenceMsMedian: number;
+  /** Share of samples (0..1) in which every prescribed lane had usable landmarks. */
+  trackedFraction: number;
+  /** Share of samples (0..1) whose frame rate was under the engine's usable floor. */
+  lowFpsFraction: number;
+  /** Inference backend in use ('CPU' means no graphics acceleration was available). */
+  delegate: 'GPU' | 'CPU' | null;
+  /** The most frequent non-ok tracking reason, or null when the stream stayed healthy. */
+  worstReason: string | null;
+}
+
 /** One completed (or abandoned) session, as persisted to localStorage. */
 export interface SessionResult {
   id: string;
@@ -221,7 +247,9 @@ export interface SessionResult {
   /** Movements that answered no note at all, across all lanes (`reps - attempted`). */
   surplusMovements?: number;
   /**
-   * THE PACING PRESCRIBED (SessionConfig.laneRestSec): the least time between two reps of one limb.
+   * THE PACING PRESCRIBED (SessionConfig.laneRestSec): the least time between two reps of ONE LANE
+   * — one movement on one side. A limb carrying two lanes can be asked for a rep in each inside it,
+   * so its ceiling is twice this lane ceiling (`limbRepsPerMinuteAt`).
    *
    * Recorded because it is the control that directly sets the rep count — the same patient, song and
    * difficulty gives 24 reps per lane at 3.0 s and 96 at 0.4 s. Without it "+26 movements vs last
@@ -244,5 +272,13 @@ export interface SessionResult {
    * than being given a reason nobody recorded.
    */
   endReason?: SessionEndReason;
+  /**
+   * THE CONDITIONS THE MEASUREMENT WAS TAKEN IN — frame rate, inference time and tracking loss.
+   *
+   * Absent on a session with no camera to describe (keyboard, autoplay) and on every record written
+   * before this was stored; both must read as "not recorded", never as a clean stream. Screens that
+   * print a degree value or a millisecond value are expected to print this beside it.
+   */
+  tracking?: TrackingQuality;
   lanes: LaneResultSummary[];
 }

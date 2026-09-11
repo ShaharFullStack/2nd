@@ -17,6 +17,7 @@ import { FINGERTIP_NAME, MOVEMENT_INFO, movementCalibrationInstruction } from '.
 import { CameraPreview } from './CameraPreview.tsx';
 import { Meter, ProgressRing, Screen, Toast, TopBar, laneName } from './common.tsx';
 import PatientBanner from './PatientBanner.tsx';
+import { ScopeNote } from './ScopeNote.tsx';
 
 /** "little finger" for a lane that has a prescribed tip, "" for a movement with no tip dimension. */
 function tipName(spec: Parameters<typeof laneFingertip>[0]): string {
@@ -500,6 +501,10 @@ export default function RomCalibrationScreen() {
               );
             })}
           </ul>
+          {/* WHERE THE RANGE IS FIRST PUT INTO DEGREES, the one line that says what kind of number it
+              is. Every percentage on the results and trend screens is measured against the range set
+              here, so this is the first place the scope has to be stated. */}
+          <ScopeNote testId="rom-scope" />
           <span className="dim">
             Each range is stored with the PATIENT, the movement, the side, the mirror convention — and, for finger
             opposition, the fingertip — it was measured on. A repeat session offers a range back only when all of those

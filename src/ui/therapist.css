@@ -207,3 +207,19 @@
   font-size: 0.85rem;
   border-radius: 10px;
 }
+
+/* ---------- scope statement (every screen that shows a measurement) ---------- */
+
+/*
+ * THE ONE LINE THAT SAYS WHAT THESE NUMBERS ARE, and it is styled to be read rather than dismissed.
+ *
+ * It inherits `.dim` (7:1 on every panel — see index.css) so it does not compete with the figures it
+ * qualifies, and takes a rule down its left edge so a therapist scanning a screen of cards can see
+ * that this line is about the card above it rather than another caption inside it. No background, no
+ * icon, no close button: it is a footnote on a measurement, present whenever the measurement is.
+ */
+.scope-note {
+  border-left: 2px solid var(--line);
+  padding-left: 12px;
+  max-width: 82ch;
+}

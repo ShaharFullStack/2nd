@@ -142,6 +142,28 @@ class SessionRuntime {
   private previewAbort: AbortController | null = null;
   /** True when the load `this.loading` refers to was cancelled and will resolve to nothing. */
   private loadCancelled = false;
+  /**
+   * True only while the load in flight was STARTED BY the audition's fallback.
+   *
+   * Cancelling an audition cancels the download it started — but since `prefetchSong` there may be a
+   * load in flight that the audition merely joined, and that one belongs to the session the therapist
+   * is about to start. Unloading it (or marking it cancelled) because they stopped listening would
+   * throw away the download the Start button is waiting for, and start it again from zero.
+   */
+  private previewOwnsLoad = false;
+  /** The song `prefetchSong` has a load running for, or null. */
+  private prefetchId: string | null = null;
+  /**
+   * Progress sinks for the ONE load in flight, and the last event it produced.
+   *
+   * A load is shared (`loadSongNow` hands the in-flight promise to a second caller for the same song),
+   * and only the first caller's `onProgress` used to be wired to the mixer. Once the download starts
+   * before Start is pressed — a prefetch with no progress bar to feed — the Play screen would join it
+   * and show a bar frozen at 0 % for the whole download. Listeners are per-caller and the latest event
+   * is replayed to a late joiner, so the bar is the load's progress whoever started it.
+   */
+  private loadProgress = new Set<(p: LoadProgress) => void>();
+  private lastLoadProgress: LoadProgress | null = null;
 
   /** The runner for the session in progress (exposed on window.__beatRehab for critics). */
   runner: GameRunner | null = null;
@@ -192,7 +214,9 @@ class SessionRuntime {
     // Share a load already running for this song — UNLESS it has been cancelled. A cancelled load is
     // a promise that will resolve to nothing, and handing it to the Start button (a therapist who
     // stopped an audition of the song they then prescribed) would start the session in silence.
-    if (this.loading && this.loadingId === songId && !this.loadCancelled) return this.loading;
+    if (this.loading && this.loadingId === songId && !this.loadCancelled) {
+      return this.withProgress(onProgress, this.loading);
+    }
     this.loadCancelled = false;
     const load = (async () => {
       const entry = await loadSongEntry(songId);
@@ -200,7 +224,17 @@ class SessionRuntime {
         this.loadedSongId = null;
         return null;
       }
-      await mixer.loadSong(entry.manifest, '/songs', onProgress);
+      this.lastLoadProgress = null;
+      await mixer.loadSong(entry.manifest, '/songs', (p) => {
+        this.lastLoadProgress = p;
+        for (const cb of [...this.loadProgress]) {
+          try {
+            cb(p);
+          } catch (err) {
+            console.warn('[runtime] a load-progress listener threw', err);
+          }
+        }
+      });
       // A load that was cancelled (`mixer.unload()` from a cancelled audition, or a newer load)
       // resolves QUIETLY with nothing in the mixer. Claiming the song is loaded would make the next
       // `loadSong` for it a no-op and start a session against an empty mixer.
@@ -210,7 +244,7 @@ class SessionRuntime {
     this.loading = load;
     this.loadingId = songId;
     try {
-      return await load;
+      return await this.withProgress(onProgress, load);
     } finally {
       // Identity-guarded: a cancelled load that settles late must not clear the bookkeeping of the
       // load that replaced it.
@@ -220,6 +254,57 @@ class SessionRuntime {
         this.loadCancelled = false;
       }
     }
+  }
+
+  /** Run `p` with `onProgress` subscribed to the load in flight (and caught up to where it is). */
+  private async withProgress<T>(onProgress: ((p: LoadProgress) => void) | undefined, p: Promise<T>): Promise<T> {
+    if (!onProgress) return p;
+    this.loadProgress.add(onProgress);
+    if (this.lastLoadProgress) onProgress(this.lastLoadProgress);
+    try {
+      return await p;
+    } finally {
+      this.loadProgress.delete(onProgress);
+    }
+  }
+
+  /**
+   * START THE DOWNLOAD WHEN THE SONG IS CHOSEN, NOT WHEN THE PATIENT IS SITTING IN FRONT OF THE
+   * CAMERA WAITING FOR IT.
+   *
+   * Every byte of the song used to be fetched after Start: measured against the production build
+   * over a throttled 8 Mbit/s link, 34 MB and 38.7 s from pressing Start to the first note, with a
+   * progress bar and a patient already in position for all of it. The stems are half of that fix
+   * (public/songs ships a 16 kHz build now, 12 MB); THIS is the other half — between the therapist
+   * choosing the song and the first note there is a camera check and two calibrations, minutes of
+   * work that need no audio at all, and the download fits inside them.
+   *
+   * Fire-and-forget, and deliberately unable to hurt anything:
+   *  - it never throws (a failed prefetch is a slower Start, not an error the therapist sees);
+   *  - it does nothing while an audition is in flight — the therapist is listening to a song they
+   *    have not chosen yet, and the audition's own ranged fetches are the cheap path;
+   *  - `loadSongNow` is idempotent per song, so pressing Start joins this download rather than
+   *    starting a second one, and the Play screen's progress bar joins with it (`withProgress`).
+   * Choosing a different song simply prefetches that one; `mixer.loadSong` unloads the previous.
+   */
+  prefetchSong(songId: string): void {
+    if (!songId) return;
+    const mixer = this.audio?.mixer;
+    if (this.loadedSongId === songId && mixer?.isLoaded) return;
+    if (this.prefetchId === songId) return;
+    // An audition owns the network (and the mixer) while it runs; its own load is the fallback path.
+    if (this.previewAbort) return;
+    this.prefetchId = songId;
+    void (async () => {
+      try {
+        await withAudioClockTimeout(this.ensureAudio());
+        await this.loadSongNow(songId);
+      } catch (err) {
+        console.warn('[runtime] prefetching the song failed; the session will load it at Start', err);
+      } finally {
+        if (this.prefetchId === songId) this.prefetchId = null;
+      }
+    })();
   }
 
   getMixerManifest(): SongManifest | null {
@@ -285,7 +370,15 @@ class SessionRuntime {
       // THIS is the expensive path, so this is the one that must be stoppable: `mixer.unload()`
       // aborts the in-flight stem downloads, which is what a cancel during a 34 MB load has to mean.
       // 90 seconds between patients is not enough to sit through a download nobody wants any more.
+      //
+      // UNLESS THE DOWNLOAD IS NOT THIS AUDITION'S TO CANCEL. `prefetchSong` may already have a load
+      // running for this song — the one the Start button is waiting for — and this fallback would
+      // simply join it. Stopping the audition then has to stop LISTENING, not throw away a download
+      // that was started for the session.
+      const joined = this.loading !== null && this.loadingId === songId && !this.loadCancelled;
+      this.previewOwnsLoad = !joined;
       const onAbortLoad = (): void => {
+        if (joined) return;
         try {
           mixer.unload();
         } catch (err) {
@@ -294,12 +387,22 @@ class SessionRuntime {
       };
       abort.signal.addEventListener('abort', onAbortLoad, { once: true });
       try {
-        const loaded = await this.loadSongNow(songId, options.onLoadProgress);
+        // Raced against the cancel, because a JOINED load does not stop when the audition does: the
+        // caller (the Setup screen's Listen button) has to be released the moment the therapist
+        // presses stop, not when the session's download finishes minutes later.
+        const loaded = await Promise.race([
+          this.loadSongNow(songId, options.onLoadProgress),
+          new Promise<null>((resolve) => {
+            if (abort.signal.aborted) resolve(null);
+            else abort.signal.addEventListener('abort', () => resolve(null), { once: true });
+          }),
+        ]);
         if (abort.signal.aborted || !loaded || !mixer.isLoaded) return null;
         mixer.playPreview(seconds);
         return loaded;
       } finally {
         abort.signal.removeEventListener('abort', onAbortLoad);
+        this.previewOwnsLoad = false;
       }
     } finally {
       options.signal?.removeEventListener('abort', onOuterAbort);
@@ -314,8 +417,10 @@ class SessionRuntime {
   stopPreview(): void {
     if (this.previewAbort) {
       // Whatever this abort takes down may include a whole-song load in flight; the next caller that
-      // wants that song must start its own rather than await this one's corpse.
-      this.loadCancelled = true;
+      // wants that song must start its own rather than await this one's corpse. Only when the load is
+      // the AUDITION'S OWN, though — a prefetched session load it merely joined survives the cancel
+      // (see `previewOwnsLoad`), because nothing about it was cancelled.
+      if (this.previewOwnsLoad) this.loadCancelled = true;
       this.previewAbort.abort();
     }
     this.previewAbort = null;
@@ -433,6 +538,16 @@ class SessionRuntime {
    */
   dispose(): void {
     this.stopPreview();
+    this.prefetchId = null;
+    this.loadProgress.clear();
+    this.lastLoadProgress = null;
+    // The load in flight is disowned here, not just cancelled: `mixer.dispose()` below aborts its
+    // downloads, and the next caller must start a fresh load rather than await a promise that
+    // belongs to a mixer this runtime no longer has. (The load's own `finally` is identity-guarded,
+    // so it cannot clear the bookkeeping of whatever replaces it.)
+    this.loading = null;
+    this.loadingId = null;
+    this.loadCancelled = false;
     this.audition = null;
     this.runner?.dispose();
     this.runner = null;

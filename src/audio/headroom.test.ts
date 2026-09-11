@@ -57,10 +57,19 @@ function rmsDb(s: Int16Array): number {
 const ids = (JSON.parse(fs.readFileSync(path.join(songsDir, 'index.json'), 'utf8')) as { songs: string[] }).songs;
 const boost = dbToGain(DEFAULT_DUCK_OPTIONS.streakBoostDb);
 
-/** Measured summed peaks quoted in the StemMixer module comment. */
-const EXPECTED: Record<string, { summed: number; boosted: number; intoLimiter: number }> = {
-  'demo-groove': { summed: 2.075, boosted: 2.303, intoLimiter: 2.338 },
-  'demo-sunrise': { summed: 1.975, boosted: 2.219, intoLimiter: 2.271 },
+/**
+ * Measured summed peaks quoted in the StemMixer module comment.
+ *
+ * These moved when the shipped stems were regenerated at 16 kHz (scripts/gen-demo-stems.mjs
+ * `--rate`, 34 MB → 12 MB for demo-groove, so a clinic hears the first note in a third of the
+ * time): the anti-alias lowpass takes the hi-hat band out of the drums, and the gain-only
+ * rebalance that keeps the mastered RATIOS intact puts the whole song ~1 dB down with it. Every
+ * figure below is therefore LOWER than the 44.1 kHz build's — the headroom budget got safer, not
+ * tighter — and that is the direction a delivery change is allowed to move them in.
+ */
+const EXPECTED: Record<string, { summed: number; boosted: number; intoLimiter: number; ceiling: number }> = {
+  'demo-groove': { summed: 1.589, boosted: 1.757, intoLimiter: 1.901, ceiling: 0.906 },
+  'demo-sunrise': { summed: 1.608, boosted: 1.795, intoLimiter: 1.932, ceiling: 0.906 },
 };
 
 /** SFX at the top of the slider: the worst case a viewer can actually produce. */
@@ -120,15 +129,20 @@ describe('master headroom against the shipped demo stems', () => {
       expect(limiterOutputPeak(worst * DEFAULT_MASTER_GAIN.limiter)).toBeLessThan(0.95);
       // and the quoted peak into the limiter
       expect(worst * DEFAULT_MASTER_GAIN.limiter).toBeCloseTo(EXPECTED[id].intoLimiter, 2);
-      // and the ~0.91 ceiling the module comment quotes
-      expect(limiterOutputPeak(worst * DEFAULT_MASTER_GAIN.limiter)).toBeCloseTo(0.915, 2);
+      // and the output ceiling the module comment quotes
+      expect(limiterOutputPeak(worst * DEFAULT_MASTER_GAIN.limiter)).toBeCloseTo(EXPECTED[id].ceiling, 2);
     });
 
     it(`${id}: the player stem is the loudest element (its ducking is the main feedback cue)`, () => {
       const m = parseManifest(JSON.parse(fs.readFileSync(path.join(songsDir, id, 'song.json'), 'utf8')));
       const loud = m.stems.map((s) => ({ id: s.id, db: rmsDb(readPcm16(path.join(songsDir, id, s.file))) }));
       const player = loud.find((l) => l.id === m.playerStem)!;
-      expect(player.db).toBeCloseTo(-13, 1);
+      // The mastering targets −13 dBRMS at the render rate; the shipped 16 kHz build lands 0.9–1.3 dB
+      // under it because the lowpass takes the hi-hat band out of THIS stem and out of no other one.
+      // What must not move is the ratio below — the player stem on top — which the generator's
+      // post-resample rebalance preserves exactly (scripts/gen-demo-stems.mjs).
+      expect(player.db).toBeGreaterThan(-14.6);
+      expect(player.db).toBeLessThan(-12.9);
       for (const other of loud) {
         if (other.id === m.playerStem) continue;
         // peak-normalised mastering used to leave the drums ~3.5 dB BELOW the bass; RMS matching

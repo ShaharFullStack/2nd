@@ -187,7 +187,7 @@ describe('a session where the patient moved and almost nothing scored', () => {
     render(<ResultsScreen />);
     const card = screen.getByTestId('results-consistency');
     expect(card.textContent).toContain('the quantity the gauge on the highway shows');
-    expect(screen.getByTestId('results-answer-basis').textContent).toContain('Counted from the first note');
+    expect(screen.getByTestId('results-answer-basis').textContent).toContain('counted from the first note');
     expect(screen.getByTestId('results-answer-basis').textContent).toMatch(/eases its first \d+ notes/);
   });
 
@@ -254,5 +254,118 @@ describe('a feature value is never printed without saying what it is a measure o
     useStore.setState({ lastResult: march });
     render(<ResultsScreen />);
     expect(screen.getByTestId('results-range-unit').textContent).toContain('body-scaled ratio');
+  });
+});
+
+/**
+ * THE HEADLINE MAY NOT HAND ITSELF TO THE STRONG SIDE.
+ *
+ * "RANGE ACHIEVED 64°" was `max(romBest)` across every lane. A hemiparetic prescription deliberately
+ * mixes the affected limb with an unaffected one, so that maximum is the strong leg essentially every
+ * time: the screen celebrated the limb the patient did not come about and put the one they did into a
+ * table below the fold.
+ */
+describe('range achieved is per limb, never a maximum across limbs', () => {
+  /** The reviewer's own session: a strong right knee and the weak left march that is the reason. */
+  const mixed = () =>
+    result({
+      lanes: [
+        lane({
+          lane: 0, movement: 'seated_march', side: 'left', movementName: 'Left Seated march',
+          romMean: 0.3, romBest: 0.34, calibratedMin: 0.1, calibratedMax: 0.5, reps: 20,
+        }),
+        lane({
+          lane: 1, movement: 'knee_extension', side: 'right', movementName: 'Right Knee extension',
+          romMean: 0.8, romBest: 0.9, calibratedMin: 100, calibratedMax: 160, reps: 22,
+        }),
+      ],
+    });
+
+  it('gives every prescribed movement its own figure, in prescription order', () => {
+    useStore.setState({ lastResult: mixed(), history: [mixed()] });
+    render(<ResultsScreen />);
+    const weak = screen.getByTestId('results-range-lane-0');
+    const strong = screen.getByTestId('results-range-lane-1');
+    expect(weak.textContent).toContain('Left Seated march');
+    expect(weak.textContent).toContain('0.24'); // 0.1 + 0.34 x 0.4
+    expect(strong.textContent).toContain('Right Knee extension');
+    expect(strong.textContent).toContain('154°'); // 100 + 0.9 x 60
+
+    // The affected side is not below the strong one in the DOM, and no single figure stands for both.
+    const tiles = screen.getByTestId('results-range').querySelectorAll('[data-testid^="results-range-lane-"]');
+    expect(tiles).toHaveLength(2);
+    expect(tiles[0]).toBe(weak);
+  });
+
+  it('never prints one lane"s best as THE range for the session', () => {
+    useStore.setState({ lastResult: mixed(), history: [mixed()] });
+    render(<ResultsScreen />);
+    const card = screen.getByTestId('results-range');
+    // The old headline: a bare 154° with no movement attached to it.
+    expect(card.textContent).toContain('Ranges from different movements are never compared');
+    for (const id of ['results-range-lane-0', 'results-range-lane-1']) {
+      const tile = screen.getByTestId(id);
+      // Every figure names the movement it belongs to, inside the same tile.
+      expect(tile.textContent).toMatch(/(Seated march|Knee extension)/);
+    }
+  });
+
+  it('singles out only the movement that IMPROVED, and ranks the gain against its own range', () => {
+    // The weak march gains a fifth of its own range; the strong knee gains a twentieth of its.
+    const before = result({
+      id: 's1', startedAt: 1_600_000_000_000,
+      lanes: [
+        lane({ lane: 0, movement: 'seated_march', side: 'left', movementName: 'Left Seated march', romMean: 0.1, romBest: 0.14, calibratedMin: 0.1, calibratedMax: 0.5 }),
+        lane({ lane: 1, movement: 'knee_extension', side: 'right', movementName: 'Right Knee extension', romMean: 0.8, romBest: 0.85, calibratedMin: 100, calibratedMax: 160 }),
+      ],
+    });
+    const now = mixed();
+    useStore.setState({ lastResult: now, history: [now, before] });
+    render(<ResultsScreen />);
+    // +0.20 of its own range for the march beats +0.05 for the knee, even though the knee moved 3°
+    // and the march moved 0.08 in its own units.
+    expect(screen.getByTestId('results-range-most-improved').textContent).toContain('Left Seated march');
+    expect(screen.getByTestId('results-range-improved-0')).toBeTruthy();
+    expect(screen.queryByTestId('results-range-improved-1')).toBeNull();
+  });
+
+  it('says so per movement when a lane measured no range at all', () => {
+    const r = result({ lanes: [lane({ lane: 0, romSamples: 0, romMean: null, romBest: null })] });
+    useStore.setState({ lastResult: r, history: [r] });
+    render(<ResultsScreen />);
+    expect(screen.getByTestId('results-range-lane-0').textContent).toContain('no range was measured');
+  });
+});
+
+/**
+ * EVERY CLINICALLY LOAD-BEARING COLUMN HAS TO BE REACHABLE ON THE CLINIC TABLET.
+ *
+ * Measured at 1024x768, the clinical table laid out at 1302 px inside a 961 px scroller: the
+ * compensation badge and the best rep were off the right-hand edge with no scrollbar and no cue.
+ */
+describe('the wide tables are reachable at 1024', () => {
+  it('puts compensation and range in the first half of the clinical table, not the last', () => {
+    useStore.setState({ lastResult: result(), history: [result()] });
+    render(<ResultsScreen />);
+    const heads = Array.from(screen.getByTestId('results-clinical-table').querySelectorAll('th')).map((h) => h.textContent);
+    expect(heads).toEqual(['Movement', 'Reps', 'Compensation', 'Range achieved', 'Notes hit', 'Timing']);
+    // Nine columns became six: the two the safety reviewer lost are now third and fourth.
+    expect(heads.indexOf('Compensation')).toBeLessThan(heads.length / 2);
+  });
+
+  it('announces the overflow in words, with buttons that move it, when there really is some', () => {
+    useStore.setState({ lastResult: result(), history: [result()] });
+    const { container } = render(<ResultsScreen />);
+    const wrap = screen.getByTestId('results-clinical-table');
+    // jsdom lays nothing out, so the overflow is simulated — the component reads these two numbers.
+    Object.defineProperty(wrap, 'scrollWidth', { value: 1302, configurable: true });
+    Object.defineProperty(wrap, 'clientWidth', { value: 961, configurable: true });
+    // Re-render so the measuring effect runs again against the stubbed layout.
+    useStore.setState({ lastResult: result({ maxCombo: 3 }), history: [result()] });
+    render(<ResultsScreen />, { container });
+    const cue = screen.getAllByTestId('results-clinical-table-scroll-cue')[0];
+    expect(cue.textContent).toContain('wider than the screen');
+    expect(cue.textContent).toContain('off to the right');
+    expect(cue.querySelectorAll('button')).toHaveLength(2);
   });
 });

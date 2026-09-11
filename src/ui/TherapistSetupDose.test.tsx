@@ -26,6 +26,7 @@ const fake = {
   previewSong: vi.fn(async () => null),
   stopPreview: vi.fn(() => undefined),
   previewingSongId: vi.fn(() => null),
+  prefetchSong: vi.fn(() => undefined),
 };
 vi.mock('../session/runtime.ts', () => ({ runtime: fake }));
 
@@ -90,14 +91,63 @@ describe('the prescription states its dose', () => {
   it('states the pacing in the units a therapist prescribes in, and separates the ceiling from the dose', async () => {
     render(<TherapistSetup />);
     const card = await screen.findByTestId('setup-dose');
-    expect(card.textContent).toContain('SAME limb');
+    // The rest is between two reps of one MOVEMENT — saying "the same limb" was the labelling half of
+    // the per-lane/per-limb bug: a limb carrying two lanes gets a rep in each inside that rest.
+    expect(card.textContent).toContain('SAME movement');
     // TWO reps-per-minute figures used to sit side by side as bare numbers — the ceiling the pacing
     // allows and the dose this chart delivers — which invites reading the ceiling as the
     // prescription. They are now one sentence that says which is which.
     const pacing = screen.getByTestId('pacing-explainer').textContent ?? '';
-    expect(pacing).toContain('no limb can be asked for more than 50 reps/min');
+    expect(pacing).toContain('no LANE can be asked for more than 50 reps/min');
     expect(pacing).toContain('actually deliver');
     expect(pacing).toContain('which is the dose above');
+  });
+
+  /**
+   * THE NUMBER A THERAPIST DOSES FROM, FOR A LIMB THAT CARRIES TWO LANES.
+   *
+   * "Left knee extension AND left ankle dorsiflexion" is an ordinary prescription, and that leg is
+   * asked for BOTH lanes. The panel printed the busiest LANE under a "each limb" label, so the figure
+   * was wrong by the number of lanes on the limb — the exact arithmetic a dose is set from.
+   */
+  it('reports a two-lanes-on-one-limb prescription as the SUM of that limb\'s lanes', async () => {
+    useStore.setState({
+      lanes: [
+        { index: 0, movement: 'knee_extension', side: 'left' },
+        { index: 1, movement: 'ankle_dorsiflexion', side: 'left' },
+        { index: 2, movement: 'seated_march', side: 'right' },
+      ],
+      calibrations: [null, null, null],
+    });
+    render(<TherapistSetup />);
+    await screen.findByTestId('setup-dose');
+
+    const reps = (testid: string) => Number((screen.getByTestId(testid).textContent ?? '').match(/\d+/)?.[0] ?? 0);
+    const laneReps = [reps('dose-lane-0'), reps('dose-lane-1'), reps('dose-lane-2')];
+    const leftSum = laneReps[0] + laneReps[1];
+    expect(leftSum).toBeGreaterThan(laneReps[2]); // two lanes of work on one leg
+
+    // The limb line is the sum, not the busiest lane…
+    expect(reps('dose-limb-left')).toBe(leftSum);
+    expect(reps('dose-limb-right')).toBe(laneReps[2]);
+    expect(screen.getByTestId('dose-limb-left').textContent).toContain('left leg');
+    expect(screen.getByTestId('dose-limb-left').textContent).toContain('2 lanes on it, added');
+
+    // …and so is the headline rate: it is the left leg's, and it is bigger than any single lane's.
+    const perMin = Number(screen.getByTestId('dose-reps-per-min').textContent);
+    const limbLine = screen.getByTestId('dose-limb-left').textContent ?? '';
+    expect(limbLine).toContain(`${perMin} reps/min`);
+    expect(screen.getByTestId('dose-limb-note').textContent).toContain('left leg');
+    expect(screen.getByTestId('dose-limb-note').textContent).toContain('2 lanes added together');
+    const perLaneMean = Number(screen.getByTestId('dose-reps-per-lane').textContent);
+    expect(perMin).toBeGreaterThan(0);
+    expect(leftSum).toBeGreaterThan(perLaneMean);
+
+    // and the pacing sentence quotes the LIMB ceiling for a limb with two lanes on it (2 × 60/1.2)
+    const pacing = screen.getByTestId('pacing-explainer').textContent ?? '';
+    expect(pacing).toContain('no LANE can be asked for more than 50 reps/min');
+    expect(pacing).toContain('2 lanes on one limb');
+    expect(pacing).toContain("that limb's ceiling is 100 reps/min");
   });
 
   it('lets a therapist set the pacing exactly, without landing a drag', async () => {

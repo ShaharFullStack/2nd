@@ -6,7 +6,8 @@ import { ReplayInput } from '../input/ReplayInput.ts';
 import type { ReplayEvent } from '../input/ReplayInput.ts';
 import { createMockCanvas, mockCanvasFactory } from '../render/canvasMock.ts';
 import type { StemMixer } from '../audio/StemMixer.ts';
-import { GameRunner } from './GameRunner.ts';
+import { FINALE_SEC, FINALE_SKIP_GUARD_SEC } from '../render/Highway.ts';
+import { GameRunner, sessionAchievement } from './GameRunner.ts';
 import type { PageLifecycle, RunSummary } from './GameRunner.ts';
 
 const LANES: LaneSpec[] = [
@@ -171,7 +172,11 @@ describe('GameRunner', () => {
   });
 
   it('ends after the last note and reports a summary the results screen can use', () => {
+    // 4.0 s ends the chart; the song-end sequence then runs for FINALE_SEC before the report.
     h.advance(6);
+    expect(h.runner.getPhase()).toBe('finale');
+    expect(h.summaries).toHaveLength(0);
+    h.advance(6 + FINALE_SEC + 0.2);
     expect(h.runner.getPhase()).toBe('ended');
     expect(h.summaries).toHaveLength(1);
     const s = h.summaries[0];
@@ -248,7 +253,7 @@ describe('every way a run can end still records the reps that were performed', (
 
   it('the chart ending is the ONLY complete run', async () => {
     const h = await setup(notes, hitAll);
-    h.advance(6);
+    h.advance(6 + FINALE_SEC + 0.2);
     expect(h.summaries[0].endReason).toBe('chart');
     expect(h.summaries[0].completed).toBe(true);
   });
@@ -482,5 +487,144 @@ describe('a miss dims the limb that missed, never the whole band', () => {
     h.advance(3);
     expect(h.mixer.laneHits).toEqual([0]);
     expect(h.mixer.laneMisses).toEqual([1]);
+  });
+});
+
+/**
+ * THE ENDING THE SONG EARNS.
+ *
+ * The chart running out used to BE the end of the run: the last note landed, 1.5 s of empty highway
+ * went by, and the screen cut to the results grid with the score odometer still mid-climb. The chart
+ * ending now starts a song-end sequence on the board and the report waits for it.
+ */
+describe('the song ends with a payoff, not a cut', () => {
+  const notes = [1, 1.5, 2, 2.5];
+  const hitAll: ReplayEvent[] = notes.map((t, i) => ({ lane: i % 2, songTime: t, strength: 1 }));
+
+  it('plays the ending on the highway before handing over to the report', async () => {
+    const h = await setup(notes, hitAll);
+    h.advance(4.2);
+    expect(h.runner.getPhase()).toBe('finale');
+    expect(h.runner.highway.isFinaleActive()).toBe(true);
+    // Nothing is reported yet: the patient is still being paid off.
+    expect(h.summaries).toHaveLength(0);
+
+    h.advance(4.2 + FINALE_SEC + 0.2);
+    expect(h.runner.highway.finaleDone()).toBe(true);
+    expect(h.runner.getPhase()).toBe('ended');
+    expect(h.summaries).toHaveLength(1);
+  });
+
+  it('does not restart the ending when the mixer reports the song over as well', async () => {
+    const h = await setup(notes, hitAll);
+    h.advance(4.2);
+    const t = h.runner.highway.finaleElapsed();
+    h.advance(4.6);
+    expect(h.runner.highway.finaleElapsed()).toBeGreaterThan(t);
+    // A second chart-end (the mixer's `ended`, arriving after the clock's) must not rewind it.
+    h.runner.step();
+    expect(h.runner.highway.finaleElapsed()).toBeGreaterThan(t);
+  });
+
+  /**
+   * SKIPPABLE BY A THERAPIST IN A HURRY — and not by the patient's own last rep. There is no
+   * controller here, so the skip is "anything at all"; the guard is what stops a palm on the glass
+   * eating the whole sequence on its first frame.
+   */
+  it('is skipped by any input, but not inside the opening guard', async () => {
+    const h = await setup(notes, hitAll);
+    h.advance(4.05);
+    expect(h.runner.highway.finaleElapsed()).toBeLessThan(FINALE_SKIP_GUARD_SEC);
+    expect(h.runner.skipFinale()).toBe(false);
+    expect(h.summaries).toHaveLength(0);
+
+    h.advance(4.05 + FINALE_SKIP_GUARD_SEC + 0.1);
+    expect(h.runner.skipFinale()).toBe(true);
+    expect(h.runner.getPhase()).toBe('ended');
+    expect(h.summaries).toHaveLength(1);
+    expect(h.summaries[0].endReason).toBe('chart');
+    expect(h.summaries[0].completed).toBe(true);
+  });
+
+  /**
+   * THE STORED SESSION IS THE CHART'S LENGTH, NOT THE CELEBRATION'S. `RunSummary.songTime` becomes
+   * the duration on the record, which is the denominator of every reps-per-minute a therapist reads.
+   */
+  it('records the session length as of the chart ending, not the end of the sequence', async () => {
+    const h = await setup(notes, hitAll);
+    h.advance(4.05);
+    const atChartEnd = h.runner.songTime();
+    h.advance(4.05 + FINALE_SEC + 0.4);
+    expect(h.summaries[0].songTime).toBeCloseTo(atChartEnd, 1);
+    expect(h.summaries[0].songTime).toBeLessThan(atChartEnd + 1);
+  });
+
+  /**
+   * A COMPLETED SONG STAYS COMPLETED. Everything that ends a run arrives at `finish()`, including a
+   * therapist tapping "End & see results" over the payoff and the screen being left during it. None
+   * of those un-finish a song that finished.
+   */
+  it('stays a complete run when it is quit or abandoned during the ending', async () => {
+    const quit = await setup(notes, hitAll);
+    quit.advance(4.2);
+    quit.runner.quit();
+    expect(quit.summaries[0].endReason).toBe('chart');
+    expect(quit.summaries[0].completed).toBe(true);
+
+    const gone = await setup(notes, hitAll);
+    gone.advance(4.2);
+    gone.runner.dispose();
+    expect(gone.summaries[0].endReason).toBe('chart');
+    expect(gone.summaries[0].completed).toBe(true);
+  });
+
+  /** Nothing can be judged once the chart has run out, so the receptors say so. */
+  it('tells the renderer it is no longer accepting input', async () => {
+    const h = await setup(notes, hitAll);
+    h.advance(4.2);
+    for (const l of LANES) expect(h.runner.highway.receptorLookOf(l.index)?.suspended, `lane ${l.index}`).toBe(true);
+  });
+});
+
+/**
+ * THE ONE SENTENCE THE ENDING SAYS ABOUT THIS SESSION.
+ *
+ * The hard case is a patient who answered six notes out of two hundred: this is the last thing the
+ * game says to them, and it may not be a grade, a rank or a comparison.
+ */
+describe('the session achievement is warm to somebody who scored badly', () => {
+  it('names the full range reached when a lane got there', () => {
+    const a = sessionAchievement({
+      reps: 40,
+      hits: 2,
+      judged: 90,
+      maxCombo: 1,
+      lanes: [
+        { name: 'Left Seated march', bestPeak: 0.94 },
+        { name: 'Right Knee extension', bestPeak: 0.4 },
+      ],
+    });
+    expect(a.text).toContain('Left Seated march');
+    expect(a.text).toContain('Full range');
+    expect(a.note).toContain('94%');
+  });
+
+  it('falls back to the work performed, never to the score', () => {
+    const a = sessionAchievement({ reps: 142, hits: 6, judged: 200, maxCombo: 2, lanes: [{ name: 'Left Seated march', bestPeak: 0.3 }] });
+    expect(a.text).toBe('142 movements performed');
+    expect(a.note).toContain('Every rep counted');
+    // Nothing on this screen may read as a mark out of ten.
+    expect(`${a.text} ${a.note}`).not.toMatch(/star|%|score|accuracy|grade/i);
+  });
+
+  it('names a run of notes when there was one worth naming', () => {
+    const a = sessionAchievement({ reps: 30, hits: 20, judged: 40, maxCombo: 12, lanes: [{ name: 'L', bestPeak: 0.5 }] });
+    expect(a.note).toContain('12 notes answered in a row');
+  });
+
+  it('says plainly when nothing was measured rather than inventing praise', () => {
+    const a = sessionAchievement({ reps: 0, hits: 0, judged: 50, maxCombo: 0, lanes: [{ name: 'L', bestPeak: null }] });
+    expect(a.text).toBe('Session recorded');
+    expect(a.note).toContain('No movement was measured');
   });
 });

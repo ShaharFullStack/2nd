@@ -332,8 +332,12 @@ describe('committed demo songs', () => {
       for (const s of m.stems) {
         const file = path.join(songsDir, id, s.file);
         expect(fs.existsSync(file), `${id}/${s.file} missing — run npm run gen-demo-stems`).toBe(true);
+        // AT THE RATE THE MANIFEST DECLARES, not at the generator's default: public/songs ships a
+        // 16 kHz build (a third of the bytes, so the first note arrives in a third of the time), and
+        // `generated.sampleRate` is what makes that deployment self-describing.
+        const rate = (JSON.parse(fs.readFileSync(path.join(songsDir, id, 'song.json'), 'utf8')) as { generated?: { sampleRate?: number } }).generated?.sampleRate ?? SR;
         const bytes = fs.statSync(file).size;
-        expect(bytes).toBe(44 + Math.round(m.durationSec * SR) * 2);
+        expect(bytes).toBe(44 + Math.round(m.durationSec * rate) * 2);
       }
     }
     // the two demos must actually be different songs
@@ -373,7 +377,10 @@ describe('committed demo songs', () => {
         // and the swung steps are genuinely late against the STRAIGHT grid (the feel is real)
         expect(oddErrs.length, id).toBeGreaterThan(5);
         const straight = oddErrs.map((e) => e + swing * stepSec * 1000).sort((a, b) => a - b);
-        expect(straight[Math.floor(straight.length / 2)]).toBeCloseTo(swing * stepSec * 1000, 0);
+        // Within the detector's own resolution on THESE files — the same 6 ms the median check above
+        // allows. The shipped 16 kHz build softens the hi-hat edge the onset detector triggers on, so
+        // it reports the swung steps ~4 ms late; the feel itself (a third of a 16th, 50 ms) is intact.
+        expect(Math.abs(straight[Math.floor(straight.length / 2)] - swing * stepSec * 1000), id).toBeLessThan(6);
       }
     }
   });

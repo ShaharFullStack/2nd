@@ -156,6 +156,84 @@ export const DEFAULT_HIGHWAY_OPTIONS: HighwayOptions = {
 
 /** Backward songTime jump (s) that is interpreted as a restart (effects/rolling state reset). */
 export const RESTART_JUMP_SEC = 2;
+
+/** One figure on the song-end screen: "142" / "movements performed". */
+export interface FinaleStat {
+  label: string;
+  value: string;
+}
+
+/**
+ * EVERY WORD OF THE ENDING, WRITTEN BY THE CALLER.
+ *
+ * The renderer animates this and invents nothing. A rehab ending has to be warm to a patient who
+ * scored 300 points out of a possible 12 000, and the only place that knows what this particular
+ * session is worth saying about is the session — see `GameRunner.finaleSpec`.
+ */
+export interface FinaleSpec {
+  /** The banner: "SONG COMPLETE". */
+  title: string;
+  /** Usually the song title, so the payoff names what was just played. */
+  subtitle?: string;
+  /** The final score. The odometer rolls up to it and stops there. */
+  score: number;
+  /** Up to `FINALE_MAX_STATS` counts from the session, in reading order. */
+  stats: FinaleStat[];
+  /** ONE sentence about what this patient did today. Never a grade, never conditional on scoring. */
+  achievement: string;
+  /** A quieter second line under it (optional). */
+  achievementNote?: string;
+  /** "Tap anywhere, or press any key, for the report". */
+  hint: string;
+}
+
+/**
+ * How long the song-end sequence runs before it hands over to the report, and the shape of it.
+ *
+ * Six seconds is the length of a Guitar Hero / Rock Band end-of-song card, and it is short enough
+ * that a therapist who does nothing is not kept waiting: it ends itself. Anyone in a hurry skips it
+ * with a tap or any key after `FINALE_SKIP_GUARD_SEC`.
+ */
+export const FINALE_SEC = 5.8;
+export const FINALE_SKIP_GUARD_SEC = 0.6;
+/** Most stat columns the row can hold at the narrowest supported canvas. */
+export const FINALE_MAX_STATS = 4;
+const FINALE_CURTAIN_SEC = 0.5;
+const FINALE_CURTAIN_ALPHA = 0.88;
+const FINALE_TITLE_AT = 0.35;
+const FINALE_SCORE_AT = 0.95;
+const FINALE_SCORE_ROLL_SEC = 1.5;
+const FINALE_STATS_AT = 1.95;
+const FINALE_STAT_STEP_SEC = 0.18;
+const FINALE_ACHIEVEMENT_AT = 2.95;
+const FINALE_HINT_AT = 3.7;
+/** The crowd throws the patient's own lane colours for this long. */
+const FINALE_CONFETTI_SEC = 3.2;
+/** Pieces per second at full `effectIntensity`. */
+const FINALE_CONFETTI_RATE = 42;
+/** Hard cap on live confetti, so the ending costs the same on a tablet as on a workstation. */
+const FINALE_CONFETTI_MAX = 180;
+/** Most the sequence may advance in one call — a backgrounded tab must not skip the payoff. */
+const FINALE_MAX_STEP_SEC = 0.25;
+const FINALE_PANEL_FILL = 'rgba(9, 12, 22, 0.94)';
+const FINALE_PANEL_LINE = 'rgba(143, 180, 255, 0.35)';
+const FINALE_RIBBON_FILL = 'rgba(255, 201, 69, 0.14)';
+const FINALE_RIBBON_LINE = 'rgba(255, 201, 69, 0.55)';
+/** First slot of `hudFit` the finale's strings own (the HUD title/attribution keep 0 and 1). */
+const FINALE_FIT_BASE = 8;
+
+/** "5,100" — the score as the HUD writes it, without pulling in `toLocaleString` per frame. */
+function formatThousands(v: number): string {
+  const n = Math.max(0, Math.round(v));
+  const s = String(n);
+  if (s.length <= 3) return s;
+  let out = '';
+  for (let i = 0; i < s.length; i++) {
+    if (i > 0 && (s.length - i) % 3 === 0) out += ',';
+    out += s[i];
+  }
+  return out;
+}
 /** How long a missed gem takes to grey out, shrink and fade after the engine declares the miss. */
 export const MISS_FIZZLE_SEC = 0.42;
 /** Frame interval above which a frame counts as "long" (dropped at 60 Hz). */
@@ -476,6 +554,26 @@ type LostReason = 'lost' | 'fault' | 'suspended';
  */
 const SONG_CLOCK_STALL_SEC = 0.2;
 
+/**
+ * One piece of end-of-song confetti.
+ *
+ * NOT `ParticlePool`. The pool is drawn with the rest of the board, which the ending's curtain then
+ * puts 88 % of black over: measured at 1280x800, the crowd's colours were there in the pixels and
+ * invisible on the screen. The celebration has to be ON TOP of the curtain, so it is its own tiny
+ * system with its own draw pass — bounded, allocated once, and alive for six seconds a session.
+ */
+interface ConfettiBit {
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  age: number;
+  life: number;
+  color: string;
+  size: number;
+  spin: number;
+}
+
 interface Popup {
   active: boolean;
   judgment: Judgment;
@@ -613,6 +711,18 @@ export class Highway {
   private multiplierPopT0 = -10;
   private displayScore = 0;
   private healthSmooth = 1;
+  /** The song-end sequence, once the chart has run out. Null for the whole rest of the song. */
+  private finale: FinaleSpec | null = null;
+  /** Seconds it has been on screen, on the renderer's WALL clock: the song's may have stopped. */
+  private finaleT = 0;
+  /** Confetti emission accumulator (pieces are spawned at a rate, not per frame). */
+  private finaleConfettiT = 0;
+  /** Seconds the last `advanceFinale` moved it, so the confetti runs on the same clock as the beats. */
+  private finaleStep = 0;
+  /** The crowd. Grown to `FINALE_CONFETTI_MAX` once and then recycled in place. */
+  private finaleBits: ConfettiBit[] = [];
+  /** Lane colours as hex, resolved once when the ending starts. */
+  private finaleColors: string[] = [];
   private lastSongTime: number | null = null;
   /**
    * Sanitized song time for the frame being drawn. Every internal draw step reads this instead of
@@ -845,6 +955,13 @@ export class Highway {
     this.displayScore = 0;
     this.healthSmooth = 1;
     this.lastSongTime = null;
+    // A restart on the same instance is a NEW run, so last run's ending must not still be playing
+    // over it (a `?seed=` re-run from the results screen reuses this Highway).
+    this.finale = null;
+    this.finaleT = 0;
+    this.finaleConfettiT = 0;
+    this.finaleStep = 0;
+    for (const b of this.finaleBits) b.age = b.life;
     this.stats.particles = 0;
     this.stats.notesDrawn = 0;
   }
@@ -1217,6 +1334,10 @@ export class Highway {
     this.drawHud(ctx, frame, dt, beatPulse);
     this.drawCombo(ctx, frame, st);
     if (this.opts.showLabels) this.drawLabels(ctx, frame);
+    // THE ENDING GOES OVER EVERYTHING, including the HUD it replaces — it IS the readout now, and
+    // the live score/combo/gauge behind it are about a song that has finished. Its clock is the
+    // runner's (`advanceFinale`), not song time: the mixer has stopped by the time it is on screen.
+    if (this.finale) this.drawFinale(ctx, this.finaleStep);
     if (this.opts.showStats) this.drawStats(ctx);
 
     ctx.globalAlpha = 1;
@@ -2884,6 +3005,7 @@ export class Highway {
   private hudSrc: string[] = ['', ''];
   private hudFit: string[] = ['', ''];
   private hudRoom: number[] = [-1, -1];
+  /** Finale strings share the same cold-path fit cache, from `FINALE_FIT_BASE` up. */
 
   /**
    * Ellipsize a HUD string to `room` px, caching the result: `TextCache.fit` measures, so it is a
@@ -2948,6 +3070,32 @@ export class Highway {
         break;
       case 'receptorQ':
         s = { font: `900 ${px(20, 13)}px ${FONT}`, color: '#ffffff', stroke: '#000000', strokeWidth: px(2, 1) };
+        break;
+      // The song-end sequence. Bigger than the HUD on purpose — it is read from across a room, by a
+      // patient who has just stopped moving, and it is the last thing this screen says to them.
+      case 'finaleTitle':
+        s = { font: `italic 900 ${px(46, 24)}px ${FONT}`, color: '#ffffff', stroke: 'rgba(0,0,0,0.55)', strokeWidth: px(3, 1), glow: '#8fb4ff', glowBlur: px(18, 6) };
+        break;
+      case 'finaleSub':
+        s = { font: `600 ${px(17, 12)}px ${FONT}`, color: UI_COLORS.textDim };
+        break;
+      case 'finaleScore':
+        s = { font: `900 ${px(58, 30)}px ${FONT}`, color: '#ffd84a', stroke: 'rgba(0,0,0,0.5)', strokeWidth: px(3, 1), glow: '#ff9d00', glowBlur: px(16, 5) };
+        break;
+      case 'finaleStat':
+        s = { font: `800 ${px(28, 17)}px ${FONT}`, color: UI_COLORS.text, stroke: 'rgba(0,0,0,0.5)', strokeWidth: px(2, 1) };
+        break;
+      case 'finaleStatLabel':
+        s = { font: `700 ${px(12, 11)}px ${FONT}`, color: UI_COLORS.textDim };
+        break;
+      case 'finaleAchievement':
+        s = { font: `800 ${px(19, 13)}px ${FONT}`, color: '#ffd84a' };
+        break;
+      case 'finaleNote':
+        s = { font: `500 ${px(14, 11)}px ${FONT}`, color: UI_COLORS.textDim };
+        break;
+      case 'finaleHint':
+        s = { font: `700 ${px(15, 11)}px ${FONT}`, color: UI_COLORS.text };
         break;
       case 'stats':
         s = { font: `${px(12, 10)}px ui-monospace, Menlo, Consolas, monospace`, color: '#9cffb0' };
@@ -3338,6 +3486,349 @@ export class Highway {
     ctx.textBaseline = 'middle';
     ctx.fillText(txt, this.width - 16, this.height - 15 * this.u);
     ctx.restore();
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // The song-end sequence
+  // ---------------------------------------------------------------------------------------------
+
+  /**
+   * Begin the song-end sequence. `GameRunner` calls this the moment the chart runs out and polls
+   * `finaleDone()` for the hand-over to the report. Calling it twice is a no-op — the second chart
+   * end (the mixer's `ended` event arriving after the clock's) must not restart the payoff.
+   */
+  startFinale(spec: FinaleSpec): void {
+    if (this.finale) return;
+    this.finale = spec;
+    this.finaleT = 0;
+    this.finaleConfettiT = 0;
+    this.finaleStep = 0;
+    for (const b of this.finaleBits) b.age = b.life;
+    this.finaleColors = [];
+    for (let i = 0; i < this.geom.laneCount; i++) this.finaleColors.push(laneColor(this.palette, i).bright);
+    if (this.finaleColors.length === 0) this.finaleColors.push('#ffffff');
+  }
+
+  /** Live confetti pieces — the crowd, for a test that has to know whether it showed up. */
+  finaleConfettiCount(): number {
+    let n = 0;
+    for (const b of this.finaleBits) if (b.age < b.life) n++;
+    return n;
+  }
+
+  /** True between `startFinale` and `clearFinale` — the board is playing the ending. */
+  isFinaleActive(): boolean {
+    return this.finale !== null;
+  }
+
+  /**
+   * Move the sequence on by `dtSec`.
+   *
+   * THE DRIVER IS THE RUNNER, NOT THIS CLASS, and that is deliberate: by the time the ending is on
+   * screen the mixer has stopped, so there is no song clock to animate against, and a renderer that
+   * reached for `performance.now()` of its own accord would be the one animation in this file that
+   * no test and no critic harness could step. `GameRunner` already owns an injectable wall clock
+   * (`nowMs`) for exactly this kind of thing, so it hands the seconds over. Clamped per call so one
+   * long frame — a tab that was backgrounded over the celebration — cannot jump the whole sequence.
+   */
+  advanceFinale(dtSec: number): void {
+    if (!this.finale || !Number.isFinite(dtSec) || dtSec <= 0) return;
+    this.finaleStep = Math.min(dtSec, FINALE_MAX_STEP_SEC);
+    this.finaleT += this.finaleStep;
+  }
+
+  /** Seconds the sequence has been on screen (its own wall clock; the song's may have stopped). */
+  finaleElapsed(): number {
+    return this.finale ? this.finaleT : 0;
+  }
+
+  /** True once the whole sequence has played (or been skipped). */
+  finaleDone(): boolean {
+    return this.finale !== null && this.finaleT >= FINALE_SEC;
+  }
+
+  /**
+   * True once the ending has been on screen long enough to be skipped deliberately.
+   *
+   * THE GUARD IS NOT A DELAY FOR ITS OWN SAKE. The skip is "anything at all" — a tap anywhere, any
+   * key — because the patient's hands may be the thing being measured and there is no controller.
+   * That means the last rep's own key-up, a palm resting on a tablet, or a therapist's finger still
+   * on the pause button would eat the entire payoff in the first frame. Half a second of the last
+   * note landing is the whole reason the sequence exists.
+   */
+  finaleSkippable(): boolean {
+    return this.finale !== null && this.finaleT >= FINALE_SKIP_GUARD_SEC;
+  }
+
+  /** Jump to the end of the sequence (therapist in a hurry). Ignored inside the skip guard. */
+  skipFinale(): boolean {
+    if (!this.finaleSkippable()) return false;
+    this.finaleT = FINALE_SEC;
+    return true;
+  }
+
+  /** Forget the sequence entirely (a new run on the same instance). */
+  clearFinale(): void {
+    this.finale = null;
+    this.finaleT = 0;
+    for (const b of this.finaleBits) b.age = b.life;
+  }
+
+  /**
+   * THE ENDING THE SONG EARNS.
+   *
+   * A patient watched a score odometer climb for 97 seconds and a combo counter beside it, and then
+   * the chart simply ran out: 1.5 s of empty highway and a cut to a results grid. Every shipped
+   * rhythm game pays the player off at the end of a song, and this one has more reason to than most
+   * — the run IS the therapy session, and the last thing the patient sees of it was nothing at all.
+   *
+   * Four beats, in the order a player expects them:
+   *   0.0 s  the board dims behind a curtain while the last gem finishes falling, and the lanes
+   *          throw their own colours up over the strike line (the crowd).
+   *   0.35 s the title lands.
+   *   0.95 s the score rolls up to where it finished — the odometer SETTLING, which is the beat the
+   *          old ending cut off mid-climb.
+   *   2.5 s  this session's own counts arrive one at a time, then the one sentence about what the
+   *          patient did today, then the hint that anything at all moves on.
+   *
+   * AND IT HAS TO BE WARM TO SOMEBODY WHO SCORED BADLY. Nothing here is a grade: there is no
+   * pass/fail, no rank, no "you needed 40 % for a star". The score is stated because the patient
+   * watched it all song and is owed the end of that animation; the sentence beside it is about
+   * movements performed, which is the thing a rehab session actually asks for and which a patient
+   * who hit six notes out of two hundred still did hundreds of. `FinaleSpec.achievement` is written
+   * by the caller for exactly that reason — the renderer never invents praise it cannot support.
+   */
+  private drawFinale(ctx: Ctx2D, dt: number): void {
+    const spec = this.finale;
+    if (!spec) return;
+    const t = this.finaleT;
+    const W = this.width;
+    const H = this.height;
+    const u = this.u;
+    const cx = W / 2;
+    const calm = this.opts.reducedMotion;
+
+    // The crowd: the patient's own lane colours thrown up over the strike line. Decorative, so it
+    // follows `effectIntensity` and stops entirely under reduced motion.
+    this.stepConfetti(dt, calm ? 0 : this.eff);
+
+    // The curtain, over EVERYTHING including the HUD. The live score readout, the answered gauge and
+    // the multiplier badge are all about a song that has finished, and at a gentler alpha they went
+    // on competing with the ending for the eye — measured at 1280x800, the six-digit "000000" in the
+    // top right was the brightest text on the screen while the card was reading out the real one.
+    const curtain = clamp(t / FINALE_CURTAIN_SEC, 0, 1) * FINALE_CURTAIN_ALPHA;
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = withAlpha(UI_COLORS.background0, curtain);
+    ctx.fillRect(0, 0, W, H);
+
+    const appear = (at: number, dur = 0.28): number => (t <= at ? 0 : clamp((t - at) / dur, 0, 1));
+
+    /**
+     * ONE PANEL, AND EVERY LINE POSITIONED OFF IT.
+     *
+     * Laid out as fractions of the canvas, the ending's lower half landed on the receptor row and
+     * the lane labels — the achievement ribbon sat across the strike line at 1280x800, which is the
+     * one part of the board still drawing hardware. A panel is also what makes the card read as a
+     * card at 1024x768, where the gems behind it are proportionally larger.
+     */
+    const stats = spec.stats.slice(0, FINALE_MAX_STATS);
+    const hasStats = stats.length > 0;
+    const hasAchievement = spec.achievement.length > 0;
+    const panelW = Math.min(W - 40 * u, 700 * u);
+    const panelH = Math.min(
+      H - 40 * u,
+      (176 + (hasStats ? 92 : 0) + (hasAchievement ? 92 : 0) + (spec.achievementNote ? 22 : 0)) * u,
+    );
+    const top = Math.max(20 * u, (H - panelH) / 2 - 10 * u);
+    const panelIn = clamp(t / FINALE_CURTAIN_SEC, 0, 1);
+    ctx.globalAlpha = panelIn * 0.94;
+    ctx.fillStyle = FINALE_PANEL_FILL;
+    roundRectPath(ctx, cx - panelW / 2, top, panelW, panelH, 20 * u);
+    ctx.fill();
+    ctx.globalAlpha = panelIn * 0.8;
+    ctx.strokeStyle = FINALE_PANEL_LINE;
+    ctx.lineWidth = Math.max(1, 1.5 * u);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    // OVER THE CURTAIN AND OVER THE CARD, UNDER THE WORDS. This is the beat where the room reacts,
+    // and under the curtain it was not a beat at all — the colours were in the pixels at 12 % and
+    // read as dust. Over the card and under the text it is a celebration that never costs a word
+    // its legibility.
+    this.drawConfetti(ctx);
+
+    let y = top + 46 * u;
+
+    // Title.
+    const titleIn = appear(FINALE_TITLE_AT, 0.3);
+    if (titleIn > 0) {
+      const pop = calm ? 1 : 1 + 0.12 * (1 - easeOutCubic(titleIn));
+      this.text.draw(ctx, spec.title, cx, y, this.style('finaleTitle'), pop, titleIn);
+      if (spec.subtitle) {
+        this.text.draw(
+          ctx,
+          this.fitFinale(0, spec.subtitle, this.style('finaleSub'), panelW - 48 * u),
+          cx,
+          y + 32 * u,
+          this.style('finaleSub'),
+          1,
+          titleIn * 0.9,
+        );
+      }
+    }
+    y += 78 * u;
+
+    // The score, settling. This is the animation the old ending cut off: the odometer was still
+    // climbing when the screen changed.
+    const scoreIn = appear(FINALE_SCORE_AT, 0.2);
+    if (scoreIn > 0) {
+      const roll = calm ? 1 : easeOutCubic(clamp((t - FINALE_SCORE_AT) / FINALE_SCORE_ROLL_SEC, 0, 1));
+      this.text.drawChars(ctx, formatThousands(Math.round(spec.score * roll)), cx, y, this.style('finaleScore'), 1, scoreIn);
+      // 42, not 34: at 1920 the score is drawn at 87 px and its descenders reached the caption.
+      this.text.draw(ctx, 'POINTS THIS SESSION', cx, y + 42 * u, this.style('finaleStatLabel'), 1, scoreIn * 0.85);
+    }
+    y += 74 * u;
+
+    // The session's own counts, arriving one at a time along one row.
+    if (hasStats) {
+      const colW = Math.min((panelW - 24 * u) / stats.length, 200 * u);
+      y += 30 * u;
+      for (let i = 0; i < stats.length; i++) {
+        const a = appear(FINALE_STATS_AT + i * FINALE_STAT_STEP_SEC, 0.22);
+        if (a <= 0) continue;
+        const x = cx + (i - (stats.length - 1) / 2) * colW;
+        this.text.drawChars(ctx, stats[i].value, x, y, this.style('finaleStat'), 1, a);
+        this.text.draw(
+          ctx,
+          this.fitFinale(1 + i, stats[i].label, this.style('finaleStatLabel'), colW - 10 * u),
+          x,
+          y + 24 * u,
+          this.style('finaleStatLabel'),
+          1,
+          a * 0.85,
+        );
+      }
+      y += 62 * u;
+    }
+
+    // The one sentence about what this patient did today, on its own ribbon so it reads as the
+    // point of the screen rather than as a caption under the score.
+    const achIn = appear(FINALE_ACHIEVEMENT_AT, 0.32);
+    if (achIn > 0 && hasAchievement) {
+      const style = this.style('finaleAchievement');
+      const room = panelW - 40 * u;
+      const label = this.fitFinale(1 + FINALE_MAX_STATS, spec.achievement, style, room - 44 * u);
+      y += 30 * u;
+      const h = 42 * u;
+      const wRibbon = Math.min(room, this.text.measure(label, style) + 44 * u);
+      ctx.globalAlpha = achIn * 0.9;
+      ctx.fillStyle = FINALE_RIBBON_FILL;
+      roundRectPath(ctx, cx - wRibbon / 2, y - h / 2, wRibbon, h, h / 2);
+      ctx.fill();
+      ctx.globalAlpha = achIn;
+      ctx.strokeStyle = FINALE_RIBBON_LINE;
+      ctx.lineWidth = Math.max(1, 1.5 * u);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+      this.text.draw(ctx, label, cx, y, style, 1, achIn);
+      if (spec.achievementNote) {
+        this.text.draw(
+          ctx,
+          this.fitFinale(2 + FINALE_MAX_STATS, spec.achievementNote, this.style('finaleNote'), room),
+          cx,
+          y + h * 0.78,
+          this.style('finaleNote'),
+          1,
+          achIn * 0.85,
+        );
+      }
+    }
+
+    // "Anything at all moves on." Only once the skip really works, so the screen never invites a
+    // tap it is about to ignore.
+    const hintIn = appear(FINALE_HINT_AT, 0.4);
+    if (hintIn > 0 && spec.hint) {
+      const breathe = calm ? 1 : 0.72 + 0.28 * Math.sin(t * 2.6);
+      this.text.draw(ctx, spec.hint, cx, Math.min(H - 24 * u, top + panelH + 30 * u), this.style('finaleHint'), 1, hintIn * breathe);
+    }
+
+    ctx.globalAlpha = 1;
+  }
+
+  /** Spawn and move the ending's confetti. `intensity` is 0 under reduced motion — no pieces at all. */
+  private stepConfetti(dt: number, intensity: number): void {
+    const g = this.geom;
+    const u = this.u;
+    if (intensity > 0 && this.finaleT < FINALE_CONFETTI_SEC) {
+      this.finaleConfettiT += dt;
+      const per = 1 / (FINALE_CONFETTI_RATE * intensity);
+      const left = roadEdgeX(g, -1, 0);
+      const span = Math.max(1, roadEdgeX(g, 1, 0) - left);
+      while (this.finaleConfettiT >= per) {
+        this.finaleConfettiT -= per;
+        const bit = this.freeBit();
+        if (!bit) break;
+        bit.x = left + this.rng() * span;
+        bit.y = g.strikeY + 8 * u;
+        bit.vx = (this.rng() - 0.5) * 150 * u;
+        bit.vy = -(320 + this.rng() * 360) * u;
+        bit.age = 0;
+        bit.life = 1.3 + this.rng() * 1.1;
+        bit.color = this.finaleColors[Math.floor(this.rng() * this.finaleColors.length)] ?? '#ffffff';
+        bit.size = (4.5 + this.rng() * 4.5) * u;
+        bit.spin = 4 + this.rng() * 7;
+      }
+    }
+    for (const b of this.finaleBits) {
+      if (b.age >= b.life) continue;
+      b.age += dt;
+      b.x += b.vx * dt;
+      b.y += b.vy * dt;
+      b.vy += 300 * u * dt;
+      b.vx *= 1 - Math.min(1, 0.6 * dt);
+    }
+  }
+
+  private freeBit(): ConfettiBit | null {
+    for (const b of this.finaleBits) if (b.age >= b.life) return b;
+    if (this.finaleBits.length >= FINALE_CONFETTI_MAX) return null;
+    const b: ConfettiBit = { x: 0, y: 0, vx: 0, vy: 0, age: 0, life: 0, color: '#ffffff', size: 1, spin: 1 };
+    this.finaleBits.push(b);
+    return b;
+  }
+
+  private drawConfetti(ctx: Ctx2D): void {
+    let any = false;
+    for (const b of this.finaleBits) if (b.age < b.life) { any = true; break; }
+    if (!any) return;
+    ctx.globalCompositeOperation = 'lighter';
+    for (const b of this.finaleBits) {
+      if (b.age >= b.life) continue;
+      const k = b.age / b.life;
+      // Full strength for most of its fall, then out — a long linear fade leaves a haze of
+      // near-invisible specks over the card for seconds.
+      ctx.globalAlpha = clamp(k > 0.7 ? (1 - k) / 0.3 : 1, 0, 1) * 0.95;
+      ctx.fillStyle = b.color;
+      // Tumbling, without a transform per piece: the width breathes while the height stays put.
+      // Never edge-on: a piece drawn at 0.6 px wide is a hairline, not a flake, and a field of them
+      // reads as interference on the panel rather than as a celebration.
+      const w = Math.max(b.size * 0.4, b.size * Math.abs(Math.cos(b.age * b.spin)));
+      ctx.fillRect(b.x - w / 2, b.y - b.size / 2, w, b.size * 1.6);
+    }
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  /** `fitHud`'s cold-path cache, for the finale's strings (they change once per session). */
+  private fitFinale(slot: number, text: string, style: TextStyle, room: number): string {
+    const i = FINALE_FIT_BASE + slot;
+    if (this.hudSrc[i] !== text || this.hudRoom[i] !== room) {
+      this.hudSrc[i] = text;
+      this.hudRoom[i] = room;
+      this.hudFit[i] = this.text.fit(text, style, room);
+    }
+    return this.hudFit[i];
   }
 }
 

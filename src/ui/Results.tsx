@@ -13,34 +13,27 @@
  * (session/trends.ts): a clinic tablet's history is device-wide, and a keyboard or autoplay run is
  * the system producing the input, not the patient producing a movement.
  */
-import { useMemo } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import type { ReactNode } from 'react';
 import { ANSWER_WARMUP_NOTES } from '../engine/scoring.ts';
-import { endReasonLabel, formatDuration, formatMs, formatPercent } from '../session/results.ts';
+import {
+  endReasonLabel,
+  formatDuration,
+  formatMs,
+  formatPercent,
+  laneRangeSummaries,
+  laneTrendKey,
+  mostImprovedRange,
+} from '../session/results.ts';
+import type { LaneRangeSummary } from '../session/results.ts';
+import { timingResolutionMs } from '../session/tracking.ts';
 import { isPatientDriven, patientSessions } from '../session/trends.ts';
 import type { LaneResultSummary, SessionResult } from '../session/types.ts';
 import { useStore } from '../state/store.ts';
 import { FEATURE_UNIT_SHORT, formatFeature } from '../vision/calibration.ts';
-import { MOVEMENT_INFO } from '../vision/features.ts';
 import { Meter, Screen, Stars, Toast, TopBar } from './common.tsx';
+import { MeasurementNote } from './ScopeNote.tsx';
 import LatencyHandover from './LatencyHandover.tsx';
-
-/** The key a movement's history is tracked under (movement + side + fingertip), as in trends.ts. */
-function laneKey(l: Pick<LaneResultSummary, 'movement' | 'side' | 'fingertip'>): string {
-  return l.fingertip ? `${l.movement}:${l.side}:${l.fingertip}` : `${l.movement}:${l.side}`;
-}
-
-/** The lane's mean peak in the movement's OWN units (degrees / ratio), or null when not measured. */
-function absoluteMean(l: LaneResultSummary): number | null {
-  if (l.romSamples <= 0 || l.romMean === null || l.calibratedMin === null || l.calibratedMax === null) return null;
-  const v = l.calibratedMin + l.romMean * (l.calibratedMax - l.calibratedMin);
-  return Number.isFinite(v) ? v : null;
-}
-
-function absoluteBest(l: LaneResultSummary): number | null {
-  if (l.romSamples <= 0 || l.romBest === null || l.calibratedMin === null || l.calibratedMax === null) return null;
-  const v = l.calibratedMin + l.romBest * (l.calibratedMax - l.calibratedMin);
-  return Number.isFinite(v) ? v : null;
-}
 
 /** "+12" / "−3" / "—". Deltas are stated as counts, never as a pass mark. */
 function delta(now: number, then: number | null): string | null {
@@ -48,6 +41,176 @@ function delta(now: number, then: number | null): string | null {
   const d = now - then;
   if (d === 0) return 'same as last time';
   return `${d > 0 ? '+' : '−'}${Math.abs(Math.round(d))} vs last time`;
+}
+
+/** A signed change in the movement's own units, for the per-limb range tiles. */
+function signedFeature(d: number, unit: 'deg' | 'ratio'): string {
+  const sign = d > 0 ? '+' : '−';
+  return `${sign}${formatFeature(Math.abs(d), unit)}`;
+}
+
+/** True when a change is smaller than the units it would be printed in can show. */
+function belowResolution(d: number, unit: 'deg' | 'ratio'): boolean {
+  return formatFeature(Math.abs(d), unit) === formatFeature(0, unit);
+}
+
+/**
+ * WHAT CHANGED SINCE LAST TIME, in a unit that can actually show it.
+ *
+ * A knee that went 152.6° → 153.2° printed "+0° vs last time", which is neither the truth ("no
+ * change") nor the measurement (+0.6°) — it is the rounding, presented as a finding. Where the
+ * movement's own units cannot resolve the change, the same change is stated as a share of THAT
+ * movement's calibrated range, which is the quantity the ranking uses anyway; where neither can
+ * resolve it, it really is no change and says so.
+ */
+function gainLabel(s: LaneRangeSummary): { text: string; note?: string } | null {
+  if (s.gain === null && s.gainPct === null) return null;
+  if (s.gain !== null && !belowResolution(s.gain, s.unit)) return { text: `${signedFeature(s.gain, s.unit)} vs last time` };
+  if (s.gainPct !== null && Math.abs(s.gainPct) >= 0.005) {
+    const pts = Math.abs(Math.round(s.gainPct * 100));
+    return {
+      // The badge stays one line at 1024 (measured: 18 characters is 184 px in a 265 px tile); the
+      // unit it is in — which is NOT the movement's own unit here — goes on the line under it.
+      text: `${s.gainPct > 0 ? '+' : '−'}${pts} ${pts === 1 ? 'pt' : 'pts'} vs last time`,
+      note: `in points of this movement’s own calibrated range: the change is under ${formatFeature(1, s.unit)}`,
+    };
+  }
+  return { text: 'same as last time' };
+}
+
+/**
+ * A WIDE TABLE THAT SAYS IT IS WIDE, AND CAN BE MOVED WITHOUT A MOUSE.
+ *
+ * `.table-wrap` is `overflow-x: auto` and nothing else. On the clinic target size (1024x768) the
+ * clinical table measured 1302 px inside a 961 px scroller: the COMPENSATION badge and the best-rep
+ * column were simply not on the screen, with no scrollbar drawn (overlay scrollbars on a touch
+ * device appear only while scrolling) and no other hint that anything was missing. A therapist
+ * reading "no compensation flags" off a table that never showed them the column is the worst
+ * failure this screen has.
+ *
+ * So the overflow is MEASURED and, when there is any, stated in words and given two full-size
+ * buttons. Both are live: the message names the columns that are off-screen and the arrows page the
+ * scroller, so the columns are reachable by touch on a tablet with no keyboard and no mouse.
+ */
+export function ScrollTable({
+  children,
+  offscreen,
+  testId,
+}: {
+  children: ReactNode;
+  /** The columns a reader loses first — named in the cue, because "scroll" alone says nothing. */
+  offscreen: string;
+  testId?: string;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [state, setState] = useState<{ more: boolean; back: boolean } | null>(null);
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const read = () => {
+      const slack = el.scrollWidth - el.clientWidth;
+      if (slack <= 4) {
+        setState((s) => (s === null ? s : null));
+        return;
+      }
+      const next = { more: el.scrollLeft < slack - 4, back: el.scrollLeft > 4 };
+      setState((s) => (s && s.more === next.more && s.back === next.back ? s : next));
+    };
+    read();
+    el.addEventListener('scroll', read, { passive: true });
+    const ro = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(read);
+    ro?.observe(el);
+    return () => {
+      el.removeEventListener('scroll', read);
+      ro?.disconnect();
+    };
+  });
+
+  const page = (dir: 1 | -1) => {
+    const el = ref.current;
+    if (!el) return;
+    el.scrollBy({ left: dir * Math.max(160, el.clientWidth * 0.7), behavior: 'smooth' });
+  };
+
+  return (
+    <div className="stack" style={{ gap: 8 }}>
+      {/* ABOVE THE TABLE, NEXT TO THE HEADER ROW THE MISSING COLUMNS BELONG TO. A five-session
+          history table is two screens tall, so a cue underneath it is a cue the therapist reads
+          after they have finished reading the table they did not know was incomplete. */}
+      {state && (
+        <div className="row" style={{ gap: 10 }} data-testid={testId ? `${testId}-scroll-cue` : 'table-scroll-cue'}>
+          <button className="btn btn-sm" onClick={() => page(-1)} disabled={!state.back} aria-label="Scroll table left">
+            ←
+          </button>
+          <button className="btn btn-sm" onClick={() => page(1)} disabled={!state.more} aria-label="Scroll table right">
+            →
+          </button>
+          <span className="dim">
+            {state.more
+              ? `This table is wider than the screen — ${offscreen} are off to the right. Swipe it or use the arrows.`
+              : 'Scrolled to the end of this table — the arrows bring the first columns back.'}
+          </span>
+        </div>
+      )}
+      <div className="table-wrap" ref={ref} data-testid={testId}>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+/** One prescribed movement's range, as the headline treats it: on its own, against its own range. */
+function RangeTile({ s, improved }: { s: LaneRangeSummary; improved: boolean }) {
+  const gain = gainLabel(s);
+  return (
+    <div
+      className="stack"
+      style={{
+        gap: 6,
+        padding: '14px 16px',
+        borderRadius: 14,
+        border: '1px solid var(--line)',
+        background: 'rgba(255,255,255,0.03)',
+        minWidth: 0,
+      }}
+      data-testid={`results-range-lane-${s.lane}`}
+    >
+      <div className="eyebrow" style={{ whiteSpace: 'normal' }}>
+        {s.movementName}
+      </div>
+      {s.measured ? (
+        <>
+          <div className="big-number mono" style={{ fontSize: 'clamp(1.9rem, 3.2vw, 2.6rem)' }}>
+            {s.best === null ? formatPercent(s.bestFraction) : formatFeature(s.best, s.unit)}
+          </div>
+          <div className="dim">
+            best rep · {formatPercent(s.bestFraction)} of this movement’s own calibrated range · {s.reps} reps
+          </div>
+          <div className="row" style={{ gap: 8 }}>
+            {gain !== null && (
+              <span className={(s.gainPct ?? 0) > 0 ? 'badge badge-ok' : 'badge'} data-testid={`results-range-gain-${s.lane}`}>
+                {gain.text}
+              </span>
+            )}
+            {improved && (
+              <span className="badge badge-ok" data-testid={`results-range-improved-${s.lane}`}>
+                biggest gain today
+              </span>
+            )}
+          </div>
+          {gain?.note && <div className="dim">{gain.note}</div>}
+        </>
+      ) : (
+        <>
+          <div className="big-number mono" style={{ fontSize: 'clamp(1.9rem, 3.2vw, 2.6rem)' }}>
+            —
+          </div>
+          <div className="dim">no range was measured in this movement</div>
+        </>
+      )}
+    </div>
+  );
 }
 
 export default function ResultsScreen() {
@@ -69,9 +232,17 @@ export default function ResultsScreen() {
 
   const previousLanes = useMemo(() => {
     const map = new Map<string, LaneResultSummary>();
-    for (const l of previous?.lanes ?? []) map.set(laneKey(l), l);
+    for (const l of previous?.lanes ?? []) map.set(laneTrendKey(l), l);
     return map;
   }, [previous]);
+
+  /**
+   * PER LIMB, IN PRESCRIPTION ORDER, NEVER A MAXIMUM ACROSS LANES. See `laneRangeSummaries` — the
+   * headline used to be `max(romBest)` over every lane, which on a mixed hemiparetic prescription
+   * picks the unaffected side essentially every time.
+   */
+  const ranges = useMemo(() => laneRangeSummaries(result?.lanes ?? [], previousLanes), [result, previousLanes]);
+  const improved = useMemo(() => mostImprovedRange(ranges), [ranges]);
 
   if (!result) {
     return (
@@ -84,12 +255,17 @@ export default function ResultsScreen() {
     );
   }
 
-  const measuredLanes = result.lanes.filter((l) => l.romSamples > 0);
-  const bestLane = measuredLanes.reduce<LaneResultSummary | null>(
-    (best, l) => (best === null || (l.romBest ?? 0) > (best.romBest ?? 0) ? l : best),
-    null,
+  const measuredRanges = ranges.filter((r) => r.measured);
+  /** This lane, last time — for the rep delta beside each movement. */
+  const previousByLane = new Map<number, LaneResultSummary | null>(
+    result.lanes.map((l) => [l.lane, previousLanes.get(laneTrendKey(l)) ?? null]),
   );
+  /** The units in play, for the one sentence that says what the figures above are measured in. */
+  const units = Array.from(new Set(measuredRanges.map((r) => r.unit)));
   const sessionsSoFar = patientSessions(history, result.patientId).filter(isPatientDriven).length;
+
+  /** The finest timing difference this session's camera stream could resolve (null when unrecorded). */
+  const timingRes = result.tracking ? timingResolutionMs(result.tracking) : null;
 
   const judged = result.hits + result.misses;
   /** Notes answered with a movement, bounded by the notes offered — null on a pre-`answerRate` record. */
@@ -133,7 +309,10 @@ export default function ResultsScreen() {
       return 'The pacing of one of these sessions was not recorded, so the number of reps ASKED FOR may have differed — read the change in reps with that in mind.';
     }
     if (Math.abs(now - then) < 0.05) return null;
-    return `The pacing differed: last session allowed ${then.toFixed(1)} s between reps of one limb and this one ${now.toFixed(1)} s, so the two sessions asked for different numbers of reps. The change in reps performed is partly the prescription, not the patient.`;
+    // PER LANE, not per limb — the same correction the setup card and the export carry: the rest is
+    // between two reps of the SAME MOVEMENT, and a limb with two lanes on it can be asked for both
+    // inside it. This sentence is read beside a rep count, so the unit has to be the right one.
+    return `The pacing differed: last session allowed ${then.toFixed(1)} s between two reps of the same movement and this one ${now.toFixed(1)} s (that rest is per lane, not per limb), so the two sessions asked for different numbers of reps. The change in reps performed is partly the prescription, not the patient.`;
   })();
 
   return (
@@ -186,8 +365,60 @@ export default function ResultsScreen() {
         </div>
       )}
 
-      {/* THE HEADLINE IS THE WORK: reps performed, range reached, and the direction of travel. */}
-      <div className="card-grid">
+      {/*
+        THE HEADLINE IS THE WORK — AND THE WORK IS PER LIMB.
+
+        This card used to print ONE figure, `max(romBest)` across every lane, under the words "RANGE
+        ACHIEVED". A hemiparetic prescription mixes an affected limb with an unaffected one on
+        purpose, so the maximum is the strong side almost every time: the screen celebrated the leg
+        the patient did not come about and filed the one they did into a table below the fold. There
+        is no "affected side" field to headline instead — `Patient` holds a name and an id and
+        nothing else, deliberately — and inventing one from the numbers would be a clinical claim
+        made up by a UI. So every prescribed movement gets its own figure, against its OWN calibrated
+        range, in prescription order, and nothing is ranked except a patient against themselves.
+      */}
+      <div className="card stack" data-testid="results-range">
+        <div className="row">
+          <div className="eyebrow">Range achieved · every movement worked</div>
+          <div className="grow" />
+          {improved && (
+            <span className="dim" data-testid="results-range-most-improved">
+              Biggest gain since last session: {improved.movementName}
+            </span>
+          )}
+        </div>
+        <div
+          style={{
+            display: 'grid',
+            gridTemplateColumns: `repeat(auto-fit, minmax(${ranges.length > 2 ? 210 : 260}px, 1fr))`,
+            gap: 12,
+            alignItems: 'stretch',
+          }}
+        >
+          {ranges.map((s) => (
+            <RangeTile key={s.lane} s={s} improved={improved?.lane === s.lane} />
+          ))}
+        </div>
+        {/* WHAT THE NUMBERS ARE. A ratio movement prints a bare "0.34" — the unit has no symbol, so
+            it has to be said in words or the figures above mean nothing. */}
+        <div className="dim" data-testid="results-range-unit">
+          {measuredRanges.length === 0
+            ? 'No range was measured in this session.'
+            : `Each figure is that movement’s best rep, measured in ${units
+                .map((u) => FEATURE_UNIT_SHORT[u])
+                .join(' and ')}${units.includes('ratio') ? ' — the movement against this patient’s own torso (or palm) size' : ' at the joint'}, out of the range calibrated for THAT movement today. Ranges from different movements are never compared with each other.`}
+        </div>
+        {/*
+          WHAT THESE FIGURES ARE, AND HOW WELL THEY WERE MEASURED — under the degrees, where they are
+          read. The scope statement used to live only in the README while this card printed a joint
+          angle to one decimal place; the tracking line beside it is the difference between a range
+          measured on a steady 30 fps stream and one measured on a 12 fps stream with the limb
+          drifting out of frame, which the record could not previously tell apart at all.
+        */}
+        <MeasurementNote tracking={result.tracking} inputMode={result.inputMode} full testId="results-measurement-note" />
+      </div>
+
+      <div className="card-grid" style={{ alignItems: 'stretch' }}>
         <div className="card stack" data-testid="results-reps">
           <div className="eyebrow">Movements performed</div>
           <div className="big-number mono">{result.reps}</div>
@@ -201,19 +432,6 @@ export default function ResultsScreen() {
                 ? (delta(result.reps, previous.reps) ?? '')
                 : 'First recorded session for this patient'}
           </div>
-          {/*
-            A REP COUNT IS ONLY COMPARABLE AGAINST THE DOSE THAT WAS ASKED FOR. Pacing is the control
-            that sets that dose directly — the same patient, song and difficulty gives 24 reps a lane
-            at 3.0 s and 96 at 0.4 s — so "+26 vs last time" is meaningless unless both sessions were
-            asked for the same number. When the pacing moved, or either session predates the control
-            and did not record it, the delta above is qualified here rather than left to be read as
-            progress.
-          */}
-          {previous && isPatientDriven(result) && pacingNote && (
-            <div className="dim" data-testid="results-pacing-note">
-              {pacingNote}
-            </div>
-          )}
           {/* Only when the song did not run to the end: otherwise judged == the whole chart and the
               line says nothing. A short session is a fact about the dose, so it is stated. */}
           {result.totalNotes > judged && judged > 0 && (
@@ -221,35 +439,17 @@ export default function ResultsScreen() {
               {judged} of the {result.totalNotes} notes prescribed were reached before the session ended
             </div>
           )}
-        </div>
-
-        <div className="card stack" data-testid="results-range">
-          <div className="eyebrow">Range achieved</div>
-          {bestLane ? (
-            <>
-              <div className="big-number mono">
-                {absoluteBest(bestLane) === null
-                  ? formatPercent(bestLane.romBest)
-                  : formatFeature(absoluteBest(bestLane) as number, MOVEMENT_INFO[bestLane.movement].unit)}
-              </div>
-              <div className="dim">
-                best rep · {bestLane.movementName} · {formatPercent(bestLane.romBest)} of the range calibrated today
-              </div>
-              {/* WHAT THE NUMBER IS. A ratio movement prints a bare "0.34" — the unit has no symbol,
-                  so it has to be said in words or the headline figure means nothing. */}
-              <div className="dim" data-testid="results-range-unit">
-                measured in {FEATURE_UNIT_SHORT[MOVEMENT_INFO[bestLane.movement].unit]}
-                {MOVEMENT_INFO[bestLane.movement].unit === 'ratio'
-                  ? ' — the movement against this patient’s own torso (or palm) size'
-                  : ' at the joint'}
-              </div>
-            </>
-          ) : (
-            <>
-              <div className="big-number mono">—</div>
-              <div className="dim">no range was measured in this session</div>
-            </>
-          )}
+          <div className="grow" />
+          {/* MOVEMENTS THAT ANSWERED NO NOTE ARE A FACT ABOUT THE MOVEMENTS, so they belong to this
+              card rather than to the notes-answered one — where they also left that cell three lines
+              taller than its neighbours and set the height of the whole row. */}
+          <div className="dim" data-testid="results-surplus">
+            {surplus === null
+              ? ''
+              : surplus > 0
+                ? `${surplus} further movement${surplus === 1 ? '' : 's'} answered no note (${result.reps} performed in total)`
+                : 'every movement performed answered a note'}
+          </div>
         </div>
 
         {/*
@@ -268,24 +468,6 @@ export default function ResultsScreen() {
               : `a movement was made for ${answered} of the ${judged} notes offered — the quantity the gauge on the highway shows`}
           </div>
           {answerRate !== null && <Meter value={answerRate} label="notes answered with a movement" />}
-          {/* NOT THE SAME NUMBER AS THE GAUGE ON A SHORT SESSION. The live gauge holds its needle up
-              over the opening notes so one missed first note does not empty it; the stored record is
-              the measurement itself, from note one. On the session a therapist stops after a handful
-              of notes — exactly what a struggling patient produces — the two differ, and this card
-              used to caption the figure "the gauge on the highway" full stop. */}
-          {answerRate !== null && (
-            <div className="dim" data-testid="results-answer-basis">
-              Counted from the first note. The gauge eases its first {ANSWER_WARMUP_NOTES} notes, so a session stopped
-              after a few notes reads higher there than here.
-            </div>
-          )}
-          <div className="dim" data-testid="results-surplus">
-            {surplus === null
-              ? ''
-              : surplus > 0
-                ? `${surplus} further movement${surplus === 1 ? '' : 's'} answered no note (${result.reps} performed in total)`
-                : 'every movement performed answered a note'}
-          </div>
         </div>
 
         <div className="card stack" data-testid="results-sessions">
@@ -294,11 +476,42 @@ export default function ResultsScreen() {
           <div className="dim">
             {previous ? `last session ${formatDuration(previous.durationSec)}, ${previous.reps} movements` : 'this is the first'}
           </div>
+          {/* The spacer is what makes this card FILL its cell. The grid stretches every card to the
+              tallest in the row, and this one carries three short lines: without it the button sat
+              directly under the caption with ~300 px of empty panel below it at 1280. */}
+          <div className="grow" />
           <button className="btn" onClick={() => goto('history')} data-testid="open-history-from-results">
             Progress over time
           </button>
         </div>
       </div>
+
+      {/*
+        A REP COUNT IS ONLY COMPARABLE AGAINST THE DOSE THAT WAS ASKED FOR. Pacing is the control
+        that sets that dose directly — the same patient, song and difficulty gives 24 reps a lane at
+        3.0 s and 96 at 0.4 s — so "+26 vs last time" is meaningless unless both sessions were asked
+        for the same number. It is a paragraph, and a paragraph inside one grid cell is what stretched
+        the whole row and left the short cards with a field of empty panel; it belongs to the
+        comparison, not to one card, so it sits across the row it qualifies.
+      */}
+      {/* NOT THE SAME NUMBER AS THE GAUGE ON A SHORT SESSION. The live gauge holds its needle up over
+          the opening notes so one missed first note does not empty it; the stored record is the
+          measurement itself, from note one. On the session a therapist stops after a handful of
+          notes — exactly what a struggling patient produces — the two differ, and this card used to
+          caption the figure "the gauge on the highway" full stop. Like the pacing note, it is a
+          paragraph about a figure rather than part of it, and a paragraph inside one grid cell sets
+          the height of the whole row. */}
+      {answerRate !== null && (
+        <div className="dim" data-testid="results-answer-basis">
+          Notes answered is counted from the first note. The gauge on the highway eases its first{' '}
+          {ANSWER_WARMUP_NOTES} notes, so a session stopped after a few notes reads higher there than here.
+        </div>
+      )}
+      {previous && isPatientDriven(result) && pacingNote && (
+        <div className="dim" data-testid="results-pacing-note">
+          {pacingNote}
+        </div>
+      )}
 
       {/*
         THE FAULT TOAST FIRES ON A RATIO, NOT ON ZERO. Gated on `hits === 0` it never fired for the
@@ -330,7 +543,7 @@ export default function ResultsScreen() {
                 : 'comparison is only drawn between camera sessions'}
           </span>
         </div>
-        <div className="table-wrap">
+        <ScrollTable offscreen="the best-rep column and the comparison with last time" testId="results-today-table">
           <table className="table">
             <thead>
               <tr>
@@ -341,27 +554,28 @@ export default function ResultsScreen() {
               </tr>
             </thead>
             <tbody>
-              {result.lanes.map((l) => {
-                const was = previousLanes.get(laneKey(l)) ?? null;
-                const mean = absoluteMean(l);
-                const wasMean = was ? absoluteMean(was) : null;
-                const unit = MOVEMENT_INFO[l.movement].unit;
+              {ranges.map((s) => {
+                const was = previousByLane.get(s.lane) ?? null;
+                const wasMean =
+                  was && was.romSamples > 0 && was.romMean !== null && was.calibratedMin !== null && was.calibratedMax !== null
+                    ? was.calibratedMin + was.romMean * (was.calibratedMax - was.calibratedMin)
+                    : null;
                 return (
-                  <tr key={l.lane} data-testid={`results-today-lane-${l.lane}`}>
-                    <td>
-                      <b>{l.movementName}</b>
+                  <tr key={s.lane} data-testid={`results-today-lane-${s.lane}`}>
+                    <td style={{ whiteSpace: 'normal' }}>
+                      <b>{s.movementName}</b>
                     </td>
                     <td>
-                      <b className="mono">{l.reps}</b>
-                      {was && <div className="dim">{delta(l.reps, was.reps)}</div>}
+                      <b className="mono">{s.reps}</b>
+                      {was && <div className="dim">{delta(s.reps, was.reps)}</div>}
                     </td>
                     <td>
-                      {l.romSamples > 0 ? (
+                      {s.measured ? (
                         <>
-                          <span className="mono">{mean === null ? formatPercent(l.romMean) : formatFeature(mean, unit)}</span>
+                          <span className="mono">{s.mean === null ? formatPercent(s.meanFraction) : formatFeature(s.mean, s.unit)}</span>
                           <div className="dim">
-                            {formatPercent(l.romMean)} of the calibrated range
-                            {wasMean !== null && mean !== null ? ` · was ${formatFeature(wasMean, unit)}` : ''}
+                            {formatPercent(s.meanFraction)} of the calibrated range
+                            {wasMean !== null && s.mean !== null ? ` · was ${formatFeature(wasMean, s.unit)}` : ''}
                           </div>
                         </>
                       ) : (
@@ -369,12 +583,17 @@ export default function ResultsScreen() {
                       )}
                     </td>
                     <td>
-                      {l.romBest === null ? (
+                      {s.bestFraction === null ? (
                         <span className="dim">—</span>
                       ) : (
-                        <span className="mono">
-                          {absoluteBest(l) === null ? formatPercent(l.romBest) : formatFeature(absoluteBest(l) as number, unit)}
-                        </span>
+                        <>
+                          <span className="mono">
+                            {s.best === null ? formatPercent(s.bestFraction) : formatFeature(s.best, s.unit)}
+                          </span>
+                          {s.gain !== null && !belowResolution(s.gain, s.unit) && (
+                            <div className="dim">{signedFeature(s.gain, s.unit)} vs last time</div>
+                          )}
+                        </>
                       )}
                     </td>
                   </tr>
@@ -382,7 +601,7 @@ export default function ResultsScreen() {
               })}
             </tbody>
           </table>
-        </div>
+        </ScrollTable>
         {previous && previous.difficulty !== result.difficulty && (
           <span className="dim">
             Last session was prescribed at {previous.difficulty} and this one at {result.difficulty}: the accuracy is
@@ -424,72 +643,97 @@ export default function ResultsScreen() {
               spread ±{result.timingBiasMadMs === null ? '—' : Math.round(result.timingBiasMadMs)} ms · latency offset in
               force {result.latencyOffsetMs} ms
             </div>
+            {/* A MILLISECOND FIGURE READ OFF A CAMERA IS BOUNDED BY THE CAMERA. A movement is only
+                ever seen in the frame it was sampled in, so at 12 fps this number is an ±83 ms
+                quantity however many decimal places it is printed to. */}
+            {result.inputMode === 'camera' && (
+              <div className="dim" data-testid="results-timing-resolution">
+                {timingRes === null
+                  ? 'The camera frame rate was not recorded for this session, so the resolution of this figure is unknown.'
+                  : `Resolved no finer than ${timingRes} ms — one frame of the camera stream this was measured from.`}
+              </div>
+            )}
           </div>
         </div>
 
-        <div className="table-wrap" style={{ marginTop: 12 }}>
-          <table className="table">
-            <thead>
-              <tr>
-                <th>Movement</th>
-                <th>Accuracy</th>
-                <th>Hits</th>
-                <th>Missed</th>
-                <th>Reps</th>
-                <th>ROM achieved</th>
-                <th>Best rep</th>
-                <th>Timing</th>
-                <th>Compensation</th>
-              </tr>
-            </thead>
-            <tbody>
-              {result.lanes.map((l) => (
-                <tr key={l.lane}>
-                  <td>
-                    <b>{l.movementName}</b>
-                    <div className="dim">{l.perfects} perfect · {l.goods} good</div>
-                  </td>
-                  <td>{formatPercent(l.accuracy)}</td>
-                  <td>{l.hits}</td>
-                  <td>{l.misses}</td>
-                  <td>{l.reps}</td>
-                  <td>
-                    {l.romSamples > 0 ? (
-                      <>
-                        {formatPercent(l.romMean)}
-                        <div className="dim">
-                          of calibrated range, {l.romSamples} reps
-                          {l.calibratedMin !== null && l.calibratedMax !== null
-                            ? ` (${l.calibratedMin.toFixed(2)}→${l.calibratedMax.toFixed(2)}${l.calibrationManual ? ', set by hand' : ''})`
-                            : ''}
-                        </div>
-                      </>
-                    ) : (
-                      <span className="dim">not measured</span>
-                    )}
-                  </td>
-                  <td>{l.romBest === null ? <span className="dim">—</span> : formatPercent(l.romBest)}</td>
-                  <td>
-                    {formatMs(l.timingBiasMs)}
-                    {l.timingBiasMadMs !== null && <div className="dim">±{Math.round(l.timingBiasMadMs)} ms</div>}
-                  </td>
-                  <td>
-                    {l.compensationKind === null ? (
-                      <span className="dim">n/a</span>
-                    ) : !l.compensationMonitored ? (
-                      <span className="badge badge-warn">not measured</span>
-                    ) : l.compensationFlags === 0 ? (
-                      <span className="badge badge-ok">clean</span>
-                    ) : (
-                      <span className="badge badge-bad">
-                        {l.compensationFlags} × {l.compensationKind.replace('_', ' ')}
-                      </span>
-                    )}
-                  </td>
+        {/*
+          NINE COLUMNS BECAME SIX, AND THE TWO THAT MATTERED MOST STOPPED BEING LAST.
+
+          Measured at 1024x768: this table laid out at 1302 px inside a 961 px scroller, so
+          COMPENSATION — the safety column — and the best rep sat off the right-hand edge with no
+          scrollbar and no cue. Columns that were separate only because they were separate numbers
+          are now one cell each (hits/missed under one "Notes" heading, mean and best range under
+          one "Range" heading), which is how a therapist reads them anyway, and COMPENSATION is the
+          third column rather than the ninth. Whatever width is left over is still announced and
+          reachable by `ScrollTable`.
+        */}
+        <div style={{ marginTop: 12 }}>
+          <ScrollTable offscreen="the timing and notes columns" testId="results-clinical-table">
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>Movement</th>
+                  <th>Reps</th>
+                  <th>Compensation</th>
+                  <th>Range achieved</th>
+                  <th>Notes hit</th>
+                  <th>Timing</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {result.lanes.map((l) => (
+                  <tr key={l.lane} data-testid={`results-clinical-lane-${l.lane}`}>
+                    <td style={{ whiteSpace: 'normal' }}>
+                      <b>{l.movementName}</b>
+                    </td>
+                    <td className="mono">{l.reps}</td>
+                    <td>
+                      {l.compensationKind === null ? (
+                        <span className="dim">n/a</span>
+                      ) : !l.compensationMonitored ? (
+                        <span className="badge badge-warn">not measured</span>
+                      ) : l.compensationFlags === 0 ? (
+                        <span className="badge badge-ok">clean</span>
+                      ) : (
+                        <span className="badge badge-bad">
+                          {l.compensationFlags} × {l.compensationKind.replace('_', ' ')}
+                        </span>
+                      )}
+                    </td>
+                    <td>
+                      {l.romSamples > 0 ? (
+                        <>
+                          <span className="mono">
+                            {formatPercent(l.romMean)} mean · {formatPercent(l.romBest)} best
+                          </span>
+                          <div className="dim">
+                            of calibrated range, {l.romSamples} reps
+                            {l.calibratedMin !== null && l.calibratedMax !== null
+                              ? ` (${l.calibratedMin.toFixed(2)}→${l.calibratedMax.toFixed(2)}${l.calibrationManual ? ', set by hand' : ''})`
+                              : ''}
+                          </div>
+                        </>
+                      ) : (
+                        <span className="dim">not measured</span>
+                      )}
+                    </td>
+                    <td className="mono">
+                      <span>
+                        {l.hits} / {l.hits + l.misses}
+                      </span>
+                      <div className="dim">
+                        {formatPercent(l.accuracy)} · {l.perfects} perfect · {l.goods} good
+                      </div>
+                    </td>
+                    <td className="mono">
+                      <span>{formatMs(l.timingBiasMs)}</span>
+                      {l.timingBiasMadMs !== null && <div className="dim">±{Math.round(l.timingBiasMadMs)} ms</div>}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </ScrollTable>
         </div>
         {result.lanes.some((l) => l.romUncertain > 0) && (
           <span className="dim">

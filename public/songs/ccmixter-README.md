@@ -65,39 +65,55 @@ stems are committed.
 ## Tips
 
 * If stems come as MP3, keep them: `AudioContext.decodeAudioData` handles MP3/OGG/WAV.
-* Bandwidth: the committed demo stems are 16-bit/44.1 kHz WAV (≈34 MB for demo-groove,
-  ≈27 MB for demo-sunrise, downloaded before the first note). Two ways to cut that for a
-  deployment on slow clinic Wi-Fi — decoding is identical either way and the
-  sample-accurate start is unaffected, because the mixer schedules decoded buffers, not files:
-  1. **No new tools.** Re-run the generator at half the sample rate:
-     `node scripts/gen-demo-stems.mjs --rate 22050` — same music, half the bytes, still
-     16-bit mono WAV, and `song.json`'s `generated.sampleRate` records what was written.
-     (Lower rates down to 8000 Hz work too; the generator applies a 4th-order Butterworth
-     lowpass at 0.42 × the target rate before decimating, and trims the result so the
-     mastered peak is never pushed through full scale.) The band limit is audible mainly on
-     the hi-hats — at 22050 the drums lose ~1.3 dB of RMS and the stem balance is otherwise
-     unchanged, so the ducking cue is as clear as at 44.1 kHz.
+* Bandwidth: **the committed demo stems are 16-bit mono WAV at 16 kHz** — 12.4 MB for
+  demo-groove and 10.0 MB for demo-sunrise, written by
+  `node scripts/gen-demo-stems.mjs --rate 16000`, with `song.json`'s `generated.sampleRate`
+  recording what was written. They used to be 44.1 kHz (34 MB / 27 MB), which measured 38.7 s
+  from pressing Start to the first note over a throttled 8 Mbit/s clinic link; at 16 kHz that
+  is 17.0 s, and with the Setup screen's prefetch running during the prescription it is the
+  count-in and nothing else (README, "Time to the first note").
+
+  **What the rate costs, measured per stem** (share of each stem's energy below the
+  anti-alias cutoff of 0.42 × the target rate): the synthesized bass, keys and lead are
+  band-limited by their own synthesis — 100.00 %, 100.00 % and 99.97 % of their energy is
+  below 6.7 kHz, so they are effectively untouched. The drums are the only broadband stem and
+  lose the hi-hat band above it: 11 % of that stem's energy, 0.9–1.3 dB of RMS. The attack
+  and the kick/snare body are unaffected, so the 16th-note hat grid the patient plays against
+  is still there — what is gone is the shimmer above 6.7 kHz. Decoding is identical either
+  way and the sample-accurate start is unaffected: the mixer schedules decoded buffers, not
+  files, and `decodeAudioData` resamples every stem to the context rate regardless.
+
+  **The balance is re-matched after the resample** (`rebalanceAfterResample` in the
+  generator). Because the lowpass only takes energy out of the drums, a naive low-rate build
+  shipped demo-sunrise with the player stem just 0.67 dB above the bass — the mastering's
+  decision undone by the delivery format. Every stem is scaled by `worstLoss / ownLoss`, so
+  the RMS ratios are exactly those of the 44.1 kHz build and the whole song sits ~1 dB
+  quieter (which only adds master headroom).
+
+  Other options:
+  1. **A different rate, no new tools.** Any rate from 8000 Hz to 44100 Hz works
+     (`--rate 44100` restores the full-bandwidth build); the generator applies a 4th-order
+     Butterworth lowpass at 0.42 × the target rate before decimating, and trims the result so
+     the mastered peak is never pushed through full scale.
   2. **With ffmpeg** (smallest, ≈1.5 MB per stem): transcode once and point `stems[].file`
      at the `.ogg` files:
      `for s in drums bass keys lead; do ffmpeg -i stems/$s.wav -c:a libvorbis -q:a 5 stems/$s.ogg; done`
+     Note what this costs in-app: the ranged audition (`src/session/audition.ts`) can slice a
+     time range out of linear-PCM WAV arithmetically, and refuses anything else — so every
+     "Listen" press falls back to downloading the whole song. That is a good trade for a
+     deployment whose songs are all fetched ahead of time, and a bad one for a therapist
+     auditioning three songs between patients.
 
-  **The 44.1 kHz decision is deliberate, not a default.** The demo stems are committed at
-  full rate because (a) the hats and the lead's top end are the only material above 11 kHz
-  and the *drums are the player stem* — the 16th-note hat grid is the timing reference the
-  patient plays against, so it is the last thing to blur; (b) the WAVs are already in the
-  git history, so regenerating them smaller adds another copy to the history instead of
-  reclaiming the old one — only a history rewrite does that, and it is out of scope here;
-  (c) Node has no built-in Vorbis/Opus/MP3 encoder and this repo may not add a dependency,
-  so no compressed variant can be produced in-repo and stay byte-reproducible. If you are
-  deploying to a clinic on slow Wi-Fi, run option 1 or 2 above at deploy time — it is one
-  command and nothing else in the pipeline changes.
+  **Why not a compressed format in-repo:** Node has no built-in Vorbis/Opus/MP3 encoder and
+  this repo may not add a dependency, so no compressed variant can be produced here and stay
+  byte-reproducible. Bandwidth reduction is the only size lever the pipeline itself has.
 * Memory, not just bandwidth: `StemMixer.loadSong` downloads the stems in parallel, so the
-  raw bodies peak together (≈34 MB for demo-groove), and `decodeAudioData` detaches each
+  raw bodies peak together (≈12.4 MB for the shipped 16 kHz demo-groove; ≈34 MB at 44.1 kHz), and `decodeAudioData` detaches each
   ArrayBuffer as it decodes it — but the decoded set stays resident: 4 stems × 97 s ×
   Float32 **at the AudioContext's rate** (decode always resamples to it) ≈ **74 MB** on a
   48 kHz context. Budget ~110 MB peak for a 4-stem 97 s song, on top of the MediaPipe wasm
-  runtime and the pose model. A `--rate 22050` build does **not** reduce this — it halves
-  the download only. Fewer or shorter stems is the only lever that moves the decoded
+  runtime and the pose model. The shipped 16 kHz build does **not** reduce this — it cuts the
+  download (34 MB → 12.4 MB) only. Fewer or shorter stems is the only lever that moves the decoded
   figure, so prefer 2–4 stems and songs under ~2 minutes for tablet deployments.
 * Safety: `song.json` is data, and this file invites you to paste manifests from third
   parties. `fetch-stems` refuses any `stems[].file` that is absolute or contains a `..`

@@ -52,22 +52,25 @@
  *
  * Memory floor (a clinic tablet also holds the MediaPipe wasm runtime and the pose model):
  * `loadSong` downloads the stems in parallel, so the raw bodies peak together at the total
- * download size (34 MB for demo-groove at 44.1 kHz); `decodeAudioData` detaches each ArrayBuffer
- * as it decodes it, so the raw copy of a stem does not stack with its decoded buffer, but the
- * decoded set does: 4 stems × 97 s × Float32 AT THE CONTEXT RATE (decodeAudioData always resamples
- * to it) ≈ 74 MB on a 48 kHz context — which a `--rate 22050` build does NOT reduce, it only
- * halves the download. Budget ~110 MB peak for a 4-stem, 97 s song. Fewer or shorter stems is the
- * only real lever; see public/songs/ccmixter-README.md.
+ * download size (12.4 MB for the shipped 16 kHz demo-groove; 34 MB at 44.1 kHz);
+ * `decodeAudioData` detaches each ArrayBuffer as it decodes it, so the raw copy of a stem does not
+ * stack with its decoded buffer, but the decoded set does: 4 stems × 97 s × Float32 AT THE CONTEXT
+ * RATE (decodeAudioData always resamples to it) ≈ 74 MB on a 48 kHz context — which a reduced-rate
+ * build does NOT reduce, it only cuts the download. Budget ~110 MB peak for a 4-stem, 97 s song.
+ * Fewer or shorter stems is the only real lever; see public/songs/ccmixter-README.md.
  *
- * Worst realistic sum at the destination = four stems summed sample-wise (2.08 groove /
- * 1.98 sunrise), with the +2 dB streak boost on the player stem (2.30 / 2.22), plus the loudest
+ * Worst realistic sum at the destination = four stems summed sample-wise (1.59 groove /
+ * 1.61 sunrise), with the +2 dB streak boost on the player stem (1.76 / 1.80), plus the loudest
  * SFX cue at the top of the slider (the hit tick, 0.62 — SFX ride on `sfxBus`, which joins the
- * master bus, so they are inside the budget rather than clipping past it). Worst case: 2.92.
- *  - without the limiter the master default is 0.32, so 2.92 × 0.32 = 0.94 never hard-clips;
+ * master bus, so they are inside the budget rather than clipping past it). Worst case: 2.42.
+ * (These dropped from 2.08 / 1.98 / 2.30 / 2.22 / 2.92 when the demo stems were regenerated at
+ * 16 kHz for the download — the lowpass takes the hi-hat band out of the drums and the
+ * post-resample rebalance puts the whole song ~1 dB down with it, so the budget got safer.)
+ *  - without the limiter the master default is 0.32, so 2.42 × 0.32 = 0.77 never hard-clips;
  *  - with the limiter (DynamicsCompressorNode, threshold −3 dB, ratio 20, knee 0, 1 ms attack,
  *    50 ms release — a limiter, not a program compressor, which would release when the player
  *    stem is ducked and swell the other stems) the master default is 0.8: the peak into the
- *    limiter is 2.34 (+7.4 dBFS); Chromium/WebKit/Gecko's kernel catches it with its ~6 ms
+ *    limiter is 1.93 (+5.7 dBFS); Chromium/WebKit/Gecko's kernel catches it with its ~6 ms
  *    look-ahead and applies an automatic make-up gain of (1/curve(0 dB))^0.6 ≈ +1.7 dB
  *    (`limiterOutputPeak` models this), for an output ceiling of ≈0.91. A limiter with this
  *    threshold only reaches 0 dBFS for inputs ≥ +20 dBFS.

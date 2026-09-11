@@ -50,6 +50,11 @@ export default function CameraFallback({
 }) {
   const goto = useStore((s) => s.goto);
   const setInputMode = useStore((s) => s.setInputMode);
+  /** Named so the sentence below is about the person in the chair, not about "the patient". */
+  const patientName = useStore((s) => {
+    const active = s.patients.find((p) => p.id === s.activePatientId);
+    return active && !active.deviceTest ? active.name : null;
+  });
   const [retrying, setRetrying] = useState(false);
   const [localAttempts, setLocalAttempts] = useState(0);
   // Whichever counted more: the host's (survives the remount) or this screen's own (for a host that
@@ -113,11 +118,25 @@ export default function CameraFallback({
 
       <div className="card stack">
         <h3>Or run this session on the keyboard</h3>
+        {/* WHAT THE RECORD ACTUALLY DOES, which is not what this card used to promise.
+            It said the run "will be stored in the history as a keyboard session" — a therapist reads
+            that as "it will be in this patient's history, labelled". It is not: `store.addResult`
+            re-files EVERY non-camera run onto the built-in "Device test (not a patient)" record
+            (state/store.ts), because a keypress is not a rep this person performed, and a run filed
+            under them would inflate their session count, spend their retention budget and sit in
+            their clinical history reading "not measured". Two honest options existed — file it under
+            the patient with a label, or say where it really goes. Filing it under the patient is the
+            thing the identity work exists to prevent, so the sentence is what changes. */}
         <p className="muted" style={{ margin: 0 }}>
           The chart, the song and the scoring all work. What is lost is the whole rehab measurement: keys 1–4
           (or D F J K) stand in for the movements, so this session records <b>no range of motion</b>, and its
-          reps are keypresses rather than movements the patient performed. It will be stored in the history as a
-          keyboard session and it will not appear in the ROM trend.
+          reps are keypresses rather than movements the patient performed.
+        </p>
+        <p className="muted" style={{ margin: 0 }} data-testid="keyboard-record-note">
+          So it is <b>not stored under {patientName ?? 'this patient'}</b>: it is filed on its own under
+          “Device test (not a patient)”, it does not count as one of {patientName ? `${patientName}'s` : 'their'}{' '}
+          sessions, and it never appears in the ROM trend. If the patient works through it, the work is real — the
+          record of it is not, and the next camera session is the one that measures them.
         </p>
         <div className="row">
           <button

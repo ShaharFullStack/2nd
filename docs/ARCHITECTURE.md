@@ -103,6 +103,23 @@ ROM calibration: patient holds rest for 2 s (min), then does 3 reps at comfortab
 ```
 `public/songs/index.json` lists song ids. Attribution must be shown in song select and results.
 
+**The committed demo stems are 16-bit mono WAV at 16 kHz** (`node scripts/gen-demo-stems.mjs
+--rate 16000`), not at the generator's 44.1 kHz default: 12.4 MB instead of 34.2 MB for
+demo-groove, which is 38.7 s → 17.0 s from Start to the first note on a throttled 8 Mbit/s link
+(README, "Time to the first note"). `generated.sampleRate` in `song.json` records what was
+written, and every consumer reads the rate from the file — stems of different songs (or of a
+re-rendered song) may differ, and `decodeAudioData` resamples each to the context rate anyway.
+A `--rate` build re-matches the stems to each other after resampling (`rebalanceAfterResample`):
+the lowpass only takes energy out of the broadband stem, so without it the mastered balance —
+player stem 2 dB on top — would be undone by the delivery format.
+
+**Loading is not allowed to happen while the patient waits.** `runtime.prefetchSong(songId)` is
+called from the Setup screen (once the song choice settles, and again on Start); it is
+fire-and-forget, idempotent per song, declines while an audition is in flight, and shares its
+load with `loadSong` — including its byte progress, so the Play screen's bar joins a download it
+did not start. Cancelling an audition must never cancel a prefetched session load
+(`previewOwnsLoad`).
+
 ## Session flow
 Home → Patient → Mode (leg/hand) → Therapist Setup (pick 2–4 movements+sides, difficulty, song, **pacing**) → Camera check → ROM calibration per lane → Latency calibration → Play → Results → persisted to localStorage (history, patient-scoped).
 
@@ -112,6 +129,26 @@ Home → Patient → Mode (leg/hand) → Therapist Setup (pick 2–4 movements+s
 - **Nothing in the patient's view may alarm about a state that has no failure.** A song can never be failed, so there is no rock meter: `RenderFrame.health` is NOTES ANSWERED (`answerRateOf` — movements made ÷ notes judged, with a `ANSWER_WARMUP_NOTES`=6 opening warm-up on the live gauge only), the gauge is labelled with what it counts, and it never pulses or turns red.
 - **Results leads with work, not with a grade.** Movements performed, range achieved, today vs THIS patient's last camera session (`patientSessions`/`isPatientDriven`), notes answered; score, stars, weighted accuracy and the per-lane clinical table are kept in full but folded away for the therapist.
 - **A ROM nudge is bounded by the patient's own evidence.** Easier/Harder step by a FRACTION of the measured range (`ROM_NUDGE_FRACTION`), never an absolute feature delta, refuse to exceed the best rep on record (`calibrationPatientBest`), refuse to shrink below the minimum usable range, and label themselves with the target they will set in the movement's units (`previewRomNudge` → `RomNudgePreview.label`).
+
+### Scope, and the conditions a measurement was taken in
+- **The scope statement travels with the numbers.** `SCOPE_STATEMENT` (src/session/results.ts) is
+  the single source, rendered by `src/ui/ScopeNote.tsx` on every screen that presents a
+  measurement — Results (under the range card), History, the ROM trend, ROM calibration — and
+  written into every export (first field of the JSON, a `SCOPE:` line in the text). It is never a
+  dialog and never dismissible: a therapist runs several sessions a day, and anything that has to
+  be clicked away is trained away by the third one.
+- **Every camera session records how well it was tracked.** `SessionResult.tracking`
+  (`TrackingQuality`) is built by `src/session/tracking.ts` from `VisionInput.getStatus()`,
+  sampled every `TRACKING_SAMPLE_MS` while the runner's phase is `playing`: median/10th-percentile
+  processed fps, median inference ms, the share of samples with usable landmarks, the low-fps
+  share, the delegate and the commonest non-ok reason. Absent means NOT RECORDED (a keyboard or
+  autoplay run, or a record written before this existed) and must never render as a clean stream.
+- **Only uncertainty that was observed may be stated.** No landmark-error estimate is invented.
+  What the screens say is what follows from the sampling: timing is resolved no finer than one
+  frame interval (`timingResolutionMs`), and a ROM figure is the peak of the frames that arrived,
+  so it is a lower bound. `trackingGrade` (good/fair/poor) is keyed off `MIN_USABLE_DETECT_FPS`
+  and the tracked share, and the trend states how many of the sessions behind its lines were
+  measured on a degraded stream.
 
 ## Dev/test affordances (mandatory)
 - `?input=keyboard` URL param bypasses camera; `?autoplay=1` bot hits every note (for screenshots); `?seed=`.

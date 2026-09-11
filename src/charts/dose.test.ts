@@ -6,6 +6,7 @@ import {
   chartDose,
   clampLaneRestSec,
   generateChartDetailed,
+  limbRepsPerMinuteAt,
   repsPerMinuteAt,
 } from './generate.ts';
 import type { SongGrid } from './generate.ts';
@@ -35,6 +36,65 @@ describe('the therapeutic dose is measurable before the session starts', () => {
     const stray = chartDose({ notes: [{ id: 1, lane: 7, time: 1 }, { id: 2, lane: 0, time: 2 }], lanes: 2 });
     expect(stray.notes).toBe(2);
     expect(stray.perLane).toEqual([1, 0]); // the out-of-range note is counted overall, not misfiled
+  });
+});
+
+/**
+ * A LIMB IS NOT A LANE, and the dose is prescribed per limb.
+ *
+ * `chartDose` reported the busiest LANE and the Setup screen printed it as "reps per minute, each
+ * limb". Prescribe two movements on one leg — knee extension AND ankle dorsiflexion on the left,
+ * which is an ordinary session — and that leg is asked for the sum of both lanes, so the figure the
+ * therapist doses from was wrong by the number of lanes on the limb.
+ */
+describe('the dose is measured per LIMB, which may carry more than one lane', () => {
+  it('adds the lanes on one limb together, and does not add another limb\'s in', () => {
+    const chart = {
+      lanes: 3,
+      notes: [
+        // left limb, lane 0: 3 reps; left limb, lane 1: 2 reps; right limb, lane 2: 4 reps
+        { id: 1, lane: 0, time: 0 }, { id: 2, lane: 0, time: 20 }, { id: 3, lane: 0, time: 40 },
+        { id: 4, lane: 1, time: 10 }, { id: 5, lane: 1, time: 50 },
+        { id: 6, lane: 2, time: 5 }, { id: 7, lane: 2, time: 25 }, { id: 8, lane: 2, time: 45 },
+        { id: 9, lane: 2, time: 55 },
+      ],
+    };
+    const dose = chartDose(chart, ['left', 'left', 'right']);
+    expect(dose.perLane).toEqual([3, 2, 4]);
+    const left = dose.perLimb.find((l) => l.key === 'left');
+    const right = dose.perLimb.find((l) => l.key === 'right');
+    expect(left?.reps).toBe(5); // 3 + 2, the SUM of the lanes on that limb
+    expect(left?.laneIndices).toEqual([0, 1]);
+    expect(right?.reps).toBe(4);
+    // 55 s of span, so the left limb's rate is 5 reps in 55 s and the right's 4 — and the reported
+    // per-limb figure is the busiest LIMB's, which the per-lane figure (4, the busiest lane) is not.
+    expect(dose.spanSec).toBeCloseTo(55, 9);
+    expect(dose.repsPerBusiestLimb).toBe(5);
+    expect(dose.lanesOnBusiestLimb).toBe(2);
+    expect(dose.repsPerMinPerLimb).toBeCloseTo(5 / (55 / 60), 9);
+    expect(dose.repsPerMinPerLane).toBeCloseTo(4 / (55 / 60), 9);
+    expect(dose.repsPerMinPerLimb).toBeGreaterThan(dose.repsPerMinPerLane);
+    // and the whole body is still the whole body
+    expect(dose.totalRepsPerMin).toBeCloseTo(9 / (55 / 60), 9);
+  });
+
+  it('one lane per limb is the case where limb and lane agree', () => {
+    const { chart } = generateChartDetailed(SONG, 2, 'medium', 1);
+    const dose = chartDose(chart, ['left', 'right']);
+    expect(dose.perLimb).toHaveLength(2);
+    expect(dose.repsPerMinPerLimb).toBeCloseTo(dose.repsPerMinPerLane, 9);
+    // and with no grouping at all every lane is its own limb, which is the same answer
+    expect(chartDose(chart).repsPerMinPerLimb).toBeCloseTo(dose.repsPerMinPerLane, 9);
+  });
+
+  it('the pacing CEILING is per lane too, so a two-lane limb may be asked for twice it', () => {
+    expect(limbRepsPerMinuteAt(1.2, 1)).toBeCloseTo(50, 9);
+    expect(limbRepsPerMinuteAt(1.2, 2)).toBeCloseTo(100, 9);
+    // a real two-lanes-on-one-limb chart never exceeds that ceiling, and does exceed the lane one
+    const { chart } = generateChartDetailed(SONG, 3, 'hard', 2, { minLaneSpacingSec: 1.2 });
+    const dose = chartDose(chart, ['left', 'left', 'right']);
+    expect(dose.repsPerMinPerLimb).toBeLessThanOrEqual(limbRepsPerMinuteAt(1.2, 2) + 1e-6);
+    expect(dose.repsPerMinPerLimb).toBeGreaterThan(repsPerMinuteAt(1.2));
   });
 });
 

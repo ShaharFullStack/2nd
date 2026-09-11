@@ -1,8 +1,18 @@
 import { describe, expect, it } from 'vitest';
 import type { ScoreResults } from '../engine/scoring.ts';
 import type { LaneRepStats, RunSummary } from './GameRunner.ts';
-import { buildPatientExport, buildSessionResult, clinicalLaneName, formatDuration, formatMs, formatPercent } from './results.ts';
-import type { SessionConfig, SessionResult } from './types.ts';
+import {
+  buildPatientExport,
+  buildSessionResult,
+  clinicalLaneName,
+  formatDuration,
+  formatMs,
+  formatPercent,
+  laneRangeSummaries,
+  laneTrendKey,
+  mostImprovedRange,
+} from './results.ts';
+import type { LaneResultSummary, SessionConfig, SessionResult } from './types.ts';
 
 const CONFIG: SessionConfig = {
   patientId: 'p-test',
@@ -382,22 +392,117 @@ describe('the exported record leads with the work, like the screen does', () => 
     const out = exported();
     const line = out.text.split('\n').find((l) => l.includes('movements performed')) ?? '';
     expect(line).toContain('26 movements performed');
-    expect(line).toContain('pacing 1.2 s between reps of one limb');
+    expect(line).toContain('pacing 1.2 s between two reps of the same movement');
     expect(line).not.toContain('pts');
     // the grade is still there for the clinician, one line down and labelled as such
     expect(out.text).toContain('Scoring (clinical): 1,200 pts');
     expect(out.text.indexOf('movements performed')).toBeLessThan(out.text.indexOf('Scoring (clinical)'));
   });
 
-  it('bumps the format version, because `health` changed meaning under a stable key', () => {
+  it('bumps the format version whenever the meaning of the file changes', () => {
+    // v2: `health` changed meaning under a stable key and was replaced by `answerRate`.
+    // v3: sessions carry the camera conditions they were measured in (`tracking`), so a reader can
+    //     tell a range measured on a clean 30 fps stream from one measured on a 12 fps stream.
     const parsed = JSON.parse(exported().json) as { version: number; fields: Record<string, string>; sessions: unknown[] };
-    expect(parsed.version).toBe(2);
+    expect(parsed.version).toBe(3);
     expect(parsed.fields.answerRate).toMatch(/notes answered/);
     expect(parsed.fields.health).toMatch(/REMOVED in v2/);
+    expect(parsed.fields.tracking).toMatch(/frames per second/);
   });
 
   it('says when a session’s pacing was never recorded rather than inventing one', () => {
     const out = exported({ laneRestSec: undefined });
     expect(out.text).toContain('pacing not recorded');
+  });
+
+  /**
+   * THE SAME QUANTITY, THE SAME UNITS, IN THE DURABLE ARTEFACT.
+   *
+   * `laneRestSec` is the rest between two reps of ONE LANE. This file used to print it as "1.2 s
+   * between reps of one limb (50 reps/min per limb at most)" while the setup screen the therapist
+   * prescribed from said the opposite in the same session — and for a prescription with two lanes on
+   * one limb the exported ceiling was wrong by a factor of two, off-device, where nobody can check it
+   * against the app. Two surfaces quoting one quantity in opposite units is a med-error pattern.
+   */
+  it('quotes the pacing per LANE and works the limb ceiling out from the lanes on the limb', () => {
+    const oneEach = exported();
+    expect(oneEach.text).toContain('at most 50 reps/min per lane, one lane per limb so that is the limb ceiling too');
+    expect(oneEach.text).not.toContain('reps of one limb');
+    expect(oneEach.text).not.toContain('reps/min per limb');
+
+    // Both lanes on the LEFT leg: the limb is asked for both, so its ceiling is twice the lane's.
+    const asStored = (JSON.parse(oneEach.json) as { sessions: SessionResult[] }).sessions[0];
+    const bilateral = exported({ lanes: asStored.lanes.map((l) => ({ ...l, side: 'left' as const })) });
+    expect(bilateral.text).toContain('at most 50 reps/min per lane; 2 lanes on the left leg, so at most 100 reps/min for that limb');
+
+    // …and the glossary the reader checks the field against says the same thing.
+    const parsed = JSON.parse(oneEach.json) as { fields: Record<string, string> };
+    expect(parsed.fields.laneRestSec).toMatch(/SAME LANE/);
+    expect(parsed.fields.laneRestSec).toMatch(/NOT per limb/);
+  });
+});
+
+/**
+ * RANGE IS PER LIMB. `max(romBest)` across a mixed prescription is the unaffected side essentially
+ * every time, and this app has no field that says which side is affected — so the presentation layer
+ * is not allowed to pick one, and these helpers make that structural rather than a UI convention.
+ */
+describe('laneRangeSummaries', () => {
+  const weak: LaneResultSummary = {
+    lane: 0, movement: 'seated_march', side: 'left', movementName: 'Left Seated march',
+    hits: 2, perfects: 0, goods: 2, misses: 18, judged: 20, accuracy: 0.1, reps: 20,
+    timingBiasMs: null, timingBiasMadMs: null, romMean: 0.3, romBest: 0.4, romSamples: 20, romUncertain: 0,
+    calibratedMin: 0.1, calibratedMax: 0.5, calibrationManual: false,
+    compensationKind: null, compensationMonitored: false, compensationFlags: 0, compensationWorst: null,
+  };
+  const strong: LaneResultSummary = {
+    ...weak,
+    lane: 1, movement: 'knee_extension', side: 'right', movementName: 'Right Knee extension',
+    romMean: 0.8, romBest: 0.95, calibratedMin: 100, calibratedMax: 160,
+  };
+
+  it('keeps prescription order and expresses every lane in its own units', () => {
+    const out = laneRangeSummaries([weak, strong]);
+    expect(out.map((s) => s.movementName)).toEqual(['Left Seated march', 'Right Knee extension']);
+    expect(out[0].best).toBeCloseTo(0.26, 5); // 0.1 + 0.4 x 0.4
+    expect(out[0].unit).toBe('ratio');
+    expect(out[1].best).toBeCloseTo(157, 5); // 100 + 0.95 x 60
+    expect(out[1].unit).toBe('deg');
+  });
+
+  it('marks a lane that measured nothing rather than reporting a zero range', () => {
+    const [only] = laneRangeSummaries([{ ...weak, romSamples: 0, romMean: null, romBest: null }]);
+    expect(only.measured).toBe(false);
+    expect(only.best).toBeNull();
+    expect(only.bestFraction).toBeNull();
+  });
+
+  it('compares each lane only with ITSELF last time', () => {
+    const previous = new Map([
+      [laneTrendKey(weak), { ...weak, romBest: 0.2 }],
+      [laneTrendKey(strong), { ...strong, romBest: 0.9 }],
+    ]);
+    const out = laneRangeSummaries([weak, strong], previous);
+    expect(out[0].gainPct).toBeCloseTo(0.2, 5);
+    expect(out[1].gainPct).toBeCloseTo(0.05, 5);
+    expect(out[0].gain).toBeCloseTo(0.08, 5); // 0.4 of its own range is 0.08 in ratio units
+    expect(out[1].gain).toBeCloseTo(3, 5);
+  });
+
+  it('ranks improvement against each lane"s own range, so a big joint cannot win by being big', () => {
+    const previous = new Map([
+      [laneTrendKey(weak), { ...weak, romBest: 0.2 }],
+      [laneTrendKey(strong), { ...strong, romBest: 0.9 }],
+    ]);
+    const out = laneRangeSummaries([weak, strong], previous);
+    // The knee moved 3 degrees and the march moved 0.08 ratio units; the march gained a fifth of
+    // its own range and the knee a twentieth of its.
+    expect(mostImprovedRange(out)?.movementName).toBe('Left Seated march');
+  });
+
+  it('names nobody when nothing improved', () => {
+    const previous = new Map([[laneTrendKey(weak), { ...weak, romBest: 0.6 }]]);
+    expect(mostImprovedRange(laneRangeSummaries([weak], previous))).toBeNull();
+    expect(mostImprovedRange(laneRangeSummaries([weak]))).toBeNull();
   });
 });
