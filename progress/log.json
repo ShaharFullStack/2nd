@@ -1,5 +1,5 @@
 {
- "updated": "2026-09-11T08:36Z",
+ "updated": "2026-09-11T13:06Z",
  "pieces": {
   "engine": {
    "round": 5,
@@ -35,6 +35,16 @@
    "round": 1,
    "status": "blockers open",
    "note": "Final review by four independent lenses (patient, therapist, clinical-safety, engineer). All four said they would not ship, and all four ind"
+  },
+  "identity": {
+   "round": 2,
+   "status": "passed 8/10",
+   "note": "Patient identity passed a fresh clinical critic at 8/10. Every session, saved range and progress trend is now scoped to a named patient; exi"
+  },
+  "fairness": {
+   "round": 1,
+   "status": "round 2",
+   "note": "Ducking is now proportionate and per lane: a weak limb's misses dip the instrument instead of silencing what the strong limb is earning. Rou"
   }
  },
  "entries": [
@@ -182,6 +192,18 @@
    "piece": "review",
    "kind": "fail",
    "text": "Final review by four independent lenses (patient, therapist, clinical-safety, engineer). All four said they would not ship, and all four independently named the same top blocker: no patient identity anywhere, so a shared clinic tablet pools two people's history, trends and saved ranges. Also: camera never released after a session, two tabs overwriting each other, an interrupted session recording nothing, one weak limb's misses muting the patient's whole instrument, a red failure alarm in a game that cannot be failed, and a results screen that reads as a grade."
+  },
+  {
+   "time": "2026-09-11T13:06Z",
+   "piece": "identity",
+   "kind": "pass",
+   "text": "Patient identity passed a fresh clinical critic at 8/10. Every session, saved range and progress trend is now scoped to a named patient; existing device records migrate into an 'unassigned' bucket a therapist can rename or reassign; records export off the device; and the stored record carries full clinical movement names instead of the canvas abbreviations."
+  },
+  {
+   "time": "2026-09-11T13:06Z",
+   "piece": "fairness",
+   "kind": "info",
+   "text": "Ducking is now proportionate and per lane: a weak limb's misses dip the instrument instead of silencing what the strong limb is earning. Round 1 critic found the ROM nudge API built but not wired to the buttons a therapist presses — now fixed and back in review."
   }
  ]
 }
