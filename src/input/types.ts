@@ -31,7 +31,37 @@ export interface LaneInputEvent {
   /** Interval the crossing time was measured across (seconds); ~1 frame normally, wider after a dropout. */
   gapSec?: number;
 }
-export interface LaneState { lane: number; value: number; armed: boolean; tracking?: boolean; }
+export interface LaneState {
+  lane: number;
+  value: number;
+  /**
+   * False when the lane cannot fire: it has already triggered and not been given back, OR it has never
+   * been confirmed below the re-arm level. A two-way collapse of the three-way fact below.
+   */
+  armed: boolean;
+  /**
+   * THE LANE'S OWN TRIGGER STATE, published by every source in this repo.
+   *
+   * `armed` cannot tell "this rep just fired" ('triggered') from "this lane has never been confirmed"
+   * ('unconfirmed'), and that is exactly the difference between a rep and an occlusion recovery: both
+   * publish `{ value >= threshold, armed: false }`, only one of them emitted a `LaneInputEvent`. A live
+   * meter therefore had to RECONSTRUCT the crossing from timing (see src/render/receptor.ts), and the
+   * reconstruction is defeated by the aliasing contract above — a source that returns the same frozen
+   * objects for a whole second of rest looks, from the outside, exactly like a stream that went silent.
+   * That cost the knowledge-of-results cue on every keyboard/replay/autoplay rep following more than
+   * `DEFAULT_MAX_GAP_SEC` of rest, i.e. essentially every rep of a real chart, on a path a patient is
+   * put on by `CameraFallback` when the camera fails.
+   *
+   * So it is published: entering 'triggered' is the crossing and nothing else can produce it
+   * (`LaneTrigger.push` only moves to 'triggered' from 'armed', on a rising edge past the threshold),
+   * `breakContinuity` and `setThreshold` move a lane to 'unconfirmed' instead, and a meter reading this
+   * never has to guess. Optional only so that a hand-built `LaneState` in a test still type-checks.
+   */
+  triggerState?: TriggerLaneState;
+  tracking?: boolean;
+}
+/** `LaneTrigger.state` (src/vision/trigger.ts), re-exported through the input contract. */
+export type TriggerLaneState = 'unconfirmed' | 'armed' | 'triggered';
 export interface InputSource {
   start(): Promise<void>;
   stop(): void;

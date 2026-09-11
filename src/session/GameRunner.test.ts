@@ -164,3 +164,32 @@ describe('GameRunner', () => {
     expect(h.runner.getPhase()).toBe('ended');
   });
 });
+
+describe('a paused run tells the renderer it is not accepting input', () => {
+  it('flips every receptor to "no reading" for the pause, and back on resume', async () => {
+    // THE ROUND-7 BLOCKER'S ROOT. `draw()` runs every animation frame whatever the phase, and
+    // `input.getLaneStates()` is live through a pause because the camera is — but `onInput` drops an
+    // event outright while the run is idle or ended, and `RhythmEngine` drops one stamped inside a
+    // pause (not judged, not scored, not recorded). The phase is the only thing that knows, so the
+    // phase is what the frame carries. See `RenderFrame.inputSuspended` and src/render/receptor.ts.
+    const h = await setup([1, 1.5, 2, 2.5], []);
+    h.advance(0.5);
+    const live = h.runner.highway.receptorLookOf(0);
+    expect(live?.tracking).toBe(true);
+    expect(live?.suspended).toBe(false);
+
+    h.runner.pause();
+    h.runner.step();
+    for (const l of LANES) {
+      const look = h.runner.highway.receptorLookOf(l.index);
+      expect(look?.suspended, `lane ${l.index}`).toBe(true);
+      expect(look?.tracking, `lane ${l.index}`).toBe(false);
+      expect(look?.goal ?? 0, `lane ${l.index}`).toBe(0);
+    }
+    // The gauge comes straight back — the stop blanks the display, it does not reset the session.
+    await h.runner.resume();
+    h.runner.step();
+    expect(h.runner.highway.receptorLookOf(0)?.suspended).toBe(false);
+    expect(h.runner.highway.receptorLookOf(0)?.tracking).toBe(true);
+  });
+});

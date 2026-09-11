@@ -1,11 +1,20 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { HitEvent, LaneSpec } from '../engine/types';
-import { DEFAULT_HIGHWAY_OPTIONS, Highway, MISS_CUE_MARGIN_U, POPUP_MAX_RISE_FRAC, makeFrame } from './Highway';
+import {
+  DEFAULT_HIGHWAY_OPTIONS,
+  Highway,
+  MISS_CUE_MARGIN_U,
+  POPUP_MAX_RISE_FRAC,
+  RESET_ARC_START,
+  RESET_ARC_SWEEP,
+  makeFrame,
+} from './Highway';
 import { createMockCanvas, mockCanvasFactory, type MockCanvas } from './canvasMock';
 import { runDemo } from './demo';
-import { FAR_FADE_FRAC, GEM_ASPECT, laneX, roadEdgeX, visibleTailSec, yAt } from './geometry';
+import { FAR_FADE_FRAC, GEM_ASPECT, laneX, receptorWellSemiHeight, roadEdgeX, roadEdgeXAtY, visibleTailSec, yAt } from './geometry';
 import { GH_PALETTE, HIGH_CONTRAST_PALETTE, hexToRgb } from './palette';
 import { TextCache, type Ctx2D } from './text';
+import { receptorGoalHolding, receptorMarkSet, type ReceptorLook } from './receptor';
 import { VisionInput } from '../input/VisionInput';
 import { LaneStateCache } from '../input/laneStates';
 import { extractFeature } from '../vision/features';
@@ -1425,22 +1434,32 @@ function targetLine(canvas: MockCanvas, hw: Highway, lane: number): MeterRect | 
 function levelLine(canvas: MockCanvas, hw: Highway, lane: number, bright: string): MeterRect | undefined {
   return meterRects(canvas, hw, lane).find((m) => m.style === bright);
 }
-/** The two threshold ticks outside the ring — short bars flush against the ring outline. */
-function targetTicks(canvas: MockCanvas, hw: Highway, lane: number): Array<{ x: number; y: number; w: number }> {
+/**
+ * The two threshold GATE POSTS outside the ring — short bars standing ACROSS the target height,
+ * flush against the ring outline.
+ *
+ * TALLER THAN THEY ARE WIDE, and that is the property under test, not a detail of the helper: they
+ * used to be horizontal hairlines at the same height and orientation as the board-wide white strike
+ * line, which at the 220 px acuity downscale is the strike line, and which merged with the
+ * neighbouring lane's pair across the gutter. So the filter demands a vertical bar — a horizontal
+ * one is not this mark, and must not be counted as one.
+ */
+function targetTicks(canvas: MockCanvas, hw: Highway, lane: number): Array<{ x: number; y: number; w: number; h: number }> {
   const g = hw.geometry;
   const cx = laneX(g, lane, 0);
-  const out: Array<{ x: number; y: number; w: number }> = [];
+  const out: Array<{ x: number; y: number; w: number; h: number }> = [];
   canvas.ctx.calls.forEach((c, i) => {
     if (c.name !== 'fillRect') return;
     const [x, y, w, h] = c.args as number[];
     if (canvas.ctx.propBefore(i, 'fillStyle') !== WHITE) return;
-    if (h > g.receptorRadius * 0.2 || w > g.receptorRadius * 0.5 || w < 2) return;
-    // Flush against this lane's own ring (the tick centre sits at ~1.0 r). The old ±0.6 r window
-    // was wide enough to also swallow the neighbouring lane's ticks, so every inner lane counted
+    if (w < 2 || h <= w) return; // a post stands up; a tick lay down
+    if (h > g.receptorRadius * 0.7 || w > g.receptorRadius * 0.25) return;
+    // Flush against this lane's own ring (the post sits just outside ~1.0 r). The old ±0.6 r window
+    // was wide enough to also swallow the neighbouring lane's marks, so every inner lane counted
     // four — which made the count depend on the ratio of lane width to receptor radius instead of
     // on the marks actually drawn.
     if (Math.abs(Math.abs(x + w / 2 - cx) - g.receptorRadius) > g.receptorRadius * 0.3) return;
-    out.push({ x, y, w });
+    out.push({ x, y, w, h });
   });
   return out;
 }
@@ -1778,8 +1797,14 @@ describe('the receptor draws four distinct states', () => {
   /**
    * Solid white arrowheads at the target line, just outside the ring — 2 per lane in (b) and
    * nowhere else. They are filled TRIANGLES where (a) has two thin bars: a change of shape and
-   * ~10× the filled area, which is what carries state (b) through a hard downscale when the
-   * hairline rim and corona have thinned to nothing.
+   * ~10× the filled area at full size.
+   *
+   * NOT what carries (b) through a hard downscale, whatever an earlier comment here claimed.
+   * Measured on a 1280x800 board reduced to 220 px wide, max-luminance across the strike band:
+   * (a)'s gate posts peak at 237/254 over 2 px and (b)'s arrowheads at 251/241 over 2 px, at the
+   * same height on the same strike line — the same white nub. `the four states differ by marks at
+   * every size and in both palettes` is where the downscale claim is actually tested, and what
+   * survives it is the additive inner rim: (b) reads as two concentric rings where (a) reads as one.
    */
   const goalWedges = (s: Rec): number => {
     const g = s.hw.geometry;
@@ -1912,6 +1937,105 @@ describe('the receptor draws four distinct states', () => {
     expect(brokenArcs(d)).toHaveLength(4 * 4); // four arcs per lane
     expect(questionGlyph(d)).toBe(true);
     expect(questionGlyph(a) || questionGlyph(b) || questionGlyph(c)).toBe(false);
+  });
+
+  /**
+   * (b) AFTER THE LANE HAS RE-ARMED — the `GOAL_MIN_SEC` overrun, and the frame nothing used to
+   * cover. A rep performed at the chart generator's own pacing re-arms ~0.1 s after the crossing
+   * (src/charts/generate.ts puts same-lane notes 0.45 s apart on hard), which is inside the KR floor,
+   * so this is a frame a real patient is in on most reps — not a corner.
+   *
+   * 40 armed rising frames, one crossing frame published the way the input layer really publishes it,
+   * then the patient back at 0.05 of ROM with the lane armed again.
+   */
+  const recordRearmedInLatch = (): Rec => {
+    const s = setup(1280, 720);
+    s.hw.resize(1280, 720, 1);
+    const frame = (t: number, value: number, armed: boolean): RenderFrame =>
+      makeFrame({
+        lanes: LANES,
+        songTime: t,
+        laneStates: LANES.map((l) => ({ lane: l.index, value, armed, tracking: true })),
+        thresholdFraction: THRESH,
+        rearmFraction: 0.6,
+        beatPhase: 0.5,
+      });
+    for (let i = 0; i < 40; i++) s.hw.draw(frame(1 + i * 0.016, 0.5, true));
+    s.hw.draw(frame(1.64, 0.75, false)); // the crossing
+    s.hw.draw(frame(1.656, 0.3, true)); // ...and straight back down, re-armed
+    s.canvas.ctx.reset();
+    s.hw.draw(frame(1.672, 0.05, true)); // at rest, ready for the next rep, 32 ms into the latch
+    return s;
+  };
+
+  it('a lane that has RE-ARMED inside the latch keeps the rep cue and drops every position claim', () => {
+    const e = recordRearmedInLatch();
+    // We really are in the overrun: the cue is still latched, and the lane really is armed.
+    const look = e.hw.receptorLookOf(0);
+    expect(look).toBeDefined();
+    expect(receptorMarkSet(look as ReceptorLook)).toBe('goal');
+    expect((look as ReceptorLook).locked).toBe(false);
+    expect(receptorGoalHolding(look as ReceptorLook)).toBe(false);
+    expect((look as ReceptorLook).rom).toBeCloseTo(0.05, 6);
+
+    // KEPT — "that rep reached your target" is still true, and these are the marks that say it. The
+    // rim + corona are the pair that makes (b) read as two concentric rings at a 220 px downscale.
+    expect(willFireRings(e)).toBe(8);
+    expect(goalWedges(e)).toBe(8);
+
+    // DROPPED — every mark that claims the patient is still up at the target. This is the defect:
+    // the split white-hot cap used to be drawn at the FLOOR of the well, over a hot-gradient column,
+    // under a full halo, on a lane sitting at rest and ready for the next rep.
+    expect(hotCaps(e)).toBe(0);
+    expect(risingCaps(e)).toBe(4); // the honest (a) level line is back, at the patient's true height
+    expect((look as ReceptorLook).glowTarget).toBeLessThan(0.01); // no forced halo at 5 % of ROM
+    // ...and the lane is drawn at LIVE size, not at the locked 12 % shrink: it can fire again. (At
+    // or above the nominal live size — the beat pulse and the re-arm pop both scale it UP, which is
+    // the point: the ring springs back on the frame the next rep starts counting.)
+    const live = meterAxis(e.hw).yBot;
+    const shrunk = meterAxis(e.hw, LOCK_RING_SCALE).yBot;
+    for (const l of LANES) {
+      const well = wellRect(e.canvas, e.hw, l.index);
+      expect(well, `lane ${l.index} well`).toBeDefined();
+      const bottom = (well as MeterRect).y + (well as MeterRect).h;
+      expect(bottom, `lane ${l.index} is not drawn shrunk`).toBeGreaterThan(shrunk);
+      expect(bottom).toBeGreaterThanOrEqual(live - 0.5);
+    }
+
+    // ...and none of (c): the lane is not locked, so it must not be told to lower to reset.
+    expect(lockHints(e)).toBe(0);
+    expect(drainCaps(e)).toBe(0);
+    expect(targetLines(e)).toBe(4); // the target is the threshold again — the next rep's target
+    expect(tickCount(e)).toBe(0); // ...marked by the arrowheads while the cue is still up
+  });
+
+  it('the goal costume is gone entirely once the KR floor has elapsed on a re-armed lane', () => {
+    // The floor buys at most GOAL_MIN_SEC. Past it, a lane at rest is plain (a) and nothing else —
+    // no rings, no arrowheads, no cap. Same frames as above, 0.2 s later.
+    const s = setup(1280, 720);
+    s.hw.resize(1280, 720, 1);
+    const frame = (t: number, value: number, armed: boolean): RenderFrame =>
+      makeFrame({
+        lanes: LANES,
+        songTime: t,
+        laneStates: LANES.map((l) => ({ lane: l.index, value, armed, tracking: true })),
+        thresholdFraction: THRESH,
+        rearmFraction: 0.6,
+        beatPhase: 0.5,
+      });
+    for (let i = 0; i < 40; i++) s.hw.draw(frame(1 + i * 0.016, 0.5, true));
+    s.hw.draw(frame(1.64, 0.75, false));
+    for (let i = 1; i <= 16; i++) s.hw.draw(frame(1.64 + i * 0.016, 0.05, true));
+    s.canvas.ctx.reset();
+    s.hw.draw(frame(1.64 + 17 * 0.016, 0.05, true)); // 0.272 s after the crossing
+    const e: Rec = s;
+    expect(receptorMarkSet(s.hw.receptorLookOf(0) as ReceptorLook)).toBe('rising');
+    expect(willFireRings(e)).toBe(0);
+    expect(goalWedges(e)).toBe(0);
+    expect(hotCaps(e)).toBe(0);
+    expect(tickCount(e)).toBe(8); // the gate posts are back
+    expect(risingCaps(e)).toBe(4);
+    expect(lockHints(e)).toBe(0);
   });
 
   // -----------------------------------------------------------------------------------------------
@@ -2122,7 +2246,7 @@ describe('the receptor draws four distinct states', () => {
     const dash = rearmDashes(canvas, hw, 0)[0];
     expect(Math.abs(prevCap - dash.y)).toBeLessThan(1.5);
     expect(Math.abs(prevChev - dash.y)).toBeLessThan(hw.geometry.receptorRadius * 0.2);
-    expect(prevArc).toBeCloseTo(Math.PI * 1.5, 6);
+    expect(prevArc).toBeCloseTo(RESET_ARC_SWEEP, 6);
     // More than half of that motion happened ABOVE the threshold — the span that used to be dead.
     // (0.36..0.6 of ROM is the old live span; 0.6..1.0 is the span this test was written for.)
     expect(descent.filter((v) => v >= THRESH)).toHaveLength(8);
@@ -2204,7 +2328,7 @@ describe('the receptor draws four distinct states', () => {
       for (const tk of ticks) {
         const outer = Math.max(Math.abs(tk.x - cx), Math.abs(tk.x + tk.w - cx));
         expect(outer, `tick reach at threshold ${threshold}`).toBeLessThan(half);
-        expect(tk.w, `tick still resolvable at threshold ${threshold}`).toBeGreaterThan(Math.max(3, g.receptorRadius * 0.09));
+        expect(tk.w, `post still resolvable at threshold ${threshold}`).toBeGreaterThan(Math.max(2.9, g.receptorRadius * 0.09));
       }
       // (b) the crossing: the two solid arrowheads, which are the mark this state survives a hard
       // downscale on — so they may be SHORTER when the line is at the ring's widest point, but they
@@ -2450,13 +2574,23 @@ describe('the receptor draws four distinct states', () => {
       const { canvas, hw } = setup(1280, 720, { reducedMotion: true, highContrast });
       hw.resize(1280, 720, 1);
       const bright = (highContrast ? HIGH_CONTRAST_PALETTE : GH_PALETTE).lanes[0].bright;
-      const drawAt = (value: number): void => {
+      // ...driven the way the input layer really drives it: state (b) is the CROSSING, published
+      // already disarmed (`armed: false` / triggerState 'triggered'), never `armed && value >= T`,
+      // which no source emits. A test that builds (b) from the unreachable conjunction is testing a
+      // state the product cannot produce.
+      const drawAt = (value: number, armed = true): void => {
         canvas.ctx.reset();
         hw.draw(
           makeFrame({
             lanes: LANES,
             songTime: 1 + value,
-            laneStates: LANES.map((l) => ({ lane: l.index, value, armed: true, tracking: true })),
+            laneStates: LANES.map((l) => ({
+              lane: l.index,
+              value,
+              armed,
+              triggerState: armed ? ('armed' as const) : ('triggered' as const),
+              tracking: true,
+            })),
             thresholdFraction: THRESH,
           }),
         );
@@ -2464,7 +2598,7 @@ describe('the receptor draws four distinct states', () => {
       drawAt(THRESH * 0.8);
       expect(hotCapSegments(canvas, hw, 0), `${highContrast} rising`).toHaveLength(0);
       expect(levelLine(canvas, hw, 0, bright), `${highContrast} rising cap`).toBeDefined();
-      drawAt(THRESH * 1.2);
+      drawAt(THRESH * 1.2, false);
       const segs = hotCapSegments(canvas, hw, 0);
       expect(segs, `${highContrast} firing`).toHaveLength(2);
       expect(levelLine(canvas, hw, 0, bright), `${highContrast} firing has no continuous cap`).toBeUndefined();
@@ -2564,8 +2698,11 @@ describe('the receptor draws four distinct states', () => {
       });
       return span;
     };
-    // The arc spans at most 1.5π, leaving the top quarter of the ring permanently open: a cue that
-    // closed into a complete ring would read as a lit ring, which is what (c) may never look like.
+    // The arc is a crescent in the ring's LOWER HALF (`RESET_ARC_SWEEP`): a cue that closed into a
+    // complete ring would read as a lit ring — and, drawn at the same radius as (b)'s goal corona,
+    // would read as the very second concentric ring that carries (b) at a 220 px downscale, which
+    // is what (c) may never look like. Its containment inside the lower half is asserted in
+    // 'the return-to-rest crescent never reaches the upper half of the ring'.
     // `record` gives each value its own Highway, so each of these is a lane the renderer is SEEING
     // for the first time, at that value: the return journey is measured from the peak it has
     // actually observed, so a lane first seen at the top of its range — at the threshold or at full
@@ -2575,8 +2712,8 @@ describe('the receptor draws four distinct states', () => {
     expect(sweep(1)).toBe(0); // first seen at full ROM: no journey has been watched
     expect(sweep(0.6)).toBe(0); // at threshold: nothing given back yet, no arc at all
     expect(sweep(0.54)).toBeGreaterThan(0);
-    expect(sweep(0.48)).toBeCloseTo(Math.PI * 0.75, 2); // half way down
-    expect(sweep(0.36)).toBeCloseTo(Math.PI * 1.5, 6); // at the re-arm line: complete, still open
+    expect(sweep(0.48)).toBeCloseTo(RESET_ARC_SWEEP * 0.5, 2); // half way down
+    expect(sweep(0.36)).toBeCloseTo(RESET_ARC_SWEEP, 6); // at the re-arm line: complete
     expect(sweep(0.48)).toBeGreaterThan(sweep(0.54));
     // It is a locked-lane cue only: a live lane never draws it.
     const live = record(0.48, true);
@@ -2799,7 +2936,12 @@ describe('every receptor look is one the real input layer produces', () => {
     // ...so the gauge must not claim otherwise, on any frame of the recovery.
     const after = seen.slice(recoveryFrom).map((k) => k.state);
     expect(after).not.toContain('goal');
-    // What it says instead is the true and actionable thing: this lane cannot score, lower to reset.
+    expect(after).not.toContain('rising');
+    // What it says instead is the true and actionable thing, from the FIRST recovered frame: "this
+    // lane cannot score, lower to reset". The recovered frame carries a measurement — it is the very
+    // frame `LaneTrigger` would have fired on had the break been short enough to keep the arming —
+    // so the receptor stops saying "I cannot see you" on it, and says the thing the patient can act
+    // on instead.
     expect(after.every((k) => k === 'locked')).toBe(true);
     // And it is the real "lower to reset", with the return-to-rest readout keyed to the re-arm level.
     expect(drainCap(canvas, hw, 0)).toBeDefined();
@@ -2844,6 +2986,72 @@ describe('every receptor look is one the real input layer produces', () => {
     hw.draw(makeFrame({ lanes: LANES, songTime: 1, laneStates: [], thresholdFraction: THRESH }));
     for (const l of LANES) expect(receptorState(canvas, hw, l.index)).toBe('lost');
   });
+
+  it('a lane whose calibration the input layer REFUSED is not drawn "rising, armed, ready"', async () => {
+    // The whole chain, on the real input layer. `VisionInput` refuses a range that cannot be a range
+    // and then publishes that lane as `{ value: 0, armed: true, triggerState: 'armed',
+    // tracking: true }` for the rest of the session — a textbook state (a) at an empty meter, for a
+    // lane that will emit nothing however hard the patient works. `getStatus()` has been saying so
+    // in plain language the whole time, and the play screen used not to read it.
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const input = new VisionInput({
+      mode: 'leg',
+      lanes: REP_LANES,
+      calibrations: [
+        // A degenerate range: min and max a thousandth of a real ROM apart.
+        calFor('seated_march', 'left', (a) => seatedPose({ kneeLift: a * 0.001, side: 'left' })),
+        calFor('knee_extension', 'right', (a) => seatedPose({ kneeExtension: a, side: 'right' })),
+      ],
+      thresholdFraction: THRESH,
+      audioContext: new FakeClock(),
+      detector: stubDetector(),
+      driveLoop: false,
+      smoothing: { kind: 'none' },
+    });
+    const fired: number[] = [];
+    input.onEvent((e) => fired.push(e.ctxTime));
+    await input.start();
+    expect(input.getInvalidCalibrations().map((c) => c.lane), 'the lane really is refused').toContain(0);
+
+    const { canvas, hw } = setup(1280, 800);
+    hw.resize(1280, 800, 1);
+    const step = (t: number, lift: number): void => {
+      input.processDetection({ tMs: t * 1000, pose: seatedPose({ kneeLift: lift, side: 'left' }), hands: [] }, t);
+      canvas.ctx.reset();
+      hw.draw(
+        makeFrame({
+          lanes: REP_LANES,
+          songTime: t,
+          laneStates: input.getLaneStates(),
+          thresholdFraction: THRESH,
+          rearmFraction: 0.6,
+        }),
+      );
+    };
+    // 20 s of real marching on that lane.
+    let f = 0;
+    for (let i = 0; i < 600; i++) {
+      const t = f++ / 30;
+      step(t, 0.5 + 0.5 * Math.sin(t * Math.PI));
+    }
+    expect(fired, 'nothing fired on the refused lane').toHaveLength(0);
+    expect(input.getLaneStates()[0]).toMatchObject({ value: 0, armed: true, triggerState: 'armed', tracking: true });
+    // THE DEFECT, pinned so it cannot come back silently: given only `LaneState`, the receptor has
+    // no way to know and correctly draws what it was handed.
+    expect(receptorState(canvas, hw, 0)).toBe('rising');
+
+    // ...which is why the renderer takes the input layer's own verdict out of band. This is exactly
+    // what the play screen now does every half second (`Play.faultedLanes` → `setLaneFaults`).
+    const status = input.getStatus();
+    expect(status.reason).toBe('uncalibrated');
+    expect(status.invalidCalibrationLanes).toEqual([0]);
+    expect((status.warnings ?? []).join(' ')).toMatch(/not calibrated/i);
+    hw.setLaneFaults(status.invalidCalibrationLanes);
+    for (let i = 0; i < 20; i++) step(f++ / 30, 0.5);
+    expect(receptorState(canvas, hw, 0), 'refused lane').toBe('lost');
+    expect(receptorState(canvas, hw, 1), 'the healthy lane is untouched').not.toBe('lost');
+    input.stop();
+  });
 });
 
 // -------------------------------------------------------------------------------------------------
@@ -2880,8 +3088,133 @@ describe('the receptor does not strobe on one noisy tracking frame', () => {
     // A patient who has really left the frame is told so, and quickly.
     for (let i = 0; i < 8; i++) t += 1 / 30;
     expect(draw(hw, canvas, t, false)).toBe('lost');
-    // ...and the gauge comes straight back when they are seen again (no hold on the way in).
-    expect(draw(hw, canvas, t + 1 / 30, true)).toBe('rising');
+    // ...AND COMING BACK COSTS ONE TRACKED FRAME, because that frame is a measurement the input
+    // layer is already using: it is the sample `LaneTrigger` is pushed and can fire on, with the
+    // crossing interpolated back across the gap (src/vision/trigger.ts). Making the recovery cost
+    // contiguous stream — as the duty-cycle rule this replaced did — is the same thing as refusing
+    // knowledge of results for reps the engine scored. See `LOST_HOLD_SEC`.
+    t += 1 / 30;
+    expect(draw(hw, canvas, t, true)).toBe('rising');
+  });
+});
+
+// -------------------------------------------------------------------------------------------------
+// THE RECEPTOR'S TIMERS ARE PERCEPTION TIMERS. Every other effect in the renderer is keyed to song
+// time so that a pause freezes it where it is. The receptor cannot be: the lane states keep arriving
+// while the song clock is stopped (GameRunner passes `input.getLaneStates()` live on every frame,
+// paused or not), and all three of the receptor's windows — the goal latch, the anti-strobe tracking
+// hold and the input layer's gap rule — are measured on the PATIENT. Frozen, all three fail the same
+// way: toward a claim that can never expire.
+// -------------------------------------------------------------------------------------------------
+
+describe('the receptor keeps its own clock when the song clock stops', () => {
+  const THRESH = 0.6;
+  /** Wall clock (ms) the Highway reads through `performance.now()`; the tests move it by hand. */
+  let wall = 0;
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  const rig = (): { canvas: MockCanvas; hw: Highway } => {
+    wall = 10_000;
+    vi.spyOn(performance, 'now').mockImplementation(() => wall);
+    const { canvas, hw } = setup(1280, 720, { reducedMotion: true });
+    hw.resize(1280, 720, 1);
+    return { canvas, hw };
+  };
+
+  /** One frame: `wallMs` of real time passes, then the frame is drawn at song time `t`. */
+  const step = (
+    canvas: MockCanvas,
+    hw: Highway,
+    t: number,
+    state: { value: number; armed: boolean; tracking?: boolean },
+    wallMs = 1000 / 60,
+  ): ReceptorState => {
+    wall += wallMs;
+    canvas.ctx.reset();
+    hw.draw(
+      makeFrame({
+        lanes: LANES,
+        songTime: t,
+        laneStates: LANES.map((l) => ({ lane: l.index, tracking: true, ...state })),
+        thresholdFraction: THRESH,
+        rearmFraction: 0.6,
+      }),
+    );
+    return receptorState(canvas, hw, 0);
+  };
+
+  /** Rise to just under the threshold, armed and tracked — the state every rep starts from. */
+  const riseTo = (canvas: MockCanvas, hw: Highway, t0: number, frames = 20): number => {
+    let t = t0;
+    for (let i = 0; i < frames; i++) {
+      step(canvas, hw, t, { value: 0.4, armed: true });
+      t += 1 / 30;
+    }
+    return t;
+  };
+
+  it('does not hold a goal celebration for the length of a pause, or replay it on resume', () => {
+    // A therapist pauses right after the patient reaches their target. The song clock stops; the
+    // camera does not. Held at song time, `goal` never ages: the white cap, the arrowheads and the
+    // corona stay at full strength for the whole pause — and then finish their remaining 0.45 s
+    // AFTER the resume, as knowledge of results about a rep that happened minutes earlier.
+    const { canvas, hw } = rig();
+    const tPause = riseTo(canvas, hw, 1);
+    expect(step(canvas, hw, tPause, { value: 0.75, armed: false })).toBe('goal');
+
+    // ...pause. Song time is frozen from here; wall time is not.
+    let held = 0;
+    let state: ReceptorState = 'goal';
+    for (let i = 0; i < 90; i++) {
+      state = step(canvas, hw, tPause, { value: 0.75, armed: false });
+      if (state === 'goal') held = (i + 1) / 60;
+    }
+    // GOAL_HOLD_SEC + GOAL_FADE_SEC = 0.6 s, plus the 0.2 s the renderer waits before it stops
+    // believing the song clock. Well inside the 1.5 s this loop covers.
+    expect(held).toBeLessThan(1);
+    expect(state).toBe('locked');
+    // ...and the resume gets the lockout it left, not the tail of a celebration.
+    expect(step(canvas, hw, tPause + 1 / 30, { value: 0.75, armed: false })).toBe('locked');
+  });
+
+  it('still says "I cannot see you" when the camera dies during a pause', () => {
+    // The anti-strobe hold (LOST_HOLD_SEC) replays the last tracked look for a fifth of a second so
+    // one marginal visibility frame cannot flip the row to "?" and back. On a stopped song clock it
+    // never expires, so an unplugged camera leaves a live-looking gauge standing at the patient's
+    // last value — the exact "meter pinned under a dead camera" lie this gauge exists to remove.
+    const { canvas, hw } = rig();
+    const t = riseTo(canvas, hw, 1);
+    expect(step(canvas, hw, t, { value: 0.4, armed: true, tracking: false })).toBe('rising'); // held
+    let state: ReceptorState = 'rising';
+    for (let i = 0; i < 60 && state !== 'lost'; i++) state = step(canvas, hw, t, { value: 0.4, armed: true, tracking: false });
+    expect(state).toBe('lost');
+  });
+
+  it('never celebrates the recovery frame of a dropout that spanned a pause', () => {
+    // The dangerous one. `LaneTrigger.breakContinuity` disarms a lane AT WHATEVER VALUE IT HAS after
+    // maxGapSec of silence, so the recovery frame is published as `{ value: 0.95, armed: false }` —
+    // byte for byte the shape of a crossing, with no LaneInputEvent and no rep behind it. The only
+    // thing that tells the two apart is how long the stream has been silent, measured on a clock
+    // that has to be running.
+    const { canvas, hw } = rig();
+    const t = riseTo(canvas, hw, 1);
+    // The patient goes out of frame and the session is stopped in the same moment.
+    let state: ReceptorState = 'rising';
+    for (let i = 0; i < 60; i++) state = step(canvas, hw, t, { value: 0.4, armed: true, tracking: false });
+    expect(state).toBe('lost');
+    // They reappear at end range, disarmed by the break. Nothing fired; nothing may be celebrated —
+    // not on the recovery frame, and not on any frame after it.
+    const after: ReceptorState[] = [];
+    for (let i = 0; i < 40; i++) after.push(step(canvas, hw, t + i / 30, { value: 0.95, armed: false }));
+    expect(after).not.toContain('goal');
+    expect(after).not.toContain('rising');
+    // From the first recovered frame it says the truth about the lane instead: locked out, lower to
+    // reset. (It is the goal LATCH that a dropout kills, not the recovery: the tracking hold is a
+    // debounce on "there is no measurement", and the recovered frame has one.)
+    expect(after.every((k) => k === 'locked')).toBe(true);
   });
 });
 
@@ -2931,7 +3264,11 @@ describe('the four states differ by marks at every size and in both palettes', (
   for (const cfg of CONFIGS) {
     it(`keeps the four states apart at ${cfg.name}`, () => {
       const sigs = new Map<string, string>();
-      for (const state of ['rising', 'goal', 'locked', 'lost'] as const) {
+      // FIVE recordings, four states: `rearmed` is the `GOAL_MIN_SEC` overrun — still state (b), but
+      // with the lane already re-armed, which is the look a patient is in on most reps at the chart
+      // generator's own pacing. It must never be confused with (a), (c) or (d); see below for why it
+      // is allowed to share (b)'s inventory.
+      for (const state of ['rising', 'goal', 'rearmed', 'locked', 'lost'] as const) {
         const { canvas, hw } = setup(cfg.w, cfg.h, cfg.opts);
         hw.resize(cfg.w, cfg.h, 1);
         const frame = (t: number, value: number, armed: boolean, tracking: boolean): RenderFrame =>
@@ -2949,7 +3286,12 @@ describe('the four states differ by marks at every size and in both palettes', (
         canvas.ctx.reset();
         if (state === 'rising') hw.draw(frame(1.5, 0.3, true, true));
         else if (state === 'goal') hw.draw(frame(1.5, 0.75, false, true));
-        else if (state === 'locked') {
+        else if (state === 'rearmed') {
+          hw.draw(frame(1.5, 0.75, false, true)); // the crossing...
+          hw.draw(frame(1.516, 0.3, true, true)); // ...and straight back down past the re-arm line
+          canvas.ctx.reset();
+          hw.draw(frame(1.532, 0.1, true, true)); // 32 ms in: armed, near rest, cue still latched
+        } else if (state === 'locked') {
           hw.draw(frame(1.5, 0.75, false, true)); // the crossing...
           for (let i = 0; i < 60; i++) hw.draw(frame(1.52 + i * 0.016, 0.75, false, true)); // ...held
           canvas.ctx.reset();
@@ -2962,10 +3304,18 @@ describe('the four states differ by marks at every size and in both palettes', (
         sigs.set(state, signature(canvas, hw, cfg.lanes));
       }
       const seen = new Map<string, string>();
-      for (const [state, sig] of sigs) {
+      for (const state of ['rising', 'goal', 'locked', 'lost'] as const) {
+        const sig = sigs.get(state) as string;
         const clash = seen.get(sig);
         expect(clash, `${state} and ${clash} draw the same marks: ${sig}`).toBeUndefined();
         seen.set(sig, state);
+      }
+      // `rearmed` is STILL (b) — the rep really did reach target — so it deliberately keeps (b)'s KR
+      // inventory and is not required to differ from it: what separates the two is the position
+      // gauge (the column, at the patient's real height), which this signature ignores on purpose.
+      // What it may never be confused with is the three states that mean something else.
+      for (const other of ['rising', 'locked', 'lost'] as const) {
+        expect(sigs.get('rearmed'), `rearmed reads as ${other}`).not.toBe(sigs.get(other));
       }
     });
   }
@@ -3025,6 +3375,239 @@ function gemDiscs(canvas: MockCanvas, hw: Highway): Array<{ cy: number; ry: numb
     .filter((c) => c.name === 'ellipse' && (c.args[1] as number) > g.strikeY + 1)
     .map((c) => ({ cy: c.args[1] as number, ry: c.args[3] as number }));
 }
+
+describe('a lane that structurally cannot fire is never drawn "armed and ready"', () => {
+  /**
+   * `LaneState` reports the patient; it does not report whether the machinery under them works. A
+   * lane whose calibration VisionInput REFUSED publishes `{ value: 0, armed: true, triggerState:
+   * 'armed', tracking: true }` for the whole session — a perfect state (a) on a lane that will emit
+   * nothing for three minutes — and `getStatus()` has said so in plain language the whole time.
+   */
+  const healthy = (value: number) =>
+    LANES.map((l) => ({ lane: l.index, value, armed: true, triggerState: 'armed' as const, tracking: true }));
+
+  it('draws a faulted lane as "no reading" with a "!", and leaves its neighbours alone', () => {
+    const { canvas, hw, scratch } = setup(1280, 800);
+    hw.resize(1280, 800, 1);
+    const frame = (t: number) => makeFrame({ lanes: LANES, songTime: t, thresholdFraction: 0.65, laneStates: healthy(0.3) });
+    hw.draw(frame(0));
+    // Before: every lane is a live, rising gauge — which is what the board really showed.
+    expect(receptorMarkSet(hw.receptorLookOf(0) as ReceptorLook)).toBe('rising');
+    hw.setLaneFaults([0]);
+    // The anti-strobe hold applies to the fault exactly as it does to a dropout (one model, one
+    // path): the lane was tracked a moment ago, so it holds LOST_HOLD_SEC before it admits it.
+    for (let i = 1; i <= 20; i++) hw.draw(frame(i * 0.02));
+    expect(receptorMarkSet(hw.receptorLookOf(0) as ReceptorLook), 'faulted lane').toBe('lost');
+    expect(receptorMarkSet(hw.receptorLookOf(1) as ReceptorLook), 'its neighbour').toBe('rising');
+    // ...and it is the FAULT glyph, not the out-of-frame one: "get back in frame" is the wrong
+    // remedy and would send the therapist after the wrong thing.
+    const before = scratch.length;
+    canvas.ctx.reset();
+    hw.draw(frame(0.45));
+    const glyphs = scratch
+      .slice(0)
+      .flatMap((c) => c.ctx.calls.filter((k) => k.name === 'fillText').map((k) => k.args[0]));
+    expect(glyphs, 'the fault glyph is rasterized').toContain('!');
+    expect(before).toBeGreaterThan(0);
+    // Nothing value-derived survives for that lane: no well ground where its receptor is.
+    const g = hw.geometry;
+    const wellsAt = (lane: number): number =>
+      canvas.ctx.calls.filter(
+        (c, i) =>
+          c.name === 'fillRect' &&
+          canvas.ctx.propBefore(i, 'fillStyle') === METER_WELL &&
+          Math.abs((c.args[0] as number) + (c.args[2] as number) / 2 - laneX(g, lane, 0)) < 2,
+      ).length;
+    expect(wellsAt(0), 'faulted lane has no meter well').toBe(0);
+    expect(wellsAt(1), 'healthy lane still has one').toBe(1);
+  });
+
+  it('clears faults again, and ignores lanes that do not exist', () => {
+    const { hw } = setup(1280, 800);
+    hw.resize(1280, 800, 1);
+    const frame = (t: number) => makeFrame({ lanes: LANES, songTime: t, thresholdFraction: 0.65, laneStates: healthy(0.3) });
+    hw.draw(frame(0));
+    hw.setLaneFaults([0, 99, -3, Number.NaN]);
+    for (let i = 1; i <= 20; i++) hw.draw(frame(i * 0.02));
+    expect(receptorMarkSet(hw.receptorLookOf(0) as ReceptorLook)).toBe('lost');
+    for (let lane = 1; lane < 4; lane++) expect(receptorMarkSet(hw.receptorLookOf(lane) as ReceptorLook)).toBe('rising');
+    // Re-calibrated mid-session: the lane comes back as a live gauge on the next tracked frame.
+    hw.setLaneFaults(null);
+    hw.draw(frame(0.5));
+    expect(receptorMarkSet(hw.receptorLookOf(0) as ReceptorLook)).toBe('rising');
+  });
+
+  it('never lets a faulted lane latch the "you reached your target" cue', () => {
+    // The cruellest version: the lane is faulted while the patient is mid-rep, so the very next
+    // published state is the crossing shape. No KR may be thrown for a lane that emitted nothing.
+    const { hw } = setup(1280, 800);
+    hw.resize(1280, 800, 1);
+    const states = (value: number, armed: boolean) =>
+      LANES.map((l) => ({
+        lane: l.index,
+        value: l.index === 0 ? value : 0.2,
+        armed: l.index === 0 ? armed : true,
+        triggerState: (l.index === 0 ? (armed ? 'armed' : 'triggered') : 'armed') as 'armed' | 'triggered',
+        tracking: true,
+      }));
+    hw.draw(makeFrame({ lanes: LANES, songTime: 0, thresholdFraction: 0.65, laneStates: states(0.5, true) }));
+    hw.setLaneFaults([0]);
+    const seen: string[] = [];
+    for (let i = 1; i <= 40; i++) {
+      hw.draw(makeFrame({ lanes: LANES, songTime: i * 0.02, thresholdFraction: 0.65, laneStates: states(0.9, false) }));
+      seen.push(receptorMarkSet(hw.receptorLookOf(0) as ReceptorLook));
+    }
+    expect(seen).not.toContain('goal');
+    expect(seen[seen.length - 1]).toBe('lost');
+  });
+});
+
+describe('nothing on the board is painted over the receptor', () => {
+  /**
+   * THE RECEPTOR ROW IS THE LAST BOARD LAYER. It is the patient's only 2 m-legible statement about
+   * what the input layer will do with their next rep, and it used to be drawn BEFORE the gems — so a
+   * note gem, which is opaque and (`RECEPTOR_GEM_RATIO * RECEPTOR_WELL_RATIO` = 1.008) almost
+   * exactly the size of the meter well it lands on, covered 96 % of its own lane's gauge whenever it
+   * was at the line. Measured on a real 'medium' session at 1280x800: a gem over the receptor's
+   * centre on 34.8 % of lane-frames, touching the well on 45.5 %.
+   */
+  const firstClip = (canvas: MockCanvas): number => canvas.ctx.calls.findIndex((c) => c.name === 'clip');
+
+  it('issues every gem blit before the receptor row starts drawing (sprite path)', () => {
+    // Implementation-agnostic: the only `clip()` in a frame is the meter well of lane 0, the first
+    // lane the receptor row draws. Compare an identical frame with and without notes — every extra
+    // blit the notes cause must land BEFORE that point, and none after it.
+    const { canvas, hw } = setup(1280, 800);
+    hw.resize(1280, 800, 1);
+    const songTime = 10;
+    // A chord on the line plus the rest of the runway: the worst case is four gems sitting on four
+    // receptors at once, which is what the chart generator writes deliberately.
+    const notes: RenderNote[] = [
+      { id: 1, lane: 0, time: songTime, state: 'pending' },
+      { id: 2, lane: 1, time: songTime, state: 'pending' },
+      { id: 3, lane: 2, time: songTime, state: 'pending' },
+      { id: 4, lane: 3, time: songTime, state: 'pending' },
+      ...notesAround(songTime, 4),
+    ];
+    const laneStates = LANES.map((l) => ({ lane: l.index, value: 0.7, armed: false, triggerState: 'triggered' as const, tracking: true }));
+    const base = makeFrame({ lanes: LANES, songTime, thresholdFraction: 0.65, laneStates });
+    hw.draw({ ...base, notes }); // warm the sprite cache so the two measured frames allocate nothing
+    const measure = (withNotes: boolean): { before: number; after: number; drawn: number } => {
+      canvas.ctx.reset();
+      hw.draw({ ...base, notes: withNotes ? notes : [] });
+      const clip = firstClip(canvas);
+      expect(clip).toBeGreaterThan(0);
+      let before = 0;
+      let after = 0;
+      canvas.ctx.calls.forEach((c, i) => {
+        if (c.name !== 'drawImage') return;
+        if (i < clip) before++;
+        else after++;
+      });
+      return { before, after, drawn: hw.getStats().notesDrawn };
+    };
+    const withNotes = measure(true);
+    const without = measure(false);
+    expect(withNotes.drawn).toBeGreaterThanOrEqual(8);
+    expect(without.drawn).toBe(0);
+    // Every gem the frame drew was issued before the receptor row began...
+    expect(withNotes.before - without.before, 'gem blits before the receptor row').toBe(withNotes.drawn);
+    // ...and not one of them after it.
+    expect(withNotes.after, 'blits after the receptor row began').toBe(without.after);
+  });
+
+  it('draws the whole gauge of a lane whose gem is sitting on it (geometric, sprite-less path)', () => {
+    // The proof frame the critic captured: lane 3 in state (c) — locked, "lower to reset" — with a
+    // gem on the line. Nothing of the ring, the drain cap, the re-arm dashes or the chevron was
+    // visible; what replaced them was a bright, fully lit hit target. Here every one of the well's
+    // own paints must be issued after the gem that covers it.
+    const canvas = createMockCanvas(1280, 800);
+    const hw = new Highway(canvas, { createCanvas: noSpriteFactory });
+    hw.resize(1280, 800, 1);
+    const g = hw.geometry;
+    const songTime = 10;
+    const laneStates = LANES.map((l) => ({ lane: l.index, value: 0.8, armed: false, triggerState: 'unconfirmed' as const, tracking: true }));
+    const notes: RenderNote[] = LANES.map((l, i) => ({ id: i + 1, lane: l.index, time: songTime, state: 'pending' as const }));
+    hw.draw(makeFrame({ lanes: LANES, songTime: songTime - 1, thresholdFraction: 0.65, laneStates }));
+    canvas.ctx.reset();
+    hw.draw(makeFrame({ lanes: LANES, songTime, notes, thresholdFraction: 0.65, laneStates }));
+    // Gems at the line: the sprite-less fallback draws each as one ellipse of the near gem radius,
+    // centred on the strike line. (The receptor's own ellipses are 1.12x wider — RECEPTOR_GEM_RATIO.)
+    const gemIdx: number[] = [];
+    canvas.ctx.calls.forEach((c, i) => {
+      if (c.name !== 'ellipse') return;
+      if (Math.abs((c.args[1] as number) - g.strikeY) > 1) return;
+      if (Math.abs((c.args[2] as number) - g.gemRadiusNear) > 0.5) return;
+      gemIdx.push(i);
+    });
+    expect(gemIdx.length, 'four gems on the line').toBe(4);
+    // The meter well's dark ground is the first thing the gauge paints, and everything readable is
+    // painted on top of it (asserted elsewhere), so it is the whole gauge's lower bound.
+    const wellIdx = canvas.ctx.calls
+      .map((c, i) => (c.name === 'fillRect' && canvas.ctx.propBefore(i, 'fillStyle') === METER_WELL ? i : -1))
+      .filter((i) => i >= 0);
+    expect(wellIdx.length, 'one well ground per lane').toBe(4);
+    expect(Math.max(...gemIdx), 'last gem vs first well').toBeLessThan(Math.min(...wellIdx));
+    // ...and the violet "lower to reset" marks of (c) too — the instruction the stalled patient
+    // needs is the very thing the covering gem used to hide.
+    const violet = canvas.ctx.calls
+      .map((c, i) => ((c.name === 'fillRect' || c.name === 'stroke') && canvas.ctx.propBefore(i, 'fillStyle') === LOCK_HINT ? i : -1))
+      .filter((i) => i >= 0);
+    expect(violet.length, 'drain cap + re-arm dashes per lane').toBeGreaterThanOrEqual(4);
+    expect(Math.max(...gemIdx)).toBeLessThan(Math.min(...violet));
+  });
+
+  it('walks a dying gem clear of the well so the miss is still seen under the ring', () => {
+    // The aggravator: a patient stalled at end range is in (c) and therefore misses every note in
+    // that lane. With the receptor now on top, a fizzle left where it lands would die invisibly
+    // behind the ring — so it walks out from under it (see `missCueY`).
+    for (const [w, h] of [
+      [1280, 800],
+      [1280, 720],
+      [1920, 1080],
+      [1366, 768],
+    ]) {
+      const canvas = createMockCanvas(w, h);
+      const hw = new Highway(canvas, { createCanvas: noSpriteFactory });
+      hw.resize(w, h, 1);
+      const g = hw.geometry;
+      const wellBottom = g.strikeY + receptorWellSemiHeight(g);
+      const noteTime = 10;
+      hw.draw(makeFrame({ lanes: LANES, songTime: noteTime - 1 }));
+      const missEv: HitEvent[] = [{ noteId: 1, lane: 2, judgment: 'miss', deltaMs: 180, time: noteTime + 0.18 }];
+      const missed: RenderNote = { id: 1, lane: 2, time: noteTime, state: 'miss', judgment: 'miss' };
+      const at = (dt: number): { cy: number; ry: number } => {
+        canvas.ctx.reset();
+        hw.draw(makeFrame({ lanes: LANES, songTime: noteTime + dt, notes: [missed], recentHits: dt === 0.28 ? missEv : [] }));
+        const discs = gemDiscs(canvas, hw);
+        expect(discs.length, `${w}x${h} +${dt}s`).toBe(1);
+        return discs[0];
+      };
+      // On the verdict frame it is not yanked anywhere: its lower third is already below the ring.
+      const verdict = at(0.28);
+      expect(verdict.cy + verdict.ry, `${w}x${h} verdict frame shows below the ring`).toBeGreaterThan(wellBottom);
+      // ...and within `MISS_CLEAR_SEC` its CENTRE is out from under the well, while it still has
+      // most of its opacity (alpha = (1 - k) * 0.75 — at +0.15 s of a 0.42 s fizzle, ~0.5).
+      for (const dt of [0.43, 0.5, 0.6]) {
+        const d = at(dt);
+        expect(d.cy, `${w}x${h} +${dt}s clear of the well`).toBeGreaterThanOrEqual(wellBottom);
+      }
+      // It never climbs back toward the line, and once clear it stays at least three quarters
+      // visible for the rest of the fizzle — the gem shrinks toward the ring's underside rather
+      // than sliding back beneath it.
+      for (const dt of [0.32, 0.36, 0.43, 0.5, 0.6, 0.68]) {
+        const d = at(dt);
+        expect(d.cy, `${w}x${h} +${dt}s never climbs back`).toBeGreaterThanOrEqual(verdict.cy - 0.001);
+        if (dt < 0.43) continue;
+        // (The nominal clearance leaves 22.5 % of the gem behind the ring; on a short canvas the
+        // bottom-edge clamp wins and it is a little more — which is the right way round, since a
+        // cue below the bottom edge is not a cue at all.)
+        const hidden = (wellBottom - (d.cy - d.ry)) / (2 * d.ry);
+        expect(hidden, `${w}x${h} +${dt}s fraction of the gem behind the ring`).toBeLessThanOrEqual(0.35);
+      }
+    }
+  });
+});
 
 describe('the miss cue lands inside the canvas', () => {
   it('keeps the whole dying gem on screen from the verdict through the fizzle, at every resolution', () => {
@@ -3578,8 +4161,15 @@ describe('the target line is a different KIND of mark from the strike line', () 
       // ...and the same height IS carried unbroken, outside the ring where no liquid reaches: two
       // solid ticks. So the reference never rests on the dashes alone.
       const ticks = targetTicks(canvas, hw, 0);
-      expect(ticks, `${name}: ticks`).toHaveLength(2);
-      for (const tick of ticks) expect(Math.abs(tick.y - (axis.yTarget - 1.1)), `${name}: tick height`).toBeLessThan(2);
+      expect(ticks, `${name}: posts`).toHaveLength(2);
+      for (const tick of ticks) {
+        // The height is the post's MIDPOINT — what survives a blur when the bar itself does not.
+        expect(Math.abs(tick.y + tick.h / 2 - axis.yTarget), `${name}: post height`).toBeLessThan(2);
+        // ...and it stands ACROSS the line, so it cannot be absorbed into the horizontal strike
+        // line at any scale. This is the whole reason it is not a tick any more.
+        expect(tick.h, `${name}: post is upright`).toBeGreaterThan(tick.w * 2);
+        expect(tick.h, `${name}: post is resolvable at a 220 px board`).toBeGreaterThan(g.receptorRadius * 0.3);
+      }
     }
   });
 
@@ -3612,5 +4202,279 @@ describe('the target line is a different KIND of mark from the strike line', () 
     const tickInner = Math.min(...ticks.map((t) => Math.abs(t.x + t.w / 2 - cx) - t.w / 2));
     // A real gap between the last dash and the first tick — at least a dash's worth of dark.
     expect(tickInner - Math.max(...xs)).toBeGreaterThan(g.receptorRadius * 0.1);
+  });
+});
+
+// -------------------------------------------------------------------------------------------------
+// The screen the receptor ships on: nothing the app floats over the board may cover it
+// -------------------------------------------------------------------------------------------------
+
+/**
+ * ROUND-3 DEFECT. The play screen's camera picture-in-picture panel was pinned in CSS to
+ * `left: 18px; bottom: 18px`, and at exactly the landscape widths a clinic tablet uses that is on
+ * top of lane 0's receptor AND its label: screenshotted and measured, lane 0's "L knee lift" read
+ * as "knee lift" at 1280x800 and "nee lift" at 1024x768, beside a fully legible "R knee lift" on
+ * lane 1. On the DEFAULT bilateral prescription the side letter is the only mark distinguishing the
+ * two lanes, so a hemiparetic patient was being told "lower to reset" on a lane nobody had named
+ * and the therapist had to say out loud which leg it was — the 90-second test failing outright.
+ *
+ * `Highway.overlayPanel` is the fix: the board's geometry decides where a DOM panel may sit,
+ * because only the board's geometry knows where the strike line, the gutter and the rock gauge are
+ * at this canvas size and lane count.
+ */
+describe('overlay panel placement', () => {
+  /** The shapes a clinic tablet presents, landscape and portrait. */
+  const SIZES: Array<[number, number]> = [
+    [1280, 800],
+    [1024, 768],
+    [1366, 768],
+    [1920, 1080],
+    [800, 400],
+    [400, 800],
+  ];
+
+  /** `Highway.u`, recomputed from the public size the way `resize()` computes it. */
+  const unit = (hw: Highway): number => {
+    const { width, height } = hw.size;
+    return Math.min(Math.max(Math.min(width / 1280, height / 720), 0.35), 2.5);
+  };
+
+  /** The y `drawLabels` puts the FIRST label row's centre at, and the row pitch under it. */
+  const labelRowY = (hw: Highway): number =>
+    hw.geometry.strikeY + hw.geometry.receptorRadius * GEM_ASPECT + 22 * unit(hw);
+
+  it.each(SIZES)('clears the receptor row and its lane labels at %ix%i', (w, h) => {
+    const { hw } = setup(w, h);
+    hw.draw(makeFrame({ lanes: LANES, songTime: 0, thresholdFraction: 0.5 }));
+    const g = hw.geometry;
+    const box = hw.overlayPanel();
+    const right = box.left + box.width;
+
+    // The label under lane 0 is the mark the panel used to eat. Its anchor, and a generous ink box
+    // around it (labels are fitted to ~0.96 of the lane pitch, centred on the lane), must be clear.
+    const lx = laneX(g, 0, -0.02);
+    const half = g.laneWidthNear * 0.48;
+    const labelTop = labelRowY(hw) - 22 * unit(hw);
+    expect(box.bottomY, 'panel bottom is above the lane-label row').toBeLessThan(labelTop);
+    // ...and above the receptor ring itself, marks included.
+    expect(box.bottomY, 'panel bottom is above the receptor band').toBeLessThan(
+      g.strikeY - g.receptorRadius * GEM_ASPECT,
+    );
+    // Horizontal overlap with lane 0's label is then irrelevant, but assert the rect really does
+    // miss the label box rather than merely sitting near it.
+    const overlapsLabelX = right > lx - half && box.left < lx + half;
+    const overlapsLabelY = box.bottomY > labelTop;
+    expect(overlapsLabelX && overlapsLabelY).toBe(false);
+  });
+
+  it('does not land on the rock gauge either — the other tenant of the left gutter', () => {
+    for (const [w, h] of SIZES) {
+      const { hw } = setup(w, h);
+      hw.draw(makeFrame({ lanes: LANES, songTime: 0, thresholdFraction: 0.5 }));
+      const g = hw.geometry;
+      const u = unit(hw);
+      // `rockGaugeBox`, recomputed from public numbers exactly as drawHud lays the gauge out.
+      const leftPanelW = Math.max(0, roadEdgeX(g, -1, 0));
+      const r = Math.min(Math.max(Math.min(leftPanelW * 0.3, hw.size.height * 0.1, 90 * u), 18), 140);
+      const gy = g.strikeY - r * 1.1;
+      expect(hw.overlayPanel().bottomY, `${w}x${h}`).toBeLessThanOrEqual(gy - r);
+    }
+  });
+
+  it('stays inside the road at the clinic-tablet widths, by narrowing rather than by overlapping', () => {
+    for (const [w, h] of [
+      [1280, 800],
+      [1024, 768],
+      [1920, 1080],
+    ] as Array<[number, number]>) {
+      const { hw } = setup(w, h);
+      const box = hw.overlayPanel();
+      expect(box.overRoad, `${w}x${h}`).toBe(false);
+      expect(box.left + box.width).toBeLessThanOrEqual(roadEdgeXAtY(hw.geometry, -1, box.bottomY) + 1e-6);
+    }
+  });
+
+  it('moves with the canvas — the whole reason it is not a CSS constant', () => {
+    const { hw } = setup(1280, 800);
+    const before = hw.overlayPanel();
+    hw.resize(1024, 768, 1);
+    const after = hw.overlayPanel();
+    expect(after.bottom).not.toBeCloseTo(before.bottom, 1);
+    expect(after.bottomY).toBeLessThan(hw.geometry.strikeY - hw.geometry.receptorRadius * GEM_ASPECT);
+  });
+
+  it('leaves the panel room to exist on every size it is offered', () => {
+    for (const [w, h] of SIZES) {
+      const box = setup(w, h).hw.overlayPanel();
+      expect(box.maxHeight, `${w}x${h}`).toBeGreaterThan(100);
+      expect(box.width).toBeGreaterThanOrEqual(150);
+    }
+  });
+});
+
+// -------------------------------------------------------------------------------------------------
+// (c) may not counterfeit (b)'s mark COUNT at 220 px
+// -------------------------------------------------------------------------------------------------
+
+describe('the return-to-rest crescent never becomes a second ring', () => {
+  it('stays in the lower half of the receptor at every point of the descent', () => {
+    const { canvas, hw } = setup(1280, 800);
+    const T = 0.6;
+    const frameAt = (value: number): RenderFrame =>
+      makeFrame({
+        lanes: LANES,
+        songTime: 0,
+        thresholdFraction: T,
+        laneStates: LANES.map((_, i) => ({ value: i === 0 ? value : 0, armed: i !== 0, tracking: true })),
+      });
+    // Rise to full ROM armed, cross (published already disarmed, as VisionInput really does), then
+    // lower all the way to the re-arm line, sampling the whole return journey.
+    let t = 0;
+    const step = (value: number): void => {
+      t += 1 / 60;
+      hw.draw({ ...frameAt(value), songTime: t });
+    };
+    for (const v of [0.2, 0.45, 0.58]) step(v);
+    step(1);
+    for (let i = 0; i < 45; i++) step(1); // outlast the 0.45 + 0.15 s goal latch
+    canvas.ctx.reset();
+    for (let v = 1; v >= 0.3; v -= 0.02) step(v);
+
+    const g = hw.geometry;
+    let seen = 0;
+    let maxSweep = 0;
+    canvas.ctx.calls.forEach((c, i) => {
+      if (c.name !== 'ellipse' || c.args.length < 7) return;
+      if (canvas.ctx.propBefore(i, 'strokeStyle') !== LOCK_HINT) return;
+      if (Math.abs((c.args[1] as number) - g.strikeY) > 0.5) return;
+      // Lane 0 is the locked one; a neighbouring lane's re-arm pop draws at the same height.
+      if (Math.abs((c.args[0] as number) - laneX(g, 0, 0)) > 1) return;
+      if (!((c.args[2] as number) > g.receptorRadius)) return;
+      const a0 = c.args[5] as number;
+      const a1 = c.args[6] as number;
+      seen++;
+      maxSweep = Math.max(maxSweep, a1 - a0);
+      // Canvas angles run clockwise with y down, so (0, π) IS the lower half of the ellipse. Both
+      // ends — and therefore the whole arc — stay strictly below the horizontal through the ring's
+      // centre, i.e. below the strike line the board draws across every receptor.
+      expect(a0).toBeGreaterThan(0);
+      expect(a1).toBeLessThan(Math.PI);
+    });
+    expect(seen, 'the crescent is drawn across the descent').toBeGreaterThan(10);
+    // It can never close: at full progress it is still well under a half-turn, so the top half of a
+    // locked receptor shows ONE ring where a goal receptor shows two (the additive rim and the
+    // corona). That is the mark-count separation the 220 px downscale rests on, and it no longer
+    // depends on the arc's alpha or on a quarter-turn gap at the top.
+    expect(maxSweep).toBeCloseTo(RESET_ARC_SWEEP, 6);
+    expect(RESET_ARC_START).toBeGreaterThan(0);
+    expect(RESET_ARC_START + RESET_ARC_SWEEP).toBeLessThan(Math.PI);
+  });
+});
+
+// -------------------------------------------------------------------------------------------------
+// A STOPPED SESSION. The round-7 blocker: a therapist pause is the brief's "mid-song stop", the
+// camera does not stop for it, `GameRunner.draw` keeps handing the renderer live lane states, and
+// the engine discards every event stamped inside it. The receptor row threw the full
+// knowledge-of-results costume for those inputs (measured on the real app: eleven consecutive frames
+// of `goal === 1` with score/reps/hits flat at 0/0/0) and read "armed, rising, ready" for the rest.
+// -------------------------------------------------------------------------------------------------
+
+describe('while the session is not accepting input, the row says so', () => {
+  const THRESH = 0.6;
+  const LOST_RING = '#a9b0bb';
+
+  const brokenArcsAt = (canvas: MockCanvas, hw: Highway): number => {
+    const g = hw.geometry;
+    let n = 0;
+    canvas.ctx.calls.forEach((c, i) => {
+      if (c.name !== 'ellipse' || c.args.length < 7) return;
+      if (Math.abs((c.args[1] as number) - g.strikeY) > 0.5) return;
+      if ((c.args[6] as number) - (c.args[5] as number) >= Math.PI * 2 - 1e-6) return;
+      if (canvas.ctx.propBefore(i, 'strokeStyle') !== LOST_RING) return;
+      n++;
+    });
+    return n;
+  };
+  /** The pause bars: two filled rectangles per lane, in the broken ring's own grey, on the strike line. */
+  const pauseBars = (canvas: MockCanvas, hw: Highway): number => {
+    const g = hw.geometry;
+    let n = 0;
+    canvas.ctx.calls.forEach((c, i) => {
+      if (c.name !== 'fillRect') return;
+      if (canvas.ctx.propBefore(i, 'fillStyle') !== LOST_RING) return;
+      if (Math.abs((c.args[1] as number) + (c.args[3] as number) / 2 - g.strikeY) > 0.5) return;
+      n++;
+    });
+    return n;
+  };
+  const glyph = (scratch: MockCanvas[], ch: string): boolean =>
+    scratch.some((c) => c.ctx.calls.some((k) => k.name === 'fillText' && k.args[0] === ch));
+
+  const states = (value: number, armed: boolean, trig: 'armed' | 'triggered') =>
+    LANES.map((l) => ({ lane: l.index, value, armed, triggerState: trig, tracking: true }));
+
+  it('blanks every lane to "no reading" with the pause bars, at any value, in any state', () => {
+    const { canvas, hw, scratch } = setup();
+    hw.resize(1280, 720, 1);
+    const frame = (t: number, ls: ReturnType<typeof states>, suspended: boolean): RenderFrame =>
+      makeFrame({ lanes: LANES, songTime: t, laneStates: ls, thresholdFraction: THRESH, rearmFraction: 0.6, beatPhase: 0.5, inputSuspended: suspended });
+    // Warm a live, rising, armed row up — a halo, a column, a target line, everything (a) draws.
+    for (let i = 0; i < 40; i++) hw.draw(frame(1 + i * 0.016, states(0.36, true, 'armed'), false));
+    canvas.ctx.reset();
+    // ...and stop the session. The song clock freezes with it, exactly as `GameRunner.pause` leaves it.
+    hw.draw(frame(1.64, states(0.36, true, 'armed'), true));
+    expect(brokenArcsAt(canvas, hw)).toBe(4 * 4); // the only broken rings on the board, one per lane
+    expect(pauseBars(canvas, hw)).toBe(4 * 2);    // ...each with the two bars in it
+    expect(glyph(scratch, '?')).toBe(false);      // not "the camera lost you" — the remedy differs
+    expect(glyph(scratch, '!')).toBe(false);
+    for (const l of LANES) {
+      const look = hw.receptorLookOf(l.index);
+      expect(receptorMarkSet(look as ReceptorLook)).toBe('lost');
+      expect(look?.suspended).toBe(true);
+      expect(look?.glowTarget).toBe(0);
+      expect(look?.locked).toBe(false);
+    }
+    // A lane held AT end range reads the same: "lower to reset" is advice about a next rep that
+    // cannot happen until the therapist resumes.
+    canvas.ctx.reset();
+    hw.draw(frame(1.64, states(0.9, false, 'triggered'), true));
+    expect(brokenArcsAt(canvas, hw)).toBe(4 * 4);
+    expect(pauseBars(canvas, hw)).toBe(4 * 2);
+  });
+
+  it('never celebrates a crossing made during the stop — and celebrates the first one after it', () => {
+    const { canvas, hw } = setup();
+    hw.resize(1280, 720, 1);
+    const frame = (t: number, ls: ReturnType<typeof states>, suspended: boolean): RenderFrame =>
+      makeFrame({ lanes: LANES, songTime: t, laneStates: ls, thresholdFraction: THRESH, rearmFraction: 0.6, beatPhase: 0.5, inputSuspended: suspended, minIntervalSec: 0.3 });
+    hw.draw(frame(1.0, states(0.2, true, 'armed'), false));
+    // THE REPRODUCTION. The song clock is frozen for the whole pause — `GameRunner` keeps drawing at
+    // the paused song time — while the patient, repositioned by their therapist, completes a rep.
+    let cues = 0;
+    for (let i = 0; i < 12; i++) {
+      hw.draw(frame(1.3015, states(0.9, false, 'triggered'), true));
+      if ((hw.receptorLookOf(0)?.goal ?? 0) > 0) cues++;
+    }
+    expect(cues).toBe(0);
+    // Resumed: still held, so still nothing to acknowledge...
+    hw.draw(frame(1.32, states(0.9, false, 'triggered'), false));
+    expect(hw.receptorLookOf(0)?.goal ?? 0).toBe(0);
+    // ...and the next real rep gets its cue, on the frame it fires, inside the refractory window of
+    // the crossing the pause discarded (which must have left no trace in the renderer's ledger).
+    hw.draw(frame(1.36, states(0.1, true, 'armed'), false));
+    hw.draw(frame(1.4, states(0.9, false, 'triggered'), false));
+    expect(hw.receptorLookOf(0)?.goal).toBe(1);
+    expect(receptorMarkSet(hw.receptorLookOf(0) as ReceptorLook)).toBe('goal');
+    canvas.ctx.reset();
+  });
+
+  it('keeps the "!" for a faulted lane through a stop, because that one is the therapist\'s to fix', () => {
+    const { hw, scratch } = setup();
+    hw.resize(1280, 720, 1);
+    hw.setLaneFaults([2]);
+    hw.draw(makeFrame({ lanes: LANES, songTime: 1, laneStates: states(0.36, true, 'armed'), thresholdFraction: THRESH, inputSuspended: true }));
+    expect(glyph(scratch, '!')).toBe(true);
+    expect(glyph(scratch, '?')).toBe(false);
+    hw.setLaneFaults(null);
   });
 });

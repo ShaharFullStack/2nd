@@ -9,6 +9,8 @@ export {
   STATE_JUDGMENT_LATE_SEC,
   POPUP_MAX_RISE_FRAC,
   MISS_CUE_MARGIN_U,
+  RESET_ARC_START,
+  RESET_ARC_SWEEP,
 } from './Highway';
 export type { RenderFrame, RenderNote, RenderLaneState, NoteVisualState, HighwayOptions, RenderStats, CanvasLike } from './types';
 export {
@@ -20,6 +22,9 @@ export {
   laneX,
   laneBoundaryX,
   roadEdgeX,
+  roadEdgeXAtY,
+  boardHardwareTop,
+  overlayPanelBox,
   project,
   isVisibleDepth,
   visibleTimeWindow,
@@ -39,9 +44,10 @@ export {
   RECEPTOR_GEM_RATIO,
   ROAD_HEIGHT_CAP,
   TAIL_BLEND_DEPTH,
+  RECEPTOR_BAND_RATIO,
   clamp,
 } from './geometry';
-export type { HighwayGeometry, GeometryOptions, Projected } from './geometry';
+export type { HighwayGeometry, GeometryOptions, Projected, OverlayPanelBox, OverlayPanelRequest } from './geometry';
 export { ParticlePool, emitHitBurst, makeRng, PARTICLE_SPARK, PARTICLE_RING, PARTICLE_STREAK, PARTICLE_SMOKE } from './particles';
 export type { EmitOptions, ParticleKind } from './particles';
 export { TextCache, DigitRoller, defaultCanvasFactory, fontPx, measureInk } from './text';
@@ -68,6 +74,7 @@ export {
   receptorLook,
   receptorLookInto,
   receptorMarkSet,
+  receptorGoalHolding,
   emptyReceptorLook,
   goalStrength,
   ReceptorHistory,
@@ -75,7 +82,11 @@ export {
   DEFAULT_MAX_GAP_SEC,
   GOAL_HOLD_SEC,
   GOAL_FADE_SEC,
+  GOAL_MIN_SEC,
   LOST_HOLD_SEC,
+  DEFAULT_MIN_INTERVAL_SEC,
+  REFRACTORY_GUARD_MIN_SEC,
+  refractoryGuard,
   METER_OVER_RANGE,
 } from './receptor';
 export type { ReceptorLook, LaneStateLike, ReceptorMarkSet } from './receptor';

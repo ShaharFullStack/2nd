@@ -95,6 +95,27 @@ export interface GameRunnerOptions {
   /** Fraction of ROM that counts as a hit — the receptors fill against it. */
   thresholdFraction: number;
   rearmFraction?: number;
+  /**
+   * The input layer's break-in-the-stream window (`VisionInput.staleFrameSec`), forwarded to the
+   * renderer as `RenderFrame.maxGapSec`.
+   *
+   * IT IS A COUPLING, NOT A TUNABLE. The receptor expires its own crossing evidence on exactly the
+   * clock `LaneTrigger` throws its arming away on, because the disarm an occlusion causes is
+   * published as byte-for-byte the same frame a real threshold crossing is. Leaving this unset made
+   * the renderer fall back to `DEFAULT_MAX_GAP_SEC` and the two agreed only because nothing has
+   * ever passed `staleFrameSec`; the first session that tuned it would have desynchronised the
+   * receptor's peak expiry and its inferred-edge guard silently. Undefined is still honoured (the
+   * scripted inputs have no such window) — it just is not the camera path's answer any more.
+   */
+  maxGapSec?: number;
+  /**
+   * The input layer's REFRACTORY window (`VisionInput.minIntervalSec`), forwarded to the renderer as
+   * `RenderFrame.minIntervalSec`. Same coupling as `maxGapSec`, for the same reason: a crossing
+   * swallowed by it locks the lane out and reports a rep but emits NO `LaneInputEvent` and scores
+   * nothing, and a receptor that does not know the number celebrates it anyway. Undefined for the
+   * scripted inputs, which emit every crossing and have no such window.
+   */
+  minIntervalSec?: number;
   countdownSec?: number;
   highwayOptions?: Partial<HighwayOptions>;
   songTitle?: string;
@@ -218,6 +239,10 @@ export class GameRunner {
       attribution: options.attribution,
       thresholdFraction: options.thresholdFraction,
       rearmFraction: options.rearmFraction,
+      maxGapSec: options.maxGapSec,
+      minIntervalSec: options.minIntervalSec,
+      // Set per frame from the phase (see `draw`). Starts true: the runner is 'idle' until `start()`.
+      inputSuspended: true,
     };
   }
 
@@ -395,6 +420,15 @@ export class GameRunner {
     f.recentHits = this.recentHits;
     f.beatPhase = beat.phase;
     f.beatIndex = beat.beatIndex;
+    // IS THE SESSION ACCEPTING INPUT? The frame keeps being drawn while it is not — a pause has to
+    // leave the gems, the popups and the bursts frozen where they are, and this loop keeps running
+    // so it can — and `input.getLaneStates()` above is LIVE either way, because the camera does not
+    // stop for a therapist pause. But `onInput` drops an event outright while the run is idle or
+    // ended, and `RhythmEngine.handleInputDetailed` drops one stamped inside a pause (not judged,
+    // not scored, not recorded), so on those frames the receptor row's live gauge would be promising
+    // a rep that cannot happen. The renderer is told, and blanks the row to "no reading". See
+    // `RenderFrame.inputSuspended`.
+    f.inputSuspended = this.phase === 'paused' || this.phase === 'idle' || this.phase === 'ended';
     this.highway.draw(f);
   }
 

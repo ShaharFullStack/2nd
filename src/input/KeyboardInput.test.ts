@@ -23,7 +23,7 @@ describe('KeyboardInput', () => {
     target.dispatchEvent(new KeyboardEvent('keydown', { key: 'd' })); // still held
     expect(events).toHaveLength(4);
     target.dispatchEvent(new KeyboardEvent('keyup', { key: 'd' }));
-    expect(input.getLaneStates()[0]).toEqual({ lane: 0, value: 0, armed: true, tracking: true });
+    expect(input.getLaneStates()[0]).toEqual({ lane: 0, value: 0, armed: true, triggerState: 'armed', tracking: true });
     clock.currentTime = 4;
     target.dispatchEvent(new KeyboardEvent('keydown', { key: 'd' }));
     expect(events[4]).toEqual({ lane: 0, ctxTime: 4, strength: 1 });

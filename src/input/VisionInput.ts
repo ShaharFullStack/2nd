@@ -65,7 +65,7 @@ import type { LaneFilterSpec } from '../vision/filters.ts';
 import { resolveLaneFilter } from '../vision/filters.ts';
 import { LanePipeline } from '../vision/pipeline.ts';
 import type { LaneSample } from '../vision/pipeline.ts';
-import { LaneTrigger } from '../vision/trigger.ts';
+import { DEFAULT_MIN_INTERVAL_SEC, LaneTrigger } from '../vision/trigger.ts';
 import { DetectLoop, MIN_USABLE_DETECT_FPS, createDetector, openCamera, pickHandResult } from '../vision/mediapipe.ts';
 import type { CameraOptions, CameraSession, DetectLoopOptions, DetectorOptions, DetectionResult, LandmarkDetector, LoopStats } from '../vision/mediapipe.ts';
 import { POSE, allVisible, aspectScale, distance2d, midpoint } from '../vision/landmarks.ts';
@@ -439,7 +439,23 @@ export class VisionInput implements InputSource {
   /** Wall-clock ms at which ctxTime last actually advanced. */
   private lastCtxAdvanceMs = Number.NEGATIVE_INFINITY;
   private ctxClockStalled = false;
-  private readonly staleFrameSec: number;
+  /**
+   * The break-in-the-stream window this input runs its `LaneTrigger`s on. PUBLIC because the
+   * renderer has to expire its own crossing evidence on exactly this clock — the disarm an
+   * occlusion causes is published as byte-for-byte the same `LaneState` a real threshold crossing
+   * is (see `RenderFrame.maxGapSec`), so a session that tunes `staleFrameSec` and leaves the
+   * receptor on its default would desynchronise the two silently.
+   */
+  readonly staleFrameSec: number;
+
+  /**
+   * The refractory window every lane trigger was built with: the minimum interval between two
+   * EMITTED `LaneInputEvent`s (`LaneTrigger.minIntervalSec`). Public for the same reason
+   * `staleFrameSec` is — a crossing swallowed by it enters 'triggered' and is published as
+   * `{ armed: false }` exactly like one that fired, so a live meter that does not know the number
+   * acknowledges a rep the score never got. See `RenderFrame.minIntervalSec`.
+   */
+  readonly minIntervalSec: number;
   private readonly pinnedLaneSec: number;
   private readonly unreachableLaneSec: number;
   private readonly unreachableAttemptFraction: number;
@@ -463,6 +479,7 @@ export class VisionInput implements InputSource {
   constructor(config: VisionInputConfig) {
     this.config = config;
     this.staleFrameSec = config.staleFrameSec ?? 0.5;
+    this.minIntervalSec = config.minIntervalSec ?? DEFAULT_MIN_INTERVAL_SEC;
     this.pinnedLaneSec = config.pinnedLaneSec ?? 8;
     this.unreachableLaneSec = config.unreachableLaneSec ?? 15;
     this.unreachableAttemptFraction = config.unreachableAttemptFraction ?? 0.5;
@@ -963,6 +980,13 @@ export class VisionInput implements InputSource {
       lane: l.spec.index,
       value: dead ? 0 : l.sample.value,
       armed: l.trigger.armed,
+      // The three-way fact `armed` collapses (see LaneState.triggerState). A live meter has to tell a
+      // rep from an occlusion recovery, and both publish `{ value >= threshold, armed: false }`: only
+      // `LaneTrigger.push` moving a lane to 'triggered' is a crossing, and it is the same moment this
+      // source emits the lane's LaneInputEvent. Published unmodified when the stream is dead too — the
+      // trigger's state is still the truth about whether the lane may fire, and `tracking: false`
+      // already tells every consumer not to read a value.
+      triggerState: l.trigger.state,
       tracking: dead ? false : l.sample.tracking,
     }));
     this.laneStatesFrame = this.frameSeq;

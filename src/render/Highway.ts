@@ -63,7 +63,7 @@
  *     actually be in — rising, the threshold crossing, locked out by hysteresis
  *     (`RenderLaneState.armed === false`) and tracking lost (`tracking === false`) — and they
  *     differ by WHICH MARKS EXIST, not by hue or brightness, so they survive low acuity and
- *     colour-vision deficits; see `drawReceptors` and receptor.ts. Level line + target ticks mean
+ *     colour-vision deficits; see `drawReceptors` and receptor.ts. Level line + target gate posts mean
  *     "keep going", a split cap + two solid arrowheads + the additive rim and corona mean "you
  *     reached your target", a desaturated ring with a chevron and a return-to-rest arc means
  *     "lower to reset", and the only ring with gaps in it means "the camera cannot see you". The
@@ -71,6 +71,16 @@
  *     already disarmed by the time the state is published — without that, the one look the whole
  *     session is for is unreachable and the patient's reward for reaching their range is the ring
  *     going grey;
+ *   - NOTHING ON THE BOARD IS PAINTED OVER A RECEPTOR. The receptor row is drawn after the gems and
+ *     the particles (see `draw`): a note gem is opaque and almost exactly the size of the meter well
+ *     it lands on, so with the conventional order a gem covered 96 % of its own lane's gauge for a
+ *     third of every lane's frames — including, worst of all, the gems a patient stalled at end
+ *     range is missing, whose fizzle sits over the "lower to reset" instruction that would end the
+ *     stall. The gems sink behind the ring instead, and a dying one walks out from under it
+ *     (`missCueY`);
+ *   - a lane the INPUT LAYER says cannot fire at all — a refused calibration, a pinned lane — is
+ *     drawn as "no reading" rather than as a live gauge (`setLaneFaults`), because the one thing the
+ *     receptor may never do is promise a rep the input layer will not produce;
  *   - meters and labels are matched to lanes by `LaneState.lane` / `LaneSpec.index` when those are
  *     present, not by array position alone;
  *   - every judgment cue is kept inside the canvas (`missCueY`, `POPUP_MAX_RISE_FRAC`);
@@ -93,6 +103,8 @@ import {
   FAR_FADE_FRAC,
   GEM_ASPECT,
   MAX_BEAT_LINES,
+  RECEPTOR_WELL_RATIO,
+  RECEPTOR_WELL_WIDTH_RATIO,
   clamp,
   depthAtY,
   depthOf,
@@ -100,12 +112,16 @@ import {
   isVisibleDepth,
   laneBoundaryX,
   laneX,
+  boardHardwareTop,
   makeGeometry,
+  overlayPanelBox,
   projectInto,
+  receptorWellSemiHeight,
   roadEdgeX,
   scaleAt,
   yAt,
   type HighwayGeometry,
+  type OverlayPanelBox,
   type Projected,
 } from './geometry';
 import {
@@ -123,7 +139,7 @@ import {
   type LanePalette,
 } from './palette';
 import { PARTICLE_RING, PARTICLE_SMOKE, PARTICLE_SPARK, PARTICLE_STREAK, ParticlePool, emitHitBurst, makeRng } from './particles';
-import { DEFAULT_MAX_GAP_SEC, DEFAULT_REARM_FRACTION, ReceptorHistory, emptyReceptorLook, receptorMarkSet, type ReceptorLook } from './receptor';
+import { DEFAULT_MAX_GAP_SEC, DEFAULT_REARM_FRACTION, ReceptorHistory, copyReceptorLook, emptyReceptorLook, receptorGoalHolding, receptorMarkSet, type ReceptorLook } from './receptor';
 import { SpriteCache, blit } from './sprites';
 import { DigitRoller, TextCache, defaultCanvasFactory, fontPx, type Ctx2D, type TextStyle } from './text';
 import type { CanvasLike, HighwayOptions, RenderFrame, RenderLaneState, RenderNote, RenderStats } from './types';
@@ -160,6 +176,20 @@ export const STATE_JUDGMENT_LATE_SEC = 1;
  * short canvas, so a judgment cue is never half-way off the board.
  */
 export const MISS_CUE_MARGIN_U = 6;
+/**
+ * How far below the receptor's meter well a dying gem is walked over its fizzle, as a fraction of
+ * its own half-height — see `missCueY`. 0.55 leaves rather more than half of it clear of the ring
+ * that is now painted over it, which is what a low-vision patient at 2 m needs to see a shape at
+ * all, without pushing the cue so far down the apron that it collides with the movement labels.
+ */
+export const MISS_CLEAR_FRAC = 0.55;
+/**
+ * How long the walk clear of the receptor takes, in seconds — a fraction of `MISS_FIZZLE_SEC`, not
+ * the whole of it, because the gem is FADING while it walks (`alpha = (1 - k) * 0.75`): a cue that
+ * only finishes arriving where it can be seen at the moment it becomes transparent has not been
+ * seen. At 0.15 s the gem is clear while it still has ~two thirds of its opacity.
+ */
+export const MISS_CLEAR_SEC = 0.15;
 /** Duration (s) of the receptor's re-arm pop — the moment a locked-out lane can fire again. */
 export const REARM_POP_SEC = 0.28;
 
@@ -256,7 +286,7 @@ const LOCK_HINT_COLOR = '#c08cff';
  * cap, the chevron and the return-to-rest arc — for every value between the threshold and full ROM,
  * i.e. for 71 % of the return journey on the default 'easy' difficulty. The patient who has just
  * been told "lower to reset" started lowering and the gauge did not move. What (c) may never wear
- * is the "this counts" MARK SET (target line, ticks, level line, hot fill, halo, rim, corona) — and
+ * is the "this counts" MARK SET (target line, posts, level line, hot fill, halo, rim, corona) — and
  * it does not; the height itself is just where the patient is.
  */
 const METER_LEVEL_CEIL = 0.93;
@@ -291,7 +321,7 @@ function meterPos(rom: number): number {
  */
 const LOCK_RING_SCALE = 0.88;
 /**
- * Length of one arm of the goal arrowheads that replace the threshold ticks in state (b), and how
+ * Length of one arm of the goal arrowheads that replace the threshold gate posts in state (b), and how
  * far the pair is inset toward the ring, both in receptor radii. They are solid triangles pointing
  * at the target line from outside the ring: a SHAPE change (and a much larger filled area) where
  * (a) has two thin bars, so "you reached it" survives the 1280 → 220 px downscale a low-vision
@@ -302,13 +332,13 @@ const GOAL_WEDGE_R = 0.34;
 /**
  * How far outside the ring a mark hung at the TARGET HEIGHT may reach, in receptor radii.
  *
- * The threshold ticks and the goal arrowheads are anchored flush to the ring's outline at the
+ * The threshold gate posts and the goal arrowheads are anchored flush to the ring's outline at the
  * target line, so how far out they start depends on where that line is: near the ring's vertical
  * centre the outline is at ~1.0 r, near the top or bottom it is much narrower. Now that the target
  * line follows the session's threshold (see `meterPos`) that anchor moves, and at a mid-range
  * threshold it sits at the ring's widest point — where a fixed-length mark would cross into the
  * neighbouring lane. Half a lane is 1.21 r at the board's widest geometry (`GEM_LANE_FRACTION` /
- * `RECEPTOR_GEM_RATIO` in geometry.ts), so two adjacent lanes' ticks would have touched and two
+ * `RECEPTOR_GEM_RATIO` in geometry.ts), so two adjacent lanes' marks would have touched and two
  * adjacent arrowheads would have merged into one blob across the gutter — turning a per-lane mark
  * into a shelf joining the receptors, which is the opposite of "which lane is at target".
  *
@@ -329,7 +359,7 @@ const TARGET_LINE_COLOR = '#ffffff';
  * The target line is drawn as `TARGET_DASH_COUNT` dashes (with equal gaps) spanning
  * `TARGET_DASH_SPAN` of the well's half-width either side of centre — see the drawing site for why
  * it is dashed at all. The span stops short of the well's edge so the outermost dash cannot line up
- * with the solid tick just outside the ring at the same height and read as one continuous run.
+ * with the gate post just outside the ring at the same height and read as one continuous run.
  */
 const TARGET_DASH_COUNT = 5;
 const TARGET_DASH_SPAN = 0.72;
@@ -339,12 +369,29 @@ const TARGET_DASH_SPAN = 0.72;
  */
 const LOST_RING_COLOR = '#a9b0bb';
 /**
- * Return-to-rest arc: starts at the upper right and sweeps clockwise through the bottom, spanning
- * at most 1.5π so the top quarter of the ring stays permanently open. A progress cue that closes
- * into a complete ring is a lit ring, which is the one thing a locked-out lane may not look like.
+ * Return-to-rest arc: a CRESCENT UNDER THE RECEPTOR. It starts just below the right-hand end of the
+ * strike line, sweeps clockwise through the bottom of the ring and ends just below the left-hand
+ * end — 0.88π at most, entirely inside the lower half.
+ *
+ * IT USED TO SPAN 1.5π, AND THAT IS THE ONE PLACE (c) FAILED ITS OWN "COUNT, NOT BRIGHTNESS" CLAIM.
+ * The arc is drawn at `outerMarkRadius` — the SAME radius family as (b)'s goal corona — so a locked
+ * lane at `resetProgress >= ~0.85` drew a nearly closed second ring outside its own: at the 220 px
+ * downscale a 10" clinic tablet at 2 m is worth, (c) and (b) then both read as TWO CONCENTRIC
+ * RINGS, and the only thing left separating them was the arc's open top quarter and a lower alpha —
+ * i.e. exactly the brightness cue the four-state model is not allowed to rest on. It is a ≤0.1 s
+ * window right before the re-arm, but it is a window in which the display says "you reached your
+ * target" to a patient who did not.
+ *
+ * Bounded to the lower half it cannot become a ring at ANY progress or any blur: the top half of a
+ * locked receptor shows one ring where a goal receptor shows two, which is a mark COUNT that
+ * survives the downscale, a luminance-only reduction and both palettes. Keeping it clear of the
+ * horizontal by 0.06π also keeps its two ends off the board-wide white strike line, which a
+ * half-circle sitting exactly on its diameter would have merged with into a closed "D".
+ *
+ * Exported so the tests measure the shipped shape rather than a copy of the number.
  */
-const RESET_ARC_START = -Math.PI / 4;
-const RESET_ARC_SWEEP = Math.PI * 1.5;
+export const RESET_ARC_START = Math.PI * 0.06;
+export const RESET_ARC_SWEEP = Math.PI * 0.88;
 /**
  * Nominal radius, in receptor radii, of the two marks drawn OUTSIDE the ring: the return-to-rest arc
  * of (c) and the goal corona of (b). Nominal because it is a wish, not a promise — `outerMarkRadius`
@@ -355,16 +402,16 @@ const OUTER_MARK_R = 1.16;
  * Largest radius a ring-shaped mark centred on a receptor may be drawn at, given its stroke width,
  * so that its OUTER edge still lands inside this lane's half of the board.
  *
- * LANE CONTAINMENT IS PART OF THE CONTRACT, and it was enforced for the target ticks and the goal
+ * LANE CONTAINMENT IS PART OF THE CONTRACT, and it was enforced for the target marks and the goal
  * arrowheads (`TARGET_MARK_MARGIN`) and not for these two. At `OUTER_MARK_R` with a stroke of up to
  * `r * 0.12` the arc reaches ~1.22 r, and half a lane is ~1.21 r at the board's widest geometry
  * (`GEM_LANE_FRACTION` / `RECEPTOR_GEM_RATIO`): measured on real pixels the arc overran its lane by
  * 2–4 px at every geometry, so four locked lanes descending together drew four violet arcs that
  * crossed in the gutters and read as ONE scalloped ribbon spanning the board — the receptors joined
- * into a shelf, which is precisely the failure the tick margin exists to prevent. Two adjacent lanes
+ * into a shelf, which is precisely the failure the mark margin exists to prevent. Two adjacent lanes
  * crossing threshold on the same chord did the same, briefly, with their coronas.
  *
- * So the radius gives way instead. `reach` is half a lane less the tick margin; the floor keeps the
+ * So the radius gives way instead. `reach` is half a lane less the mark margin; the floor keeps the
  * mark outside the ring it belongs to (it can never bind on a real board — the geometry guarantees
  * half a lane ≥ 1.2 r — but a synthetic geometry must degrade to "touching the ring", never to
  * "inside the neighbour").
@@ -384,6 +431,44 @@ const LOST_RING_GAP_RAD = 0.52;
 const LOST_RING_PHASE = Math.PI / 4;
 /** Breathing rate (rad/s) of the "no signal" ring — slow, unrelated to the beat, off under reduced motion. */
 const LOST_BREATHE_RATE = 2.4;
+/**
+ * WHY a receptor is showing "no reading". All three draw the SAME broken ring — the mark set is the
+ * patient's remedy and none of these three has one — and differ only in the glyph inside it, which
+ * is a mark for whoever is standing at the tablet:
+ *   'lost'      "?"  the tracker has no landmarks: get back in frame (the patient's move);
+ *   'fault'     "!"  this lane cannot measure at all this session (`setLaneFaults`): the
+ *                    therapist's move, and the words are in the play screen's alert panel;
+ *   'suspended' ❚❚   the session is not accepting input: nothing counts until it is resumed.
+ * See `drawLostReceptor` and `ReceptorLook.suspended`.
+ */
+type LostReason = 'lost' | 'fault' | 'suspended';
+
+/**
+ * How long the SONG clock may stand still, in wall-clock seconds, before the receptor stops timing
+ * itself by it.
+ *
+ * Every other effect in this renderer is keyed to song time on purpose — a pause must freeze the
+ * gems, the bursts and the popups where they are. The receptor is the exception, and it is not a
+ * style choice: its three timers (`GOAL_HOLD_SEC`, `LOST_HOLD_SEC` and the input layer's
+ * `maxGapSec`) are PERCEPTION and EVIDENCE windows measured on the patient, not on the music, and
+ * the lane states feeding them keep arriving while the song clock is stopped (`GameRunner.draw`
+ * passes `input.getLaneStates()` live on every frame, paused or not).
+ *
+ * Frozen, those three timers all fail in the same direction — toward a stale claim that cannot
+ * expire. A therapist hits pause (or the browser suspends the AudioContext, which is the same thing
+ * to this renderer) and: a goal latch lit just before the stop is held at full strength for the
+ * whole pause and then finishes its remaining 0.45 s AFTER the resume, long after the rep;
+ * `LOST_HOLD_SEC` never elapses, so a patient who leaves frame (or a camera that is unplugged)
+ * during the pause leaves a live-looking gauge standing at their last value instead of "I cannot
+ * see you"; and the gap rule that expires the crossing evidence — the one thing standing between an
+ * occlusion recovery and a full goal celebration for a rep that never fired — cannot fire either,
+ * because it measures its window on the same stopped clock.
+ *
+ * So the receptor runs on `Highway.receptorT`: song time while the song clock is moving, wall time
+ * while it is not. The threshold is far above any legitimate audio-clock quantization (128-sample
+ * quanta are ~2.7 ms) and far below the window in which a stale cue becomes a lie.
+ */
+const SONG_CLOCK_STALL_SEC = 0.2;
 
 interface Popup {
   active: boolean;
@@ -489,6 +574,18 @@ export class Highway {
    * `drawLabels` so the label under a receptor never disagrees with the receptor above it.
    */
   private laneTracking = new Uint8Array(MAX_LANES).fill(1);
+  /**
+   * Lanes the INPUT LAYER has reported cannot produce a rep at all this session, whatever the
+   * patient does — see `setLaneFaults`. 1 = faulted.
+   */
+  private laneFault = new Uint8Array(MAX_LANES);
+  /**
+   * The look each lane was DRAWN FROM this frame, published for the other live meters on screen —
+   * see `receptorLookOf`. Allocated once per lane, overwritten in place.
+   */
+  private readonly laneLooks: ReceptorLook[] = [];
+  /** How many entries of `laneLooks` this frame actually resolved (lane count can change). */
+  private laneLooksCount = 0;
   /** lane → index into frame.laneStates / frame.lanes for this frame (see `resolveLaneMaps`). */
   private stateIdx = new Int8Array(MAX_LANES);
   private specIdx = new Int8Array(MAX_LANES);
@@ -517,6 +614,14 @@ export class Highway {
    * songStartCtxTime` before the start time is armed) cannot reach any smoothed accumulator.
    */
   private stNow = 0;
+  /**
+   * The receptor's clock (seconds, monotone): song time while the song clock advances, wall time
+   * while it is stopped. See `SONG_CLOCK_STALL_SEC` — the receptor's timers are perception windows
+   * measured on the patient, and the patient does not pause with the song.
+   */
+  private receptorT = 0;
+  /** Wall seconds the song clock has stood still for (0 while it is advancing). */
+  private songStillSec = 0;
   private warnedThreshold = false;
   private lastDrawWall = -1;
   private sortBuf: RenderNote[] = [];
@@ -564,6 +669,70 @@ export class Highway {
    */
   private get coreEff(): number {
     return 0.55 + 0.45 * this.eff;
+  }
+
+  /**
+   * The `ReceptorLook` lane `lane` was DRAWN FROM on the last frame — the one thing every other
+   * live meter in the patient's field of view has to agree with.
+   *
+   * ONE VOICE, AND WHY AGREEING IS NOT ENOUGH. The play screen's picture-in-picture lane meters
+   * (src/ui/Play.tsx) sit ~300 px from the receptor row and show the same four states. They used to
+   * run their own `ReceptorHistory` on `performance.now()`, which is the same MODEL but not the
+   * same CLOCK: this renderer times the receptor on `receptorT`, which stands still for up to
+   * `SONG_CLOCK_STALL_SEC` whenever the song clock stalls. So the goal latch, the `LOST_HOLD_SEC`
+   * hold and the gap rule could be up to 0.2 s out of step between two meters whose entire contract
+   * is that they cannot contradict each other — a patient could be shown "you reached it" on one
+   * and "lower to reset" on the other, at the instant that matters most. Reading the drawn look
+   * removes the class of failure rather than narrowing it: there is one model, one clock, one set
+   * of numbers, and the second meter is at worst one animation frame behind the first.
+   *
+   * Returns undefined before the first draw, or for a lane outside the current lane count. The
+   * object is owned by the renderer and reused every frame — read it, never keep or mutate it.
+   */
+  receptorLookOf(lane: number): Readonly<ReceptorLook> | undefined {
+    if (!Number.isInteger(lane) || lane < 0 || lane >= this.laneLooksCount) return undefined;
+    return this.laneLooks[lane];
+  }
+
+  /**
+   * Lanes that STRUCTURALLY CANNOT FIRE — the input layer knows it, and until now the receptor had
+   * no vocabulary for it.
+   *
+   * `LaneState` reports what the patient is doing; it does not report whether the machinery under it
+   * works. A lane whose calibration `VisionInput` REFUSED publishes `{ value: 0, armed: true,
+   * triggerState: 'armed', tracking: true }` for the whole session — which is a perfectly formed
+   * state (a): "rising, armed, ready", at an empty meter, for a lane that will emit nothing for
+   * three minutes. A lane the pinned-lane watchdog has given up on is the same class of thing from
+   * the other end: it publishes a locked lane, so the receptor says "lower to reset" — an order the
+   * patient carries out and the meter does not answer, for as long as they keep trying.
+   * `VisionInput.getStatus()` names both (`invalidCalibrationLanes`, `pinnedLanes`) in
+   * plain language, and nothing on the play screen used to read it.
+   *
+   * THE HONEST DRAWING FOR THEM IS (d), NOT A FIFTH STATE. The four mark sets are the patient's four
+   * remedies, and a faulted lane has no patient-side remedy at all: there is no measurement worth
+   * gauging from, which is exactly what (d) says and exactly why (d) draws nothing value-derived. So
+   * a faulted lane is handed to the receptor's state model as a lane with NO `LaneState` — it reads
+   * as (d) through the same path, the same anti-strobe hold and the same classifier, so the
+   * picture-in-picture meters agree with it for free (`receptorLookOf`). What changes is the glyph
+   * inside the broken ring: "!" rather than "?", because "get back in frame" is the wrong remedy and
+   * the therapist is the one who has to act. At the 220 px acuity proxy the two are the same mark set
+   * — which is correct, they are the same instruction to the patient — and the WORDS belong on the
+   * play screen, from `getStatus().warnings`, where a therapist reads them.
+   *
+   * NOT `unreachableLanes`: that lane is measuring the patient correctly and simply falling short,
+   * which is what (a) is for — a graded "how much further" readout is the honest answer and the one
+   * the therapist needs to see. It is a warning to read, not a fault to draw.
+   *
+   * Pass an empty array (or null) to clear. Out-of-range entries are ignored.
+   */
+  setLaneFaults(lanes: readonly number[] | null | undefined): void {
+    this.laneFault.fill(0);
+    if (!lanes) return;
+    for (const raw of lanes) {
+      if (typeof raw !== 'number' || !Number.isFinite(raw)) continue;
+      const lane = Math.round(raw);
+      if (lane >= 0 && lane < MAX_LANES) this.laneFault[lane] = 1;
+    }
   }
 
   /** Current geometry (rebuilt on resize / lane-count change). */
@@ -654,7 +823,13 @@ export class Highway {
     this.laneArmed.fill(1);
     this.laneRearmT0.fill(-10);
     this.laneTracking.fill(1);
+    // The published looks are a record of what was DRAWN; nothing has been drawn since the reset,
+    // so no other meter may go on reading them (see `receptorLookOf`).
+    this.laneLooksCount = 0;
     this.history.reset();
+    // `receptorT` is deliberately NOT rewound: it is a monotone perception clock, and every timer
+    // read off it (`laneRearmT0`, the history's own stamps) is cleared here instead.
+    this.songStillSec = 0;
     this.lastCombo = 0;
     this.lastComboShown = 0;
     this.comboBounceT0 = -10;
@@ -943,7 +1118,32 @@ export class Highway {
     this.stNow = st;
     if (this.lastSongTime !== null && st < this.lastSongTime - RESTART_JUMP_SEC) this.reset();
     const dt = this.lastSongTime === null ? 0 : clamp(st - this.lastSongTime, 0, 0.1);
+    // A SONG CLOCK THAT WENT BACKWARDS is a restart or a seek, and nothing observed before it is
+    // evidence about the rep the patient is making now. `ReceptorHistory` used to notice that for
+    // itself, because it was handed `songTime` directly; the perception clock below is monotone by
+    // construction (that is the whole point of it), so the renderer has to say it out loud. A jump
+    // bigger than `RESTART_JUMP_SEC` is already handled by the full `reset()` above; this catches
+    // the smaller ones, which are exactly the ones a short seek makes.
+    const back = this.lastSongTime !== null && st < this.lastSongTime;
+    // How far the song clock moved, UNCLAMPED unlike `dt`. That clamp protects the smoothed
+    // accumulators (glow, rolling score, health) from one long frame; the receptor's timers are the
+    // opposite case — they are EVIDENCE windows, and under-reporting how long a hitch lasted is
+    // what keeps a stale arming alive across it and lets the recovery frame be read as a crossing.
+    // A long frame really did last that long.
+    const songDelta = this.lastSongTime === null ? 0 : Math.max(0, st - this.lastSongTime);
     this.lastSongTime = st;
+    if (back) this.history.reset();
+    // The receptor's perception clock (see `SONG_CLOCK_STALL_SEC`): song time while the song clock
+    // is moving — so every existing timing, and every frame this renderer has ever been driven
+    // through, is unchanged — and wall time once it has been stopped for longer than any audio-clock
+    // quantization can explain. `wallDt` IS capped, because that is the leg where the renderer is
+    // guessing: a backgrounded tab returning after a minute expires the receptor's evidence once
+    // rather than sixty times over.
+    const wallDt = this.lastDrawWall >= 0 ? clamp((t0 - this.lastDrawWall) / 1000, 0, 0.25) : 0;
+    if (songDelta > 0) this.songStillSec = 0;
+    else this.songStillSec += wallDt;
+    const rdt = songDelta > 0 ? songDelta : this.songStillSec >= SONG_CLOCK_STALL_SEC ? wallDt : 0;
+    this.receptorT += rdt;
     const energy = clamp(frame.energy ?? 0, 0, 1);
     const mult = clamp(frame.multiplier, 1, 8);
     // A non-finite beat phase is a *missing* value, not beat zero. `clamp` maps NaN to its low
@@ -966,10 +1166,40 @@ export class Highway {
     this.drawRoad(ctx, frame, mult, beatPulse, energy, beat);
     this.drawLaneFlashes(ctx, st);
     this.drawStrikeLine(ctx, frame, beatPulse);
-    this.drawReceptors(ctx, frame, dt, beatPulse);
     this.stats.notesDrawn = this.drawNotes(ctx, frame);
     this.particles.update(dt);
     this.drawParticles(ctx);
+    // THE RECEPTOR ROW IS THE LAST BOARD LAYER, AND THAT IS A CLINICAL RULE, NOT A STYLE CHOICE.
+    //
+    // It used to be drawn BEFORE the gems, the way a fret board is drawn under its notes — which is
+    // right for Guitar Hero, where the fret carries no information, and wrong here, where the ring
+    // IS the biofeedback. The numbers: a gem at the strike line is `gemRadiusNear * GEM_ASPECT`
+    // (63.1 px at 1280x800) against a meter well of `receptorRadius * GEM_ASPECT *
+    // RECEPTOR_WELL_RATIO` (63.6 px), it is opaque, and it is centred on the same point — so a gem
+    // sitting on its receptor covers 96 % of that lane's well. Measured on a real 'medium' session
+    // at 1280x800: a gem covered the receptor's centre on 1252 of 3600 lane-frames (34.8 %) and
+    // touched the well on 45.5 %. A capture of lane 3 in state (c) showed NOTHING of it — no ring,
+    // no drain cap, no re-arm dashes, no chevron — only a bright, fully lit hit gem where "you
+    // cannot score until you lower" was the whole message.
+    //
+    // AND THE WORST CASE IS THE CLINICALLY CENTRAL ONE. A patient stalled at end range is in (c) and
+    // therefore misses every note in that lane; each missed gem then decelerates and fizzles over
+    // the strike line for `MISS_FIZZLE_SEC`, so the instruction that would end the stall was hidden
+    // precisely by the evidence of the stall. (`missCueY` now also walks a dying gem clear of the
+    // well, so the fizzle is still SEEN — see there.)
+    //
+    // WHAT THE GEM LOSES, AND WHY THAT IS THE RIGHT TRADE. The gem is now occluded by the ring
+    // exactly while it is inside it: its top cap shrinks away behind the well's upper rim and it is
+    // fully swallowed at the instant its centre reaches the strike line, then re-emerges below. That
+    // is not a cost, it is a crisper timing cue than "the centre is level with a line" — the gem
+    // drops into the ring like a coin into a slot, and the whole 4 s approach, which is where the
+    // read-ahead lives, is untouched. What the ring loses if the order is the other way round is the
+    // only 2 m-legible statement the patient has about what their next rep will do.
+    //
+    // Particles go under it for the same reason: the hit burst is emitted AT the receptor, and an
+    // additive spray over the ring is the same occlusion argument at lower alpha. It now blooms from
+    // behind the ring, which is also how a struck fret reads.
+    this.drawReceptors(ctx, frame, rdt, beatPulse);
     // Popups go LAST, over the burst they belong to. They used to be drawn under the gems and under
     // the particle layer, on the theory that judgment text is redundant feedback and the next target
     // is not — but the burst is emitted at the same point the word is anchored to, so in practice
@@ -1436,8 +1666,8 @@ export class Highway {
    *
    * The meter is a GAUGE: a flat dark well, a liquid column with a hard-edged top, a target line at
    * the session's `thresholdFraction` with the rest of the patient's calibrated ROM as headroom
-   * above it, and two ticks marking that same threshold outside the ring where no liquid can cover
-   * them. The target line is fixed for the session, and where it sits IS the prescription: low on
+   * above it, and two upright gate posts marking that same threshold outside the ring where no
+   * liquid can cover them. The target line is fixed for the session, and where it sits IS the prescription: low on
    * the well for an easy session, near the top for a hard one.
    *
    * THE COLUMN IS ONE LINEAR SCALE IN ALL FOUR STATES, and it is a POSITION, not a verdict. Every
@@ -1453,29 +1683,42 @@ export class Highway {
    *
    *   (a) rising, armed        → lane-coloured ring with the beat pulse; liquid rising in the well;
    *                              a lane-coloured LEVEL LINE at the patient's current value; the
-   *                              white TARGET LINE + ticks above it; halo growing with fill².
+   *                              white TARGET LINE + its two gate posts; halo growing with fill².
    *                              "Keep going — this much further." The fixed target line is what
    *                              makes half way distinguishable from nearly there.
    *   (b) the threshold
-   *       CROSSING (`goal`)    → the frame the lane actually fired on, held ~0.45 s (see
-   *                              receptor.ts: the crossing is one frame and the trigger has already
-   *                              disarmed by the time `LaneState` is published, so this is a latch,
-   *                              not a level test). The liquid stands in the overshoot headroom
-   *                              above the target line — here, and only here, that height is read
-   *                              as "this rep cleared the target by this much", which is the
-   *                              ROM-achieved number a therapist is after — the
-   *                              level line SPLITS into two white-hot segments with a gap in the
-   *                              middle (a change in the NUMBER of marks, which survives the
-   *                              high-contrast palette where the rising cap is already near-white),
-   *                              the two threshold ticks are replaced by two solid ARROWHEADS
-   *                              pointing at the target line (a change in shape and ~10× the filled
-   *                              area, so the state survives a 220 px downscale without relying on
-   *                              the hairline rings), and two additive rings appear that exist in no
-   *                              other state: an inner rim and a corona. "You reached it."
-   *                              Then it glides — ring scale and ring alpha both ramp — into (c),
-   *                              rather than stepping down 12 % at the instant of success. The
-   *                              column itself does not move at the handover at all: it is the same
-   *                              gauge on the same scale before and after.
+   *       CROSSING (`goal`)    → the frame the lane actually fired on (see receptor.ts: the crossing
+   *                              is one frame and the trigger has already disarmed by the time
+   *                              `LaneState` is published, so this is a latch, not a level test).
+   *                              Two additive rings appear that exist in no other state — an inner
+   *                              rim and a corona, so the receptor reads as TWO concentric rings
+   *                              where every other state reads as one, which is the separation that
+   *                              survives the 220 px downscale, desaturation to luminance and both
+   *                              dichromatic simulations — and the two threshold gate posts are
+   *                              replaced by two solid ARROWHEADS pointing at the target line (a
+   *                              change in shape at the same height). "You reached it."
+   *                              WHILE THE REP IS STILL IN HAND (`locked`) it also says where the
+   *                              patient is: the liquid stands white-hot in the overshoot headroom
+   *                              above the target line — here, and only here, that height is read as
+   *                              "this rep cleared the target by this much", the ROM-achieved number
+   *                              a therapist is after — and the level line SPLITS into two white-hot
+   *                              segments with a gap in the middle.
+   *                              BOUNDED AT BOTH ENDS. The latch ends at the RE-ARM, not on a fixed
+   *                              0.6 s timer: the moment the patient drops below the re-arm level
+   *                              the lane is armed, at rest and ready, and the honest message is "go
+   *                              again". At the chart generator's own note spacing (0.45 s on hard)
+   *                              a brisk rep re-arms ~0.1 s after crossing, so a fixed latch meant a
+   *                              ready lane wore the full goal costume for the whole inter-rep
+   *                              interval and (a) was never drawn for a lane keeping up at all.
+   *                              `GOAL_MIN_SEC` (0.15 s) is the floor that keeps KR catchable at
+   *                              all; through that short overrun the KR marks stay (the rep really
+   *                              did reach target) and every position mark reverts to its (a) form
+   *                              at the patient's true height (they really are back at rest).
+   *                              If instead they keep HOLDING, the latch runs its full
+   *                              `GOAL_HOLD_SEC` and then glides — ring scale and ring alpha both
+   *                              ramp — into (c), rather than stepping down 12 % at the instant of
+   *                              success. The column itself does not move at either handover: it is
+   *                              the same gauge on the same scale before and after.
    *                              GUARDED: an armed → not-armed edge is not always a crossing (a
    *                              stream break longer than `maxGapSec` and a mid-song threshold
    *                              change both disarm a lane at whatever value it has, and publish
@@ -1489,7 +1732,7 @@ export class Highway {
    *                              `thresholdFraction * rearmFraction`. Dead grey ring shrunk 12 %,
    *                              grey liquid at the patient's true height (which is where they
    *                              really are — it may start above the target height and travels down
-   *                              through it), NO level line, NO target line or ticks, NO halo —
+   *                              through it), NO level line, NO target line or posts, NO halo —
    *                              and instead the four return-to-rest marks that exist only here: a
    *                              violet drain cap on top of the column, a dashed re-arm line at the
    *                              level to come back down to, a downward chevron half way between
@@ -1522,6 +1765,14 @@ export class Highway {
    *                              holds the last tracked look for `LOST_HOLD_SEC` (0.2 s) first — but
    *                              a lane that was never tracked, including one with no `LaneState`
    *                              at all, shows (d) immediately.
+   *                              (d) IS ALSO WHAT A STOPPED SESSION READS AS, on every lane and at
+   *                              every value (`RenderFrame.inputSuspended`): the camera does not
+   *                              stop for a therapist pause, but the engine discards every event
+   *                              stamped inside one, so "how much further" and "you reached it" are
+   *                              both lies while it is set and the only true statement left is the
+   *                              one (d) makes. Same mark set, same anti-strobe path, same
+   *                              classifier — only the glyph changes, to the pause bars. See
+   *                              `LostReason` and receptor.ts.
    *
    * A lane is in exactly one of these every frame, and every one of them is reachable from the
    * input layer as it actually runs — `Highway.test.ts` drives a real `VisionInput` over a real rep
@@ -1549,7 +1800,21 @@ export class Highway {
     // receptor's "you reached your target" latch expires on the same clock, because the disarming a
     // break causes is published as exactly the frame a real crossing is. See RenderFrame.maxGapSec.
     const maxGap = Number.isFinite(frame.maxGapSec as number) && (frame.maxGapSec as number) > 0 ? (frame.maxGapSec as number) : DEFAULT_MAX_GAP_SEC;
-    const st = this.stNow;
+    // The input layer's REFRACTORY window, if this source has one (the scripted sources do not — see
+    // `RenderFrame.minIntervalSec`). 0 means "no such window": every crossing this lane publishes was
+    // emitted, and the latch may fire for all of them.
+    const minInterval = Number.isFinite(frame.minIntervalSec as number) && (frame.minIntervalSec as number) > 0 ? (frame.minIntervalSec as number) : 0;
+    // IS THE SESSION EVEN LISTENING? (`RenderFrame.inputSuspended`.) The lane states keep arriving
+    // through a therapist pause — the camera does not stop — and the engine throws every event
+    // stamped inside it away, so a gauge that keeps gauging is claiming a rep will count when it
+    // will not. Handed to the state model, which blanks every lane to "no reading" and refuses to
+    // latch or credit any crossing inside the stop. See receptor.ts.
+    const suspended = frame.inputSuspended === true;
+    // NOT `this.stNow`: the receptor's latches are perception windows, and they have to keep
+    // running when the song clock stops (see `SONG_CLOCK_STALL_SEC`). Everything else in the frame
+    // is still keyed to song time, so a pause still freezes the gems, the bursts and the popups.
+    const rt = this.receptorT;
+    this.laneLooksCount = g.laneCount;
     const still = this.opts.reducedMotion;
     const r = g.receptorRadius;
     const ry = r * GEM_ASPECT;
@@ -1557,7 +1822,13 @@ export class Highway {
     for (let lane = 0; lane < g.laneCount; lane++) {
       // The two things one frame cannot decide — that the threshold was just crossed, and whether a
       // `tracking: false` is a dropout or one noisy frame — come from `ReceptorHistory`.
-      this.history.update(look, lane, this.laneState(frame, lane), threshold, rearm, st, maxGap);
+      // A FAULTED LANE HAS NO MEASUREMENT WORTH GAUGING FROM — see `setLaneFaults`. It is handed to
+      // the state model as a lane with no `LaneState` at all, which is the model's existing (and
+      // correct) reading of "there is nothing here": (d), through the same anti-strobe hold and the
+      // same classifier every other meter on screen uses. It is NOT special-cased downstream, so
+      // there is no path on which a faulted lane can still be drawn "armed and ready".
+      const faulted = this.laneFault[lane] === 1;
+      this.history.update(look, lane, faulted ? undefined : this.laneState(frame, lane), threshold, rearm, rt, maxGap, minInterval, suspended);
       // State (b) is LATCHED, not a level test: no input source in this repo ever publishes
       // `armed && value >= threshold` (the trigger disarms on the crossing sample, before
       // getLaneStates reads it), so "you reached your target" is drawn from the crossing EDGE and
@@ -1567,32 +1838,69 @@ export class Highway {
       // so the picture-in-picture lane meters next to the camera preview cannot be in a different
       // state from the receptor at the same instant.
       const marks = receptorMarkSet(look);
-      const hot = marks === 'goal';
-      // The return-to-rest marks belong to (c) alone. During the latch the lane is both locked and
-      // freshly scored, and the patient is told the second thing first; when the latch ends the
+      // (b) makes TWO claims, and they expire at different moments — see `receptorGoalHolding`.
+      //
+      // `scored` is "this rep reached your target", a fact about a rep that happened. It owns the KR
+      // marks: the additive inner rim + corona (the second concentric ring, which is what actually
+      // separates (b) from (a) at a 220 px downscale) and the two solid arrowheads at the target
+      // line. True for the whole latch.
+      //
+      // `hot` is "…and you are still up there holding it", a fact about the patient RIGHT NOW. It
+      // owns the marks that encode a POSITION: the white-hot liquid material and the split white-hot
+      // level cap. Without this split, the `GOAL_MIN_SEC` overrun paints a split white-hot cap at
+      // the FLOOR of the well on a lane standing at rest.
+      //
+      // IT IS `receptorGoalHolding`, WHICH TESTS THE LEVEL AND NOT ONLY THE LOCKOUT — the same
+      // predicate, on the same numbers, that the picture-in-picture meter uses on the same frame.
+      // It used to be `scored && look.locked`, and the lockout does not end at the target line: it
+      // ends at the RE-ARM line, `thresholdFraction * rearmFraction` of ROM. Measured on a real
+      // VisionInput rep (0.8 s, threshold 0.65, re-arm 0.6) the difference was ~0.13 s during which
+      // the column wore the hot material and the split white-hot cap while standing visibly BELOW
+      // the dashed target line on the same gauge — the position marks contradicting the position.
+      // The KR marks below are keyed to `scored` and are unaffected: that rep did reach the target.
+      const scored = marks === 'goal';
+      const hot = receptorGoalHolding(look);
+      // The return-to-rest marks belong to (c) alone. For most of the latch the lane is both locked
+      // and freshly scored, and the patient is told the second thing first; when the latch ends the
       // ring has already glided into the lockout look and the "lower to reset" instruction appears.
+      // (If instead the patient lowers past the re-arm line first, the latch ends THERE and there is
+      // no (c) to hand over to — the lane is armed and the next rep counts. That is the common case
+      // at the chart generator's own note spacing.)
       const showLock = marks === 'locked';
       // ...and, inside (c), whether the patient has anywhere left to lower TO. A lane can be locked
       // while already below the re-arm line ('unconfirmed' is a statement about what has been
-      // observed, not about the current value: `setThreshold`, a reset, or a stream break can leave
-      // one at 0.1 of ROM). Pointing a "lower to reset" chevron at a line the patient is already
-      // under is an order they cannot obey, so the two ORDER marks — the violet drain cap read as
-      // "bring this down" and the chevron — are keyed to this, not to `locked`. Everything else
-      // about (c) stays: the lane still cannot score and still says so.
+      // observed, not about the current value). Pointing a "lower to reset" chevron at a line the
+      // patient is already under is an order they cannot obey, so the two ORDER marks — the violet
+      // drain cap read as "bring this down" and the chevron — are keyed to this, not to `locked`.
+      // Everything else about (c) stays: the lane still cannot score and still says so.
+      //
+      // IT IS A NARROW STATE, AND IT IS WORTH KNOWING HOW NARROW. Driven against the real input
+      // layer the only thing that reaches it is `LaneTrigger.reset()` — a calibration replaced
+      // mid-session — and then only for the render frames before the next camera frame re-arms the
+      // lane. A retune leaves the lane AT OR ABOVE the new re-arm level by construction, and a
+      // stream break re-arms a patient who returns at rest inside the same push. See
+      // `ReceptorLook.needsLower`, which documents the measurement.
       const showLower = showLock && look.needsLower !== false;
       // What the label under this receptor must agree with (post-hold, not the raw flag).
       this.laneTracking[lane] = look.tracking ? 1 : 0;
+      // ONE VOICE, LITERALLY: the play screen's picture-in-picture meters are drawn from THIS
+      // object, not from a second history on a second clock. See `receptorLookOf`.
+      if (!this.laneLooks[lane]) this.laneLooks[lane] = emptyReceptorLook(rearm);
+      copyReceptorLook(this.laneLooks[lane], look);
       const color = laneColor(this.palette, lane);
       const lockColor = this.palette.miss;
       const x = laneX(g, lane, 0);
       const y = g.strikeY;
 
       // Re-arm edge: the instant the lane can fire again gets a visible pop, because that is the
-      // instant the patient's next rep starts counting.
+      // instant the patient's next rep starts counting. It is also the instant the goal latch is cut
+      // (see `receptorGoalHolding`), so the pop never springs a full-size, full-alpha ring back into
+      // view still wearing the hot column and split cap of (b) — "ready for the next rep" and "you
+      // are still up at your target" drawn on the same ring on the same frame.
       const armedNow = !look.locked && look.tracking ? 1 : 0;
-      if (armedNow && !this.laneArmed[lane]) this.laneRearmT0[lane] = st;
+      if (armedNow && !this.laneArmed[lane]) this.laneRearmT0[lane] = rt;
       this.laneArmed[lane] = armedNow;
-      const popAge = st - this.laneRearmT0[lane];
+      const popAge = rt - this.laneRearmT0[lane];
       const popK = popAge >= 0 && popAge < REARM_POP_SEC ? Math.pow(1 - popAge / REARM_POP_SEC, 2) : 0;
 
       // Smoothed halo. `glowTarget` is 0 whenever the lane cannot fire, so the halo drains away
@@ -1607,7 +1915,16 @@ export class Highway {
       // untracked), so the light is already back at zero when tracking returns and the recovering
       // lane fades up from its true value rather than from a stale one.
       if (!look.tracking) {
-        this.drawLostReceptor(ctx, x, y, r, ry, st, still);
+        // GLYPH PRECEDENCE: fault > stop > dropout, and it is ordered by what the person reading it
+        // can do about it. A FAULT survives a pause because it is a session-long condition with a
+        // therapist-side remedy, and a therapist pausing to work out why a lane is dead is exactly
+        // who is looking; the stop is already stated in words across the whole screen, so spending
+        // the lane's one glyph on it there would cost the diagnosis and buy nothing. A DROPOUT does
+        // not survive it, because "get back in frame" is an instruction to a patient whose reps
+        // cannot count yet anyway — and patients routinely leave frame during a stop, so "?" on a
+        // paused row would be noise. (The camera's own health still has words: the input layer's
+        // warnings are printed at full width in the pause overlay itself.)
+        this.drawLostReceptor(ctx, x, y, r, ry, rt, still, faulted ? 'fault' : look.suspended ? 'suspended' : 'lost');
         continue;
       }
 
@@ -1650,7 +1967,7 @@ export class Highway {
       // on the frame the note is struck, so the receptor went grey-white at the exact instant the
       // patient looked at it, and blind reviewers read the struck fret as a stray sprite rather
       // than as "that lane, resetting". Lockout is still unmistakable: the ring shrinks 12 %, drops
-      // to 60 % alpha, loses its halo, loses its target ticks and gains the violet chevron and the
+      // to 60 % alpha, loses its halo, loses its target posts and gains the violet chevron and the
       // return-to-rest arc — five marks, none of which is hue.
       const ringColor = showLock ? this.lockedColor(color, lockColor) : color;
       const spr = this.sprites.receptor(ringColor, r);
@@ -1671,8 +1988,8 @@ export class Highway {
       // the patient's ROM as headroom above it.
       // The fixed mark is what makes "half way" different from "nearly there" at 2 m — a level with
       // nothing to read it against is only comparable to itself.
-      const wr = r * 0.92 * pulse;
-      const wry = ry * 0.9 * pulse;
+      const wr = r * RECEPTOR_WELL_WIDTH_RATIO * pulse;
+      const wry = ry * RECEPTOR_WELL_RATIO * pulse;
       const yBot = y + wry;
       const span = wry * 2;
       // Every height in the well is `meterPos` of a ROM value and nothing else — one linear scale,
@@ -1680,7 +1997,7 @@ export class Highway {
       // therefore a POSITION: the same height means the same millimetres of movement whatever the
       // lane's arming is doing, and the same movement means the same distance on screen whether the
       // patient makes it below the target line or above it. What that position MEANS for the next
-      // rep is carried by the mark set around it: (a)/(b) draw the target line, its ticks and a
+      // rep is carried by the mark set around it: (a)/(b) draw the target line, its outer marks and a
       // level line; (c) draws none of those and instead draws the drain cap, the dashed re-arm
       // line, the chevron and the return-to-rest arc.
       //
@@ -1776,8 +2093,10 @@ export class Highway {
         // The violet dashes of (c) share the dash idea but never share a frame with it, are a
         // different colour, and there are three of them at a different height.
         //
-        // The solid ticks flush against the ring outline (below, outside the well) carry the same
-        // height as unbroken marks, so the reference is never dashes alone.
+        // The two solid GATE POSTS flush against the ring outline (below, outside the well) stand
+        // ACROSS this height as unbroken marks, so the reference is never dashes alone — and being
+        // at right angles to the strike line, they are the one part of it that cannot be absorbed
+        // into it at a 220 px downscale.
         {
           const th = Math.max(2, 2.2 * this.u);
           const unit = (wr * TARGET_DASH_SPAN * 2) / (TARGET_DASH_COUNT * 2 - 1);
@@ -1833,7 +2152,7 @@ export class Highway {
 
       if (!showLock) {
         // ...and the same target line marked OUTSIDE the ring, where no liquid can ever cover it
-        // and no acuity loss can merge it with the level line. Two ticks flush against the ring's
+        // and no acuity loss can merge it with the level line. Two upright posts flush against the ring's
         // outline at exactly the threshold height.
         const dy = clamp((yTarget - y) / (ry * pulse), -1, 1);
         const edge = r * pulse * Math.sqrt(Math.max(0, 1 - dy * dy));
@@ -1850,14 +2169,23 @@ export class Highway {
         // gutter. The mark keeps its length by moving its INNER end inward (onto the ring, which has
         // nothing to collide with) instead of its outer end outward.
         const markLimit = g.laneWidthNear * 0.5 - Math.max(2, r * TARGET_MARK_MARGIN);
-        if (hot) {
-          // GOAL REACHED. The two thin ticks become two SOLID ARROWHEADS pointing at the target
+        if (scored) {
+          // GOAL REACHED. The two gate posts become two SOLID ARROWHEADS pointing at the target
           // line from outside the ring — the same two marks, changed in shape and roughly ten times
-          // the filled area. This is the mark (b) survives a hard downscale on: the additive rim and
-          // corona are hairlines that thin out to nothing at 220 px, and "white and brighter" is not
-          // a distinction in the high-contrast palette, where the rising cap is already near-white.
-          // Solid triangles at a fixed height either side of the ring are still two unmistakable
-          // blobs at the target line when everything else has blurred together.
+          // the filled area, so (a) and (b) are told apart out here by SHAPE and not only by the
+          // rings inside.
+          //
+          // THEY ARE NOT WHAT CARRIES (b) AT 220 px, and the claim that they were is worth
+          // correcting because it is the rationale a future change would be defended with. Measured:
+          // a 1280x800 board downscaled to 220 px wide, max-luminance profile across the strike
+          // band — (a)'s gate posts peak at 237/254 over 2 px and (b)'s arrowheads peak at 251/241
+          // over 2 px, at the same height on the same strike line. Numerically and visually the same
+          // white nub; the ~10x filled area does not survive the downscale as area. What DOES carry,
+          // in the GH palette, the high-contrast palette, pure luminance and simulated
+          // deuteranopia/tritanopia alike, is the additive inner rim below: (b) reads as two
+          // concentric rings where (a) reads as one. Mark COUNT, at the one scale that matters.
+          // The arrowheads earn their place at full size and in the mid range, and they cost
+          // nothing — but if the rim ever has to go, (b) loses its downscale separation with it.
           // Grown inward from the lane's outer limit (see TARGET_MARK_MARGIN), never past it, and
           // never shorter than a mark that reads as a triangle rather than as a dot — so when the
           // ring is wide at this height (a mid-range threshold, or the re-arm pop mid-scale) it is
@@ -1878,17 +2206,34 @@ export class Highway {
           }
           ctx.globalAlpha = 1;
         } else {
-          // Two ticks flush against the ring's outline at exactly the threshold height, ending at
-          // the same outer limit the arrowheads do (see TARGET_MARK_MARGIN) so they cannot reach
-          // into the neighbouring lane when the target line sits at the ring's widest point.
-          const tick = clamp(markLimit - edge, Math.max(3, r * 0.1), Math.max(3, r * 0.24));
-          // Same rule as the arrowheads: the outer end is the lane's, the inner end gives way.
-          const tickX = Math.min(edge, markLimit - tick);
-          const th = Math.max(2, 2.2 * this.u);
+          // Two GATE POSTS flush against the ring's outline, centred on exactly the threshold
+          // height: short bars standing ACROSS the target line, not along it.
+          //
+          // THEY USED TO LIE ALONG IT, AND AT 2 m THAT MADE THEM SOMETHING ELSE. They were thin
+          // horizontal white ticks, and the threshold height on the default difficulty ('easy',
+          // 0.5) is 0.465 of the well — a few pixels from the board-wide WHITE STRIKE LINE that
+          // crosses every ring. Downscaled to the 220 px board (the acuity proxy for a 10" tablet
+          // at 2 m) a white horizontal hairline a few pixels from a white horizontal rule is the
+          // rule; and two neighbouring lanes' ticks, pointing at each other across a ~9 px gutter,
+          // blur into one bar spanning it. The claimed second, unbroken reference did not survive
+          // to the distance the whole design is specified at, so it was carrying nothing.
+          //
+          // A bar at right angles to the strike line cannot be absorbed into it at any scale, and
+          // two posts either side of a gutter stay two marks because neither reaches across it.
+          // The height is the post's MIDPOINT (it is centred on `yTarget`), which is what survives
+          // a blur: a short vertical smudge keeps its centre. It is also a different SHAPE from the
+          // solid arrowheads of (b) — which are horizontal, and ~5x the filled area — so the pair
+          // (a)/(b) is still told apart by shape out here, not only by the rings inside.
+          const pw = Math.max(3, r * 0.11);
+          const ph = Math.max(6, r * 0.42);
+          // Same rule as the arrowheads: the outer end is the lane's (see TARGET_MARK_MARGIN), and
+          // the inner end gives way — the post moves onto the ring outline rather than into the
+          // neighbouring lane.
+          const postX = Math.min(edge + Math.max(1, this.u), markLimit - pw);
           ctx.fillStyle = TARGET_LINE_COLOR;
           ctx.globalAlpha = 0.92;
-          ctx.fillRect(x + tickX, yTarget - th * 0.5, tick, th);
-          ctx.fillRect(x - tickX - tick, yTarget - th * 0.5, tick, th);
+          ctx.fillRect(x + postX, yTarget - ph * 0.5, pw, ph);
+          ctx.fillRect(x - postX - pw, yTarget - ph * 0.5, pw, ph);
           ctx.globalAlpha = 1;
         }
       } else {
@@ -1898,7 +2243,6 @@ export class Highway {
         // mark inside the ring, and on the frame of a hit (lockout starts there) two blind
         // reviewers read the receptor as "a stray, wrongly-scaled sprite" because of it. The
         // chevron is an instruction attached to the ring, so the ring has to win.
-        ctx.strokeStyle = LOCK_HINT_COLOR;
         ctx.lineCap = 'round';
         if (showLower) {
           const chev = r * 0.26;
@@ -1912,19 +2256,51 @@ export class Highway {
           // span from the patient's real peak down to the threshold.
           const cy = yLevel + (yRearm - yLevel) * 0.5;
           ctx.globalAlpha = clamp(1 - 0.45 * look.resetProgress, 0, 1);
-          ctx.lineWidth = Math.max(2, r * 0.1);
-          ctx.beginPath();
-          ctx.moveTo(x - chev, cy - chev * 0.5);
-          ctx.lineTo(x, cy + chev * 0.5);
-          ctx.lineTo(x + chev, cy - chev * 0.5);
-          ctx.stroke();
+          const lw = Math.max(2, r * 0.1);
+          const stroke = (): void => {
+            ctx.beginPath();
+            ctx.moveTo(x - chev, cy - chev * 0.5);
+            ctx.lineTo(x, cy + chev * 0.5);
+            ctx.lineTo(x + chev, cy - chev * 0.5);
+            ctx.stroke();
+          };
+          // ADDITIVE, because this is (c)'s only POSITIVE mark and it is drawn on top of the one
+          // thing whose luminance it cannot choose: the locked column, which the patient is lowering
+          // THROUGH it. Measured on 220 px downscales (the acuity proxy for a 10" tablet at 2 m)
+          // through the chevron apex, the flat violet peaked at 159/255 against a column at 130-137
+          // (GH palette) and 158 against 122-133 (high contrast) — 19-22 % Weber, and under a tritan
+          // simulation the violet collapses toward the olive of the column. (c) was therefore leaning
+          // mainly on the ABSENCE of (a)'s target line and gate posts: subtractive evidence, the only
+          // state in the set carried that way.
+          //
+          // Compositing the same stroke additively makes it STRICTLY brighter than whatever it sits
+          // on, by construction, in every palette and at every fill height — re-measured on the same
+          // 220 px downscales, the apex goes to 190-224/255 at 1.3-12.6 Weber against its
+          // neighbours. It does drift toward white over a bright column, and that is the trade taken
+          // deliberately: the mark's job is to be a SHAPE that survives luminance-only vision and
+          // both dichromatic simulations (the four states are told apart by mark count and shape,
+          // never by hue), and the violet identity of the "lower to reset" instruction is still
+          // carried at full saturation by the drain cap, the dashed re-arm line and the return
+          // crescent, which sit on dark ground and have contrast to spare.
+          //
+          // A DARK CASING WAS TRIED FIRST AND IS THE WRONG TOOL HERE. The map-label halo works when
+          // the mark is thick relative to the blur; this stroke is ~2 px once the board is at 220 px,
+          // so the box filter averaged the trench INTO the chevron and took its peak DOWN from 145
+          // to 123 — worse at exactly the scale the requirement is written for.
+          ctx.globalCompositeOperation = 'lighter';
+          ctx.strokeStyle = LOCK_HINT_COLOR;
+          ctx.lineWidth = lw;
+          stroke();
+          ctx.globalCompositeOperation = 'source-over';
         }
-        // Return-to-rest progress: an arc outside the ring that grows as the value drains back
-        // toward the re-arm level and is complete the instant the lane can fire again. The chevron
-        // says what to do; this says how much further, which is the part a patient holding at end
-        // range cannot otherwise know. It is deliberately never a closed ring — the top quarter
-        // stays open — and it is drawn in a hue no lane palette contains, so it cannot be read as
-        // a lit lane ring on the yellow / orange lane at 2 m.
+        ctx.strokeStyle = LOCK_HINT_COLOR;
+        // Return-to-rest progress: a crescent outside the ring, under it, that grows as the value
+        // drains back toward the re-arm level and is complete the instant the lane can fire again.
+        // The chevron says what to do; this says how much further, which is the part a patient
+        // holding at end range cannot otherwise know. It is confined to the ring's LOWER HALF
+        // (`RESET_ARC_SWEEP`) so that it can never become a second concentric ring the way (b)'s
+        // corona — drawn at the same radius — is one, and it is drawn in a hue no lane palette
+        // contains, so it cannot be read as a lit lane ring on the yellow / orange lane at 2 m.
         //
         // ...and it stays in its own lane. At the nominal 1.16 r with this stroke it reached past
         // half a lane, so four locked lanes coming down together joined into one scalloped ribbon
@@ -1941,9 +2317,18 @@ export class Highway {
         ctx.globalAlpha = 1;
       }
 
-      // "This will score": an inner rim lit in the lane colour, drawn only while the lane would
-      // actually fire. It pulses with the beat, which is what "pulses when armed" has to look like.
-      if (hot) {
+      // "THAT REP REACHED YOUR TARGET" — the KR mark, and the one thing that separates (b) from (a)
+      // once the board is downscaled to the ~220 px a 10" tablet at 2 m is worth: an additive inner
+      // rim in the lane colour, so the receptor reads as TWO concentric rings where every other
+      // state reads as one. Mark count, not brightness and not hue — it survives desaturation to
+      // luminance and both dichromatic simulations, which "white and brighter" does not (in the
+      // high-contrast palette the rising cap is already near-white).
+      //
+      // Keyed to `scored`, not to `hot`: this is a claim about the rep just made, and it stays true
+      // for the whole latch including the `GOAL_MIN_SEC` overrun after the lane has re-armed. The
+      // marks that claim the patient is still AT the target are keyed to `hot` and have already gone
+      // by then.
+      if (scored) {
         ctx.globalCompositeOperation = 'lighter';
         ctx.globalAlpha = clamp((0.5 + 0.35 * (still ? 0.4 : beatPulse)) * goal, 0, 1);
         ctx.strokeStyle = color.bright;
@@ -1982,8 +2367,13 @@ export class Highway {
    * gaps, breathing slowly at a rate that has nothing to do with the music — with a large "?" in the
    * middle. Grey-but-solid means "lower to reset" (c); grey-and-broken means "the camera has lost
    * you", and the fix is to move back into frame, not to move differently.
+   *
+   * `why` picks the glyph only — see `LostReason`. The ring is identical for all three because the
+   * ring is what is read at 2 m and at 2 m they are one statement: there is no reading here, and
+   * nothing you do with this limb changes that. The glyph is read at arm's length, by whoever can
+   * act: "?" the patient, "!" and ❚❚ the therapist.
    */
-  private drawLostReceptor(ctx: Ctx2D, x: number, y: number, r: number, ry: number, st: number, still: boolean): void {
+  private drawLostReceptor(ctx: Ctx2D, x: number, y: number, r: number, ry: number, st: number, still: boolean, why: LostReason = 'lost'): void {
     const breathe = still ? 0.8 : 0.6 + 0.4 * (0.5 - 0.5 * Math.cos(st * LOST_BREATHE_RATE));
     const arc = (Math.PI * 2) / LOST_RING_SEGMENTS;
     ctx.strokeStyle = LOST_RING_COLOR;
@@ -2001,7 +2391,28 @@ export class Highway {
       ctx.stroke();
     }
     ctx.globalAlpha = 1;
-    this.text.draw(ctx, '?', x, y, this.style('receptorQ'), 1.5, clamp(0.65 + 0.35 * breathe, 0, 1));
+    // ❚❚ — the session is stopped; nothing the patient does counts until it is resumed. DRAWN, not
+    // typed: it is the same two bars as the pause button that produced it (and as the one on the
+    // play screen's own control), it needs no font to contain the glyph, and two solid bars survive
+    // the 220 px acuity downscale that turns a "?" into a smudge — so at 2 m this is four arcs plus
+    // TWO marks where the other two readings are four arcs plus one.
+    if (why === 'suspended') {
+      const bw = Math.max(2, r * 0.17);
+      const bh = Math.max(bw * 2, ry * 0.62);
+      const gap = bw * 0.85;
+      ctx.fillStyle = LOST_RING_COLOR;
+      ctx.globalAlpha = clamp(0.65 + 0.35 * breathe, 0, 1);
+      ctx.fillRect(x - gap * 0.5 - bw, y - bh * 0.5, bw, bh);
+      ctx.fillRect(x + gap * 0.5, y - bh * 0.5, bw, bh);
+      ctx.globalAlpha = 1;
+      return;
+    }
+    // "?" — the tracker cannot see you, move back into frame. "!" — this lane is not measuring you
+    // at all and no movement will change that (`setLaneFaults`); the remedy is the therapist's, and
+    // the words for it are on the play screen. Same broken ring, so the MARK SET (and therefore what
+    // it tells a patient at 2 m) is unchanged: only the glyph, which is read at arm's length, says
+    // which of the two it is.
+    this.text.draw(ctx, why === 'fault' ? '!' : '?', x, y, this.style('receptorQ'), 1.5, clamp(0.65 + 0.35 * breathe, 0, 1));
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -2068,7 +2479,7 @@ export class Highway {
         // biggest thing on the board — the opposite of a fizzle.
         const rSeen = g.gemRadiusNear * scaleAt(g, dSeen);
         radius = (rSeen + (p.radius - rSeen) * 0.35) * (1 - k * 0.5);
-        y = this.missCueY(y, radius);
+        y = this.missCueY(y, radius, k);
       } else if (d < 0) {
         // Pending gem past the line: keep full colour (a late hit may still land) but dim gently
         // toward the bottom so it reads as "getting away".
@@ -2107,16 +2518,37 @@ export class Highway {
   }
 
   /**
-   * Keep a miss cue (dying gem, puff) fully inside the canvas.
+   * Where a miss cue (dying gem, puff) is allowed to be, between two edges it may not cross.
    *
-   * The engine declares a miss at `note.time + goodMs + grace` — up to 280 ms past the line — and
-   * with the default geometry a gem of that age is still entirely on screen (`gemVisibleTailSec`
-   * ≥ 300 ms at every tested resolution, asserted in geometry.test.ts). This clamp is the backstop
-   * for tuned options and short canvases: a cue drawn half below the bottom edge is not a cue, and
-   * "it was issued" is not the same as "the patient saw it".
+   * BELOW: the bottom of the canvas. The engine declares a miss at `note.time + goodMs + grace` —
+   * up to 280 ms past the line — and with the default geometry a gem of that age is still entirely
+   * on screen (`gemVisibleTailSec` ≥ 300 ms at every tested resolution, asserted in
+   * geometry.test.ts). This clamp is the backstop for tuned options and short canvases: a cue drawn
+   * half below the bottom edge is not a cue, and "it was issued" is not the same as "the patient
+   * saw it".
+   *
+   * ABOVE: the receptor's meter well, which is now painted OVER the gems (see `draw`). That fixed
+   * the occlusion, and it would have cost the miss cue if nothing else changed: the verdict lands
+   * while the dying gem's centre is only ~40 px past the line at 1280x800, i.e. still well inside a
+   * ±63.6 px well, and the fizzle only drifts ~35 px further over its whole life. The gem would have
+   * greyed, shrunk and faded out entirely behind the ring.
+   *
+   * So the fizzle is also a walk clear of the ring: over `MISS_CLEAR_SEC` — a third of the fizzle,
+   * because the gem is fading the whole time and has to be clear while it still has opacity to be
+   * seen with — the gem eases (`easeOutCubic`) down to `MISS_CLEAR_FRAC` of its own half-height
+   * below the bottom rim of the well. It is never yanked: the walk starts at zero on the verdict
+   * frame, where the gem is still at full size and its lower third is already below the ring.
+   * That is the ONE mechanism carrying the miss on the board itself, and it keeps the two
+   * statements spatially separate the way they are logically separate: the ring says what the
+   * patient's limb is doing now, the gem sliding out from under it says the note they did not reach
+   * is gone. The bottom clamp still wins if a short canvas leaves no room for both — the red lane
+   * tint and the judgment popup are the miss cues that do not need apron space.
    */
-  private missCueY(y: number, radius: number): number {
-    return Math.min(y, this.height - radius * GEM_ASPECT - MISS_CUE_MARGIN_U * this.u);
+  private missCueY(y: number, radius: number, fizzle = 1): number {
+    const clear = this.geom.strikeY + receptorWellSemiHeight(this.geom) + radius * GEM_ASPECT * MISS_CLEAR_FRAC;
+    const walk = easeOutCubic(clamp((fizzle * MISS_FIZZLE_SEC) / MISS_CLEAR_SEC, 0, 1));
+    const walked = clear > y ? y + (clear - y) * walk : y;
+    return Math.min(walked, this.height - radius * GEM_ASPECT - MISS_CUE_MARGIN_U * this.u);
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -2589,11 +3021,51 @@ export class Highway {
     if (combo >= 2) this.lastComboShown = combo;
   }
 
+  /**
+   * Rock gauge placement (centre + radius, CSS px): the one piece of HUD furniture that lives in the
+   * board's LEFT GUTTER, which is also the only place an app can put an overlay panel. Extracted
+   * from `drawHud` so `overlayPanel` reads the same numbers the gauge is drawn from rather than a
+   * copy that can drift out of step with it.
+   */
+  private rockGaugeBox(): { x: number; y: number; r: number } {
+    const g = this.geom;
+    const pad = 16 * this.u;
+    const leftPanelW = Math.max(0, roadEdgeX(g, -1, 0));
+    const r = clamp(Math.min(leftPanelW * 0.3, this.height * 0.1, 90 * this.u), 18, 140);
+    return { x: Math.max(r * 1.25 + pad, leftPanelW * 0.45), y: g.strikeY - r * 1.1, r };
+  }
+
+  /**
+   * Where the APP may put a DOM overlay panel over this board — the play screen's camera
+   * picture-in-picture and its lane meters (src/ui/Play.tsx).
+   *
+   * THE RENDERER HAS TO ANSWER THIS BECAUSE ONLY THE RENDERER KNOWS. The board is drawn in canvas
+   * coordinates from the canvas size and the lane count: the strike line, the receptor radius, the
+   * width of the gutter beside the road and the rock gauge standing in it all move with both. A
+   * panel pinned in CSS to `left: 18px; bottom: 18px` therefore has no way to know that at
+   * 1280x800 it is sitting exactly on lane 0's receptor and on the label that names the limb — and
+   * it was: the default bilateral prescription read "knee lift" against a fully legible
+   * "R knee lift" next door, so the one mark distinguishing the two lanes of the prescription was
+   * behind the panel and a therapist had to say out loud which leg the receptor belonged to.
+   *
+   * `boardHardwareTop` is the hard constraint (nothing over the receptor row or its labels); the
+   * gutter width at the panel's own bottom edge sets how wide it may be; the gauge keeps it from
+   * landing on the rock meter. See `overlayPanelBox` for the rules and for what gives way first.
+   * Call it after `resize()` and whenever the lane count changes.
+   */
+  overlayPanel(req: { margin?: number; minWidth?: number; maxWidth?: number } = {}): OverlayPanelBox {
+    const gauge = this.rockGaugeBox();
+    return overlayPanelBox(this.geom, {
+      floorY: Math.min(boardHardwareTop(this.geom), gauge.y - gauge.r),
+      margin: req.margin ?? Math.max(10, Math.round(16 * this.u)),
+      minWidth: req.minWidth ?? 150,
+      maxWidth: req.maxWidth ?? 280,
+    });
+  }
+
   private drawHud(ctx: Ctx2D, frame: RenderFrame, dt: number, beatPulse: number): void {
     const W = this.width;
-    const H = this.height;
     const u = this.u;
-    const g = this.geom;
     const pad = 16 * u;
 
     // Score (top-right, rolling digits). A non-finite score (or a display value that somehow went
@@ -2649,11 +3121,12 @@ export class Highway {
     if (!Number.isFinite(this.healthSmooth)) this.healthSmooth = health;
     this.healthSmooth += (health - this.healthSmooth) * clamp(dt * 6, 0, 1);
     const hv = this.healthSmooth;
-    // Size the gauge from the free space left of the road at the strike line; keep it clear of the road edge.
-    const leftPanelW = Math.max(0, roadEdgeX(g, -1, 0));
-    const gaugeR = clamp(Math.min(leftPanelW * 0.3, H * 0.1, 90 * u), 18, 140);
-    const gx = Math.max(gaugeR * 1.25 + pad, leftPanelW * 0.45);
-    const gy = g.strikeY - gaugeR * 1.1;
+    // Size and place the gauge from the free space left of the road at the strike line (see
+    // `rockGaugeBox` — `overlayPanel` reads the same numbers, so a DOM panel cannot land on it).
+    const gauge = this.rockGaugeBox();
+    const gaugeR = gauge.r;
+    const gx = gauge.x;
+    const gy = gauge.y;
     const a0 = Math.PI * 0.75;
     const a1 = Math.PI * 2.25;
     ctx.lineCap = 'round';
@@ -2822,7 +3295,8 @@ export class Highway {
     for (let lane = 0; lane < g.laneCount; lane++) {
       const label = this.labelText[lane];
       if (!label) continue;
-      // Post-hold tracking as `drawReceptors` resolved it this frame (it runs first), not the raw
+      // Post-hold tracking as `drawReceptors` resolved it this frame (it runs earlier in the
+      // frame — see `draw`, where the receptor row is the last BOARD layer), not the raw
       // per-frame flag: a label that greys out on a single noisy frame while the receptor above it
       // stays live is the same two-meters-disagreeing failure the receptor contract exists to stop.
       const tracking = this.laneTracking[lane] === 1;

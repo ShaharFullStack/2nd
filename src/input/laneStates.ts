@@ -12,6 +12,20 @@
  *
  * The lanes of a scripted source are binary (held / not held), so the whole state is one bitmask: when
  * the mask is unchanged the previous frozen array is returned unchanged, and identity comparison works.
+ *
+ * WHAT THE MEMOIZATION COSTS, AND WHY `triggerState` IS NOT OPTIONAL HERE. Returning the same objects
+ * for minutes at a time means a consumer cannot tell "nothing has changed" from "nothing has been
+ * OBSERVED", and a live meter needs that difference: the receptor's knowledge-of-results cue used to be
+ * reconstructed from an armed → not-armed edge whose evidence expired after `DEFAULT_MAX_GAP_SEC` of
+ * apparent silence (src/render/receptor.ts), so under this cache every rep that followed more than half
+ * a second of rest — essentially every rep of a real chart — produced NO goal cue at all on the
+ * keyboard, replay and autoplay paths. That is not a dev-only path: `CameraFallback` offers keyboard to
+ * a patient when the camera fails. `build` therefore publishes the lane's trigger state, which turns the
+ * crossing from an inference into a fact that a frozen object can carry for as long as it likes.
+ *
+ * RESIDUAL: a press and a release that both happen between two polls are still invisible, in this field
+ * as in `armed` — the mask is the whole state, and it is compared, not journalled. At 60 Hz that needs a
+ * sub-16 ms tap; `ReplayInput` holds a lane for `holdSec` (0.12 s) and `KeyboardInput.press` for 80 ms.
  */
 import type { LaneState } from './types.ts';
 
@@ -44,7 +58,19 @@ function build(laneCount: number, active: (lane: number) => boolean): LaneState[
   for (let lane = 0; lane < laneCount; lane++) {
     const on = active(lane);
     // Frozen like VisionInput's: a consumer that mutates a shared meter must throw, not corrupt it.
-    out[lane] = Object.freeze({ lane, value: on ? 1 : 0, armed: !on, tracking: true }) as LaneState;
+    //
+    // `triggerState` is what makes the memoization safe for a live meter (see `LaneState.triggerState`
+    // and the note above): a held lane is 'triggered' — the source emitted a `LaneInputEvent` for it at
+    // the instant it went held, and for no other reason — and a free lane is 'armed'. A meter watching
+    // for the goal cue can read the crossing off the transition instead of reconstructing it from how
+    // long ago the objects last changed, which is the one thing this cache destroys.
+    out[lane] = Object.freeze({
+      lane,
+      value: on ? 1 : 0,
+      armed: !on,
+      triggerState: on ? 'triggered' : 'armed',
+      tracking: true,
+    }) as LaneState;
   }
   return Object.freeze(out) as LaneState[];
 }

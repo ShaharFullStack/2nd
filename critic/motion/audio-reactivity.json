@@ -1,5 +1,5 @@
 {
-  "capturedAt": "2026-09-10T23:05:50.770Z",
+  "capturedAt": "2026-09-11T07:47:37.614Z",
   "failures": [],
   "stems": {
     "stems": [
@@ -21,7 +21,7 @@
     "ducked": false,
     "hits": 3,
     "misses": 0,
-    "songTime": 3.3216326530612243
+    "songTime": 3.3100226757369615
   },
   "whileMissing": {
     "gains": {
@@ -34,7 +34,7 @@
     "ducked": true,
     "hits": 3,
     "misses": 2,
-    "songTime": 5.452063492063491
+    "songTime": 5.46077097505669
   },
   "recovery": {
     "before": 0.05,

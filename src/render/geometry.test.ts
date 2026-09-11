@@ -23,7 +23,11 @@ import {
   project,
   radiusBucket,
   roadEdgeX,
+  roadEdgeXAtY,
   roadWidthFactor,
+  boardHardwareTop,
+  overlayPanelBox,
+  RECEPTOR_BAND_RATIO,
   scaleAt,
   visibleTimeWindow,
   yAt,
@@ -550,5 +554,87 @@ describe('radius buckets', () => {
       expect(Math.abs(bucketRadius(b, 4, 40, 12) - r)).toBeLessThanOrEqual((36 / 11) * 0.5 + 1e-9);
     }
     expect(bucketRadius(0, 4, 40, 1)).toBe(40);
+  });
+});
+
+// -------------------------------------------------------------------------------------------------
+// Overlay placement: nothing the app floats over the canvas may cover the receptor row or its labels
+// -------------------------------------------------------------------------------------------------
+
+describe('overlay placement', () => {
+  /** The landscape shapes a clinic tablet actually presents, plus the extremes. */
+  const SIZES: Array<[number, number, number]> = [
+    [1280, 800, 4],
+    [1024, 768, 4],
+    [1366, 768, 2],
+    [1920, 1080, 4],
+    [800, 400, 4],
+    [400, 800, 4],
+  ];
+  const REQ = { margin: 16, minWidth: 150, maxWidth: 280 };
+
+  it('reads the road edge at a screen y exactly as roadEdgeX reads it at a depth', () => {
+    const g = makeGeometry(W, H, 4);
+    for (const d of [1, 0.7, 0.3, 0, -0.05, -0.2, g.minDepth]) {
+      for (const side of [-1, 1] as const) {
+        expect(roadEdgeXAtY(g, side, yAt(g, d))).toBeCloseTo(roadEdgeX(g, side, d), 6);
+      }
+    }
+  });
+
+  it('reserves the whole receptor band, marks included, not just the ring', () => {
+    const g = makeGeometry(W, H, 4);
+    // The ring's own top edge...
+    const ringTop = g.strikeY - g.receptorRadius * GEM_ASPECT;
+    // ...is not the top of the band: the goal corona and the return-to-rest crescent are drawn
+    // outside it and the re-arm pop scales the lot up, and those are the marks that carry (b)/(c).
+    expect(boardHardwareTop(g)).toBeLessThan(ringTop);
+    expect(g.strikeY - boardHardwareTop(g)).toBeCloseTo(g.receptorRadius * GEM_ASPECT * RECEPTOR_BAND_RATIO, 6);
+  });
+
+  it.each(SIZES)('keeps the panel clear of the receptor band at %ix%i (%i lanes)', (w, h, lanes) => {
+    const g = makeGeometry(w, h, lanes);
+    const box = overlayPanelBox(g, { ...REQ, floorY: boardHardwareTop(g) });
+    // THE ONE PROMISE. Everything from here to the bottom edge belongs to the receptors and to the
+    // labels that name the limb each one is for; the panel's bottom edge is above it, by a margin.
+    expect(box.bottomY).toBeLessThanOrEqual(boardHardwareTop(g) - REQ.margin);
+    expect(box.bottom).toBeCloseTo(h - box.bottomY, 6);
+    expect(box.left).toBe(REQ.margin);
+    expect(box.width).toBeGreaterThanOrEqual(REQ.minWidth);
+    expect(box.width).toBeLessThanOrEqual(REQ.maxWidth);
+    expect(box.maxHeight).toBeGreaterThan(0);
+  });
+
+  it('gives the road its width back rather than growing over it, and says so when it cannot', () => {
+    // Landscape: the gutter beside a four-lane board is narrower than the panel's preferred width,
+    // so the WIDTH gives way and the panel's right edge lands inside the road's left edge at its
+    // own bottom (the widest point of the road it can reach).
+    const wide = makeGeometry(1280, 800, 4);
+    const box = overlayPanelBox(wide, { ...REQ, floorY: boardHardwareTop(wide) });
+    expect(box.overRoad).toBe(false);
+    expect(box.left + box.width).toBeLessThanOrEqual(roadEdgeXAtY(wide, -1, box.bottomY));
+    expect(box.width).toBeLessThan(REQ.maxWidth);
+
+    // Portrait: a 296 px board on a 400 px canvas leaves no gutter that could hold a readable
+    // panel at all. It is placed anyway — above the hardware band, which is the constraint that
+    // matters — and flagged, because a panel over the far road hides oncoming gems while a panel
+    // over the receptor row hides the state the patient is being asked to act on.
+    const narrow = makeGeometry(400, 800, 4);
+    const tight = overlayPanelBox(narrow, { ...REQ, floorY: boardHardwareTop(narrow) });
+    expect(tight.overRoad).toBe(true);
+    expect(tight.width).toBe(REQ.minWidth);
+    expect(tight.bottomY).toBeLessThanOrEqual(boardHardwareTop(narrow) - REQ.margin);
+  });
+
+  it('never places the panel off the canvas, whatever floor it is given', () => {
+    const g = makeGeometry(1280, 800, 4);
+    for (const floorY of [-500, 0, 10, g.height * 2, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const box = overlayPanelBox(g, { ...REQ, floorY });
+      expect(box.bottomY).toBeGreaterThan(0);
+      expect(box.bottomY).toBeLessThanOrEqual(g.height);
+      expect(box.bottom).toBeGreaterThanOrEqual(0);
+      expect(box.maxHeight).toBeGreaterThanOrEqual(0);
+      expect(Number.isFinite(box.width)).toBe(true);
+    }
   });
 });

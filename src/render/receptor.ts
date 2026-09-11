@@ -26,7 +26,9 @@
  *   the threshold crossing              →  (b) the rep just reached the target ROM — the frame the
  *                                          input engine emitted its `LaneInputEvent` on. See
  *                                          "THE CROSSING IS ONE FRAME" below: this is a LATCHED
- *                                          state, not a level test.
+ *                                          state, not a level test — and a latch bounded at BOTH
+ *                                          ends, by the crossing and by the re-arm that gives the
+ *                                          rep back.
  *   tracking + !armed                   →  (c) the lane *cannot* fire, no matter how hard the
  *                                          patient pushes, until they lower past the re-arm line.
  *                                          This is the single most common thing a rehab patient
@@ -46,21 +48,59 @@
  * `trigger.armed` (src/input/VisionInput.ts) — so the crossing frame is published as
  * `{ value: >= threshold, armed: false }` and NO frame from ANY input source in this repo ever
  * satisfies `armed && value >= threshold`. (The scripted sources are the same by construction:
- * src/input/laneStates.ts publishes a held lane as `{ value: 1, armed: false }`.) A `willFire`
- * look conditioned on that conjunction is therefore dead code, and a renderer built on it gives the
- * patient NO gauge-level acknowledgement of the one thing the session is for — reaching the target
- * range. Worse, without a latch the gauge *steps down* at the instant of success: the last armed
- * frame paints a nearly full column, the next frame is capped by the lockout ceiling.
+ * src/input/laneStates.ts publishes a held lane as `{ value: 1, armed: false }`.) There is
+ * therefore NO single-frame test for state (b), and this file deliberately does not offer one: a
+ * look built by `receptorLookInto` alone always reads `goal: 0`, so a consumer cannot accidentally
+ * ship a meter whose "this counts" cue is unreachable. (`ReceptorLook.willFire` used to be exactly
+ * such an offer. It was false on every frame of every source, the play screen's picture-in-picture
+ * meters were built on it, and the result was a meter that went from the rising look straight to
+ * the grey lockout look at the instant of success. Removed.)
  *
- * So state (b) is detected as an EDGE and held for `GOAL_HOLD_SEC` (+ `GOAL_FADE_SEC` of ramp):
- * a lane that was armed on the previous tracked frame and is now locked at or past the threshold
- * has just crossed it — that is the frame the trigger fired on. `ReceptorHistory.update` sets
- * `ReceptorLook.goal` from that latch, and `goal > 0` is what the renderer draws state (b) from.
- * `willFire` is kept as the single-frame form of the same claim (and still refreshes the latch), so
- * that if the input layer ever publishes the crossing as armed — or a caller hands the model a
- * synthetic state — nothing has to change.
+ * So state (b) is a LATCH, set on the frame the lane ENTERS 'triggered'. `ReceptorHistory.update`
+ * sets `ReceptorLook.goal` from it, and `goal > 0` is what the renderer draws state (b) from.
+ * Without a latch the gauge also *steps down* at the instant of success: the last armed frame paints
+ * a nearly full column, the next frame is capped by the lockout ceiling.
  *
- * AN ARMED → NOT-ARMED EDGE IS NOT ALWAYS A CROSSING, AND THAT IS THE DANGEROUS PART. `LaneTrigger`
+ * AND THE LATCH ENDS WHEN THE LOCKOUT DOES, WHICH IS THE OTHER HALF OF THE SAME HONESTY. (b) is an
+ * overlay on (c): it describes a rep the patient is still holding. The instant the value drops below
+ * the re-arm level the lane is armed again and the true message is "go again", so the latch is cut
+ * there — floored at `GOAL_MIN_SEC` (0.15 s) so knowledge of results is catchable at all, and capped
+ * at `GOAL_HOLD_SEC + GOAL_FADE_SEC` for a patient who keeps holding. It used to be that fixed
+ * 0.6 s with no reference to the arming, and at the game's own pacing that was not an edge case but
+ * the steady state: a brisk rep re-arms ~0.1 s after crossing and same-lane notes are 0.45 s apart
+ * on 'hard', so a lane sitting AT REST AND READY wore the full "you reached your target" costume for
+ * the entire inter-rep interval — (a)'s "how much further" readout was never drawn for a lane keeping
+ * up at all, and the cue spilled into the next repetition's concentric phase, which is precisely when
+ * augmented feedback stops being contingent.
+ *
+ * DURING THE `GOAL_MIN_SEC` OVERRUN THE TWO CLAIMS OF (b) COME APART, and `receptorGoalHolding` is
+ * how every meter tells them apart: "that rep reached your target" is still true (KR marks stay),
+ * "and you are still up there" is not (the position marks revert to their (a) form at the patient's
+ * true height).
+ *
+ * SO A FLUID REP READS (a) → (b) → (a), AND (c) IS THE STALL STATE. That is a design claim and it is
+ * worth stating, because it decides what a therapist sees most of the time. `GOAL_HOLD_SEC` (0.45 s)
+ * is longer than the whole lockout of a rep performed at the chart generator's own pacing (0.22 s on
+ * hard, 0.29 s on medium, 0.43 s on easy, crossing to re-arm), so a patient who is keeping up goes
+ * from the goal cue straight back to the rising gauge. (c) appears when the lockout OUTLASTS the
+ * cue — i.e. when the patient reaches target and stops, which is the single most common thing a
+ * rehab patient does, or has slow eccentric control, or is 'unconfirmed' for one of the reasons
+ * below. That is the moment "lower to reset" is information: a patient already descending at pace is
+ * obeying an order they do not need to be given (the same reasoning `needsLower` applies inside (c)),
+ * and cycling the receptor through three costumes inside a 0.45 s rep would cost more legibility at
+ * 2 m than the instruction could buy back. What does NOT change is the honesty of the gauge: the
+ * column is the same position on the same linear ROM axis in (b) as in (c), so the descent is drawn
+ * to scale either way.
+ *
+ * THE CROSSING IS PUBLISHED, NOT GUESSED. Every source in this repo now ships
+ * `LaneState.triggerState` — `VisionInput` from `LaneTrigger.state`, the scripted sources from
+ * their held/free bit (src/input/laneStates.ts) — and `LaneTrigger` enters 'triggered' from one
+ * place only: a rising edge past the threshold, from 'armed' (trigger.ts `push`). So "the lane
+ * entered 'triggered'" IS "the input layer fired this lane", and the latch reads it directly.
+ * The inference below is the fallback for a hand-built state that omits the field.
+ *
+ * AN ARMED → NOT-ARMED EDGE IS NOT ALWAYS A CROSSING, AND THAT IS WHY THE INFERENCE IS A FALLBACK
+ * RATHER THAN THE RULE. `LaneTrigger`
  * disarms a lane for three different reasons, and only one of them is a rep:
  *   1. it crossed the threshold ('triggered') — the rep the latch exists for;
  *   2. `breakContinuity` — the sample stream was silent for longer than `maxGapSec`, so the lane
@@ -72,43 +112,142 @@
  *      this file was written to remove;
  *   3. `setThreshold` — a therapist making the song easier mid-song re-checks every lane's arming
  *      against the new re-arm level and disarms the ones that are not already below it.
- * The renderer therefore refuses the edge unless its evidence is still good, applying the trigger's
- * own rule to itself ("an unobserved window is not evidence"): the arming is forgotten when the last
- * DISTINCT tracked sample is more than `maxGapSec` old (case 2 — `RenderFrame.maxGapSec`, defaulting
- * to `DEFAULT_MAX_GAP_SEC`, the same 0.5 s VisionInput passes its triggers), and whenever the
- * threshold or re-arm fraction changes between frames (case 3). Better still, a source that
- * publishes `LaneStateLike.triggerState` is believed instead of guessed at: then only
- * 'armed' → 'triggered' is a crossing, and an 'unconfirmed' lane is never one.
+ * When a source publishes `triggerState` none of that arises: cases 2 and 3 both land in
+ * 'unconfirmed', the crossing is the 'triggered' entry, and neither an occlusion recovery nor a
+ * retune can counterfeit it. For a state that omits the field the renderer refuses the edge unless
+ * its evidence is still good, applying the trigger's own rule to itself ("an unobserved window is
+ * not evidence"): the arming is forgotten when the last DISTINCT tracked sample is more than
+ * `maxGapSec` old (case 2 — `RenderFrame.maxGapSec`, defaulting to `DEFAULT_MAX_GAP_SEC`, the same
+ * 0.5 s VisionInput passes its triggers), and whenever the threshold or re-arm fraction changes
+ * between frames (case 3).
  *
- * RESIDUAL, stated because the rest of this is a promise. Two windows remain in which the latch can
- * fire for a crossing the score did not get, and neither is closable from inside the renderer:
- *   - REFRACTORY. `LaneTrigger` swallows a crossing that lands within `minIntervalSec` (0.3 s) of
- *     the previous one, and that window is not exposed in `LaneState`. Such a crossing still enters
- *     'triggered', so the latch still fires: true of the patient's MOVEMENT (VisionInput reports the
- *     rep either way, `LaneRepEvent.emitted: false`) but not of the score.
- *   - AN UNREPORTED STALL. The gap rule measures the silence the renderer can SEE. If the camera
- *     simply stops delivering frames, `VisionInput` keeps republishing the last sample with
- *     `tracking: true` until its own stall watchdog (`staleFrameSec`, the same 0.5 s) fires, so up
- *     to `maxGapSec` of the trigger's silence can be invisible here. Only a lane whose re-arm-level
- *     crossing happened to fall inside that window is affected, and the honest fix is upstream:
- *     publish `triggerState` (or the observation time) in `LaneState`, which removes the guess
- *     entirely. The renderer must not invent either number.
- * The guard errs the other way too, deliberately: a RENDER hitch longer than `maxGapSec` (a long GC
- * pause, a backgrounded tab) also expires the arming, so a crossing that happens across it loses its
- * acknowledgement even though it scored. That is the correct direction to be wrong in — a missing
- * cue costs one moment of knowledge-of-results on a frame the patient could not see anyway, while a
- * false one teaches the wrong movement and costs the display its credibility.
+ * THOSE TWO RULES DO NOT TOUCH `prevTrigger`, AND THAT IS THE POINT. They expire an INFERENCE the
+ * renderer made from timing; the published trigger state is the input layer's own continuity-
+ * checked state machine, and a window this renderer did not watch does not make a later 'triggered'
+ * less of a crossing (a break moves the lane to 'unconfirmed', so the transition it produces is
+ * never a crossing anyway). Tying the two together is what broke state (b) on every scripted path:
+ * `LaneStateCache` returns the SAME frozen objects while the held bitmask is unchanged, so a
+ * patient at rest for longer than `maxGapSec` looked silent, the arming was forgotten, and no rep
+ * that followed more than half a second of rest could ever produce a goal cue — on the very path
+ * `CameraFallback` puts a patient on when the camera fails.
+ *
+ * THE REFRACTORY WINDOW IS RECONSTRUCTED, NOT IGNORED. `LaneTrigger` swallows a crossing that lands
+ * within `minIntervalSec` (0.3 s) of the last EMITTED one: the lane still enters 'triggered', so the
+ * latch used to fire for it, and a patient with clonus, a tremor or a bounce at end range got TWO
+ * full acknowledgements against ONE step of the score (driven live: two crossings 0.2 s apart,
+ * events=1, reps=2, two 0.15 s goal cues). The window is not published in `LaneState`, so the
+ * renderer keeps the same ledger the trigger does — the time of the last crossing it credited — and
+ * applies the same test — between INTERPOLATED crossing times, as the trigger does (`crossingTime`),
+ * widened by one render step so it only ever refuses a crossing it is sure was swallowed. See
+ * `REFRACTORY_GUARD_MIN_SEC` for what the residual band still lets through, and why that is the
+ * right direction to leave it in.
+ *
+ * (The other residual this file used to carry — an UNREPORTED CAMERA STALL letting the gap rule
+ * under-measure the trigger's silence — is closed by `triggerState`: a lane recovering from a stall
+ * is 'unconfirmed', whatever the renderer believes about how long it has been since it last saw a
+ * distinct sample.)
+ *
+ * The fallback guard errs the other way, deliberately: for a state with no `triggerState`, a RENDER
+ * hitch longer than `maxGapSec` (a long GC pause, a backgrounded tab) also expires the arming, so a
+ * crossing across it loses its acknowledgement even though it scored. That is the correct direction
+ * to be wrong in — a missing cue costs one moment of knowledge-of-results on a frame the patient
+ * could not see anyway, while a false one teaches the wrong movement and costs the display its
+ * credibility.
  *
  * NOISE, AND WHY (d) IS DEBOUNCED. `tracking` comes straight off a per-frame hard visibility gate
  * (src/vision/landmarks.ts, MIN_VISIBILITY) via src/vision/pipeline.ts, and nothing in the chain
  * debounces it. A landmark chattering across that gate — marginal framing, motion blur at peak rep
  * velocity, exactly the conditions of a real clinic — would strobe the whole receptor row between a
  * full gauge and "?" at frame rate. During Play the receptor is the patient's only out-of-frame
- * signal, so it has to be stable: `ReceptorHistory` holds the last tracked look for `LOST_HOLD_SEC`
- * before it will show (d), and reports that it is doing so as `ReceptorLook.stale`. A lane that has
- * NEVER been tracked (including one with no `LaneState` at all) skips the hold and reads (d)
- * immediately — for an absent measurement the honest default is "I cannot see you", not a live,
- * at-rest gauge.
+ * signal, so it has to be stable. So (d) is entered by the CURRENT UNINTERRUPTED DARK RUN reaching
+ * `LOST_HOLD_SEC`, and left by the first tracked frame. `ReceptorLook.stale` reports the hold while
+ * the last tracked look is being replayed. A lane that has NEVER been tracked (including one with no
+ * `LaneState` at all) skips the hold and reads (d) immediately — for an absent measurement the
+ * honest default is "I cannot see you", not a live, at-rest gauge.
+ *
+ * AND WHY THE DEBOUNCE IS A TIMEOUT AND NOT A DUTY CYCLE. This file used to spend a DARKNESS BUDGET
+ * instead — untracked time debited, tracked time forgiven at a rate set by a 50 % `LOST_DUTY_FLOOR`,
+ * (d) latched with a Schmitt trigger — on the theory that "a tracker that is mostly dead must not be
+ * able to suppress (d) with one lucky frame per cycle, because the reps performed inside its dark
+ * windows score nothing". THE SECOND HALF OF THAT SENTENCE IS FALSE, and it was never checked
+ * against the input layer. `LaneTrigger` keeps a lane's arming across ANY break up to `maxGapSec`
+ * (0.5 s) and interpolates the crossing across it (src/vision/trigger.ts `breakContinuity`,
+ * `push`), so a rep performed half in the dark still fires, still emits its `LaneInputEvent` and
+ * still scores. Driven end to end (real `LaneTrigger`, 1.2 s reps, 30 fps camera, 60 Hz render,
+ * 20 s) the duty floor read:
+ *
+ *     duty 1.00 → 17 events, 17 goal cues,  0 % of frames "lost"
+ *     duty 0.52 → 16 events,  5 goal cues, 47 %
+ *     duty 0.48 → 15 events,  5 goal cues, 51 %
+ *     duty 0.42 → 17 events,  0 goal cues, 97 %
+ *     duty 0.33 → 17 events,  1 goal cue,  97 %
+ *
+ * i.e. a session in which the score odometer, the hit bursts and the judgment popups all fire for
+ * every rep while the receptor row says "I cannot see you" on 97 % of frames and the patient loses
+ * knowledge of results — the one therapeutic ingredient this file exists to protect — for sixteen
+ * reps out of seventeen. A 4 % change in tracking duty flipped the display between a flawless gauge
+ * and a session-long "?". The receptor's contract is that it means exactly what the input engine
+ * means, and a duty cycle is not a quantity the engine has any opinion about: what the engine cares
+ * about is the LENGTH OF THE CURRENT GAP, which is what the rule now measures.
+ *
+ * WHAT THAT COSTS, AND WHY IT IS THE RIGHT DIRECTION. A stream whose gaps are longer than
+ * `LOST_HOLD_SEC` now shows (d) during each gap and the live gauge in between — 1-in-15 tracked
+ * frames at 30 fps (0.47 s gaps) reads "lost" about half the time, which is an honest report of a
+ * half-dark stream, and the flicker is bounded below by the hold so visibility-gate chatter (gaps of
+ * one to five frames) never produces it at all. A frame on which the receptor says (d) is a frame on
+ * which `LaneState.tracking` is false and the input layer HAS NO MEASUREMENT EITHER: what
+ * `VisionInput` pushes for it is a NULL sample, which cannot cross anything, so no `LaneInputEvent`
+ * can be emitted on it. (d) therefore never
+ * contradicts a rep that scored, and the frame the engine DOES fire on — the first tracked frame
+ * after the gap, crossing interpolated back across it — is a frame on which the hold has already
+ * been released, so its KR cue is drawn. That agreement is pinned end to end in `receptor.test.ts`
+ * ("the receptor may not call a lane lost while the engine is scoring it").
+ *
+ * AND WHILE THE SESSION IS NOT ACCEPTING INPUT, THE HONEST READING IS "NO READING" — for every
+ * lane, at every value. A therapist pause is the most-used control on the play screen and it is the
+ * "mid-song stop" case: `GameRunner` keeps drawing every animation frame and keeps handing this
+ * model LIVE `getLaneStates()` (the camera never stops for a pause), while `RhythmEngine` drops any
+ * event stamped inside the pause — not judged, not scored, not even recorded. Nothing in this file
+ * used to know a pause existed, so a patient repositioned by their therapist mid-pause produced the
+ * full knowledge-of-results costume for an input the engine discarded: measured on the real app,
+ * eleven consecutive frames of `goal === 1` with score/reps/hits flat at 0/0/0. That is the one hard
+ * fail of a concurrent-feedback display — a celebration for a rep that scored nothing — and it came
+ * with the other half of the same lie, because for the rest of the pause the same gauge read (a)
+ * "armed, rising, ready" when the true answer to "what will the input layer do with your next rep"
+ * was "nothing".
+ *
+ * So `RenderFrame.inputSuspended` (built from the runner's own phase, which is the only thing that
+ * knows) reaches `update` as `suspended`, and while it is set the look is the SAME "no reading" look
+ * a dead tracker produces — `tracking: false`, nothing value-derived, `receptorMarkSet` 'lost' —
+ * plus `ReceptorLook.suspended`, which changes only the GLYPH inside the broken ring (see
+ * `Highway.drawLostReceptor`). Same mark set on purpose: at 2 m the statement is the same statement,
+ * the patient's remedy is the same (none — it is the therapist's move), and the words that separate
+ * the two are already on the same screen, in the pause overlay the stop came from. It is the reading
+ * `Highway.setLaneFaults` already chose for a lane the input layer has refused, for the same reason.
+ *
+ * THE EVIDENCE KEEPS BEING GATHERED THROUGH IT, AND THAT IS WHAT MAKES THE RESUME HONEST. Exactly
+ * three things change while suspended: no crossing is CREDITED (so no latch — and, the expensive
+ * half, the refractory ledger `emittedT` is not written), any latch already lit is dropped instead
+ * of being held over the stop, and the output is the "no reading" one. The per-lane record
+ * underneath — `prevTrigger`, the arming, the observed peak, the dark run — keeps being fed from the
+ * live states, so a rep performed DURING the pause moves the state machine exactly as it really did
+ * and cannot be re-read as a crossing on the first frame after the resume. Freezing the record
+ * instead would be worse than the bug it fixed: a patient still holding at end range when the
+ * therapist resumes would arrive as an 'armed' → 'triggered' edge across the stop and be celebrated
+ * for a rep that fired into a paused engine.
+ *
+ * AND THE LEDGER IS WHY THE CREDIT HAS TO BE WITHHELD AND NOT MERELY HIDDEN. `emittedT` is the
+ * refractory reconstruction's base (see `REFRACTORY_GUARD_MIN_SEC`): a phantom crossing stamped into
+ * it during a pause would suppress the acknowledgement of the first REAL rep performed within
+ * `minIntervalSec` of it after the resume — under-celebrating a rep that scored, the one error
+ * direction this file argues must never happen.
+ *
+ * WHAT IT COSTS is one frame at the boundary, in the safe direction. A crossing the input layer
+ * processed in the few milliseconds between `pause()` and the next draw is still judged (the engine
+ * judges an event STAMPED before the pause point — a camera crossing captured just before the stop
+ * and delivered ~100 ms later must not lose its rep) and will not be acknowledged here. A missing
+ * cue on the frame the patient is being told the session has stopped costs one moment of knowledge
+ * of results; a false one teaches the wrong movement.
  *
  * `receptorLookInto` collapses one `RenderLaneState` into what the receptor should read;
  * `ReceptorHistory.update` adds the two things a single frame cannot know (the crossing latch and
@@ -117,11 +256,13 @@
  * `thresholdFraction * rearmFraction`), so a given movement is the same distance on screen wherever
  * in the range it is made — during the rise and during the return alike. What differs between the
  * states is not the scale but the SET OF MARKS (see `Highway.drawReceptors`):
- * (a) one continuous level line + the target line and two ticks, (b) those
+ * (a) one continuous level line + the target line and its two upright gate posts, (b) those
  * plus liquid above the target line, a level cap SPLIT into two white-hot segments, two additive
- * rings, and the ticks replaced by two solid arrowheads, (c) a desaturated ring whose column stands
+ * rings, and the posts replaced by two solid arrowheads, (c) a desaturated ring whose column stands
  * at the patient's true height and travels down through the target height as they lower, with a
- * violet drain cap on it, a dashed re-arm line, a "lower to reset" chevron and a return-to-rest arc
+ * violet drain cap on it, a dashed re-arm line, a "lower to reset" chevron and a return-to-rest
+ * crescent UNDER the ring (`Highway.RESET_ARC_SWEEP` bounds it to the ring's lower half, so that a
+ * nearly re-armed lane cannot read as the two concentric rings that carry (b))
  * — all four of which move for the WHOLE descent, from the patient's real peak down to the re-arm
  * line — and no level line, target line or halo at all, and
  * (d) the only ring on the board with gaps in it, plus a "?", and nothing else. (The chevron and the
@@ -177,26 +318,143 @@ export function meterOverSpan(thresholdFraction: number): number {
 }
 
 /**
- * How long the goal-attainment look (b) is held at full strength after the threshold crossing.
- * Knowledge of results is the therapeutic ingredient here, and the crossing itself lasts one 33 ms
- * camera frame — far below the ~100 ms a patient mid-rep can be expected to catch, and far below
- * the hit burst it has to stand alongside. 0.45 s sits between the judgment popup (0.5 s) and the
- * re-arm pop (0.28 s), so the three cues read as one sequence rather than as a flicker.
+ * CEILING on the goal-attainment look (b): how long it is held at full strength after the threshold
+ * crossing *if the lane is still locked out the whole time*. Knowledge of results is the therapeutic
+ * ingredient here, and the crossing itself lasts one 33 ms camera frame — far below the ~100 ms a
+ * patient mid-rep can be expected to catch, and far below the hit burst it has to stand alongside.
+ * 0.45 s sits between the judgment popup (0.5 s) and the re-arm pop (0.28 s), so the three cues read
+ * as one sequence rather than as a flicker.
+ *
+ * IT IS A CEILING, NOT THE DURATION. The latch is cut short by the RE-ARM — see `GOAL_MIN_SEC` and
+ * `ReceptorHistory.update`. This number only governs a patient who is still holding at end range.
  */
 export const GOAL_HOLD_SEC = 0.45;
 /**
  * Ramp at the end of the hold. The marks of (b) stay until `goal` reaches 0; the ramp is what the
  * renderer glides the ring scale, the ring alpha and the liquid column down with, so the gauge
  * settles into the lockout look (c) instead of stepping down 12 % at the moment of success.
+ *
+ * It only ever runs for a lane that is STILL LOCKED at `GOAL_HOLD_SEC` — i.e. one being held at end
+ * range, where (b) really does hand over to (c). A lane that re-arms first ends the latch on the
+ * re-arm edge instead (see `GOAL_MIN_SEC`), and there is nothing to glide into: the ring is already
+ * at live size and the re-arm pop fires on that very frame.
  */
 export const GOAL_FADE_SEC = 0.15;
+/**
+ * FLOOR on the goal-attainment look (b), and the one place two requirements pull against each other.
+ *
+ * (1) KR must be perceptible. The crossing lasts one 33 ms camera frame; the motor-learning value of
+ *     concurrent feedback is nil if the patient cannot catch it mid-rep, so the cue has to be on
+ *     screen for at least ~150 ms.
+ * (2) KR must not outlive what it reports. The moment the lane RE-ARMS, the true statement about the
+ *     lane changes from "that rep reached your target" to "go again"; a cue that keeps claiming the
+ *     first through the next repetition's concentric phase is non-contingent feedback, which is the
+ *     failure mode this whole file exists to avoid.
+ *
+ * On a brisk rep these collide: driven through a real `VisionInput` + `LaneTrigger` at the chart
+ * generator's own pacing (0.4 s rep, threshold 0.5, re-arm 0.6), the crossing-to-re-arm interval is
+ * ~0.10-0.13 s — shorter than (1) needs. So the latch ends at the re-arm, **but never before
+ * `GOAL_MIN_SEC` has elapsed since the crossing**, and the overrun that buys is bounded by this
+ * number: at most 0.15 s, typically one or two frames.
+ *
+ * WHAT THE OVERRUN MAY AND MAY NOT DRAW. During it the lane is armed and (usually) back near rest,
+ * and every mark that encodes a POSITION — the liquid's material, the level cap — reverts to its
+ * (a) form and stands at the patient's true height. What stays is the KR itself: the additive inner
+ * rim and corona (the second concentric ring, which is what actually separates (b) from (a) at a
+ * 220 px downscale) and the two solid arrowheads at the target line. Those are claims about the rep
+ * just made, which is still true; a white-hot split cap at the floor of the well is a claim about
+ * where the patient is, which is not. See `Highway.drawReceptors` and `receptorGoalHolding`.
+ *
+ * 0.15 s also sits an order of magnitude inside the tightest inter-rep interval the game asks for
+ * (0.45 s same-lane spacing on 'hard', src/charts/generate.ts), so the cue cannot reach the next
+ * repetition's concentric phase even in the worst case.
+ */
+export const GOAL_MIN_SEC = 0.15;
 
 /**
- * How long the last tracked look is held before the receptor admits it cannot see the patient.
- * Long enough to swallow the visibility-gate chatter described above (a few frames at 30 fps),
- * short enough that a patient who has actually left frame is told so within a fifth of a second.
+ * THE LENGTH OF DARKNESS (d) IS ENTERED ON: how long the last tracked look is held before the
+ * receptor admits it cannot see the patient. Long enough to swallow the visibility-gate chatter
+ * described above (a few frames at 30 fps), short enough that a patient who has actually left frame
+ * is told so within a fifth of a second.
+ *
+ * It is measured on the CURRENT UNINTERRUPTED DARK RUN — "how long since the last frame that carried
+ * a measurement" — and a tracked frame resets it to zero. That is the same quantity `LaneTrigger`
+ * measures its own continuity on (`maxGapSec`), one notch more cautious: the trigger keeps a lane
+ * scorable across a gap of up to 0.5 s, while the receptor stops claiming to see the patient after
+ * 0.2 s of it. Under-claiming in that window costs nothing the patient can act on (there is no
+ * measurement to gauge from either way) and never contradicts a score, because no event can be
+ * emitted on a frame with no sample. See the file header for the duty-cycle rule this replaced and
+ * the measurements that condemned it.
  */
 export const LOST_HOLD_SEC = 0.2;
+
+
+/**
+ * THE INPUT LAYER'S REFRACTORY WINDOW, mirrored here the way `DEFAULT_MAX_GAP_SEC` mirrors the
+ * trigger's continuity window: the minimum interval between two EMITTED `LaneInputEvent`s
+ * (`src/vision/trigger.ts`, `DEFAULT_MIN_INTERVAL_SEC`). A crossing that lands inside it still
+ * enters 'triggered' — the lane really does lock out, and `VisionInput` really does report the rep,
+ * with `LaneRepEvent.emitted: false` — but no event is sent and nothing scores.
+ *
+ * IT IS OPT-IN, AND THAT IS NOT A DEFAULT-OFF SAFETY VALVE BUT A FACT ABOUT THE SOURCES. Only
+ * `LaneTrigger` has this window: `KeyboardInput`, `ReplayInput` and `AutoplayInput` emit every
+ * crossing they are given, however close together, so reconstructing a refractory window on those
+ * paths would refuse an acknowledgement for a rep that really did score. The receptor therefore
+ * applies it only when the frame carries the number (`RenderFrame.minIntervalSec`, which
+ * `GameRunner` forwards from `VisionInput.minIntervalSec` on the camera path and leaves undefined on
+ * the scripted ones) — exactly the shape `maxGapSec` already has.
+ */
+export const DEFAULT_MIN_INTERVAL_SEC = 0.3;
+
+/**
+ * FLOOR on the slack the renderer allows itself when reconstructing the refractory window — the
+ * margin by which a measured inter-crossing interval may fall short of `minIntervalSec` and still be
+ * celebrated. Suppressing knowledge of results for a rep that really scored is the expensive error
+ * (it is the therapeutic ingredient), so the renderer never refuses a crossing it is not sure the
+ * trigger swallowed, and the margin is how sure it insists on being.
+ *
+ * THE MARGIN IS THE RENDERER'S OWN STEP — see `refractoryGuard`. This is only the floor under it,
+ * for a renderer whose step is reported as zero (a repeated timestamp, a synthetic clock), which
+ * would otherwise demand the interval be exact and refuse a crossing on a rounding error. Half a
+ * 60 Hz frame.
+ *
+ * THE MARGIN USED TO BE A FLAT 0.05 s, SIZED FOR A COARSER RECONSTRUCTION THAN THE ONE THIS FILE NOW
+ * DOES. The renderer used to time a crossing by the render frame on which it first saw the lane
+ * enter 'triggered', while `LaneTrigger` times it by INTERPOLATION between the two samples that
+ * bracket the threshold — so the two clocks differed by up to a camera frame plus a render frame at
+ * each end, and the guard had to cover all of it. Swept on a real trigger at `minIntervalSec` 0.3
+ * (30 fps camera, 60 Hz render, two crossings `sep` apart), that left a measured 0.27-0.30 s band in
+ * which the receptor threw a full KR cue for a crossing the input layer had swallowed: one step of
+ * the score, two celebrations — and 3.3-3.7 Hz is exactly where a clonus beat or an end-range bounce
+ * lives.
+ *
+ * `crossingTime` now runs the trigger's own interpolation on the renderer's own timestamps, which
+ * takes the camera quantisation out of the estimate, and the margin is the render step. Re-swept on
+ * the same rig: separations up to 0.28 s give one event and ONE cue, 0.305 s and up give two events
+ * and two cues, and the residual band is ~0.285-0.30 s — one render step wide where it was three.
+ *
+ * IT IS DELIBERATELY NOT NARROWER THAN THE RENDERER'S OWN CLOCK. Swept again with the render loop at
+ * 10 Hz, no crossing the trigger emitted loses its acknowledgement; a FIXED 0.05 s margin did
+ * suppress one there (two crossings 0.34 s apart), which is the expensive direction. A margin that
+ * tracks the step is right at both ends.
+ */
+export const REFRACTORY_GUARD_MIN_SEC = 0.008;
+
+/**
+ * The margin to allow for a render step of `step` seconds — see `REFRACTORY_GUARD_MIN_SEC`.
+ *
+ * `crossingTime` reconstructs a crossing as `t0 + f * (t1 - t0)` from the render timestamps of the
+ * two samples that bracket the threshold, using the same fraction `f` the trigger uses. Each of
+ * those timestamps is the camera frame's time plus the wait until the render poll that first saw it,
+ * which is in `[0, step)`, so for a true crossing at `c` the reconstruction lands in `[c, c + step)`
+ * and the difference of two of them is in `(-step, step)`. One step is therefore exactly the
+ * uncertainty, and demanding any more accuracy than that is claiming an accuracy the renderer does
+ * not have.
+ */
+export function refractoryGuard(step: number): number {
+  const s = Number.isFinite(step) && step > 0 ? step : 0;
+  return Math.max(REFRACTORY_GUARD_MIN_SEC, s);
+}
 
 /** What the receptor should read for one lane this frame. */
 export interface ReceptorLook {
@@ -216,19 +474,26 @@ export interface ReceptorLook {
    */
   over: number;
   /**
-   * True exactly when the lane would score on THIS frame's numbers: re-armed, tracked, and at or
-   * past threshold. See the file header — no input source in this repo publishes such a frame, so
-   * in the running product this is always false and state (b) is driven by `goal`. It is kept as
-   * the single-frame form of the same claim (it refreshes the latch when it is true), so a future
-   * input layer that publishes the crossing as armed needs no renderer change.
-   */
-  willFire: boolean;
-  /**
    * Goal-attainment strength 0..1 — the LATCHED form of "this rep reached the target". 1 on and
-   * just after the threshold crossing, ramping to 0 at the end of `GOAL_HOLD_SEC + GOAL_FADE_SEC`.
-   * Set by `ReceptorHistory.update`, which is the only thing that can see the crossing edge;
-   * `receptorLookInto` on its own can only report the single-frame form (`willFire ? 1 : 0`).
-   * `goal > 0` is state (b) and is the only thing that earns the "this counts" marks.
+   * just after the threshold crossing. `goal > 0` is state (b) and is the only thing that earns the
+   * "this counts" marks.
+   *
+   * IT ENDS WHEN THE LANE RE-ARMS (floored at `GOAL_MIN_SEC` so the cue is catchable at all, capped
+   * at `GOAL_HOLD_SEC + GOAL_FADE_SEC` for a patient who keeps holding at end range). The re-arm is
+   * the moment the true statement about the lane changes from "that rep reached your target" to "go
+   * again", and at the game's own pacing it arrives ~0.1 s after the crossing, not 0.6 s — a fixed
+   * 0.6 s latch left a lane sitting AT REST AND READY wearing the full goal costume for the whole
+   * inter-rep interval, which on 'hard' (0.45 s same-lane spacing) is every frame of every rep.
+   *
+   * DURING THE `GOAL_MIN_SEC` OVERRUN `locked` IS ALREADY FALSE, and consumers must honour it: see
+   * `receptorGoalHolding`. The KR marks (the second ring, the arrowheads) are true then; the marks
+   * that encode where the patient IS are not, and must be drawn in their (a) form.
+   *
+   * ONLY `ReceptorHistory.update` EVER SETS IT NON-ZERO, because only it can see the crossing: the
+   * crossing frame is published already disarmed (see the file header), so there is no single-frame
+   * test for it and this file offers none. `receptorLookInto` on its own always writes 0 — a
+   * consumer that skips the history therefore gets a meter with no "this counts" cue at all, which
+   * is a visible hole rather than a cue that silently never fires.
    *
    * Optional only so that a hand-built look literal written against the older shape still
    * type-checks; every function here writes it, so read it as `look.goal ?? 0`.
@@ -240,9 +505,16 @@ export interface ReceptorLook {
    * `thresholdFraction * rearmFraction`. Independent of `fill` — an unconfirmed lane below the
    * threshold is just as unable to fire. False while `tracking` is false: (d) outranks (c).
    *
-   * `locked` and `goal > 0` overlap for the length of the latch, and that is not a contradiction:
-   * the lane really has fired and really cannot fire again. The renderer resolves it by drawing (b)
-   * for the latch and (c) after it — first "you got there", then "now come back down".
+   * `locked` and `goal > 0` overlap for MOST of the latch, and that is not a contradiction: the lane
+   * really has fired and really cannot fire again. The renderer resolves it by drawing (b) for the
+   * latch and (c) after it — first "you got there", then "now come back down".
+   *
+   * THEY COME APART AT THE RE-ARM, AND THIS FLAG IS THE ONE THAT IS LIVE. The latch is cut short by
+   * the re-arm (see `goal`), but not below `GOAL_MIN_SEC`, so for up to 0.15 s a look can carry
+   * `goal > 0` with `locked === false`: the rep just scored AND the lane is ready again. Both are
+   * true. A consumer that reads `goal > 0` alone and paints the whole "at/above target, held" look
+   * off it will draw a full gauge for a lane standing at rest — exactly the defect the re-arm bound
+   * exists to remove. Use `receptorGoalHolding` for anything that claims a position.
    */
   locked: boolean;
   /**
@@ -298,11 +570,25 @@ export interface ReceptorLook {
    * bring down, and the chevron) is drawn from THIS, not from `locked`.
    *
    * A locked lane can sit BELOW the re-arm line: 'unconfirmed' is a statement about what has been
-   * observed, not about the current value, so `setThreshold`, a reset, or a stream break can leave a
-   * lane at 0.1 of ROM unable to fire. Telling that patient to lower further is an instruction they
-   * cannot carry out — they are already past the line they are being pointed at. The lane still
+   * observed, not about the current value. Telling that patient to lower further is an instruction
+   * they cannot carry out — they are already past the line they are being pointed at. The lane still
    * cannot score, so it is still (c) and still says so; it just stops giving an order that is
-   * already obeyed, and its return-to-rest arc is complete.
+   * already obeyed, and its return-to-rest crescent is complete.
+   *
+   * THE ONE CAUSE THAT REALLY PRODUCES IT IS `LaneTrigger.reset()`, i.e. a calibration replaced
+   * mid-session (`VisionInput.setCalibration`), and then only until the next camera frame. This used
+   * to name three causes and driven against the real trigger the other two are impossible — pinned
+   * in `receptor.test.ts` ("names the ONE cause that really produces a locked lane below the re-arm
+   * line"):
+   *   - `setThreshold` disarms only the lanes NOT already below the NEW re-arm level
+   *     (src/vision/trigger.ts), so the value it leaves 'unconfirmed' at is at or above that level
+   *     and `needsLower` is TRUE;
+   *   - a stream break does leave the lane 'unconfirmed' at whatever value it had, but the push that
+   *     ends the break re-arms it in the same call when the recovered value is below the re-arm
+   *     level, before `VisionInput` reads `trigger.state` — so a patient who comes back at rest is
+   *     published 'armed', never locked.
+   * It is kept for the reset case and for the scripted and hand-built states that can reach it: it
+   * costs two `if`s and removing it would put an unobeyable order on screen.
    *
    * Optional for the same reason as `goal`; always written by the functions here.
    */
@@ -327,6 +613,18 @@ export interface ReceptorLook {
    * Optional for the same reason as `goal`; always written by the functions here.
    */
   stale?: boolean;
+  /**
+   * True when this look says "no reading" because THE SESSION IS NOT ACCEPTING INPUT — a therapist
+   * pause, a mid-song stop — rather than because the tracker lost the patient. See the file header.
+   *
+   * `tracking` is false either way and `receptorMarkSet` reads 'lost' either way, and that is
+   * deliberate: the mark set is the patient's REMEDY, and neither state has one. This flag exists
+   * for the one mark that is read at arm's length rather than at 2 m — the glyph inside the broken
+   * ring — so a therapist can tell "the camera cannot see this lane" from "I stopped the session".
+   *
+   * Optional for the same reason as `goal`; always written by the functions here.
+   */
+  suspended?: boolean;
 }
 
 /**
@@ -337,12 +635,13 @@ export interface ReceptorLook {
  *
  * ONE VOICE. The receptor row is not the only movement meter in the patient's field of view: the
  * play screen's picture-in-picture lane meters sit next to the camera preview for the whole session
- * (src/ui/Play.tsx). They used to be drawn from their own single-frame reading, which meant they had
- * no crossing latch and could only test `willFire` — the conjunction no input source in this repo
- * ever publishes (see the file header) — so on the frame the patient reached their target the
- * receptor threw the full goal look and the meter 300 px away went straight to the grey "lower to
- * reset" costume. Two meters disagreeing at the one moment that matters is worse than either being
- * wrong on its own. Both now go through `ReceptorHistory.update` and classify with this function.
+ * (src/ui/Play.tsx). They used to be drawn from their own single-frame reading, which had no
+ * crossing latch at all, so on the frame the patient reached their target the receptor threw the
+ * full goal look and the meter 300 px away went straight to the grey "lower to reset" costume. Two
+ * meters disagreeing at the one moment that matters is worse than either being wrong on its own.
+ * They are now drawn from THE SAME LOOK OBJECTS the receptor row resolved on that frame
+ * (`Highway.receptorLookOf`), classified here — not from a second history on a second clock, which
+ * left them up to `SONG_CLOCK_STALL_SEC` out of step during an audio-clock stall.
  *
  * The order is the precedence order and it is not arbitrary: no measurement outranks everything
  * (nothing derived from a value may be drawn), the crossing outranks the lockout it causes (the
@@ -353,10 +652,43 @@ export type ReceptorMarkSet = 'lost' | 'goal' | 'locked' | 'rising';
 
 /** Classify a look into its mark set — see `ReceptorMarkSet`. */
 export function receptorMarkSet(look: ReceptorLook): ReceptorMarkSet {
+  // 'lost' also covers the two states that have no PATIENT-side remedy and therefore no mark set of
+  // their own: a lane the input layer has refused (`Highway.setLaneFaults`) and a session that is
+  // not accepting input at all (`ReceptorLook.suspended`). Both are "there is no reading here",
+  // which is what this set means and what it draws; only the glyph inside the ring tells them apart.
   if (!look.tracking) return 'lost';
   if ((look.goal ?? 0) > 0) return 'goal';
   if (look.locked) return 'locked';
   return 'rising';
+}
+
+/**
+ * Within mark set 'goal', is the lane STILL HOLDING the rep it is being congratulated for?
+ *
+ * The (b) costume makes two different claims, and they expire at different moments:
+ *   - "this rep reached your target" — a fact about a rep that happened, still true for the whole
+ *     latch. Carried by the KR marks: the additive inner rim + corona (one more concentric ring than
+ *     any other state has, which is what separates (b) from (a) at a 220 px downscale) and the two
+ *     solid arrowheads at the target line.
+ *   - "…and you are still up there, holding it" — a fact about the patient RIGHT NOW, which stops
+ *     being true the instant the patient comes down off the target. Carried by the position marks:
+ *     the hot liquid material and the split white-hot level cap, plus the forced halo.
+ * The latch is cut at the re-arm, but never before `GOAL_MIN_SEC`, so the second claim can outlive
+ * its truth by up to 0.15 s unless somebody checks. This is that check, and it is exported for the
+ * same reason `receptorMarkSet` is: EVERY live meter in the patient's field of view has to resolve
+ * it the same way, from the same numbers, on the same frame.
+ *
+ * IT TESTS THE LEVEL, NOT ONLY THE LOCKOUT, and the difference is most of a second of the eccentric
+ * phase. `locked` runs from the crossing to the RE-ARM line (`thresholdFraction * rearmFraction`),
+ * which is well below the target: on the default session (threshold 0.65, re-arm 0.6) a rep is
+ * locked all the way down to 0.39 of ROM. Keying "you are still up there" to the lockout alone
+ * therefore drew the hot column and the split white-hot cap while the patient's level was visibly
+ * BELOW the dashed target line on the same gauge — measured on a real `VisionInput` rep, ~0.13 s of
+ * it — which is the gauge contradicting itself. The rep is still in hand (the KR marks stay, keyed
+ * to `receptorMarkSet(look) === 'goal'`); the patient is simply not up there any more.
+ */
+export function receptorGoalHolding(look: ReceptorLook): boolean {
+  return (look.goal ?? 0) > 0 && look.locked && look.fill >= 1;
 }
 
 /** Shape of the per-lane state this reads (structurally `RenderLaneState`). */
@@ -365,14 +697,15 @@ export interface LaneStateLike {
   armed: boolean;
   tracking?: boolean;
   /**
-   * The input layer's OWN trigger state, when it publishes one. `armed` collapses 'unconfirmed' and
-   * 'triggered' into one flag, and the difference between them is exactly the difference between
-   * "this rep fired" and "this lane has never been confirmed", which is what the crossing latch has
-   * to guess at otherwise (see `ReceptorHistory.update`). When it is present the receptor reads it
-   * instead of guessing, and `armed` is derived from it so the two can never disagree.
+   * The input layer's OWN trigger state. `armed` collapses 'unconfirmed' and 'triggered' into one
+   * flag, and the difference between them is exactly the difference between "this rep fired" and
+   * "this lane has never been confirmed", which is what the crossing latch has to guess at
+   * otherwise (see `ReceptorHistory.update`). When it is present the receptor reads it instead of
+   * guessing, and `armed` is derived from it so the two can never disagree.
    *
-   * `VisionInput` does not publish it in `LaneState` yet (it does expose it on `LaneDebug` /
-   * `LaneActivity`); until it does, the latch falls back to the edge rule and the gap rule below.
+   * Published by every source in this repo: `VisionInput` from `LaneTrigger.state`, the scripted
+   * sources from their held bit (src/input/laneStates.ts). For a hand-built state that omits it,
+   * the latch falls back to the edge rule and the gap rule below.
    */
   triggerState?: 'unconfirmed' | 'armed' | 'triggered';
 }
@@ -380,15 +713,24 @@ export interface LaneStateLike {
 /** A zeroed look, for callers that need one to pass to `receptorLookInto` / `ReceptorHistory`. */
 export function emptyReceptorLook(rearmFraction: number = DEFAULT_REARM_FRACTION): ReceptorLook {
   return {
-    fill: 0, over: 0, willFire: false, goal: 0, locked: false, needsLower: false,
+    fill: 0, over: 0, goal: 0, locked: false, needsLower: false,
     resetProgress: 0, rom: 0, peakRom: 0, resetLevel: rearmFraction, glowTarget: 0, tracking: true, stale: false,
+    suspended: false,
   };
+}
+
+/**
+ * Copy a look into an existing one (allocation-free). Exported because `Highway` publishes the
+ * looks it drew this frame to the play screen's picture-in-picture meters — see `ReceptorMarkSet`,
+ * "ONE VOICE": the two meters must not merely agree, they must be the same numbers.
+ */
+export function copyReceptorLook(out: ReceptorLook, src: ReceptorLook): ReceptorLook {
+  return copyLook(out, src);
 }
 
 function copyLook(out: ReceptorLook, src: ReceptorLook): ReceptorLook {
   out.fill = src.fill;
   out.over = src.over;
-  out.willFire = src.willFire;
   out.goal = src.goal ?? 0;
   out.locked = src.locked;
   out.needsLower = src.needsLower ?? false;
@@ -399,14 +741,15 @@ function copyLook(out: ReceptorLook, src: ReceptorLook): ReceptorLook {
   out.glowTarget = src.glowTarget;
   out.tracking = src.tracking;
   out.stale = src.stale ?? false;
+  out.suspended = src.suspended ?? false;
   return out;
 }
 
 /**
  * Fill an existing `ReceptorLook` (allocation-free; the renderer calls this once per lane per
- * frame). SINGLE-FRAME ONLY: `goal` is just `willFire`, which no real input source produces, and
+ * frame). SINGLE-FRAME ONLY: `goal` is always 0 (the crossing cannot be seen in one frame) and
  * tracking is not debounced — go through `ReceptorHistory.update` for the state the receptor is
- * actually drawn from.
+ * actually drawn from, or the meter you build will have no state (b) at all.
  *
  * `state` may be undefined, and that is NOT an idle lane: a lane with no meter has no measurement,
  * so it reads as (d) tracking lost. (`GameRunner`'s first frame ships `laneStates: []`; drawing
@@ -455,9 +798,14 @@ export function receptorLookInto(
   out.peakRom = locked ? peak : value;
   out.tracking = tracking;
   out.stale = false;
+  // A single frame knows nothing about whether the SESSION is accepting input: that is a fact about
+  // the runner's phase, and only `ReceptorHistory.update` is told it.
+  out.suspended = false;
   out.locked = locked;
-  out.willFire = armed && tracking && fill >= 1;
-  out.goal = out.willFire ? 1 : 0;
+  // NOT a level test. No source publishes the crossing as armed (the trigger disarms on the sample
+  // that crosses), so `armed && fill >= 1` is unreachable and a look built here has no state (b):
+  // `ReceptorHistory.update` latches it from the lane ENTERING 'triggered'.
+  out.goal = 0;
   // 0 at the top of the journey, 1 once the value has dropped to the re-arm line — measured over
   // the REAL distance `peak - rearmRom`, so every millimetre of the descent moves it. A lane locked
   // below the line already ('unconfirmed' after a reset, a stream break or a threshold change) has
@@ -504,8 +852,27 @@ interface LaneHistory {
   prevTrigger: 'unconfirmed' | 'armed' | 'triggered' | undefined;
   /** Time of the most recent threshold crossing (-Infinity = never). */
   goalT0: number;
+  /**
+   * Time the lane first became able to fire again AFTER that crossing — the moment the rep it
+   * reports was handed back (+Infinity while the lane is still locked out). The goal latch ends
+   * here, floored at `goalT0 + GOAL_MIN_SEC`. See `GOAL_MIN_SEC`.
+   */
+  goalReleaseT: number;
+  /**
+   * Time of the last crossing this renderer CREDITED as an emitted `LaneInputEvent` — the base the
+   * refractory reconstruction measures the next one from, mirroring `LaneTrigger.lastEventTime`.
+   * Interpolated the way `LaneTrigger` interpolates its own — see `crossingTime` and
+   * `REFRACTORY_GUARD_MIN_SEC`.
+   */
+  emittedT: number;
   everTracked: boolean;
-  lastTrackedAt: number;
+  /**
+   * Length of the CURRENT uninterrupted dark run in seconds — time since the last frame that
+   * carried a measurement, zeroed by every tracked frame. See `LOST_HOLD_SEC`.
+   */
+  dark: number;
+  /** The latch this renderer draws (d) from: the dark run has passed `LOST_HOLD_SEC`. */
+  lost: boolean;
   /**
    * Time of the last DISTINCT tracked sample — the renderer's estimate of the input layer's
    * `lastObservedTime`. See `ReceptorHistory.update`: `now - observedAt` is the gap `LaneTrigger`
@@ -536,19 +903,51 @@ interface LaneHistory {
 
 function newLaneHistory(): LaneHistory {
   return {
-    seen: false, prevArmed: false, prevTrigger: undefined, goalT0: -Infinity, everTracked: false,
-    lastTrackedAt: -Infinity, observedAt: -Infinity,
+    seen: false, prevArmed: false, prevTrigger: undefined, goalT0: -Infinity, goalReleaseT: Infinity,
+    emittedT: -Infinity, everTracked: false,
+    // A lane with no tracked frame behind it is (d) from its first frame: for an absent measurement
+    // the honest default is "I cannot see you", not a live, at-rest gauge.
+    dark: 0, lost: true, observedAt: -Infinity,
     srcRef: undefined, srcValue: NaN, srcArmed: false, srcTracking: false, srcTrigger: undefined,
     threshold: NaN, rearm: NaN, peak: NaN,
     last: emptyReceptorLook(), t: -Infinity,
   };
 }
 
-/** Drop the crossing evidence: whatever happens next, it is not a rising edge this renderer watched. */
+/**
+ * Drop the INFERRED crossing evidence: whatever happens next, it is not a rising edge this renderer
+ * watched. `prevTrigger` is deliberately untouched — see the file header ("THOSE TWO RULES DO NOT
+ * TOUCH `prevTrigger`"). It is not this renderer's inference, it is the input layer's own state
+ * machine, which does its own continuity checking and answers a break with 'unconfirmed'.
+ */
 function forgetArming(h: LaneHistory): void {
   h.seen = false;
   h.prevArmed = false;
-  h.prevTrigger = undefined;
+}
+
+/**
+ * WHEN the crossing this frame reports actually happened, on the renderer's own clock — the number
+ * the refractory reconstruction measures its intervals between (see `REFRACTORY_GUARD_MIN_SEC`).
+ *
+ * It is `LaneTrigger`'s own interpolation (src/vision/trigger.ts `push`: the crossing is placed
+ * between the last sample below the threshold and the one at or above it, at the fraction of the way
+ * the threshold sits between their VALUES), evaluated on the two render timestamps the renderer has
+ * for those same two samples. Running the same formula on the same pair of values is what removes
+ * the camera-frame quantisation from the renderer's estimate: both endpoints are then wrong only by
+ * the wait between a camera frame and the render poll that first saw it, which is less than one
+ * render step and in the SAME direction for both.
+ *
+ * Falls back to `now` — the frame the crossing was noticed on, which is what this used to be — when
+ * there is nothing to interpolate from: no previous observation, a previous observation that was not
+ * below the threshold (so this is not the bracketing pair the trigger used), or a non-increasing
+ * pair.
+ */
+function crossingTime(h: LaneHistory, rom: number, threshold: number, now: number): number {
+  const t0 = h.observedAt;
+  const v0 = h.last.rom ?? NaN;
+  if (!Number.isFinite(t0) || !(t0 < now) || !(v0 < threshold) || !(rom > v0)) return now;
+  const f = clamp((threshold - v0) / (rom - v0), 0, 1);
+  return t0 + f * (now - t0);
 }
 
 /**
@@ -567,8 +966,27 @@ export class ReceptorHistory {
   }
 
   /**
-   * Fill `out` with the look lane `lane` should be drawn from at time `now` (seconds; the same
-   * clock every frame — `RenderFrame.songTime` in the renderer).
+   * Fill `out` with the look lane `lane` should be drawn from at time `now` (seconds).
+   *
+   * `now` MUST BE A PERCEPTION CLOCK, not the song clock. All three windows this class owns — the
+   * goal latch, the tracking hold and the gap rule that expires the crossing evidence — are
+   * measured on the PATIENT, and the lane states keep arriving while a session is stopped (a
+   * therapist pause, a suspended AudioContext). On a clock that stops with the song, all three fail
+   * in the same direction: a latched goal is held at full strength for the whole stop and then
+   * finishes after the resume, the tracking hold never expires so a dead camera leaves a live-
+   * looking gauge, and the gap rule cannot throw away a stale arming — which is the one thing
+   * standing between an occlusion recovery and a full celebration for a rep that never fired.
+   * `Highway` passes `Highway.receptorT` (song time while the song clock runs, wall time while it
+   * does not) and the play screen's picture-in-picture meters pass `performance.now()`; both keep
+   * running. The clock must be monotone and in seconds; a step backwards is read as a new song and
+   * drops this lane's history.
+   *
+   * `suspended` is "the session is not accepting input right now" — `RenderFrame.inputSuspended`,
+   * which `GameRunner` builds from its own phase (a therapist pause, a run that has not started or
+   * has ended). It is not a property of the lane and not something any `LaneState` can carry: the
+   * camera keeps publishing, the patient keeps moving, and the engine throws the events away. While
+   * it is set nothing is celebrated, nothing is credited to the refractory ledger, and the look is
+   * the "no reading" one. See the file header for why the per-lane record keeps being fed anyway.
    */
   update(
     out: ReceptorLook,
@@ -578,6 +996,8 @@ export class ReceptorHistory {
     rearmFraction: number,
     now: number,
     maxGapSec: number = DEFAULT_MAX_GAP_SEC,
+    minIntervalSec: number = 0,
+    suspended: boolean = false,
   ): ReceptorLook {
     let h = this.lanes[lane];
     if (!h) {
@@ -587,6 +1007,7 @@ export class ReceptorHistory {
     // A clock that jumped backwards is a new song / a seek, not a rep: nothing before it is
     // evidence about what the patient is doing now.
     if (Number.isFinite(now) && now < h.t) Object.assign(h, newLaneHistory());
+    const prevT = h.t;
     h.t = now;
 
     // ---- what counts as a NEW observation ------------------------------------------------------
@@ -605,15 +1026,24 @@ export class ReceptorHistory {
     // an observation") so a future memoization that reuses the object across frames cannot silently
     // turn a still patient into a stream break.
     //
-    // Where they can diverge is a source that returns the SAME object for many processed frames.
-    // The scripted sources do exactly that (`src/input/laneStates.ts` caches on a held/not-held
-    // bitmask), and there a patient held at one value for longer than `maxGapSec` looks silent from
-    // here. The consequence is bounded and one-directional: the arming evidence and the peak are
-    // dropped, so the renderer may WITHHOLD a goal latch (a rising rep re-seeds `seen` several
-    // frames before it crosses, so a real crossing survives) and may restart the return journey from
-    // the patient's current height, which under-reports their progress. It can never invent a
-    // crossing. That is the safe direction, and the honest fix is the same one the RESIDUAL
-    // paragraph names: publish `triggerState` (or the sample's observation time) in `LaneState`.
+    // Where they diverge is a source that returns the SAME object for many processed frames. The
+    // scripted sources do exactly that (`src/input/laneStates.ts` caches on a held/not-held
+    // bitmask), and there a patient AT REST for longer than `maxGapSec` looks silent from here —
+    // which used to destroy state (b) outright on those paths, not merely blunt it. The reasoning
+    // that let it ship was written down in this very comment: "a rising rep re-seeds `seen` several
+    // frames before it crosses, so a real crossing survives". That is false for a scripted lane,
+    // which is BINARY — `{value: 0, armed: true}` → `{value: 1, armed: false}` in one step, with
+    // every preceding frame the same cached object. There is no rising ramp to re-seed anything, so
+    // the inferred edge could not fire for any rep following more than half a second of rest, i.e.
+    // essentially every rep of a real chart, on the path `CameraFallback` hands a patient when the
+    // camera fails. Measured in the real app: 36 goal frames after 0.10/0.30/0.45 s of rest, ZERO
+    // after 0.55/1.0/5.0 s.
+    //
+    // The fix is the one this file kept naming: `LaneState.triggerState` is now published by every
+    // source, so the crossing is read off the input layer's own state machine and the gap rule —
+    // which still governs the inferred edge and the peak — cannot suppress it. What a frozen object
+    // still costs is the RETURN JOURNEY's peak (restarted from the patient's current height, which
+    // under-reports their progress) and never a false crossing: still the safe direction.
     const fresh =
       state !== h.srcRef ||
       !(state === undefined || (state.value === h.srcValue && state.armed === h.srcArmed && (state.tracking !== false) === h.srcTracking && state.triggerState === h.srcTrigger));
@@ -657,39 +1087,173 @@ export class ReceptorHistory {
 
     receptorLookInto(out, state, thresholdFraction, rearmFraction, h.peak);
 
-    if (out.tracking) {
-      // THE CROSSING. The trigger flips to 'triggered' on the sample that crosses, so the crossing
-      // frame arrives as "locked, at or past threshold" one frame after an armed one. That edge —
-      // not `armed && fill >= 1`, which no source emits — is the moment the lane fired.
-      //
-      // When the source publishes its trigger state the edge is a FACT rather than an inference:
-      // only 'armed' → 'triggered' is a crossing, and an 'unconfirmed' lane never is one however
-      // full its meter. That is the same distinction the gap rule above reconstructs by hand.
-      const cross = h.srcTrigger !== undefined && h.prevTrigger !== undefined
-        ? h.prevTrigger === 'armed' && h.srcTrigger === 'triggered'
+    // ---- IS THERE A MEASUREMENT RIGHT NOW? (the (d) hold) --------------------------------------
+    // `out.tracking` here is the RAW per-frame flag; what the receptor draws is the latch below,
+    // which is that flag debounced by the length of the CURRENT DARK RUN (see `LOST_HOLD_SEC`).
+    //
+    // ENTERING COSTS `LOST_HOLD_SEC` OF UNINTERRUPTED DARKNESS; LEAVING COSTS ONE TRACKED FRAME, and
+    // the asymmetry is the whole agreement with the input layer. A tracked frame is a sample
+    // `LaneTrigger` was pushed and may have fired on — it is, for a rep that crossed inside the gap,
+    // exactly the frame the crossing is interpolated back across and the event emitted on
+    // (src/vision/trigger.ts `push`). Making the recovery cost contiguous stream (as a duty-cycle
+    // rule must) is therefore the same thing as refusing knowledge of results for reps the engine
+    // scored; see the file header for what that measured.
+    //
+    // The step is clamped to `gap` so one enormous frame (a GC pause, a resumed tab) cannot spend an
+    // unbounded amount of darkness on evidence nobody gathered, and to >= 0 so a repeated timestamp
+    // is inert.
+    const step = Number.isFinite(prevT) ? clamp(now - prevT, 0, gap) : 0;
+    const tracked = out.tracking;
+    if (tracked) {
+      h.everTracked = true;
+      h.dark = 0;
+      h.lost = false;
+    } else {
+      // Capped at the hold: once it is spent the lane is in (d) and staying there until a tracked
+      // frame arrives, so an hour with the camera unplugged does not accumulate an hour of float.
+      h.dark = Math.min(LOST_HOLD_SEC, h.dark + step);
+      if (h.dark >= LOST_HOLD_SEC) h.lost = true;
+    }
+    // A lane with no tracked frame behind it at all is (d) from its first frame, whatever the run
+    // length says: for an absent measurement the honest default is "I cannot see you".
+    if (!h.everTracked) h.lost = true;
+    // A latch that has been entered describes a window this renderer did not watch, so it expires
+    // the goal latch the way a stream break expires the arming: whatever crossed in there must not
+    // be celebrated when the picture comes back, ~0.2 s after the fact and no longer contingent.
+    //
+    // A SUSPENDED SESSION EXPIRES IT TOO, and for the harder-nosed version of the same reason: a
+    // stop does not merely interrupt the view of the rep, it ENDS the window in which that rep meant
+    // anything. Knowledge of results that is held across a pause and finishes its 0.45 s after the
+    // resume is feedback delivered into the next repetition's concentric phase, which is exactly the
+    // non-contingency this whole file exists to avoid — and it would also flicker back on for a stop
+    // shorter than the latch. Cut here, once, and there is nothing left to resurrect.
+    if (h.lost || suspended) {
+      h.goalT0 = -Infinity;
+      h.goalReleaseT = Infinity;
+    }
+
+    if (tracked) {
+      // THE CROSSING — the one moment this whole file exists to find. It is never
+      // `armed && fill >= 1` (no source emits that frame); it is the lane passing into the
+      // trigger's 'triggered' state, which it does only by rising through the threshold.
+      const cross = h.srcTrigger !== undefined
+        // PUBLISHED. `LaneTrigger` enters 'triggered' from exactly one place — a rising edge past
+        // the threshold, from 'armed' — so ENTERING it is the fire, whatever the renderer saw (or
+        // failed to see) in between. Written as "was not 'triggered', is now" rather than
+        // "'armed' → 'triggered'" because a renderer polling slower than the source can miss the
+        // 'armed' frame in between two reps; it cannot miss the fact that a new lockout began.
+        // `prevTrigger` must be known: a lane whose FIRST observed state is 'triggered' may have
+        // been mid-hold when this renderer started, and that is not a rep it watched.
+        ? h.prevTrigger !== undefined && h.srcTrigger === 'triggered' && h.prevTrigger !== 'triggered'
+        // INFERRED, for a state that omits the field: an armed → locked edge at or past threshold,
+        // but only while the evidence for the arming is still good (see the gap and tune rules).
         : h.seen && h.prevArmed && out.locked && out.fill >= 1;
-      if (out.willFire || cross) h.goalT0 = now;
+      // THE REFRACTORY WINDOW — the one way a crossing reaches 'triggered' with NO
+      // `LaneInputEvent` behind it. `LaneTrigger` swallows a crossing that lands within
+      // `minIntervalSec` of the last EMITTED one: the lane still locks out, `VisionInput` still
+      // reports the rep (`LaneRepEvent.emitted: false`), and nothing scores. Driven live, two
+      // crossings 0.2 s apart produced events=1, reps=2 and TWO full goal cues against ONE score
+      // step — a clonus beat, a tremor peak or a bounce at end range, i.e. the population this is
+      // built for, and a contradiction on screen a therapist has to explain away.
+      //
+      // So the renderer keeps the trigger's own ledger — the time of the last crossing it credited,
+      // interpolated exactly the way the trigger interpolates its own (`crossingTime`) — and applies
+      // the same `>= minIntervalSec` test to it, widened by one render step (`refractoryGuard`) so a
+      // crossing it is not SURE was swallowed is still celebrated. It is deliberately not exact: a
+      // crossing inside the guard band updates this ledger where the trigger's did not, which can
+      // only ever cost one later suppression, i.e. one more celebration. Over-celebrating is what
+      // this already did; under-celebrating a rep that scored would cost the patient their
+      // knowledge of results.
+      const interval = Number.isFinite(minIntervalSec) && minIntervalSec > 0 ? minIntervalSec : 0;
+      // Both ends of the comparison are INTERPOLATED crossing times, the same quantity
+      // `LaneTrigger.lastEventTime` holds — not the frames they were noticed on. See `crossingTime`.
+      const crossT = cross ? crossingTime(h, out.rom as number, clamp(thresholdFraction, 0.05, 1), now) : now;
+      const emitted =
+        interval <= 0 || !(h.emittedT > -Infinity) || crossT - h.emittedT >= interval - refractoryGuard(step);
+      // ...and NOT WHILE THE SESSION IS SUSPENDED. The state machine below still follows this
+      // crossing (`prevTrigger` is updated, so the resume cannot re-read it as a fresh edge), but
+      // the engine discarded the event, so it earns no latch — and, just as importantly, it must not
+      // be written into `h.emittedT`, or the first real rep performed within `minIntervalSec` of it
+      // after the resume would lose ITS acknowledgement to a crossing that never scored.
+      if (cross && !h.lost && !suspended && emitted) {
+        h.emittedT = crossT;
+        h.goalT0 = now;
+        // A fresh rep is in hand again, so the previous release stops governing this latch.
+        h.goalReleaseT = Infinity;
+      }
+      // THE OTHER END OF THE LATCH. A lockout ends when the patient drops back below the re-arm
+      // level, and at that instant the honest message stops being "you reached your target" and
+      // becomes "go again": the lane is armed, at rest, and the next rep counts. Recorded here (not
+      // derived from a timer) because the only thing that knows when the rep was handed back is the
+      // input layer's own arming, which is exactly what `out.locked` is.
+      if (!out.locked && h.goalT0 > -Infinity && h.goalReleaseT === Infinity) h.goalReleaseT = now;
       h.seen = true;
       h.prevArmed = !out.locked;
       h.prevTrigger = h.srcTrigger;
-      h.everTracked = true;
-      h.lastTrackedAt = now;
       // THE TOP OF THE RETURN JOURNEY. While the lane is locked this only ever rises (see
       // `ReceptorLook.peakRom`); the moment it re-arms the journey is over and the next one starts
       // from wherever the patient is when they next lock out.
       h.peak = out.locked ? (out.peakRom as number) : NaN;
       if (fresh) h.observedAt = now;
       copyLook(h.last, out);
-    } else if (h.everTracked && now - h.lastTrackedAt < LOST_HOLD_SEC) {
+    }
+
+    if (h.lost) {
+      // (d). Nothing derived from a value may survive this. `receptorMarkSet` ranks 'lost' first
+      // precisely so that no other state can be read out of the leftovers; every field below is
+      // documented as meaningless while `tracking` is false, and they are zeroed anyway so a
+      // consumer that forgets cannot paint a lockout or a halo out of them. This branch is only
+      // ever reached on an UNTRACKED frame now (a tracked one clears the latch above), so it can no
+      // longer overrule a live measurement.
+      out.tracking = false;
+      out.stale = false;
+      out.locked = false;
+      out.needsLower = false;
+      out.goal = 0;
+      out.glowTarget = 0;
+      out.resetProgress = 0;
+      out.peakRom = out.rom;
+    } else if (!tracked) {
       // Anti-strobe hold: replay the last real measurement rather than flipping the whole row to
-      // "?" on one frame that failed the visibility gate.
+      // "?" on one frame that failed the visibility gate. Bounded by the dark run above, so a
+      // dropout that outlasts `LOST_HOLD_SEC` ends up in (d) instead of replaying forever.
       copyLook(out, h.last);
       out.stale = true;
     }
 
-    const goal = out.tracking ? goalStrength(now - h.goalT0) : 0;
+    let goal = out.tracking ? goalStrength(now - h.goalT0) : 0;
+    // BOUNDED BY THE LOCKOUT IT OVERLAYS. `goalStrength` is the ceiling — the shape for a patient
+    // who is still holding at end range. A patient who has already lowered past the re-arm level has
+    // given the rep back, and the cue has to go with it; `GOAL_MIN_SEC` is the only thing that keeps
+    // it on screen past that point, and only long enough to be seen at all. See `GOAL_MIN_SEC`.
+    if (goal > 0 && h.goalReleaseT !== Infinity && now >= Math.max(h.goalReleaseT, h.goalT0 + GOAL_MIN_SEC)) {
+      goal = 0;
+    }
     out.goal = goal;
-    if (goal > 0) out.glowTarget = Math.max(out.glowTarget, goal);
+    // The halo is forced to the latch's strength ONLY while the rep is still in hand — which means
+    // locked AND still at or above the target, exactly as `receptorGoalHolding` defines it. In the
+    // `GOAL_MIN_SEC` overrun the lane is armed and usually back at rest, and for the eccentric phase
+    // between the target line and the re-arm line it is locked but coming down; in both,
+    // `glowTarget` is already the honest `fill * fill`, and forcing a full halo paints "this will
+    // fire, hard" onto a gauge the patient has visibly lowered.
+    if (receptorGoalHolding(out)) out.glowTarget = Math.max(out.glowTarget, goal);
+    // ---- AND IS THE SESSION EVEN LISTENING? ----------------------------------------------------
+    // Last, and over everything above, because it outranks everything above: while the session is
+    // not accepting input, the answer to "what will the input layer do with your next rep" is
+    // "nothing", at every value and in every one of the other three states. The look is therefore
+    // byte-for-byte the one a lane with no measurement produces — the same fields blanked, in the
+    // same order, so 'lost' and 'suspended' cannot drift apart — plus the flag that picks the glyph.
+    if (suspended) {
+      out.tracking = false;
+      out.stale = false;
+      out.locked = false;
+      out.needsLower = false;
+      out.goal = 0;
+      out.glowTarget = 0;
+      out.resetProgress = 0;
+      out.peakRom = out.rom;
+      out.suspended = true;
+    }
     return out;
   }
 }

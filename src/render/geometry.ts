@@ -162,6 +162,25 @@ export const GEM_LANE_FRACTION = 0.37;
 export const GEM_HEIGHT_CAP = 0.14;
 /** Receptor ring radius relative to the gem radius (ring sits just outside the gem). */
 export const RECEPTOR_GEM_RATIO = 1.12;
+/**
+ * The meter well inside the receptor ring, as fractions of the ring's own half-width and
+ * half-height (`Highway.drawReceptors` draws it at exactly these). Exported because the well is not
+ * a private drawing detail: it is the region that carries every one of the four states' readable
+ * marks, so other paints have to be able to ask where it is (`receptorWellSemiHeight`) and the
+ * tests have to be able to measure occlusion of it against the shipped number rather than a copy.
+ *
+ * NOTE HOW CLOSE THEY ARE TO THE GEM. `RECEPTOR_GEM_RATIO * RECEPTOR_WELL_RATIO` is 1.008, so the
+ * well's half-height is 1.008 gem radii against the gem's `GEM_ASPECT` — i.e. a gem centred on its
+ * receptor covers ~96 % of the well's area. There is no "mostly visible" middle ground to tune
+ * toward: either the ring is painted after the gems or the gauge is gone whenever a note is on it.
+ */
+export const RECEPTOR_WELL_RATIO = 0.9;
+export const RECEPTOR_WELL_WIDTH_RATIO = 0.92;
+
+/** Half-height (px) of a receptor's meter well at the strike line — see `RECEPTOR_WELL_RATIO`. */
+export function receptorWellSemiHeight(g: HighwayGeometry): number {
+  return g.receptorRadius * GEM_ASPECT * RECEPTOR_WELL_RATIO;
+}
 /** Road width is also capped relative to height so ultrawide canvases don't get a flat, empty road. */
 export const ROAD_HEIGHT_CAP = 1.3;
 
@@ -449,4 +468,111 @@ export function radiusBucket(radius: number, minRadius: number, maxRadius: numbe
 export function bucketRadius(bucket: number, minRadius: number, maxRadius: number, buckets: number): number {
   if (buckets <= 1) return maxRadius;
   return minRadius + ((maxRadius - minRadius) * bucket) / (buckets - 1);
+}
+
+// -------------------------------------------------------------------------------------------------
+// Overlay placement: where the APP may put a DOM panel over this board
+// -------------------------------------------------------------------------------------------------
+
+/**
+ * Vertical half-extent of the band the receptor hardware owns, in receptor radii (the ring is drawn
+ * as an ellipse of half-height `receptorRadius * GEM_ASPECT`).
+ *
+ * 1.34 rather than 1.0 because the ring is not the whole mark: the goal corona and the
+ * return-to-rest arc are drawn at up to `OUTER_MARK_R` (1.16 r) outside it, and the re-arm pop
+ * scales the whole thing by up to ~1.14 for a fifth of a second. A band measured at the ring alone
+ * would let an overlay clip the very marks that carry states (b) and (c) at 2 m.
+ */
+export const RECEPTOR_BAND_RATIO = 1.34;
+
+/**
+ * Top edge (CSS px, canvas coordinates) of the band the receptor hardware and its lane labels own.
+ *
+ * NOTHING THE APP DRAWS OVER THE CANVAS MAY ENTER IT. This is not decoration: the receptor row is
+ * the patient's live biofeedback and the label under each receptor is the only thing on screen that
+ * says WHICH LIMB the lane belongs to. `Highway.drawLabels` exists precisely so "the label under a
+ * receptor never disagrees with the receptor above it" — and the play screen then floated its
+ * camera picture-in-picture panel on top of lane 0's, so at 1280x800 the default bilateral
+ * prescription read "knee lift" on one lane and "R knee lift" on the other and a hemiparetic
+ * patient was being told to lower a leg nobody had named. The band runs from here to the bottom
+ * edge of the canvas, so an overlay clears it by sitting ABOVE this y.
+ */
+export function boardHardwareTop(g: HighwayGeometry): number {
+  return g.strikeY - g.receptorRadius * GEM_ASPECT * RECEPTOR_BAND_RATIO;
+}
+
+/**
+ * Left/right road edge x at a SCREEN y, rather than at a depth. Exact (and cheap) everywhere,
+ * including below the strike line: the road's edges are straight lines through the vanishing point,
+ * so the perspective scale at a given y is just `(y - vpY) / (strikeY - vpY)` by definition of
+ * `yAt` — no depth inversion, no tail-blend special case.
+ */
+export function roadEdgeXAtY(g: HighwayGeometry, side: -1 | 1, y: number): number {
+  const denom = g.strikeY - g.vpY;
+  const s = denom === 0 ? 1 : (y - g.vpY) / denom;
+  return g.vpX + side * g.nearHalfWidth * s;
+}
+
+export interface OverlayPanelRequest {
+  /** Lowest y (CSS px) the panel may reach; its bottom edge is placed `margin` above this. */
+  floorY: number;
+  /** Gap kept from the canvas edges, from `floorY` and from the road edge. */
+  margin: number;
+  /** Narrowest the panel may be made in order to clear the road (it is still placed if it cannot). */
+  minWidth: number;
+  /** Widest the panel is ever made. */
+  maxWidth: number;
+}
+
+export interface OverlayPanelBox {
+  /** CSS px from the canvas's left edge. */
+  left: number;
+  /** CSS px from the canvas's BOTTOM edge (what a CSS `bottom:` wants). */
+  bottom: number;
+  width: number;
+  /** Room between the panel's bottom edge and the top of the canvas. */
+  maxHeight: number;
+  /** y of the panel's bottom edge, from the canvas top (the same place as `bottom`). */
+  bottomY: number;
+  /**
+   * True when the lane gutter could not hold the panel even at `minWidth`, so it overlaps the road
+   * (a narrow portrait board leaves no gutter at all). The hardware band is still clear — a panel
+   * over the far half of the road hides approaching gems, a panel over the receptor row hides the
+   * state the patient is being asked to act on, and only one of those two is survivable.
+   */
+  overRoad: boolean;
+}
+
+/**
+ * Place a rectangular overlay panel — the play screen's camera picture-in-picture and its lane
+ * meters — in the board's bottom-left corner without covering anything the patient reads.
+ *
+ * Two constraints, in priority order:
+ *   1. its bottom edge sits above `floorY` (see `boardHardwareTop`, and whatever HUD furniture the
+ *      renderer has in the left gutter), so no receptor, no lane label and no rock gauge is ever
+ *      behind it;
+ *   2. its right edge sits inside the road's left edge AT ITS OWN BOTTOM EDGE — the widest point of
+ *      the road it can reach — so it does not clip approaching gems either. The WIDTH gives way for
+ *      this, down to `minWidth`; past that the panel would stop being readable itself, and it is
+ *      placed anyway with `overRoad` set.
+ *
+ * Pure function of the geometry: no DOM, no renderer state, unit-tested in geometry.test.ts.
+ */
+export function overlayPanelBox(g: HighwayGeometry, req: OverlayPanelRequest): OverlayPanelBox {
+  const margin = Math.max(0, Number.isFinite(req.margin) ? req.margin : 0);
+  const minWidth = Math.max(1, Number.isFinite(req.minWidth) ? req.minWidth : 1);
+  const maxWidth = Math.max(minWidth, Number.isFinite(req.maxWidth) ? req.maxWidth : minWidth);
+  const left = margin;
+  const floor = Number.isFinite(req.floorY) ? Math.min(req.floorY, g.height) : g.height;
+  const bottomY = Math.max(1, Math.min(g.height, floor - margin));
+  const room = roadEdgeXAtY(g, -1, bottomY) - left - margin;
+  const width = clamp(room, minWidth, maxWidth);
+  return {
+    left,
+    bottom: Math.max(0, g.height - bottomY),
+    width,
+    maxHeight: Math.max(0, bottomY - margin),
+    bottomY,
+    overRoad: room < width,
+  };
 }
