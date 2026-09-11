@@ -441,6 +441,7 @@ export function SessionBars({
   height = 120,
   color = '#35d6ff',
   label,
+  flagged,
   format = (v: number) => `${Math.round(v * 100)}%`,
 }: {
   values: (number | null)[];
@@ -449,8 +450,17 @@ export function SessionBars({
   height?: number;
   color?: string;
   label: string;
+  /**
+   * COLUMNS MEASURED ON A DEGRADED (OR UNRECORDED) CAMERA STREAM — outlined in amber, exactly as the
+   * line plots ring their points. Accuracy is as much a property of the stream as range is: a lane
+   * whose landmarks were usable for 62 % of the session cannot answer notes it never saw, and a
+   * column drawn like its neighbours says that the two are the same kind of number. Same length as
+   * `values`; omitted = nothing to flag.
+   */
+  flagged?: readonly boolean[];
   format?: (v: number) => string;
 }) {
+  const isFlagged = (i: number) => flagged !== undefined && flagged.length === values.length && flagged[i] === true;
   const host = useRef<HTMLDivElement>(null);
   const [measured, setMeasured] = useState(0);
   useEffect(() => {
@@ -498,7 +508,16 @@ export function SessionBars({
         {/* One tick per session on the baseline, at the same x as the plots above — the marks that
             make the shared time axis visible rather than merely claimed. */}
         {values.map((_, i) => (
-          <line key={`t${i}`} x1={x(i)} x2={x(i)} y1={base} y2={base + 4} stroke="#3a465f" strokeWidth={1.5} />
+          <line
+            key={`t${i}`}
+            x1={x(i)}
+            x2={x(i)}
+            y1={base}
+            y2={base + (isFlagged(i) ? 9 : 4)}
+            stroke={isFlagged(i) ? '#ffb020' : '#3a465f'}
+            strokeWidth={isFlagged(i) ? 2.5 : 1.5}
+            data-flagged={isFlagged(i) ? 'true' : undefined}
+          />
         ))}
 
         {values.map((v, i) => {
@@ -516,9 +535,13 @@ export function SessionBars({
               height={Math.max(1.5, base - y(v))}
               rx={3}
               fill={color}
-              opacity={i === lastIndex ? 1 : 0.62}
+              opacity={isFlagged(i) ? 0.35 : i === lastIndex ? 1 : 0.62}
+              stroke={isFlagged(i) ? '#ffb020' : undefined}
+              strokeWidth={isFlagged(i) ? 2.5 : undefined}
+              data-flagged={isFlagged(i) ? 'true' : undefined}
+              data-testid={isFlagged(i) ? `bars-flag-${i}` : undefined}
             >
-              <title>{`${at && at.length === values.length ? `${shortDate(at[i])} · ` : ''}${format(v)}`}</title>
+              <title>{`${at && at.length === values.length ? `${shortDate(at[i])} · ` : ''}${format(v)}${isFlagged(i) ? ' · degraded or unrecorded camera stream' : ''}`}</title>
             </rect>
           );
         })}
@@ -541,11 +564,19 @@ export function SessionBars({
 }
 
 /**
- * "+12 pts" / "−4°" / "—" delta chip, green when up, red when down.
+ * "+12 pts" / "−4°" / "—" delta chip, green when up, red when down — UNLESS the two sessions it spans
+ * were not measured alike, in which case the chip says so IN THE CHIP.
  *
  * `scale`/`digits`/`unit` exist because a card can carry two deltas of DIFFERENT quantities — a
  * percentage-point change in ROM and a change in degrees at the joint — and a chip that silently
  * rendered both as "pts" would be the same collision the titles are careful to avoid.
+ *
+ * `qualified` is the part that matters clinically. A therapist with ninety seconds between patients
+ * reads the chip: a green "▲ +40 pts" with a grey sentence underneath saying the last session was
+ * measured on an 11.8 fps stream has already told them the wrong thing, because the qualifier is
+ * subordinate to the claim it contradicts. So a delta taken across two differently-tracked sessions
+ * is not allowed to render as a win at all — it keeps the number (it is the measurement that was
+ * made), loses the green, and carries the reason inside its own box.
  */
 export function DeltaBadge({
   value,
@@ -553,6 +584,8 @@ export function DeltaBadge({
   goodWhenUp = true,
   scale = 100,
   digits = 0,
+  qualified = null,
+  testId,
 }: {
   value: number | null;
   unit?: string;
@@ -560,17 +593,58 @@ export function DeltaBadge({
   /** Multiplier from `value`'s units to the displayed number (100 = fraction → percentage points). */
   scale?: number;
   digits?: number;
+  /**
+   * Why this change may not be read as a result: a short tag drawn inside the chip and a longer
+   * sentence on its tooltip. Null = the two ends were measured alike (or there is nothing to span).
+   */
+  qualified?: { tag: string; title?: string } | null;
+  testId?: string;
 }) {
-  if (value === null || !Number.isFinite(value)) return <span className="badge">no trend yet</span>;
+  if (value === null || !Number.isFinite(value)) {
+    return (
+      <span className="badge" data-testid={testId}>
+        no trend yet
+      </span>
+    );
+  }
   const n = value * scale;
   const shown = Math.abs(n).toFixed(digits);
-  if (Number(shown) === 0) return <span className="badge">no change</span>;
   const up = n > 0;
   const good = up === goodWhenUp;
+  const zero = Number(shown) === 0;
   // A degree sign hugs its number; a word does not.
   const gap = unit === '\u00b0' ? '' : ' ';
+  if (qualified) {
+    return (
+      <span
+        className="badge badge-warn delta-qualified"
+        title={qualified.title}
+        data-testid={testId}
+        data-qualified="true"
+      >
+        {zero ? (
+          'no change'
+        ) : (
+          <>
+            {up ? '▲' : '▼'} {up ? '+' : '−'}
+            {shown}
+            {gap}
+            {unit}
+          </>
+        )}
+        <span className="delta-tag"> · {qualified.tag}</span>
+      </span>
+    );
+  }
+  if (zero) {
+    return (
+      <span className="badge" data-testid={testId}>
+        no change
+      </span>
+    );
+  }
   return (
-    <span className={good ? 'badge badge-ok' : 'badge badge-bad'}>
+    <span className={good ? 'badge badge-ok' : 'badge badge-bad'} data-testid={testId}>
       {up ? '▲' : '▼'} {up ? '+' : '−'}
       {shown}
       {gap}

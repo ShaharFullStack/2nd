@@ -80,18 +80,40 @@ describe('the song downloads before the patient is waiting for it', () => {
     expect(fake.prefetchSong).toHaveBeenCalledWith('demo-groove');
   });
 
-  it('prefetches the SELECTED song once the choice has settled, not every song scrolled past', async () => {
+  it('starts on the song that is ALREADY selected the moment the screen opens', async () => {
+    // There is nothing to debounce about the song this screen opens on: it is the default or the
+    // therapist's own last choice, and on a throttled link a 1.2 s wait before starting is 1.2 s of
+    // the patient's session spent on nothing.
     vi.useFakeTimers();
     try {
       render(<TherapistSetup />);
       await act(async () => {
         await vi.advanceTimersByTimeAsync(0); // the catalog resolves
       });
-      expect(fake.prefetchSong).not.toHaveBeenCalled(); // not on the first paint
+      expect(fake.prefetchSong).toHaveBeenCalledWith('demo-groove');
+      expect(fake.prefetchSong).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('debounces a CHANGE of song, so flicking through the catalogue starts one download', async () => {
+    vi.useFakeTimers();
+    try {
+      render(<TherapistSetup />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      fake.prefetchSong.mockClear();
+      await act(async () => {
+        fireEvent.click(screen.getByTestId('song-demo-sunrise'));
+        await vi.advanceTimersByTimeAsync(300);
+      });
+      expect(fake.prefetchSong).not.toHaveBeenCalled(); // still choosing
       await act(async () => {
         await vi.advanceTimersByTimeAsync(1500);
       });
-      expect(fake.prefetchSong).toHaveBeenCalledWith('demo-groove');
+      expect(fake.prefetchSong).toHaveBeenCalledWith('demo-sunrise');
     } finally {
       vi.useRealTimers();
     }

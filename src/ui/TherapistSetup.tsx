@@ -108,11 +108,25 @@ export default function TherapistSetup() {
    * Settled selection only (a ~1.2 s pause after the last change), so flicking through the catalogue
    * starts one download rather than four; `prefetchSong` itself declines while an audition is in
    * flight and is idempotent per song, so this can fire as often as it likes.
+   *
+   * WITH ONE EXCEPTION: THE SONG THAT IS ALREADY SELECTED WHEN THIS SCREEN OPENS. There is nothing
+   * to debounce about it — nobody has flicked anywhere yet, it is the default or the therapist's own
+   * last choice, and on a throttled link those 1.2 s are 1.2 s of the patient's session spent doing
+   * nothing. The debounce is for CHANGES, so it applies from the second selection onward.
    */
+  const prefetched = useRef<string | null>(null);
   useEffect(() => {
     const entry = catalog?.find((e) => e.id === songId);
     if (!entry || entry.status !== 'ready') return;
-    const id = setTimeout(() => runtime.prefetchSong(entry.id), 1200);
+    if (prefetched.current === null) {
+      prefetched.current = entry.id;
+      runtime.prefetchSong(entry.id);
+      return;
+    }
+    const id = setTimeout(() => {
+      prefetched.current = entry.id;
+      runtime.prefetchSong(entry.id);
+    }, 1200);
     return () => clearTimeout(id);
   }, [catalog, songId]);
 

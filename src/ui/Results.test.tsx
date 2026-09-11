@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { cleanup, render, screen } from '@testing-library/react';
-import type { LaneResultSummary, SessionResult } from '../session/types.ts';
+import type { LaneResultSummary, SessionResult, TrackingQuality } from '../session/types.ts';
 import { DEFAULT_SETTINGS, defaultLanes, useStore } from '../state/store.ts';
 import ResultsScreen from './Results.tsx';
 
@@ -15,6 +15,23 @@ function lane(patch: Partial<LaneResultSummary> = {}): LaneResultSummary {
   };
 }
 
+/**
+ * A clean stream, unless a test says otherwise. Both fixtures carry one so the DEFAULT case on this
+ * screen is a like-for-like comparison — which is what the green chips below are asserting about.
+ */
+function tracking(patch: Partial<TrackingQuality> = {}): TrackingQuality {
+  return {
+    samples: 190, fpsMedian: 29.5, fpsLow: 27, inferenceMsMedian: 11.5,
+    trackedFraction: 0.99, lowFpsFraction: 0, delegate: 'GPU', worstReason: null,
+    ...patch,
+  };
+}
+
+/** The same stream at 11.8 fps with the limb usable for 62 % of the session. */
+function poorTracking(): TrackingQuality {
+  return tracking({ fpsMedian: 11.8, fpsLow: 8.2, trackedFraction: 0.62, lowFpsFraction: 0.71, worstReason: 'no_landmarks' });
+}
+
 function result(patch: Partial<SessionResult> = {}): SessionResult {
   return {
     id: 's2', patientId: 'p1', patientName: 'R.K.', startedAt: 1_700_000_000_000, endedAt: 1_700_000_100_000,
@@ -24,7 +41,7 @@ function result(patch: Partial<SessionResult> = {}): SessionResult {
     score: 400, stars: 1, accuracy: 0.1, starAccuracy: 0.1, maxCombo: 2, totalNotes: 40,
     hits: 4, perfects: 1, goods: 3, misses: 36, reps: 38, answerRate: 0.95,
     timingBiasMs: 20, timingBiasMadMs: 15, latencyOffsetMs: 120, suggestedLatencyMs: null,
-    completed: true, lanes: [lane()],
+    completed: true, lanes: [lane()], tracking: tracking(),
     ...patch,
   };
 }
@@ -343,6 +360,53 @@ describe('range achieved is per limb, never a maximum across limbs', () => {
  * Measured at 1024x768, the clinical table laid out at 1302 px inside a 961 px scroller: the
  * compensation badge and the best rep were off the right-hand edge with no scrollbar and no cue.
  */
+/**
+ * ONE NUMBER, ONE VERDICT.
+ *
+ * The ranking behind "biggest gain today" accepted any positive change while the badge beside it
+ * printed "same as last time" for anything under both the movement's unit resolution and half a
+ * point of range. A knee that moved 0.15° rendered both, one under the other, and the card header
+ * named that limb as the day's achievement — on a mixed prescription, the unaffected one.
+ */
+describe('the range card never celebrates a change it has called unmeasurable', () => {
+  /** Both sessions tracked cleanly, so the comparability chip has nothing to add to the verdict. */
+  const GOOD = {
+    samples: 200, fpsMedian: 30, fpsLow: 27, inferenceMsMedian: 18, trackedFraction: 0.98,
+    lowFpsFraction: 0, delegate: 'GPU' as const, worstReason: null,
+  };
+  const knee = lane({ lane: 0, movement: 'knee_extension', side: 'right', movementName: 'Right Knee extension', romBest: 0.75, calibratedMin: 90, calibratedMax: 140 });
+  const march = lane({ lane: 1, movement: 'seated_march', side: 'left', movementName: 'Left Seated march', romBest: 0.4, romMean: 0.3, calibratedMin: 0.1, calibratedMax: 0.5 });
+  const today = result({ lanes: [knee, march], tracking: GOOD });
+  // +0.15° on a 50° range: under a degree AND under half a point of its own range. The march is flat.
+  const before = result({ id: 's1', startedAt: 1_600_000_000_000, tracking: GOOD, lanes: [{ ...knee, romBest: 0.75 - 0.15 / 50 }, march] });
+
+  it('says "same as last time" without also saying "biggest gain today"', () => {
+    useStore.setState({ lastResult: today, history: [today, before] });
+    render(<ResultsScreen />);
+    expect(screen.getByTestId('results-range-gain-0').textContent).toBe('same as last time');
+    expect(screen.queryByTestId('results-range-improved-0')).toBeNull();
+    expect(screen.queryByTestId('results-range-improved-1')).toBeNull();
+    expect(screen.queryByTestId('results-range-most-improved')).toBeNull();
+  });
+
+  it('does not paint "same as last time" as a gain', () => {
+    useStore.setState({ lastResult: today, history: [today, before] });
+    render(<ResultsScreen />);
+    expect(screen.getByTestId('results-range-gain-0').className).not.toContain('badge-ok');
+  });
+
+  it('still names a real gain, and paints that one', () => {
+    // +5° is well over both floors.
+    const wasWorse = result({ id: 's1', startedAt: 1_600_000_000_000, tracking: GOOD, lanes: [{ ...knee, romBest: 0.65 }, march] });
+    useStore.setState({ lastResult: today, history: [today, wasWorse] });
+    render(<ResultsScreen />);
+    expect(screen.getByTestId('results-range-gain-0').textContent).toContain('+5°');
+    expect(screen.getByTestId('results-range-gain-0').className).toContain('badge-ok');
+    expect(screen.getByTestId('results-range-improved-0')).toBeTruthy();
+    expect(screen.getByTestId('results-range-most-improved').textContent).toContain('Right Knee extension');
+  });
+});
+
 describe('the wide tables are reachable at 1024', () => {
   it('puts compensation and range in the first half of the clinical table, not the last', () => {
     useStore.setState({ lastResult: result(), history: [result()] });
@@ -351,6 +415,42 @@ describe('the wide tables are reachable at 1024', () => {
     expect(heads).toEqual(['Movement', 'Reps', 'Compensation', 'Range achieved', 'Notes hit', 'Timing']);
     // Nine columns became six: the two the safety reviewer lost are now third and fourth.
     expect(heads.indexOf('Compensation')).toBeLessThan(heads.length / 2);
+  });
+
+  /**
+   * THE CUE MAY NOT NAME A COLUMN THE THERAPIST IS LOOKING STRAIGHT AT.
+   *
+   * The names used to be a hard-coded string handed in by the caller, so the trend table — measured
+   * at 548 px inside a 506 px scroller with only "Accuracy" cut — told the reader that "the peak and
+   * accuracy columns are off to the right". Over-stating loses no data, but on a project whose rule
+   * is that a caption may not promise what the renderer does not draw, a cue that names columns it
+   * has not measured is the same class of bug. jsdom lays nothing out, so the layout is stubbed and
+   * the component is asked what it says about it.
+   */
+  it('names only the columns it measured as off screen, never the ones on it', () => {
+    useStore.setState({ lastResult: result(), history: [result()] });
+    const { container } = render(<ResultsScreen />);
+    const wrap = screen.getByTestId('results-clinical-table');
+    Object.defineProperty(wrap, 'scrollWidth', { value: 1302, configurable: true });
+    Object.defineProperty(wrap, 'clientWidth', { value: 961, configurable: true });
+    // The scroller spans 0..961; the last two header cells start past its right edge.
+    wrap.getBoundingClientRect = () => ({ left: 0, right: 961, top: 0, bottom: 40, width: 961, height: 40, x: 0, y: 0, toJSON: () => ({}) }) as DOMRect;
+    const heads = Array.from(wrap.querySelectorAll('th'));
+    const edges = [0, 200, 380, 560, 980, 1160, 1302];
+    heads.forEach((th, i) => {
+      th.getBoundingClientRect = () => ({
+        left: edges[i], right: edges[i + 1], top: 0, bottom: 40, width: edges[i + 1] - edges[i], height: 40,
+        x: edges[i], y: 0, toJSON: () => ({}),
+      }) as DOMRect;
+    });
+    useStore.setState({ lastResult: result({ maxCombo: 3 }), history: [result()] });
+    render(<ResultsScreen />, { container });
+    const cue = screen.getAllByTestId('results-clinical-table-scroll-cue')[0].textContent ?? '';
+    expect(cue).toContain('Notes hit');
+    expect(cue).toContain('Timing');
+    // Everything that fits is NOT named.
+    for (const on of ['Movement', 'Reps', 'Compensation', 'Range achieved']) expect(cue).not.toContain(`${on} column`);
+    expect(cue).not.toContain('Compensation');
   });
 
   it('announces the overflow in words, with buttons that move it, when there really is some', () => {
@@ -367,5 +467,160 @@ describe('the wide tables are reachable at 1024', () => {
     expect(cue.textContent).toContain('wider than the screen');
     expect(cue.textContent).toContain('off to the right');
     expect(cue.querySelectorAll('button')).toHaveLength(2);
+  });
+});
+
+/**
+ * TODAY AGAINST LAST TIME IS A COMPARISON OF TWO CAMERA STREAMS AS MUCH AS OF TWO PATIENTS' DAYS.
+ *
+ * "+0.02 vs last time" and "biggest gain today" in green, on a session this app graded poor, against
+ * one it graded good, is the equipment presented as the patient — and a grey sentence lower down the
+ * card does not undo a green chip.
+ */
+describe('a gain is not a gain when the two sessions were not measured alike', () => {
+  const poorToday = () => result({ tracking: poorTracking(), lanes: [lane({ romBest: 0.9, romMean: 0.8 })] });
+
+  it('strips the green from the gain chip and says why inside it', () => {
+    useStore.setState({ lastResult: poorToday(), history: [poorToday(), lastWeek()] });
+    render(<ResultsScreen />);
+    const gain = screen.getByTestId('results-range-gain-0');
+    expect(gain.textContent).toContain('vs last time');
+    expect(gain.className).not.toContain('badge-ok');
+    expect(gain.getAttribute('data-qualified')).toBe('true');
+    expect(gain.textContent).toContain('measured unevenly');
+  });
+
+  it('will not hand "biggest gain today" to a session it cannot compare', () => {
+    useStore.setState({ lastResult: poorToday(), history: [poorToday(), lastWeek()] });
+    render(<ResultsScreen />);
+    const badge = screen.getByTestId('results-range-improved-0');
+    expect(badge.className).not.toContain('badge-ok');
+    expect(badge.textContent).toContain('biggest change today');
+    // …and the headline carries the same short tag the chips do, rather than a phrase of its own:
+    // a therapist reading the badge and a therapist reading the line must be told the same thing.
+    expect(screen.getByTestId('results-range-most-improved').textContent).toContain('Biggest change');
+    expect(screen.getByTestId('results-range-most-improved').textContent).toContain('measured unevenly');
+  });
+
+  it('states the conditions of BOTH sessions beside the chips', () => {
+    useStore.setState({ lastResult: poorToday(), history: [poorToday(), lastWeek()] });
+    render(<ResultsScreen />);
+    const note = screen.getByTestId('results-comparison-note');
+    expect(note.textContent).toContain('tracked good');
+    expect(note.textContent).toContain('poor');
+    expect(note.textContent).toContain('camera rather than the patient');
+  });
+
+  it('qualifies the rep delta too — a lost limb is a lost rep', () => {
+    useStore.setState({ lastResult: poorToday(), history: [poorToday(), lastWeek()] });
+    render(<ResultsScreen />);
+    expect(screen.getByTestId('results-reps-delta').textContent).toContain('vs last time');
+    expect(screen.getByTestId('results-reps-delta-qualifier').textContent).toContain('measured unevenly');
+  });
+
+  it('treats a previous session with no tracking block as unknown, not as clean', () => {
+    const old = { ...lastWeek(), tracking: undefined };
+    useStore.setState({ lastResult: result(), history: [result(), old] });
+    render(<ResultsScreen />);
+    expect(screen.getByTestId('results-comparison-note').textContent).toContain('no tracking quality recorded');
+    expect(screen.getByTestId('results-range-gain-0').className).not.toContain('badge-ok');
+  });
+
+  it('says nothing at all when both sessions were tracked well', () => {
+    useStore.setState({ lastResult: result(), history: [result(), lastWeek()] });
+    render(<ResultsScreen />);
+    expect(screen.queryByTestId('results-comparison-note')).toBeNull();
+    expect(screen.queryByTestId('results-reps-delta-qualifier')).toBeNull();
+  });
+});
+
+/**
+ * THE COMPARISON HAS TO SAY WHAT IT IS A COMPARISON AGAINST.
+ *
+ * Seeded live before this was fixed: patient Amara, previous session a 24-second walk-out with 19
+ * movements. Results printed "Movements performed 98 · +79 vs last time", "+30 vs last time" per
+ * movement and "Biggest gain since last session: Left Seated march", and a regex over the whole
+ * rendered page for /ended early|stopped by|incomplete|did not finish/ matched NOTHING. One screen
+ * later the ROM trend sets exactly those runs aside from every figure, and History labels the row
+ * "stopped by therapist". Two screens, two rules, and the one a therapist reads first flattered.
+ */
+describe('today is compared against a whole session, and the screen says which one', () => {
+  /** The walk-out: 24 seconds, 19 movements, stopped by the therapist. */
+  const walkOut = () =>
+    result({
+      id: 'abort',
+      startedAt: 1_650_000_000_000,
+      endedAt: 1_650_000_024_000,
+      durationSec: 24,
+      reps: 19,
+      completed: false,
+      endReason: 'quit',
+      lanes: [lane({ reps: 19, romMean: 0.35, romBest: 0.4 })],
+    });
+
+  it('skips a walk-out in favour of the last COMPLETED session, and names the one it kept', () => {
+    useStore.setState({ lastResult: result(), history: [result(), walkOut(), lastWeek()] });
+    render(<ResultsScreen />);
+
+    // the delta is against last week's 26 reps, not against the walk-out's 19
+    expect(screen.getByTestId('results-reps-delta').textContent).toContain('+12 vs last time');
+    expect(screen.getByTestId('results-today-lane-0').textContent).toContain('+12 vs last time');
+
+    const basis = screen.getByTestId('results-comparison-basis');
+    expect(basis.textContent).toContain('the last session this patient completed');
+    expect(basis.textContent).toContain('stopped by therapist');
+    expect(basis.textContent).toContain('19 movements');
+    // and the card the rows sit in says it too, beside the deltas themselves
+    expect(screen.getByTestId('results-today').textContent).toContain('COMPLETED camera session');
+  });
+
+  it('never lets a walk-out silently stand in for last time', () => {
+    useStore.setState({ lastResult: result(), history: [result(), walkOut(), lastWeek()] });
+    render(<ResultsScreen />);
+    // the exact regex the critic ran over the rendered page
+    expect(document.body.textContent!).toMatch(/ended early|stopped by|incomplete|did not finish/);
+  });
+
+  it('still compares when every earlier session ended early — but not in green, and not silently', () => {
+    useStore.setState({ lastResult: result(), history: [result(), walkOut()] });
+    render(<ResultsScreen />);
+
+    const delta = screen.getByTestId('results-reps-delta');
+    expect(delta.textContent).toContain('+19 vs last time');
+    expect(screen.getByTestId('results-reps-delta-qualifier').textContent).toContain('last session ended early');
+
+    const gain = screen.getByTestId('results-range-gain-0');
+    expect(gain.className).not.toContain('badge-ok');
+    expect(gain.getAttribute('data-qualified')).toBe('true');
+    expect(gain.textContent).toContain('last session ended early');
+
+    expect(screen.getByTestId('results-range-improved-0').textContent).toContain('biggest change today');
+    expect(screen.getByTestId('results-comparison-basis').textContent).toContain('did not reach the end of its chart');
+    // the card that names the session compared with says what kind of session it was
+    expect(screen.getByTestId('results-sessions').textContent).toContain('ended early');
+  });
+
+  it('says nothing about completeness when the previous session simply is the last one', () => {
+    useStore.setState({ lastResult: result(), history: [result(), lastWeek()] });
+    render(<ResultsScreen />);
+    expect(screen.queryByTestId('results-comparison-basis')).toBeNull();
+    expect(screen.queryByTestId('results-today-basis')).toBeNull();
+    expect(screen.getByTestId('results-reps-delta').textContent).toBe('+12 vs last time');
+  });
+
+  /**
+   * A STORED KEY THAT CHANGED MEANING. `reps` used to be the engine's event count and is now the sum
+   * of the per-lane column; the two differ by construction on spasticity, clonus and tremor. Records
+   * written under the old rule cannot be told apart by a version — but on exactly the records where
+   * the definitions disagree, the record's own headline disagrees with its own column, and that is
+   * the case the delta must not present as patient change.
+   */
+  it('flags a delta drawn across two definitions of "a movement"', () => {
+    const oldRecord = { ...lastWeek(), reps: 20, lanes: [lane({ reps: 26, romMean: 0.4, romBest: 0.5 })] };
+    useStore.setState({ lastResult: result(), history: [result(), oldRecord] });
+    render(<ResultsScreen />);
+    const tag = screen.getByTestId('results-reps-delta-qualifier');
+    expect(tag.textContent).toContain('counted differently');
+    expect(tag.getAttribute('title')).toContain('26');
   });
 });

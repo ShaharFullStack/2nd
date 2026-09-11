@@ -24,14 +24,16 @@ import {
   laneRangeSummaries,
   laneTrendKey,
   mostImprovedRange,
+  rangeChange,
 } from '../session/results.ts';
 import type { LaneRangeSummary } from '../session/results.ts';
-import { timingResolutionMs } from '../session/tracking.ts';
+import { compareTracking, timingResolutionMs } from '../session/tracking.ts';
+import type { TrackingComparison } from '../session/tracking.ts';
 import { isPatientDriven, patientSessions } from '../session/trends.ts';
 import type { LaneResultSummary, SessionResult } from '../session/types.ts';
 import { useStore } from '../state/store.ts';
 import { FEATURE_UNIT_SHORT, formatFeature } from '../vision/calibration.ts';
-import { Meter, Screen, Stars, Toast, TopBar } from './common.tsx';
+import { Meter, Screen, shortDate, Stars, Toast, TopBar } from './common.tsx';
 import { MeasurementNote } from './ScopeNote.tsx';
 import LatencyHandover from './LatencyHandover.tsx';
 
@@ -41,6 +43,103 @@ function delta(now: number, then: number | null): string | null {
   const d = now - then;
   if (d === 0) return 'same as last time';
   return `${d > 0 ? '+' : '−'}${Math.abs(Math.round(d))} vs last time`;
+}
+
+/**
+ * THE SESSION EVERY COMPARISON ON THIS SCREEN IS DRAWN AGAINST, and what kind of session it was.
+ *
+ * Every "vs last time" here — the rep delta, each movement's row, each range tile's chip, "biggest
+ * gain today" — spans exactly two sessions. Which two, and whether either of them ran to the end of
+ * its chart, is the difference between a finding and an artefact, so it is decided once and carried
+ * to every one of them.
+ */
+interface ComparisonBasis {
+  /** The session compared against: the most recent one this patient COMPLETED, where one exists. */
+  previous: SessionResult | null;
+  /** Patient-driven runs NEWER than `previous`, passed over because they did not reach the end. */
+  skipped: SessionResult[];
+  /** True when `previous` itself ended early — this patient has no completed session yet. */
+  incomplete: boolean;
+}
+
+const EMPTY_BASIS: ComparisonBasis = { previous: null, skipped: [], incomplete: false };
+
+/**
+ * A qualifier that rides INSIDE a delta chip, in the pattern `compareTracking` established.
+ *
+ * `tag` is short enough to sit in the badge (the therapist with ninety seconds reads the badge, not
+ * the sentence under the card); `note` is the sentence, carried as the chip's title and printed in
+ * full beside the figures it qualifies.
+ */
+interface CompareQualifier {
+  tag: string;
+  note: string;
+}
+
+/** Every reason this comparison is not a plain like-for-like one, in one chip and one sentence. */
+function mergeQualifiers(parts: readonly (CompareQualifier | null)[]): CompareQualifier | null {
+  const kept = parts.filter((q): q is CompareQualifier => q !== null);
+  if (kept.length === 0) return null;
+  return { tag: kept.map((q) => q.tag).join(' \u00b7 '), note: kept.map((q) => q.note).join(' ') };
+}
+
+/** "9 Sep (stopped by therapist, 0:24, 19 movements)" — what a run that ended early actually was. */
+function abortedPhrase(s: SessionResult): string {
+  return `${shortDate(s.startedAt)} (${endReasonLabel(s.endReason ?? null)}, ${formatDuration(s.durationSec)}, ${s.reps} movement${
+    s.reps === 1 ? '' : 's'
+  })`;
+}
+
+/**
+ * WHAT THIS SCREEN IS COMPARING TODAY WITH, IN WORDS, whenever that is not simply "last time".
+ *
+ * Null on the ordinary case — the previous session was a whole session and it is the one being
+ * compared against — because a caveat printed every session is a caveat read in none of them.
+ *
+ * Two lengths, because it is needed in two places and the same paragraph printed twice on one screen
+ * reads as a rendering fault. `full` sits with the range tiles, which are the first comparison on the
+ * page; `short` sits with the per-movement rows, whose own header already names the session, and
+ * carries only the fact that header cannot: which run was passed over, and what it was.
+ */
+function basisSentence(basis: ComparisonBasis): { short: string; full: string } | null {
+  const prev = basis.previous;
+  if (!prev) return null;
+  if (basis.incomplete) {
+    const short = `Last time is ${abortedPhrase(prev)} \u2014 it did not reach the end of its chart.`;
+    return {
+      short,
+      full: `${short} So it is a shorter session than today's, and the changes on this screen are partly the length of it. This patient has no completed camera session to compare with yet.`,
+    };
+  }
+  if (basis.skipped.length === 0) return null;
+  const list = basis.skipped.map(abortedPhrase).join(', ');
+  const one = basis.skipped.length === 1;
+  const short = `${one ? 'A more recent session' : `${basis.skipped.length} more recent sessions`} ended early and ${
+    one ? 'is' : 'are'
+  } not what today is compared against: ${list}.`;
+  return {
+    short,
+    full: `Compared with ${shortDate(prev.startedAt)}, the last session this patient completed \u2014 not with the most recent one. ${short} ${
+      one ? 'It is' : 'They are'
+    } listed on the history screen.`,
+  };
+}
+
+/**
+ * DOES THIS RECORD'S OWN REP COUNT MEAN WHAT TODAY'S MEANS?
+ *
+ * `buildSessionResult` writes `reps` as the sum of the per-lane column (`max(engine events, reps the
+ * camera observed)`); it used to write the engine's event count, and the two differ BY CONSTRUCTION
+ * on spasticity, clonus and tremor, which is this app's core population. A stored record carries no
+ * marker for which definition it was written under — but it does carry both numbers, and on a record
+ * written under the old rule the headline disagrees with the column beneath it. Where the two agree
+ * the definitions agree too and there is nothing to say; where they do not, "+79 vs last time" spans
+ * two definitions of "a movement" and says so.
+ */
+function repsAgreeWithLanes(s: SessionResult): boolean {
+  if (s.lanes.length === 0) return true;
+  if (!s.lanes.every((l) => typeof l.reps === 'number' && Number.isFinite(l.reps))) return true;
+  return s.reps === s.lanes.reduce((n, l) => n + l.reps, 0);
 }
 
 /** A signed change in the movement's own units, for the per-limb range tiles. */
@@ -62,24 +161,56 @@ function belowResolution(d: number, unit: 'deg' | 'ratio'): boolean {
  * movement's own units cannot resolve the change, the same change is stated as a share of THAT
  * movement's calibrated range, which is the quantity the ranking uses anyway; where neither can
  * resolve it, it really is no change and says so.
+ *
+ * WHICH IS A DECISION, NOT A FORMAT, so it is taken by `rangeChange` in session/results.ts and the
+ * ranking that draws "biggest gain today" takes it there too. The two used to decide separately and
+ * could therefore print both verdicts about one number, on one tile.
  */
-function gainLabel(s: LaneRangeSummary): { text: string; note?: string } | null {
-  if (s.gain === null && s.gainPct === null) return null;
-  if (s.gain !== null && !belowResolution(s.gain, s.unit)) return { text: `${signedFeature(s.gain, s.unit)} vs last time` };
-  if (s.gainPct !== null && Math.abs(s.gainPct) >= 0.005) {
-    const pts = Math.abs(Math.round(s.gainPct * 100));
-    return {
-      // The badge stays one line at 1024 (measured: 18 characters is 184 px in a 265 px tile); the
-      // unit it is in — which is NOT the movement's own unit here — goes on the line under it.
-      text: `${s.gainPct > 0 ? '+' : '−'}${pts} ${pts === 1 ? 'pt' : 'pts'} vs last time`,
-      note: `in points of this movement’s own calibrated range: the change is under ${formatFeature(1, s.unit)}`,
-    };
+function gainLabel(s: LaneRangeSummary): { text: string; kind: 'up' | 'down' | 'same'; note?: string } | null {
+  const change = rangeChange(s);
+  if (change.kind === 'none') return null;
+  if (change.kind === 'same') return { text: 'same as last time', kind: 'same' };
+  if (change.inUnits && s.gain !== null) {
+    return { text: `${signedFeature(s.gain, s.unit)} vs last time`, kind: change.kind };
   }
-  return { text: 'same as last time' };
+  const pts = Math.abs(Math.round((s.gainPct ?? 0) * 100));
+  return {
+    // The badge stays one line at 1024 (measured: 18 characters is 184 px in a 265 px tile); the
+    // unit it is in — which is NOT the movement's own unit here — goes on the line under it.
+    text: `${change.kind === 'up' ? '+' : '−'}${pts} ${pts === 1 ? 'pt' : 'pts'} vs last time`,
+    kind: change.kind,
+    note: `in points of this movement’s own calibrated range: the change is under ${formatFeature(1, s.unit)}`,
+  };
+}
+
+/** "the Compensation column" / "the Notes hit and Timing columns" / "" when nothing was measured. */
+function columnPhrase(names: readonly string[]): string {
+  if (names.length === 0) return 'columns';
+  if (names.length === 1) return `the ${names[0]} column`;
+  const head = names.slice(0, -1).join(', ');
+  return `the ${head} and ${names[names.length - 1]} columns`;
+}
+
+/** Header cells whose box is cut by the scroller's left or right edge, right now, in table order. */
+function clippedColumns(el: HTMLElement): { right: string[]; left: string[] } {
+  const right: string[] = [];
+  const left: string[] = [];
+  const box = el.getBoundingClientRect();
+  // No layout at all (jsdom, a display:none ancestor): measure nothing rather than guess.
+  if (box.width <= 0) return { right, left };
+  for (const th of Array.from(el.querySelectorAll('thead th'))) {
+    const name = (th.textContent ?? '').trim();
+    if (!name) continue;
+    const r = th.getBoundingClientRect();
+    if (r.width <= 0) continue;
+    if (r.right > box.right + 2) right.push(name);
+    else if (r.left < box.left - 2) left.push(name);
+  }
+  return { right, left };
 }
 
 /**
- * A WIDE TABLE THAT SAYS IT IS WIDE, AND CAN BE MOVED WITHOUT A MOUSE.
+ * A WIDE TABLE THAT SAYS IT IS WIDE — AND NAMES THE COLUMNS IT MEASURED, NOT THE ONES IT EXPECTED.
  *
  * `.table-wrap` is `overflow-x: auto` and nothing else. On the clinic target size (1024x768) the
  * clinical table measured 1302 px inside a 961 px scroller: the COMPENSATION badge and the best-rep
@@ -88,9 +219,18 @@ function gainLabel(s: LaneRangeSummary): { text: string; note?: string } | null 
  * reading "no compensation flags" off a table that never showed them the column is the worst
  * failure this screen has.
  *
- * So the overflow is MEASURED and, when there is any, stated in words and given two full-size
- * buttons. Both are live: the message names the columns that are off-screen and the arrows page the
- * scroller, so the columns are reachable by touch on a tablet with no keyboard and no mouse.
+ * So the overflow is MEASURED and, when there is any, stated in words and given two 44 px buttons
+ * that really page the scroller.
+ *
+ * AND THE WORDS COME FROM THE SAME MEASUREMENT. The cue used to take the names of the missing
+ * columns as a hard-coded string from the caller, so the trend table — 548 px inside a 506 px
+ * scroller, with only "Accuracy" actually cut — told the therapist that "the peak and accuracy
+ * columns are off to the right" while they were looking straight at the peak column. It over-stated
+ * rather than under-stated, so no data was lost, but on a project whose rule is that a caption may
+ * not promise what the renderer does not draw, a cue that names columns it has not measured is the
+ * same class of bug. The header cells are measured against the scroller's own box on every scroll
+ * and every resize, and only the ones whose box is cut are named. `offscreen` survives only as the
+ * fallback for a table with no header row to measure.
  */
 export function ScrollTable({
   children,
@@ -98,12 +238,12 @@ export function ScrollTable({
   testId,
 }: {
   children: ReactNode;
-  /** The columns a reader loses first — named in the cue, because "scroll" alone says nothing. */
-  offscreen: string;
+  /** Fallback wording for a table with no measurable header row. Normally unused. */
+  offscreen?: string;
   testId?: string;
 }) {
   const ref = useRef<HTMLDivElement>(null);
-  const [state, setState] = useState<{ more: boolean; back: boolean } | null>(null);
+  const [state, setState] = useState<{ more: boolean; back: boolean; right: string[]; left: string[] } | null>(null);
 
   useEffect(() => {
     const el = ref.current;
@@ -114,8 +254,17 @@ export function ScrollTable({
         setState((s) => (s === null ? s : null));
         return;
       }
-      const next = { more: el.scrollLeft < slack - 4, back: el.scrollLeft > 4 };
-      setState((s) => (s && s.more === next.more && s.back === next.back ? s : next));
+      const cut = clippedColumns(el);
+      const next = { more: el.scrollLeft < slack - 4, back: el.scrollLeft > 4, right: cut.right, left: cut.left };
+      setState((s) =>
+        s &&
+        s.more === next.more &&
+        s.back === next.back &&
+        s.right.join('|') === next.right.join('|') &&
+        s.left.join('|') === next.left.join('|')
+          ? s
+          : next,
+      );
     };
     read();
     el.addEventListener('scroll', read, { passive: true });
@@ -133,6 +282,21 @@ export function ScrollTable({
     el.scrollBy({ left: dir * Math.max(160, el.clientWidth * 0.7), behavior: 'smooth' });
   };
 
+  /** What is cut right now, in the order a reader loses it. Never a column that is on screen. */
+  const message = (s: { more: boolean; back: boolean; right: string[]; left: string[] }): string => {
+    const parts: string[] = [];
+    if (s.more) {
+      parts.push(
+        s.right.length > 0 || !offscreen
+          ? `${columnPhrase(s.right)} ${s.right.length === 1 ? 'is' : 'are'} off to the right`
+          : `${offscreen} are off to the right`,
+      );
+    }
+    if (s.back) parts.push(`${columnPhrase(s.left)} ${s.left.length === 1 ? 'is' : 'are'} off to the left`);
+    if (parts.length === 0) return 'This table is wider than the screen. Swipe it or use the arrows.';
+    return `This table is wider than the screen — ${parts.join(', and ')}. Swipe it or use the arrows.`;
+  };
+
   return (
     <div className="stack" style={{ gap: 8 }}>
       {/* ABOVE THE TABLE, NEXT TO THE HEADER ROW THE MISSING COLUMNS BELONG TO. A five-session
@@ -140,16 +304,30 @@ export function ScrollTable({
           after they have finished reading the table they did not know was incomplete. */}
       {state && (
         <div className="row" style={{ gap: 10 }} data-testid={testId ? `${testId}-scroll-cue` : 'table-scroll-cue'}>
-          <button className="btn btn-sm" onClick={() => page(-1)} disabled={!state.back} aria-label="Scroll table left">
+          {/* 44 px in BOTH directions: `.btn-sm` sets the height, and an arrow glyph in 12 px of
+              padding is a 34 px-wide target without this. */}
+          <button
+            className="btn btn-sm"
+            style={{ minWidth: 44 }}
+            onClick={() => page(-1)}
+            disabled={!state.back}
+            aria-label="Scroll table left"
+          >
             ←
           </button>
-          <button className="btn btn-sm" onClick={() => page(1)} disabled={!state.more} aria-label="Scroll table right">
+          <button
+            className="btn btn-sm"
+            style={{ minWidth: 44 }}
+            onClick={() => page(1)}
+            disabled={!state.more}
+            aria-label="Scroll table right"
+          >
             →
           </button>
-          <span className="dim">
-            {state.more
-              ? `This table is wider than the screen — ${offscreen} are off to the right. Swipe it or use the arrows.`
-              : 'Scrolled to the end of this table — the arrows bring the first columns back.'}
+          {/* Live, because the sentence changes as the scroller moves and a screen reader that read
+              it once would be describing a position the table has left. */}
+          <span className="dim" role="status" aria-live="polite">
+            {message(state)}
           </span>
         </div>
       )}
@@ -160,8 +338,17 @@ export function ScrollTable({
   );
 }
 
-/** One prescribed movement's range, as the headline treats it: on its own, against its own range. */
-function RangeTile({ s, improved }: { s: LaneRangeSummary; improved: boolean }) {
+/**
+ * One prescribed movement's range, as the headline treats it: on its own, against its own range.
+ *
+ * `qualified` is everything that is wrong with subtracting these two sessions: how each was tracked
+ * (session/tracking.ts), and whether the earlier one ran to the end of its chart at all. It is not
+ * decoration on the tile: "+0.02 vs last time" and "biggest gain today" in green, measured against a
+ * session the app itself graded poor — or against a 24-second walk-out — is the equipment or the
+ * clock rendered as the patient, and a grey sentence further down the card does not undo a green
+ * chip for a therapist reading it in ninety seconds. So the chips themselves carry the verdict.
+ */
+function RangeTile({ s, improved, qualified }: { s: LaneRangeSummary; improved: boolean; qualified: CompareQualifier | null }) {
   const gain = gainLabel(s);
   return (
     <div
@@ -187,15 +374,40 @@ function RangeTile({ s, improved }: { s: LaneRangeSummary; improved: boolean }) 
           <div className="dim">
             best rep · {formatPercent(s.bestFraction)} of this movement’s own calibrated range · {s.reps} reps
           </div>
+          {/* The tiles in this row are stretched to the tallest of them (a movement whose change has
+              to be explained carries an extra two lines), so without this the shorter ones ended in
+              ~110 px of empty panel and the badges sat at three different heights. */}
+          <div className="grow" />
           <div className="row" style={{ gap: 8 }}>
+            {/* THE COLOUR SAYS WHAT THE WORDS SAY. Keyed off `gainPct > 0` it painted the words
+                "same as last time" green on any change above zero and grey on any change below it —
+                two tiles reading identically and coloured oppositely. */}
             {gain !== null && (
-              <span className={(s.gainPct ?? 0) > 0 ? 'badge badge-ok' : 'badge'} data-testid={`results-range-gain-${s.lane}`}>
+              <span
+                className={
+                  qualified
+                    ? 'badge badge-warn delta-qualified'
+                    : gain.kind === 'up'
+                      ? 'badge badge-ok'
+                      : 'badge'
+                }
+                title={qualified?.note ?? undefined}
+                data-qualified={qualified ? 'true' : undefined}
+                data-testid={`results-range-gain-${s.lane}`}
+              >
                 {gain.text}
+                {qualified && <span className="delta-tag"> · {qualified.tag}</span>}
               </span>
             )}
             {improved && (
-              <span className="badge badge-ok" data-testid={`results-range-improved-${s.lane}`}>
-                biggest gain today
+              <span
+                className={qualified ? 'badge badge-warn delta-qualified' : 'badge badge-ok'}
+                title={qualified?.note ?? undefined}
+                data-qualified={qualified ? 'true' : undefined}
+                data-testid={`results-range-improved-${s.lane}`}
+              >
+                {qualified ? 'biggest change today' : 'biggest gain today'}
+                {qualified && <span className="delta-tag"> · {qualified.tag}</span>}
               </span>
             )}
           </div>
@@ -207,6 +419,7 @@ function RangeTile({ s, improved }: { s: LaneRangeSummary; improved: boolean }) 
             —
           </div>
           <div className="dim">no range was measured in this movement</div>
+          <div className="grow" />
         </>
       )}
     </div>
@@ -221,14 +434,33 @@ export default function ResultsScreen() {
   const history = useStore((s) => s.history);
 
   /**
-   * The previous session THIS patient drove, if any. The record for the run just finished is already
-   * in the history, so it is excluded by id rather than by position.
+   * WHICH SESSION "LAST TIME" IS — AND WHETHER IT IS A WHOLE SESSION.
+   *
+   * This used to be `mine[0]`: the most recent camera session, whatever it was. On a patient whose
+   * last visit was a 24-second walk-out — 19 movements, `endReason: 'quit'` — today's 98 movements
+   * rendered as "+79 vs last time", "+30 vs last time" per movement and "Biggest gain since last
+   * session", with nothing anywhere on the screen saying what the comparison was against. One
+   * screen later the ROM trend sets exactly those runs aside from every change figure, for the
+   * reason written on it: a nine-rep walk-out is not the other end of a like-for-like comparison.
+   * Two screens, two rules, and the one a therapist reads first was the one that flattered.
+   *
+   * So this screen now applies the trend's rule: the basis is the most recent session this patient
+   * COMPLETED, and the shorter runs in between are named rather than silently skipped (a delta
+   * against a session that is not the last one is its own way of misleading). When there is no
+   * completed session at all, the comparison is still drawn — a first fortnight of aborted runs is
+   * still the patient's own history — but it carries the same kind of qualifier the tracking verdict
+   * rides on, in the chip itself, because a grey sentence underneath does not undo a green badge.
    */
-  const previous: SessionResult | null = useMemo(() => {
-    if (!result || !isPatientDriven(result)) return null;
+  const basis: ComparisonBasis = useMemo(() => {
+    if (!result || !isPatientDriven(result)) return EMPTY_BASIS;
     const mine = patientSessions(history, result.patientId).filter((s) => s.id !== result.id && isPatientDriven(s));
-    return mine[0] ?? null; // history is newest-first
+    // history is newest-first. `completed !== false` so a record written before the flag existed
+    // reads as a whole session rather than as an abort nobody recorded.
+    const i = mine.findIndex((s) => s.completed !== false);
+    if (i >= 0) return { previous: mine[i], skipped: mine.slice(0, i), incomplete: false };
+    return { previous: mine[0] ?? null, skipped: [], incomplete: mine.length > 0 };
   }, [history, result]);
+  const previous = basis.previous;
 
   const previousLanes = useMemo(() => {
     const map = new Map<string, LaneResultSummary>();
@@ -266,6 +498,64 @@ export default function ResultsScreen() {
 
   /** The finest timing difference this session's camera stream could resolve (null when unrecorded). */
   const timingRes = result.tracking ? timingResolutionMs(result.tracking) : null;
+
+  /**
+   * WHETHER TODAY MAY BE SUBTRACTED FROM LAST TIME AT ALL.
+   *
+   * Every comparison on this screen — each lane's gain chip, "biggest gain today", the rep delta —
+   * spans these two sessions, and they were measured on whatever camera and whatever machine load
+   * each day happened to bring. `compareTracking` is the one place that decides; the chips read it so
+   * that a change across a poor-tracked session and a good-tracked one cannot render as a plain win
+   * anywhere on the screen.
+   */
+  const comparison: TrackingComparison | null = previous
+    ? compareTracking(previous.tracking, result.tracking, {
+        from: `the session on ${shortDate(previous.startedAt)}`,
+        to: "today's session",
+      })
+    : null;
+  const comparisonNote = comparison && comparison.kind !== 'like-for-like' ? comparison.note : null;
+
+  /**
+   * EVERYTHING THAT IS WRONG WITH SUBTRACTING THESE TWO SESSIONS, IN THE CHIP THAT DOES IT.
+   *
+   * Tracking was already here. Completeness was not, and it is the louder of the two: a session that
+   * ended after 24 seconds is not a small measurement error, it is a different amount of therapy. A
+   * chip that says "+79" in green over a walk-out is the screen telling the patient they had a big
+   * day, and the qualifier has to be on the chip for the same reason the tracking one is.
+   */
+  const trackingQualifier: CompareQualifier | null =
+    comparison && comparison.kind !== 'like-for-like' && comparison.tag !== null && comparison.note !== null
+      ? { tag: comparison.tag, note: comparison.note }
+      : null;
+  const completenessQualifier: CompareQualifier | null =
+    basis.incomplete && previous !== null
+      ? {
+          tag: 'last session ended early',
+          note: `The session compared with \u2014 ${abortedPhrase(previous)} \u2014 did not reach the end of its chart, so it asked for fewer movements than today did.`,
+        }
+      : null;
+  /** What qualifies every RANGE comparison on the screen (the tiles, the rows, "biggest gain"). */
+  const rangeQualifier = mergeQualifiers([completenessQualifier, trackingQualifier]);
+  /**
+   * The rep delta carries one more: a previous record whose own headline disagrees with its own
+   * per-lane column was written before "movements performed" became that column's total.
+   */
+  const repsQualifier = mergeQualifiers([
+    completenessQualifier,
+    previous !== null && !repsAgreeWithLanes(previous)
+      ? {
+          tag: 'counted differently',
+          note: `That session's record stores ${previous.reps} movements while its own per-movement column adds up to ${previous.lanes.reduce(
+            (n, l) => n + l.reps,
+            0,
+          )}: it was written before a movement the camera saw but scored nothing began to count. The difference below spans both definitions.`,
+        }
+      : null,
+    trackingQualifier,
+  ]);
+  /** The sentence naming the session being compared against, when that needs saying at all. */
+  const basisNote = basisSentence(basis);
 
   const judged = result.hits + result.misses;
   /** Notes answered with a movement, bounded by the notes offered — null on a pre-`answerRate` record. */
@@ -383,7 +673,14 @@ export default function ResultsScreen() {
           <div className="grow" />
           {improved && (
             <span className="dim" data-testid="results-range-most-improved">
-              Biggest gain since last session: {improved.movementName}
+              {/* "SINCE LAST SESSION" HAS TO BE THE SESSION IT IS ACTUALLY SINCE. Where that is not
+                  the patient's most recent run — because the most recent run ended early — the
+                  headline names the date it IS since, and where even that run ended early the whole
+                  phrase drops to "change", the same demotion an unevenly-tracked pair gets. */}
+              {rangeQualifier ? 'Biggest change since' : 'Biggest gain since'}{' '}
+              {basis.skipped.length > 0 && previous ? `${shortDate(previous.startedAt)}` : 'last session'}:{' '}
+              {improved.movementName}
+              {rangeQualifier ? ` — ${rangeQualifier.tag}` : ''}
             </span>
           )}
         </div>
@@ -396,9 +693,35 @@ export default function ResultsScreen() {
           }}
         >
           {ranges.map((s) => (
-            <RangeTile key={s.lane} s={s} improved={improved?.lane === s.lane} />
+            <RangeTile key={s.lane} s={s} improved={improved?.lane === s.lane} qualified={rangeQualifier} />
           ))}
         </div>
+        {/*
+          WHAT THE COMPARISON IS WORTH, BESIDE THE CHIPS THAT MAKE IT. Only printed when the two
+          sessions were NOT measured alike: on a like-for-like pair there is nothing to warn about,
+          and a caveat that appears every session is a caveat that is read none of them.
+        */}
+        {comparisonNote && (
+          <div className="dim" data-testid="results-comparison-note">
+            <span className="badge badge-warn">{comparison?.tag}</span> {comparisonNote}
+          </div>
+        )}
+        {/*
+          WHAT "LAST TIME" IS, WHEREVER IT IS NOT SIMPLY THE LAST SESSION.
+
+          The screen used to compare today against the most recent camera session whatever it was,
+          so a patient whose previous visit was a 24-second walk-out read "+79 movements vs last
+          time" with no word anywhere about what they were being compared against. The trend screen
+          sets those runs aside; this one now does too, and says which session it kept.
+        */}
+        {basisNote && (
+          <div className="dim" data-testid="results-comparison-basis">
+            <span className={basis.incomplete ? 'badge badge-warn' : 'badge'}>
+              {basis.incomplete ? 'last session ended early' : 'compared with the last completed session'}
+            </span>{' '}
+            {basisNote.full}
+          </div>
+        )}
         {/* WHAT THE NUMBERS ARE. A ratio movement prints a bare "0.34" — the unit has no symbol, so
             it has to be said in words or the figures above mean nothing. */}
         <div className="dim" data-testid="results-range-unit">
@@ -423,14 +746,31 @@ export default function ResultsScreen() {
           <div className="eyebrow">Movements performed</div>
           <div className="big-number mono">{result.reps}</div>
           <div className="dim">
-            across {result.lanes.length} movement{result.lanes.length === 1 ? '' : 's'} in {formatDuration(result.durationSec)}
+            {/* "IN 1:37" WOULD NOW BE A CLAIM ABOUT THE INTERVAL, and the count no longer stops at
+                the chart's last note: the song-end sequence keeps counting the movements the patient
+                makes over it (GameRunner `onInput`), while the stored duration stays the SONG's
+                length, which is what the dose was prescribed against. So the two facts are stated
+                side by side rather than one inside the other. */}
+            across {result.lanes.length} movement{result.lanes.length === 1 ? '' : 's'} · the song ran{' '}
+            {formatDuration(result.durationSec)}
           </div>
+          {/* A REP COUNT IS A CAMERA MEASUREMENT TOO. A stream whose landmarks were usable for 62 %
+              of the session cannot have seen every rep, so a delta across it is qualified in the
+              same words as the range chips rather than printed flat. */}
           <div className="dim" data-testid="results-reps-delta">
             {!isPatientDriven(result)
               ? 'Not compared: the patient did not drive this session'
               : previous
                 ? (delta(result.reps, previous.reps) ?? '')
                 : 'First recorded session for this patient'}
+            {previous && isPatientDriven(result) && repsQualifier && (
+              <>
+                {' '}
+                <span className="badge badge-warn" title={repsQualifier.note} data-testid="results-reps-delta-qualifier">
+                  {repsQualifier.tag}
+                </span>
+              </>
+            )}
           </div>
           {/* Only when the song did not run to the end: otherwise judged == the whole chart and the
               line says nothing. A short session is a fact about the dose, so it is stated. */}
@@ -467,6 +807,10 @@ export default function ResultsScreen() {
               ? 'not recorded for this session'
               : `a movement was made for ${answered} of the ${judged} notes offered — the quantity the gauge on the highway shows`}
           </div>
+          {/* The spacer both its neighbours carry. Without it this card's three short lines left
+              109 px of empty panel at 1280 and 133 px at 1024 against their 21 px, and the row read
+              as unfinished. Measured, both sizes. */}
+          <div className="grow" />
           {answerRate !== null && <Meter value={answerRate} label="notes answered with a movement" />}
         </div>
 
@@ -474,7 +818,12 @@ export default function ResultsScreen() {
           <div className="eyebrow">Camera sessions recorded</div>
           <div className="big-number mono">{sessionsSoFar}</div>
           <div className="dim">
-            {previous ? `last session ${formatDuration(previous.durationSec)}, ${previous.reps} movements` : 'this is the first'}
+            {/* NAMED, because it is not always the last one: where the most recent run ended early
+                the comparison is drawn against the last COMPLETED session, and this line is where a
+                therapist checks which session that was. */}
+            {previous
+              ? `compared with ${shortDate(previous.startedAt)} — ${formatDuration(previous.durationSec)}, ${previous.reps} movement${previous.reps === 1 ? '' : 's'}${basis.incomplete ? ', ended early' : ''}`
+              : 'this is the first'}
           </div>
           {/* The spacer is what makes this card FILL its cell. The grid stretches every card to the
               tallest in the row, and this one carries three short lines: without it the button sat
@@ -537,13 +886,17 @@ export default function ResultsScreen() {
           <div className="grow" />
           <span className="dim">
             {previous
-              ? 'compared with this patient’s last camera session'
+              ? basis.incomplete
+                ? `compared with ${shortDate(previous.startedAt)}, which ended early`
+                : basis.skipped.length > 0
+                  ? `compared with ${shortDate(previous.startedAt)}, this patient’s last COMPLETED camera session`
+                  : 'compared with this patient’s last camera session'
               : result.inputMode === 'camera'
                 ? 'no earlier camera session to compare with yet'
                 : 'comparison is only drawn between camera sessions'}
           </span>
         </div>
-        <ScrollTable offscreen="the best-rep column and the comparison with last time" testId="results-today-table">
+        <ScrollTable testId="results-today-table">
           <table className="table">
             <thead>
               <tr>
@@ -602,6 +955,14 @@ export default function ResultsScreen() {
             </tbody>
           </table>
         </ScrollTable>
+        {/* The per-movement deltas in the rows above span the same two sessions as everything else on
+            the screen, so the sentence that says which two sits with them rather than only at the
+            top of the page. */}
+        {basisNote && (
+          <span className="dim" data-testid="results-today-basis">
+            {basisNote.short}
+          </span>
+        )}
         {previous && previous.difficulty !== result.difficulty && (
           <span className="dim">
             Last session was prescribed at {previous.difficulty} and this one at {result.difficulty}: the accuracy is
@@ -668,7 +1029,7 @@ export default function ResultsScreen() {
           reachable by `ScrollTable`.
         */}
         <div style={{ marginTop: 12 }}>
-          <ScrollTable offscreen="the timing and notes columns" testId="results-clinical-table">
+          <ScrollTable testId="results-clinical-table">
             <table className="table">
               <thead>
                 <tr>

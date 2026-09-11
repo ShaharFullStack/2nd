@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
-import type { LaneResultSummary, SessionResult } from '../session/types.ts';
+import type { LaneResultSummary, SessionResult, TrackingQuality } from '../session/types.ts';
 import RomTrend from './RomTrend.tsx';
 
 function lane(patch: Partial<LaneResultSummary> = {}): LaneResultSummary {
@@ -17,6 +17,18 @@ function lane(patch: Partial<LaneResultSummary> = {}): LaneResultSummary {
 
 const PATIENT = 'p-test';
 
+/** A stream that did what the measurement assumes. */
+function tracking(patch: Partial<TrackingQuality> = {}): TrackingQuality {
+  return {
+    samples: 180, fpsMedian: 30, fpsLow: 28, inferenceMsMedian: 12,
+    trackedFraction: 0.99, lowFpsFraction: 0, delegate: 'GPU', worstReason: null,
+    ...patch,
+  };
+}
+
+/** 11.8 fps with the landmarks usable for 62 % of the session — the case the whole module exists for. */
+const POOR = tracking({ fpsMedian: 11.8, fpsLow: 8.2, trackedFraction: 0.62, lowFpsFraction: 0.7, worstReason: 'no_landmarks' });
+
 function session(id: string, at: number, lanes: LaneResultSummary[]): SessionResult {
   return {
     id, patientId: PATIENT, patientName: 'Test Patient', startedAt: at, endedAt: at + 1, durationSec: 120,
@@ -25,7 +37,7 @@ function session(id: string, at: number, lanes: LaneResultSummary[]): SessionRes
     score: 1, stars: 3, accuracy: 0.8, starAccuracy: 0.8, maxCombo: 1, totalNotes: 10,
     hits: 8, perfects: 4, goods: 4, misses: 2, reps: 12, answerRate: 1,
     timingBiasMs: null, timingBiasMadMs: null, latencyOffsetMs: 120, suggestedLatencyMs: null,
-    completed: true, lanes,
+    completed: true, lanes, tracking: tracking(),
   };
 }
 
@@ -426,5 +438,100 @@ describe('the session-by-session list is reachable and ordered like the other sc
     const rows = [...screen.getByTestId('trend-knee_extension:left').querySelectorAll('.trend-points tbody tr')];
     expect(rows.length).toBe(4);
     expect(rows.some((r) => (r.textContent ?? '').includes('stopped by therapist'))).toBe(true);
+  });
+});
+
+/**
+ * THE CONFOUND THIS WHOLE FILE IS ABOUT.
+ *
+ * A trend is the one view where a change in the EQUIPMENT and a change in the PATIENT look the same,
+ * and this card is the surface a therapist changes a prescription on. A rise driven entirely by a
+ * session measured at 11.8 fps with the limb usable 62 % of the time may not be drawn as four
+ * identical dots and a green chip.
+ */
+describe('a session measured on a degraded stream is marked WHERE THE COMPARISON IS MADE', () => {
+  const mixed = [
+    { ...session('d', 4_000_000, [lane({ romMean: 0.71, accuracy: 0.9 })]), tracking: POOR },
+    session('c', 3_000_000, [lane({ romMean: 0.33, accuracy: 0.6 })]),
+    session('b', 2_000_000, [lane({ romMean: 0.27, accuracy: 0.55 })]),
+    session('a', 1_000_000, [lane({ romMean: 0.21, accuracy: 0.5 })]),
+  ];
+
+  it('does not paint the delta green when the two ends were tracked differently', () => {
+    render(<RomTrend history={mixed} patientId={PATIENT} />);
+    const badge = screen.getByTestId('trend-rom-delta-knee_extension:left');
+    // the number is still there — it is the measurement that was made
+    expect(badge.textContent).toContain('+50 pts');
+    // ...but it is not a win, and it says why inside its own box
+    expect(badge.className).not.toContain('badge-ok');
+    expect(badge.getAttribute('data-qualified')).toBe('true');
+    expect(badge.textContent).toContain('measured unevenly');
+  });
+
+  it('qualifies the accuracy delta the same way — it is as much a property of the stream', () => {
+    render(<RomTrend history={mixed} patientId={PATIENT} />);
+    const badge = screen.getByTestId('trend-accuracy-delta-knee_extension:left');
+    expect(badge.className).not.toContain('badge-ok');
+    expect(badge.textContent).toContain('measured unevenly');
+  });
+
+  it('rings the degraded point on the plot rather than drawing it like the rest', () => {
+    const { container } = render(<RomTrend history={mixed} patientId={PATIENT} />);
+    // the last point (index 3 of the four plotted, oldest first) is the poor-tracked session
+    expect(container.querySelector('[data-testid="spark-flag-3"]')).toBeTruthy();
+    expect(container.querySelector('[data-testid="spark-flag-0"]')).toBeNull();
+    expect(container.querySelector('[data-testid="bars-flag-3"]')).toBeTruthy();
+  });
+
+  it('says on the card how many of ITS OWN sessions were measured badly', () => {
+    render(<RomTrend history={mixed} patientId={PATIENT} />);
+    const line = screen.getByTestId('trend-tracking-knee_extension:left');
+    expect(line.textContent).toContain('1 of these 4 sessions');
+    expect(line.textContent).toContain('degraded');
+  });
+
+  it('states the grade of every session in the session-by-session list', () => {
+    render(<RomTrend history={mixed} patientId={PATIENT} />);
+    expect(screen.getByTestId('trend-point-tracking-knee_extension:left-d').textContent).toBe('poor');
+    expect(screen.getByTestId('trend-point-tracking-knee_extension:left-a').textContent).toBe('good');
+  });
+
+  it('treats a record with no tracking block as unknown, never as a clean stream', () => {
+    const noBlock = [
+      { ...session('b', 2_000_000, [lane({ romMean: 0.7 })]), tracking: undefined },
+      session('a', 1_000_000, [lane({ romMean: 0.5 })]),
+    ];
+    render(<RomTrend history={noBlock} patientId={PATIENT} />);
+    const badge = screen.getByTestId('trend-rom-delta-knee_extension:left');
+    expect(badge.className).not.toContain('badge-ok');
+    expect(badge.textContent).toContain('tracking unknown');
+    expect(screen.getByTestId('trend-point-tracking-knee_extension:left-b').textContent).toBe('not recorded');
+  });
+
+  it('leaves a like-for-like comparison alone — the caveat is not furniture', () => {
+    render(<RomTrend history={IMPROVING} patientId={PATIENT} />);
+    const badge = screen.getByTestId('trend-rom-delta-knee_extension:left');
+    expect(badge.className).toContain('badge-ok');
+    expect(badge.getAttribute('data-qualified')).toBeNull();
+    expect(screen.queryByTestId('trend-tracking-knee_extension:left')).toBeNull();
+  });
+
+  it('counts the sessions BEHIND THESE LINES, not the patient\'s whole camera history', () => {
+    // twelve stored sessions, the four most recent all tracked good: with "Last 4" selected the
+    // sentence under the plots must not be about the eight that are not on screen.
+    const many: SessionResult[] = [];
+    for (let i = 12; i >= 1; i--) {
+      const good = i > 8;
+      many.push({
+        ...session(`s${i}`, i * 1_000_000, [lane({ romMean: 0.4 + i * 0.01 })]),
+        tracking: good ? tracking() : POOR,
+      });
+    }
+    render(<RomTrend history={many} patientId={PATIENT} />);
+    fireEvent.click(screen.getByTestId('trend-window-4'));
+    const mix = screen.getByTestId('trend-tracking-mix');
+    expect(mix.textContent).toContain('All 4 camera sessions behind these lines');
+    fireEvent.click(screen.getByTestId('trend-window-8'));
+    expect(screen.getByTestId('trend-tracking-mix').textContent).toContain('Of the 8 camera sessions behind these lines');
   });
 });

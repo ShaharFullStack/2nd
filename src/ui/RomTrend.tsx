@@ -48,7 +48,8 @@ import { endReasonLabel, formatPercent } from '../session/results.ts';
 import { DEFAULT_TREND_WINDOW, movementTrends, trendCoverage } from '../session/trends.ts';
 import type { MovementTrend, TrendPoint } from '../session/trends.ts';
 import type { SessionResult } from '../session/types.ts';
-import { trackingMix } from '../session/tracking.ts';
+import { compareTracking, trackingConditions, trackingMixOfGrades, TRACKING_NOT_RECORDED } from '../session/tracking.ts';
+import type { TrackingComparison, TrackingGrade } from '../session/tracking.ts';
 import { DeltaBadge, SessionBars, Sparkline, shortDate } from './common.tsx';
 import { ScopeNote } from './ScopeNote.tsx';
 import { ScrollTable } from './Results.tsx';
@@ -119,24 +120,90 @@ function cardBasis(points: readonly TrendPoint[]): { shown: TrendPoint[]; exclud
   return { shown: points.slice(), excluded: [] };
 }
 
-/** First and last non-null value of a series, and how many there were. */
-function ends(values: readonly (number | null)[]): { first: number | null; last: number | null; n: number } {
+/**
+ * First and last non-null value of a series, HOW MANY there were, and WHICH SESSIONS the two ends
+ * are.
+ *
+ * The indices are not bookkeeping: the delta below is `last − first`, and whether that subtraction
+ * may be presented as a result depends on how those two particular sessions were tracked. A series
+ * with a gap in the middle spans a different pair from the one the card's date range names.
+ */
+function ends(values: readonly (number | null)[]): {
+  first: number | null;
+  last: number | null;
+  n: number;
+  firstIndex: number;
+  lastIndex: number;
+} {
   let first: number | null = null;
   let last: number | null = null;
+  let firstIndex = -1;
+  let lastIndex = -1;
   let n = 0;
-  for (const v of values) {
+  for (let i = 0; i < values.length; i++) {
+    const v = values[i];
     if (v === null || !Number.isFinite(v)) continue;
-    if (first === null) first = v;
+    if (first === null) {
+      first = v;
+      firstIndex = i;
+    }
     last = v;
+    lastIndex = i;
     n++;
   }
-  return { first, last, n };
+  return { first, last, n, firstIndex, lastIndex };
 }
 
 /** latest − first, but only when there really are two points to span. */
 function spanChange(e: { first: number | null; last: number | null; n: number }): number | null {
   if (e.first === null || e.last === null || e.n < 2) return null;
   return e.last - e.first;
+}
+
+/** A point that was measured on a degraded stream, or whose record never said. */
+function pointFlagged(p: TrendPoint): boolean {
+  return p.trackingGrade === null || p.trackingGrade !== 'good';
+}
+
+/** "tracking poor" / "tracking not recorded", in the badge the rest of the app uses for it. */
+function TrackingChip({ point, testId }: { point: TrendPoint; testId?: string }) {
+  const g = point.trackingGrade;
+  return (
+    <span
+      className={g === 'good' ? 'badge badge-ok' : g === 'fair' ? 'badge badge-warn' : g === 'poor' ? 'badge badge-bad' : 'badge badge-warn'}
+      title={point.tracking ? trackingConditions(point.tracking) : TRACKING_NOT_RECORDED}
+      data-testid={testId}
+    >
+      {g === null ? 'not recorded' : g}
+    </span>
+  );
+}
+
+/**
+ * WHETHER A DELTA ACROSS THIS SERIES' TWO ENDS MAY BE DRAWN AS A RESULT.
+ *
+ * `null` when there is no delta to draw (fewer than two measured points). Otherwise the verdict from
+ * `compareTracking` on the two sessions the subtraction is actually taken across — which is the only
+ * pair that matters, and not necessarily the first and last session on the card.
+ */
+function endsComparison(
+  shown: readonly TrendPoint[],
+  e: { n: number; firstIndex: number; lastIndex: number },
+): TrackingComparison | null {
+  if (e.n < 2 || e.firstIndex < 0 || e.lastIndex < 0) return null;
+  const from = shown[e.firstIndex];
+  const to = shown[e.lastIndex];
+  if (!from || !to) return null;
+  return compareTracking(from.tracking, to.tracking, {
+    from: `the ${shortDate(from.at)} session`,
+    to: `the ${shortDate(to.at)} one`,
+  });
+}
+
+/** The chip qualifier for a comparison, or null when the two ends were measured alike. */
+function qualifierOf(c: TrackingComparison | null): { tag: string; title?: string } | null {
+  if (!c || c.kind === 'like-for-like' || c.tag === null) return null;
+  return { tag: c.tag, title: c.note ?? undefined };
 }
 
 function TrendCard({ trend }: { trend: MovementTrend }) {
@@ -158,6 +225,22 @@ function TrendCard({ trend }: { trend: MovementTrend }) {
   const romChange = spanChange(romEnds);
   const absoluteChange = spanChange(absEnds);
   const accuracyChange = spanChange(accuracyEnds);
+  /**
+   * THE POINTS THAT WERE NOT MEASURED LIKE THE REST, AND THE DELTAS THAT SPAN THEM.
+   *
+   * Both halves are needed and neither substitutes for the other: the ring on the dot says WHICH
+   * session was measured on a degraded (or unrecorded) stream, and the chip qualifier stops the
+   * subtraction taken across it from rendering as a plain gain. A card whose rise from 21 % to 71 %
+   * is driven entirely by a session tracked at 11.8 fps used to draw four identical dots and a green
+   * "▲ +40 pts" — the equipment presented as the patient.
+   */
+  const flags = shown.map(pointFlagged);
+  const anyFlagged = flags.some(Boolean);
+  const romComparison = endsComparison(shown, romEnds);
+  const absComparison = endsComparison(shown, absEnds);
+  const accuracyComparison = endsComparison(shown, accuracyEnds);
+  /** The mix behind THIS card, counted over the sessions it draws — never the whole stored history. */
+  const mix = trackingMixOfGrades(shown.map((p) => p.trackingGrade));
   /** Reps in the sessions this card's figures are about, and in the ones it set aside. */
   const shownReps = shown.reduce((n, p) => n + p.reps, 0);
   const excludedReps = excluded.reduce((n, p) => n + p.reps, 0);
@@ -194,19 +277,46 @@ function TrendCard({ trend }: { trend: MovementTrend }) {
         </span>
       </div>
 
+      {/*
+        HOW EVENLY THIS CARD'S OWN SESSIONS WERE MEASURED — at the top of the card, not in a sentence
+        under the whole grid. The count is over the sessions THIS card draws, so it can be checked
+        against the dots beside it; a per-patient total under a "Last 4" window is a number that does
+        not match its own view.
+      */}
+      {(mix.degraded > 0 || mix.unrecorded > 0) && (
+        <div className="dim" data-testid={`trend-tracking-${trend.key}`}>
+          <span className="badge badge-warn">measured unevenly</span>{' '}
+          {mix.degraded > 0 && (
+            <>
+              {mix.degraded} of these {mix.total} sessions {mix.degraded === 1 ? 'was' : 'were'} measured on a degraded
+              camera stream
+            </>
+          )}
+          {mix.degraded > 0 && mix.unrecorded > 0 && ' and '}
+          {mix.unrecorded > 0 && (
+            <>
+              {mix.unrecorded} of these {mix.total} {mix.unrecorded === 1 ? 'has' : 'have'} no tracking quality recorded
+            </>
+          )}
+          . Those sessions are ringed on the plots and listed session by session below; a change taken
+          across one of them is marked on its badge.
+        </div>
+      )}
+
       <div className="trend-block">
         <div className="trend-row">
           <div className="trend-figure">
             <span className="k">ROM achieved</span>
             <span className="v">{measured > 0 ? formatPercent(romEnds.last) : '—'}</span>
           </div>
-          <DeltaBadge value={romChange} />
+          <DeltaBadge value={romChange} qualified={qualifierOf(romComparison)} testId={`trend-rom-delta-${trend.key}`} />
         </div>
         {measured > 0 ? (
           <Sparkline
             values={romValues}
             at={at}
-            label={`${trend.label}: range of motion, as a percentage of that day's calibrated range, over the last ${sessions} camera sessions`}
+            flagged={flags}
+            label={`${trend.label}: range of motion, as a percentage of that day's calibrated range, over the last ${sessions} camera sessions${anyFlagged ? '; sessions measured on a degraded or unrecorded camera stream are ringed' : ''}`}
             color="#ff3d7f"
             band={1}
           />
@@ -234,11 +344,14 @@ function TrendCard({ trend }: { trend: MovementTrend }) {
               scale={1}
               digits={unit === 'deg' ? 0 : 2}
               unit={unit === 'deg' ? '\u00b0' : 'units'}
+              qualified={qualifierOf(absComparison)}
+              testId={`trend-absolute-delta-${trend.key}`}
             />
           </div>
           <Sparkline
             values={absoluteValues}
             at={at}
+            flagged={flags}
             min={Number.NEGATIVE_INFINITY}
             max={Number.POSITIVE_INFINITY}
             minSpan={unit === 'deg' ? 8 : 0.08}
@@ -260,7 +373,11 @@ function TrendCard({ trend }: { trend: MovementTrend }) {
             <span className="k">Accuracy</span>
             <span className="v">{formatPercent(accuracyEnds.last)}</span>
           </div>
-          <DeltaBadge value={accuracyChange} />
+          <DeltaBadge
+            value={accuracyChange}
+            qualified={qualifierOf(accuracyComparison)}
+            testId={`trend-accuracy-delta-${trend.key}`}
+          />
         </div>
         {/* COLUMNS ON A FIXED 0–100 % AXIS, not a third autoscaled line. Accuracy is a different
             quantity from the two plots above, and an autoscaled line under an autoscaled line reads
@@ -270,7 +387,8 @@ function TrendCard({ trend }: { trend: MovementTrend }) {
         <SessionBars
           values={accuracyValues}
           at={at}
-          label={`${trend.label}: accuracy of the notes judged in this lane, out of 100 %, over the last ${sessions} camera sessions`}
+          flagged={flags}
+          label={`${trend.label}: accuracy of the notes judged in this lane, out of 100 %, over the last ${sessions} camera sessions${anyFlagged ? '; sessions measured on a degraded or unrecorded camera stream are outlined' : ''}`}
           color="#35d6ff"
         />
         <span className="dim">
@@ -305,10 +423,11 @@ function TrendCard({ trend }: { trend: MovementTrend }) {
           the patient did, then the range, then the grade. Reps sitting last was how it came to be
           the column that fell off.
         */}
-        <ScrollTable
-          offscreen={absMeasured > 0 ? 'the peak and accuracy columns' : 'the accuracy column'}
-          testId={`trend-points-table-${trend.key}`}
-        >
+        {/* NO GUESSED COLUMN NAMES. This prop used to carry them, and measured at 1280 and 1920 the
+            table was 537–548 px inside a 504–506 px scroller with only "Accuracy" actually cut — so
+            the cue named the peak column while the therapist was looking straight at it.
+            `ScrollTable` measures the header cells and names the ones that really are off screen. */}
+        <ScrollTable testId={`trend-points-table-${trend.key}`}>
           <table className="table">
             <thead>
               <tr>
@@ -317,6 +436,9 @@ function TrendCard({ trend }: { trend: MovementTrend }) {
                 <th>ROM</th>
                 {absMeasured > 0 && <th title={absoluteTitle(unit)}>{absoluteColumn(unit)}</th>}
                 <th>Accuracy</th>
+                {/* THE COLUMN THAT SAYS WHICH ROW IS A MEASUREMENT AND WHICH IS A GUESS. The rings on
+                    the plot locate a degraded session; this says what was wrong with it. */}
+                <th>Tracking</th>
               </tr>
             </thead>
             <tbody>
@@ -339,6 +461,9 @@ function TrendCard({ trend }: { trend: MovementTrend }) {
                       </td>
                     )}
                     <td className="mono">{formatPercent(p.accuracy)}</td>
+                    <td>
+                      <TrackingChip point={p} testId={`trend-point-tracking-${trend.key}-${p.sessionId}`} />
+                    </td>
                   </tr>
                 ))}
             </tbody>
@@ -396,7 +521,23 @@ export default function RomTrend({ history, patientId }: { history: readonly Ses
   // `history` is the whole device's; `patientId` is what makes these series this patient's.
   const trends = useMemo(() => movementTrends(history, patientId, windowSize), [history, patientId, windowSize]);
   const coverage = useMemo(() => trendCoverage(history, patientId), [history, patientId]);
-  const mix = useMemo(() => trackingMix(history, patientId), [history, patientId]);
+  /**
+   * THE SESSIONS BEHIND THESE LINES — the ones actually plotted in the window on screen, counted
+   * once each however many cards they appear on.
+   *
+   * This used to count the patient's whole camera history regardless of the window: with "Last 4"
+   * selected and the four most recent sessions all tracked good, the line under the plots still read
+   * "Of this patient's 12 camera sessions, 8 were measured on a degraded camera stream". It erred
+   * toward caution, but the sentence says "behind these lines", and a number that does not match its
+   * own view teaches a therapist to discount the sentence.
+   */
+  const mix = useMemo(() => {
+    const grades = new Map<string, TrackingGrade | null>();
+    // `cardBasis` is what each card actually draws (a run that ended early is set aside where two
+    // complete sessions exist), so the count matches the dots, not merely the window.
+    for (const t of trends) for (const p of cardBasis(t.points).shown) grades.set(p.sessionId, p.trackingGrade);
+    return trackingMixOfGrades([...grades.values()]);
+  }, [trends]);
 
   // Nothing the patient drove: say so plainly rather than plotting the bot's keypresses as progress.
   if (trends.length === 0) {
@@ -456,14 +597,14 @@ export default function RomTrend({ history, patientId }: { history: readonly Ses
         <span className="dim" data-testid="trend-tracking-mix">
           {mix.degraded === 0 && mix.unrecorded === 0
             ? `All ${mix.total} camera session${mix.total === 1 ? '' : 's'} behind these lines were measured on a camera stream that held up.`
-            : `Of this patient's ${mix.total} camera session${mix.total === 1 ? '' : 's'}, ` +
+            : `Of the ${mix.total} camera session${mix.total === 1 ? '' : 's'} behind these lines, ` +
               [
                 mix.degraded > 0 ? `${mix.degraded} ${mix.degraded === 1 ? 'was' : 'were'} measured on a degraded camera stream` : null,
                 mix.unrecorded > 0 ? `${mix.unrecorded} ${mix.unrecorded === 1 ? 'has' : 'have'} no tracking quality recorded` : null,
               ]
                 .filter(Boolean)
                 .join(' and ') +
-              '. A difference between two sessions measured differently is partly the equipment; the session table states each one.'}
+              '. Those points are ringed on the plots, named in each card\u2019s session list, and any change badge taken across one of them says so on the badge itself.'}
         </span>
       </div>
 

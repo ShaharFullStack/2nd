@@ -4595,6 +4595,44 @@ describe('the song-end sequence', () => {
     expect(words).not.toMatch(/★|star|failed|rank|grade/i);
   });
 
+  /**
+   * THE ENDING REPLACES THE GAME CHROME. IT DOES NOT SIT ON TOP OF IT.
+   *
+   * The curtain is 0.88, not 1: under it the live readouts were dimmed and perfectly readable, and
+   * they stayed for the whole 6.6 s. Observed at 1024x768 and 1280x800 — the COMBO block ("27"), its
+   * "x3" multiplier badge, the ANSWERED gauge and the rolling six-digit score all still on screen
+   * beside the card counting the same session out properly. Every one is a live readout of a song
+   * that has finished; two score readouts on one screen, one settling and one frozen, is the game
+   * contradicting itself in the last thing the patient sees.
+   */
+  it('clears the live HUD — score, combo, multiplier, gauge — for the payoff', () => {
+    const playing = makeFrame({ lanes: LANES, songTime: 10, combo: 27, multiplier: 3, health: 0.5, thresholdFraction: 0.5 });
+
+    // While the song is on, all of it is drawn.
+    const during = setup();
+    during.hw.resize(1280, 720, 1);
+    during.hw.draw(playing);
+    expect(wrote(during.scratch, 'SCORE')).toBe(true);
+    expect(wrote(during.scratch, 'COMBO')).toBe(true);
+    expect(wrote(during.scratch, 'ANSWERED')).toBe(true);
+    expect(wrote(during.scratch, 'x3')).toBe(true); // the multiplier badge
+
+    // Once the ending starts, none of it is — on the SAME frame, so nothing but the sequence differs.
+    const after = setup();
+    after.hw.resize(1280, 720, 1);
+    after.hw.startFinale(SPEC);
+    run(after.hw, FINALE_SEC + 0.2, playing);
+    expect(wrote(after.scratch, 'SCORE')).toBe(false);
+    expect(wrote(after.scratch, 'COMBO')).toBe(false);
+    expect(wrote(after.scratch, 'ANSWERED')).toBe(false);
+    expect(wrote(after.scratch, 'x3')).toBe(false);
+    // …and the card itself still reads out, so this removed the chrome and not the payoff.
+    expect(wrote(after.scratch, 'SONG COMPLETE')).toBe(true);
+    expect(wrote(after.scratch, 'MOVEMENTS PERFORMED')).toBe(true);
+    expect(wrote(after.scratch, SPEC.achievement)).toBe(true);
+    expect(wrote(after.scratch, SPEC.hint)).toBe(true);
+  });
+
   it('holds the skip for the opening of the sequence, then accepts it', () => {
     const { hw } = setup();
     hw.resize(1280, 720, 1);
@@ -4699,9 +4737,85 @@ describe('the song-end sequence', () => {
   it('draws at the small end of the supported canvas without throwing', () => {
     const { hw, scratch } = setup(1024, 768);
     hw.resize(1024, 768, 1);
-    hw.startFinale({ ...SPEC, stats: [...SPEC.stats, { value: '9', label: 'LONGEST RUN' }, { value: '1:37', label: 'TIME MOVING' }] });
+    hw.startFinale({ ...SPEC, stats: [...SPEC.stats, { value: '9', label: 'LONGEST RUN' }, { value: '1:37', label: 'SONG LENGTH' }] });
     run(hw, FINALE_SEC + 0.2, makeFrame({ lanes: LANES, songTime: 10, thresholdFraction: 0.5 }));
     expect(wrote(scratch, 'SONG COMPLETE')).toBe(true);
-    expect(wrote(scratch, 'TIME MOVING')).toBe(true);
+    expect(wrote(scratch, 'SONG LENGTH')).toBe(true);
+  });
+
+  /**
+   * THE CLAUSE THAT MAKES THE PERCENTAGE HONEST MAY NOT BE THE PART THAT GETS CUT.
+   *
+   * This line went through `TextCache.fit`, which truncates with an ellipsis and does not shrink.
+   * Measured in the live renderer at both clinic sizes, the note the game shows on the ONE occasion
+   * it says "Full range reached" came out as "… — of the range calibrated fo…" at 1024x768 and
+   * "… — of the range calibrated…" at 1280x800 — so what reached the patient was "Left Seated march
+   * 95%" beside a limb name, which reads as 95 % of a normal joint rather than of the range their
+   * therapist calibrated for that movement this morning. The longest note this card can be handed
+   * is used here: two of the longest clinical lane names, their figures, "and N more", and the
+   * clause.
+   */
+  it('wraps the achievement note in full rather than ellipsing the clause that qualifies it', () => {
+    const note =
+      'Left Ankle dorsiflexion 95% · Right Ankle dorsiflexion 92% · and 2 more — each of the range calibrated for THAT movement today.';
+    for (const [w, h] of [[1024, 768], [1280, 800], [1920, 1080]] as const) {
+      const { hw, scratch } = setup(w, h);
+      hw.resize(w, h, 1);
+      hw.startFinale({
+        ...SPEC,
+        achievement: 'Full range reached — 4 of 4 movements',
+        achievementNote: note,
+      });
+      run(hw, FINALE_SEC + 0.2, makeFrame({ lanes: LANES, songTime: 10, thresholdFraction: 0.5 }));
+
+      // Every string this canvas rasterised, in the order it was first drawn. The note's lines are
+      // the ones that are pieces of the note, and joined back up with the spaces the wrap broke on
+      // they must be the note — the whole note, and no ellipsis anywhere in it.
+      const drawn: string[] = [];
+      for (const c of scratch) {
+        for (const k of c.ctx.calls) {
+          if (k.name !== 'fillText') continue;
+          const text = String(k.args[0]);
+          if (!drawn.includes(text)) drawn.push(text);
+        }
+      }
+      // Walk the note, consuming the longest drawn string that starts what is left of it: the
+      // wrapped lines have to tile the note end to end, with nothing missing and nothing added.
+      const lines: string[] = [];
+      let rest = note;
+      for (let guard = 0; rest.length > 0 && guard < 16; guard++) {
+        let piece = '';
+        for (const t of drawn) {
+          if (t.length > piece.length && (rest === t || rest.startsWith(`${t} `))) piece = t;
+        }
+        if (piece === '') break;
+        lines.push(piece);
+        rest = rest.slice(piece.length).replace(/^ /, '');
+      }
+      expect(lines.join(' '), `${w}x${h}`).toBe(note);
+      expect(lines.length, `${w}x${h} wrapped`).toBeGreaterThan(1);
+      expect(lines.some((t) => t.includes('…')), `${w}x${h} ellipsis`).toBe(false);
+    }
+  });
+
+  /**
+   * AND IT IS LEGIBLE FROM TWO METRES. At `px(14, 11)` on a 1024 canvas the qualifier rendered at
+   * 11 px in 55 %-alpha grey — the smallest and faintest text on a card written to be read across a
+   * treatment room by a patient who may have low vision.
+   */
+  it('draws the achievement note no smaller than 13 px at the smallest clinic size', () => {
+    const { hw, scratch } = setup(1024, 768);
+    hw.resize(1024, 768, 1);
+    hw.startFinale({ ...SPEC, achievementNote: 'Landed on a note or not: the movement is the work.' });
+    run(hw, FINALE_SEC + 0.2, makeFrame({ lanes: LANES, songTime: 10, thresholdFraction: 0.5 }));
+    let px = 0;
+    for (const c of scratch) {
+      const drawnHere = c.ctx.calls.filter((k) => k.name === 'fillText');
+      if (drawnHere.length === 0) continue;
+      if (!drawnHere.every((k) => String(k.args[0]).includes('the movement is the work'))) continue;
+      const m = /(\d+(?:\.\d+)?)px/.exec(String(c.ctx.props.font));
+      if (m) px = Math.max(px, Number(m[1]));
+    }
+    expect(px).toBeGreaterThanOrEqual(13);
   });
 });

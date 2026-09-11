@@ -155,14 +155,9 @@ export default function HistoryScreen() {
             </button>
           </div>
           <div className="card">
-            <ScrollTable
-              offscreen={
-                showScoring
-                  ? 'the scoring columns — accuracy, score, stars, best combo and timing'
-                  : 'the length and the per-movement detail'
-              }
-              testId="history-table"
-            >
+            {/* No guessed column names: `ScrollTable` measures which header cells are cut and says
+                those. The guess here was "the scoring columns" whether or not they were showing. */}
+            <ScrollTable testId="history-table">
             <table className="table">
             <thead>
               {/* WORK FIRST: what the patient did, then how long it took, then — only if asked for —

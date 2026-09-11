@@ -114,11 +114,22 @@ the lowpass only takes energy out of the broadband stem, so without it the maste
 player stem 2 dB on top — would be undone by the delivery format.
 
 **Loading is not allowed to happen while the patient waits.** `runtime.prefetchSong(songId)` is
-called from the Setup screen (once the song choice settles, and again on Start); it is
-fire-and-forget, idempotent per song, declines while an audition is in flight, and shares its
+called from the Setup screen (immediately for the song that screen opens on — there is nothing to
+debounce about a choice already made — then debounced ~1.2 s on any CHANGE, and again on Start); it
+is fire-and-forget, idempotent per song, declines while an audition is in flight, and shares its
 load with `loadSong` — including its byte progress, so the Play screen's bar joins a download it
 did not start. Cancelling an audition must never cancel a prefetched session load
 (`previewOwnsLoad`).
+
+**And a tablet pays for a song once.** The mixer fetches through `cachingStemFetch`
+(`src/session/stemCache.ts`, passed to `new StemMixer({ fetch })` in runtime): whole, successful,
+same-origin stem responses are kept in Cache Storage under `beat-rehab-stems-v1`, bounded to
+`MAX_CACHED_STEMS` oldest-first, so a reload or the next patient starts the song from disk whatever
+cache headers the clinic's server sends. Every failure path — no Cache Storage, a quota refusal, a
+ranged (audition) request, a 206/404 — falls through to the plain network fetch: this layer may make
+a session start faster, never wrong and never not at all. `npm run critic:firstnote` measures the
+result the way the README's table is measured: production build, `vite preview`, 8 Mbit/s with 40 ms
+latency and the HTTP cache disabled, timed from the Start click to the bot answering note one.
 
 ## Session flow
 Home → Patient → Mode (leg/hand) → Therapist Setup (pick 2–4 movements+sides, difficulty, song, **pacing**) → Camera check → ROM calibration per lane → Latency calibration → Play → Results → persisted to localStorage (history, patient-scoped).
@@ -149,6 +160,27 @@ Home → Patient → Mode (leg/hand) → Therapist Setup (pick 2–4 movements+s
   so it is a lower bound. `trackingGrade` (good/fair/poor) is keyed off `MIN_USABLE_DETECT_FPS`
   and the tracked share, and the trend states how many of the sessions behind its lines were
   measured on a degraded stream.
+- **THE QUALIFIER RIDES ON THE COMPARISON, NOT UNDER IT.** Recording tracking quality changes no
+  decision until it reaches the place where one number is subtracted from another — a trend delta, a
+  gain chip, "biggest gain today" — because comparison is where equipment noise masquerades as
+  patient change. `compareTracking(from, to)` (session/tracking.ts) is the single gate: `like-for-like`
+  only when BOTH sessions recorded tracking and both were graded good; `uneven` when the grades
+  differ or both are degraded; `unrecorded` when either end has no block (absent reads as absent,
+  never as a clean stream). Every surface that spans two sessions passes its two ENDPOINTS through it:
+  - `TrendPoint` carries `tracking` and `trackingGrade`, so the ROM, peak and accuracy plots ring
+    (`Sparkline.flagged`) or outline (`SessionBars.flagged`) the points that were not measured like
+    the rest, and the session-by-session list grades every row;
+  - `DeltaBadge` takes `qualified` and, when set, LOSES THE GREEN and prints the reason inside its own
+    box ("▲ +49 pts · measured unevenly"). A grey sentence under a green chip is not a qualifier — a
+    therapist with ninety seconds reads the chip;
+  - Results qualifies each lane's gain chip, "biggest gain today" (which becomes "biggest change
+    today"), the rep delta and the card header from the same verdict;
+  - counts of degraded sessions are taken over the sessions ON SCREEN (`trackingMixOfGrades` on the
+    plotted window), never over the patient's whole stored history;
+  - the export states the rule in words (`COMPARING SESSIONS:` in the text, and the `fields.tracking`
+    legend in the JSON), because the file is read with no app around it.
+  `critic/measured-unevenly.mjs` drives the whole thing in the real app at 1024x768, 1280x800 and
+  1920x1080 against a seeded shared tablet whose latest session was tracked at 11.8 fps.
 
 ## Dev/test affordances (mandatory)
 - `?input=keyboard` URL param bypasses camera; `?autoplay=1` bot hits every note (for screenshots); `?seed=`.

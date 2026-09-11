@@ -39,7 +39,9 @@
 import type { Fingertip, Movement, Side } from '../engine/types.ts';
 import { MOVEMENT_INFO } from '../vision/features.ts';
 import { clinicalLaneName } from './results.ts';
-import type { InputMode, LaneResultSummary, SessionEndReason, SessionResult } from './types.ts';
+import { sessionTrackingGrade } from './tracking.ts';
+import type { TrackingGrade } from './tracking.ts';
+import type { InputMode, LaneResultSummary, SessionEndReason, SessionResult, TrackingQuality } from './types.ts';
 
 /** One session's contribution to one movement's trend. */
 export interface TrendPoint {
@@ -79,6 +81,22 @@ export interface TrendPoint {
   completed: boolean;
   /** What stopped it, when the record says (older records do not). */
   endReason: SessionEndReason | null;
+  /**
+   * HOW WELL THE CAMERA WAS TRACKING WHEN THIS POINT WAS MEASURED — on the POINT, not only in a
+   * count under the grid.
+   *
+   * Without this field every dot on every line is drawn identically by construction, and a patient
+   * whose latest session ran at 11.8 fps with the limb usable 62 % of the time contributes the same
+   * kind of mark as one measured on a clean 30 fps stream. The trend is the view this project's own
+   * docs name as the place where a change in the equipment and a change in the patient are
+   * indistinguishable, so the qualifier has to ride on the point and on the delta taken across it.
+   *
+   * `tracking` is the stored block (null when the record has none — an old record, since only camera
+   * sessions reach a trend at all) and `trackingGrade` is the verdict the screens colour by. Null
+   * means NOT RECORDED and must never be rendered as a clean stream.
+   */
+  tracking: TrackingQuality | null;
+  trackingGrade: TrackingGrade | null;
 }
 
 export interface MovementTrend {
@@ -294,6 +312,8 @@ export function movementTrends(
         compensationFlags: lane.compensationMonitored ? lane.compensationFlags : 0,
         completed: session.completed !== false,
         endReason: session.endReason ?? null,
+        tracking: session.tracking ?? null,
+        trackingGrade: sessionTrackingGrade(session),
       });
       if (s !== null) previousSpan = s;
     }

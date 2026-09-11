@@ -14,6 +14,7 @@ import type { SongManifest } from '../audio/manifest.ts';
 import { attributionText } from '../audio/manifest.ts';
 import type { Fingertip, Mode, Movement, Side } from '../engine/types.ts';
 import { compensationKind, FINGERTIP_NAME, MOVEMENT_INFO } from '../vision/features.ts';
+import { formatFeature } from '../vision/calibration.ts';
 import type { RomCalibration } from '../vision/calibration.ts';
 import type { LaneRepStats, RunSummary } from './GameRunner.ts';
 import type { InputMode, LaneResultSummary, Patient, SessionConfig, SessionEndReason, SessionResult, TrackingQuality } from './types.ts';
@@ -135,6 +136,24 @@ export function buildSessionResult(opts: BuildResultOptions): SessionResult {
     };
   });
 
+  /**
+   * THE HEADLINE COUNT IS THE SUM OF THE COLUMN UNDER IT. NOT A SECOND OPINION ABOUT IT.
+   *
+   * `results.reps` is the ENGINE's count — one per input event it was handed. Each lane's `reps`
+   * above is `max(that, the reps the input source actually observed)`, which is the right number
+   * (a crossing swallowed by the camera's refractory window reports a rep and emits no input event;
+   * a movement that never reached the hit threshold is still a rep). Summing the engine's total
+   * while printing the per-lane maxima under it let the report print "Movements performed 126" over
+   * a per-movement column that added up to more than 126 — the headline contradicted by its own
+   * table, in the one figure this screen exists to lead with.
+   *
+   * So the headline is the column's own total, and `surplusMovements` — the movements that answered
+   * no note — is re-derived from it rather than from the engine's smaller total, or the two figures
+   * on the same card would disagree by the same difference.
+   */
+  const repsTotal = lanes.reduce((n, l) => n + l.reps, 0);
+  const attemptedTotal = lanes.reduce((n, l) => n + (l.attempted ?? 0), 0);
+
   return {
     id: opts.id ?? newSessionId(now()),
     patientId: config.patientId,
@@ -160,7 +179,7 @@ export function buildSessionResult(opts: BuildResultOptions): SessionResult {
     perfects: results.perfects,
     goods: results.goods,
     misses: results.misses,
-    reps: results.reps,
+    reps: repsTotal,
     // The gauge's quantity under its own name, plus the movements it does NOT contain (see
     // session/types.ts: `health` meant three different things over this record's life).
     //
@@ -169,7 +188,7 @@ export function buildSessionResult(opts: BuildResultOptions): SessionResult {
     // record must be the measurement itself, or a session abandoned after three notes would be
     // filed as near-perfect.
     answerRate: answerRateOf(results.attempted, results.hits + results.misses, 0),
-    surplusMovements: results.surplus,
+    surplusMovements: Math.max(0, repsTotal - attemptedTotal),
     // THE DOSE THAT WAS GIVEN. Without it a rep count from last week is not comparable with today's.
     ...(config.laneRestSec !== undefined ? { laneRestSec: config.laneRestSec } : {}),
     timingBiasMs: results.timingBiasMs,
@@ -276,17 +295,64 @@ export function laneRangeSummaries(
 }
 
 /**
+ * The smallest change in a movement's OWN calibrated range that this app will call a change: half a
+ * point. Below it the difference is inside what one camera frame's peak can move, and the screens
+ * say "same as last time" — see `rangeChange`.
+ */
+export const MIN_GAIN_PCT = 0.005;
+
+/** How a lane's change since last time may be spoken about. One rule, shared by every surface. */
+export type RangeChangeKind = 'up' | 'down' | 'same' | 'none';
+
+export interface RangeChange {
+  kind: RangeChangeKind;
+  /** True when the change is large enough to be printed in the movement's OWN units. */
+  inUnits: boolean;
+}
+
+/**
+ * IS THERE A CHANGE HERE AT ALL, AND MAY IT BE NAMED?
+ *
+ * The one rule, in one place, because two surfaces were applying two. `mostImprovedRange` accepted
+ * any `gainPct > 0` while the tile beside it printed "same as last time" for anything under both the
+ * movement's unit resolution and half a point of range — so a knee that moved 0.15° rendered "same
+ * as last time" and "biggest gain today" one under the other, and the card header named that limb
+ * as the day's achievement on a change it had just declared unmeasurable. On a mixed prescription
+ * that limb is the unaffected one, which is the exact failure the per-limb headline was built to
+ * end, reintroduced one element to the right of the fix.
+ *
+ * A change is real when it is resolvable in the movement's own units, OR when it is at least
+ * `MIN_GAIN_PCT` of that movement's own calibrated range. Anything else is 'same'.
+ */
+export function rangeChange(s: Pick<LaneRangeSummary, 'gain' | 'gainPct' | 'unit'>): RangeChange {
+  if (s.gain === null && s.gainPct === null) return { kind: 'none', inUnits: false };
+  if (s.gain !== null && formatFeature(Math.abs(s.gain), s.unit) !== formatFeature(0, s.unit)) {
+    return { kind: s.gain > 0 ? 'up' : 'down', inUnits: true };
+  }
+  if (s.gainPct !== null && Math.abs(s.gainPct) >= MIN_GAIN_PCT) {
+    return { kind: s.gainPct > 0 ? 'up' : 'down', inUnits: false };
+  }
+  return { kind: 'same', inUnits: false };
+}
+
+/**
  * The movement that gained the most against its own previous session, or null when nothing gained.
  *
  * THE ONLY SINGLING-OUT THIS SCREEN DOES. It ranks a patient against themselves per limb, so it can
  * never hand the headline to the strong side for being strong: a knee that went 61° → 62° does not
  * out-rank a seated march that went 0.21 → 0.29, because the two are never compared — each lane's
  * gain is expressed as a fraction of its OWN calibrated range before they are ordered.
+ *
+ * AND THE GAIN HAS TO BE ONE. A ranking with no resolution floor named a limb "biggest gain today"
+ * on 0.15° — a difference the same screen prints as "same as last time", and one smaller than the
+ * peak of a single dropped camera frame. `rangeChange` is the floor, and it is the same one the
+ * badge beside the figure uses, so the two can no longer describe one number differently.
  */
 export function mostImprovedRange(summaries: readonly LaneRangeSummary[]): LaneRangeSummary | null {
   let best: LaneRangeSummary | null = null;
   for (const s of summaries) {
     if (s.gainPct === null || s.gainPct <= 0) continue;
+    if (rangeChange(s).kind !== 'up') continue;
     if (best === null || (s.gainPct as number) > (best.gainPct as number)) best = s;
   }
   return best;
@@ -466,6 +532,15 @@ export function buildPatientExport(input: PatientExportInput): PatientExport {
   // printed, with nothing else around it to say what produced the numbers.
   lines.push('');
   lines.push(`SCOPE: ${SCOPE_STATEMENT}`);
+  // AND THE RULE FOR SUBTRACTING ONE SESSION FROM ANOTHER, in the artefact where somebody will do
+  // exactly that with a ruler and no app in front of them. Each session below states the camera
+  // conditions it was measured in; two sessions measured differently are not a like-for-like pair,
+  // and the difference between them is partly the equipment.
+  lines.push(
+    'COMPARING SESSIONS: each session below states how well the camera was tracking while it was ' +
+      'measured. A change between two sessions tracked differently — or between one that recorded ' +
+      'tracking quality and one that did not — is partly the equipment, not the patient.',
+  );
   lines.push('');
 
   for (const s of sessions) {
@@ -528,7 +603,10 @@ export function buildPatientExport(input: PatientExportInput): PatientExport {
           'second), inferenceMsMedian, trackedFraction (share of the session with usable landmarks), ' +
           'lowFpsFraction, delegate, worstReason. Absent = not recorded (every session before v3, and every ' +
           'session with no camera). Timing is resolved no finer than one frame interval (1000/fpsMedian ms) ' +
-          'and a range is the peak OF THE FRAMES THAT ARRIVED, so it is a lower bound.',
+          'and a range is the peak OF THE FRAMES THAT ARRIVED, so it is a lower bound. A DIFFERENCE ' +
+          'BETWEEN TWO SESSIONS IS ONLY LIKE-FOR-LIKE WHEN BOTH CARRY THIS BLOCK AND BOTH WERE ' +
+          'TRACKED WELL (fpsMedian >= 24 and trackedFraction >= 0.95); otherwise part of the change ' +
+          'is the camera.',
       },
       exportedAt: now,
       patient,

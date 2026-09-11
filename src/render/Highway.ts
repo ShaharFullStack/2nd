@@ -231,6 +231,19 @@ const FINALE_RIBBON_FILL = 'rgba(255, 201, 69, 0.14)';
 const FINALE_RIBBON_LINE = 'rgba(255, 201, 69, 0.55)';
 /** First slot of `hudFit` the finale's strings own (the HUD title/attribution keep 0 and 1). */
 const FINALE_FIT_BASE = 8;
+/**
+ * Lines the achievement's second line may wrap onto before it is cut.
+ *
+ * IT IS A WRAP, NOT AN ELLIPSIS, AND THAT IS THE WHOLE POINT. This line was drawn through
+ * `TextCache.fit`, which truncates and does not shrink, so on the one occasion the game says "Full
+ * range reached" the clause that makes the percentage honest — that it is of the range calibrated
+ * for THAT movement TODAY, and not of a normal joint — was the part that got cut: measured at
+ * 1024x768 it read "… — of the range calibrated fo…", leaving a bare "95 %" beside a limb name.
+ * Four lines is more than the longest note this card can be handed (two clinical lane names, their
+ * percentages, "and N more" and the qualifier) needs at the narrowest supported canvas, and the
+ * panel grows to hold whatever comes back, so the cut below is a backstop and not the normal path.
+ */
+const FINALE_NOTE_MAX_LINES = 4;
 
 /** "5,100" — the score as the HUD writes it, without pulling in `toLocaleString` per frame. */
 function formatThousands(v: number): string {
@@ -733,6 +746,9 @@ export class Highway {
   private finaleBits: ConfettiBit[] = [];
   /** Lane colours as hex, resolved once when the ending starts. */
   private finaleColors: string[] = [];
+  /** `wrapFinaleNote`'s cache: the note changes once a session, the wrap costs a measure per word. */
+  private finaleNoteKey = '';
+  private finaleNoteLines: string[] = [];
   private lastSongTime: number | null = null;
   /**
    * Sanitized song time for the frame being drawn. Every internal draw step reads this instead of
@@ -1341,13 +1357,29 @@ export class Highway {
     // (`POPUP_MAX_RISE_FRAC`) keeps it in the receptor's own band rather than up the approach path,
     // and it is gone in half a second.
     this.drawPopups(ctx, st);
-    this.drawHud(ctx, frame, dt, beatPulse);
-    this.drawCombo(ctx, frame, st);
-    if (this.opts.showLabels) this.drawLabels(ctx, frame);
-    // THE ENDING GOES OVER EVERYTHING, including the HUD it replaces — it IS the readout now, and
-    // the live score/combo/gauge behind it are about a song that has finished. Its clock is the
-    // runner's (`advanceFinale`), not song time: the mixer has stopped by the time it is on screen.
-    if (this.finale) this.drawFinale(ctx, this.finaleStep);
+    /*
+      THE ENDING REPLACES THE GAME CHROME. IT DOES NOT SIT ON TOP OF IT.
+
+      The curtain is 0.88, not 1: drawn under it, the live readouts were dimmed and perfectly
+      readable, and they stayed for the whole 6.6 s. Observed at 1024x768 and 1280x800 — the COMBO
+      block ("27"), its "x3" multiplier badge, the ANSWERED gauge and the rolling six-digit score all
+      still on screen beside the card that was counting the same session out properly. Every one of
+      them is a live readout of a song that has finished: the combo cannot change, the gauge cannot
+      move, and the score is the number the card itself is rolling up. Two score readouts on one
+      screen, one settling and one frozen, is the game contradicting itself in the last thing the
+      patient sees.
+
+      So while the sequence is playing, the chrome is simply not drawn. The board behind it (lanes,
+      receptors, the last gem's effect) is, because that is the thing the curtain is fading.
+      Its clock is the runner's (`advanceFinale`), not song time: the mixer has stopped by now.
+    */
+    if (this.finale) {
+      this.drawFinale(ctx, this.finaleStep);
+    } else {
+      this.drawHud(ctx, frame, dt, beatPulse);
+      this.drawCombo(ctx, frame, st);
+      if (this.opts.showLabels) this.drawLabels(ctx, frame);
+    }
     if (this.opts.showStats) this.drawStats(ctx);
 
     ctx.globalAlpha = 1;
@@ -3112,8 +3144,14 @@ export class Highway {
       case 'finaleAchievement':
         s = { font: `800 ${px(27, 15)}px ${FONT}`, color: '#ffd84a' };
         break;
+      // THE QUALIFIER, NOT A CAPTION. This line is what makes the figure above it honest — "of the
+      // range calibrated for THAT movement today", which is the difference between 95 % of a
+      // patient's own calibrated range and 95 % of a normal joint. At `px(14, 11)` in 55 %-alpha
+      // grey it was the smallest, faintest text on a card meant to be read from two metres, and it
+      // was also the one string the layout truncated. It is now floored at 13 px, drawn at nearly
+      // full contrast, and WRAPPED rather than cut (see `wrapFinaleNote`).
       case 'finaleNote':
-        s = { font: `500 ${px(14, 11)}px ${FONT}`, color: UI_COLORS.textDim };
+        s = { font: `500 ${px(15, 13)}px ${FONT}`, color: 'rgba(242,244,255,0.86)' };
         break;
       case 'finaleHint':
         s = { font: `700 ${px(15, 11)}px ${FONT}`, color: UI_COLORS.text };
@@ -3530,6 +3568,22 @@ export class Highway {
     if (this.finaleColors.length === 0) this.finaleColors.push('#ffffff');
   }
 
+  /**
+   * Replace the WORDS AND FIGURES of a sequence already on screen, without touching its clock.
+   *
+   * The ending keeps counting: a camera session does not stop seeing the patient when the music
+   * stops, and the movements they make over the payoff are counted into the same session (see
+   * `GameRunner.onInput`). A card built once at the chart's end would therefore have gone stale
+   * while it was being read — it would say 126 movements and the report would say 131 — so the
+   * runner hands the card back whenever a count changes. `startFinale` still owns the timeline,
+   * the confetti and the skip guard; this only swaps what is written on it. Ignored when no
+   * sequence is playing, so it can never start one by the back door.
+   */
+  updateFinale(spec: FinaleSpec): void {
+    if (!this.finale) return;
+    this.finale = spec;
+  }
+
   /** Live confetti pieces — the crowd, for a test that has to know whether it showed up. */
   finaleConfettiCount(): number {
     let n = 0;
@@ -3666,11 +3720,21 @@ export class Highway {
     const hasAchievement = spec.achievement.length > 0;
     const hasNote = hasAchievement && !!spec.achievementNote;
     const panelW = Math.min(W - 40 * u, 700 * u);
+    // THE NOTE IS MEASURED BEFORE THE PANEL IS SIZED, because it is the one block whose height the
+    // canvas decides: it wraps to as many lines as the qualifier needs at this width, and the panel
+    // is then built tall enough to hold them. The old fixed `22 * u` allowance is what forced the
+    // line through an ellipsis in the first place.
+    const noteStyle = this.style('finaleNote');
+    const noteRoom = panelW - 40 * u;
+    const noteLines = hasNote ? this.wrapFinaleNote(spec.achievementNote as string, noteStyle, noteRoom) : [];
+    const noteLineH = Math.max(16 * u, fontPx(noteStyle.font) * 1.32);
+    const noteGap = 8 * u;
+    const noteBlockH = noteLines.length > 0 ? noteGap + noteLines.length * noteLineH : 0;
     // Every block's height, in the same numbers the cursor below advances by, so the panel is
     // exactly as tall as what is drawn in it at any canvas size.
     const panelH = Math.min(
       H - 40 * u,
-      (134 + (hero ? 86 : 0) + (hasRow ? 84 : 0) + (hasAchievement ? 76 + (hasNote ? 22 : 0) : 0) + 74) * u,
+      (134 + (hero ? 86 : 0) + (hasRow ? 84 : 0) + (hasAchievement ? 76 : 0) + 74) * u + noteBlockH,
     );
     const top = Math.max(20 * u, (H - panelH) / 2 - 10 * u);
     const panelIn = clamp(t / FINALE_CURTAIN_SEC, 0, 1);
@@ -3782,19 +3846,15 @@ export class Highway {
         ctx.stroke();
         ctx.globalAlpha = 1;
         this.text.draw(ctx, label, cx, y, style, 1, achIn);
-        if (spec.achievementNote) {
-          this.text.draw(
-            ctx,
-            this.fitFinale(2 + FINALE_MAX_STATS, spec.achievementNote, this.style('finaleNote'), room),
-            cx,
-            y + h * 0.72,
-            this.style('finaleNote'),
-            1,
-            achIn * 0.85,
-          );
+        // The qualifier, on as many lines as it takes. Drawn at nearly the ribbon's own opacity:
+        // it is the sentence that decides what the percentage above it means, not a footnote.
+        let ny = y + h / 2 + noteGap + noteLineH / 2;
+        for (const line of noteLines) {
+          this.text.draw(ctx, line, cx, ny, noteStyle, 1, achIn * 0.95);
+          ny += noteLineH;
         }
       }
-      y += 52 * u + (hasNote ? 22 * u : 0);
+      y += 52 * u + noteBlockH;
     }
 
     // THE SCORE, LAST AND SMALL — but still SEEN TO SETTLE. The patient watched this odometer climb
@@ -3814,7 +3874,18 @@ export class Highway {
     const hintIn = appear(FINALE_HINT_AT, 0.4);
     if (hintIn > 0 && spec.hint) {
       const breathe = calm ? 1 : 0.72 + 0.28 * Math.sin(t * 2.6);
-      this.text.draw(ctx, spec.hint, cx, Math.min(H - 24 * u, top + panelH + 30 * u), this.style('finaleHint'), 1, hintIn * breathe);
+      // FIT IT. The hint sits outside the panel and is the one finale string that was drawn raw, so
+      // at 1024x768 a sentence that also tells the patient they can stop moving ran off both edges.
+      const style = this.style('finaleHint');
+      this.text.draw(
+        ctx,
+        this.fitFinale(3 + FINALE_MAX_STATS, spec.hint, style, W - 32 * u),
+        cx,
+        Math.min(H - 24 * u, top + panelH + 30 * u),
+        style,
+        1,
+        hintIn * breathe,
+      );
     }
 
     ctx.globalAlpha = 1;
@@ -3882,6 +3953,46 @@ export class Highway {
     }
     ctx.globalAlpha = 1;
     ctx.globalCompositeOperation = 'source-over';
+  }
+
+  /**
+   * The achievement's second line, broken across lines at word boundaries so NOTHING IS CUT.
+   *
+   * `TextCache.fit` — what every other string on this card goes through — truncates with an
+   * ellipsis, which is right for a lane label that has a neighbour to collide with and wrong for
+   * the one line on the screen whose job is to qualify a number. Greedy wrap, one `measure` per
+   * word on a cold path (the note changes once a session), cached on the font and the room so a
+   * resize re-wraps and a frame does not.
+   *
+   * The backstop at `FINALE_NOTE_MAX_LINES` exists for input this card is not supposed to be handed
+   * (a single unbreakable word wider than the panel, a note ten lines long); real notes come back
+   * in two or three lines at 1024x768 and the panel is sized from the count either way.
+   */
+  private wrapFinaleNote(text: string, style: TextStyle, room: number): string[] {
+    const key = `${style.font}|${Math.round(room)}|${text}`;
+    if (this.finaleNoteKey === key) return this.finaleNoteLines;
+    const lines: string[] = [];
+    let line = '';
+    for (const word of text.split(/\s+/)) {
+      if (word === '') continue;
+      const next = line === '' ? word : `${line} ${word}`;
+      if (line !== '' && this.text.measure(next, style) > room) {
+        lines.push(line);
+        line = word;
+      } else {
+        line = next;
+      }
+    }
+    if (line !== '') lines.push(line);
+    if (lines.length > FINALE_NOTE_MAX_LINES) lines.length = FINALE_NOTE_MAX_LINES;
+    // A word longer than the panel is the only thing left that can overflow; it is ellipsised
+    // rather than allowed to run off both edges.
+    for (let i = 0; i < lines.length; i++) {
+      if (this.text.measure(lines[i], style) > room) lines[i] = this.text.fit(lines[i], style, room);
+    }
+    this.finaleNoteKey = key;
+    this.finaleNoteLines = lines;
+    return lines;
   }
 
   /** `fitHud`'s cold-path cache, for the finale's strings (they change once per session). */

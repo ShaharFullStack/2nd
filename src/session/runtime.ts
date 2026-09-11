@@ -8,6 +8,7 @@
  * all live on that one clock, so a second context would silently desynchronise the session.
  */
 import { loadSongCatalog, loadSongEntry } from '../audio/manifest.ts';
+import { cachingStemFetch } from './stemCache.ts';
 import type { SongEntry, SongManifest } from '../audio/manifest.ts';
 import { Sfx } from '../audio/sfx.ts';
 import { StemMixer } from '../audio/StemMixer.ts';
@@ -171,7 +172,11 @@ class SessionRuntime {
   /** Create (or return) the one AudioContext. MUST be called from a user gesture handler. */
   async ensureAudio(): Promise<AudioHandles> {
     if (!this.audio) {
-      const mixer = new StemMixer();
+      // THE MIXER FETCHES THROUGH THE APP'S OWN STEM CACHE (session/stemCache.ts). The first session
+      // on a tablet pays for the song; a reload, the next patient, or a therapist who pressed Start
+      // on sight does not — whatever cache headers the clinic's server happens to send. It degrades
+      // to a plain fetch wherever Cache Storage is unavailable.
+      const mixer = new StemMixer({ fetch: cachingStemFetch() });
       this.audio = { ctx: mixer.ctx, mixer, sfx: mixer.createSfx() };
     }
     await this.audio.mixer.resumeContext();

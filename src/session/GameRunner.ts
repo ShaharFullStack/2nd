@@ -22,7 +22,7 @@ import type { CompensationKindName, InputSource, LaneInputEvent, LaneRepEvent, S
 import { Highway } from '../render/Highway.ts';
 import type { FinaleSpec } from '../render/Highway.ts';
 import type { CanvasLike, HighwayOptions, RenderFrame, RenderNote } from '../render/types.ts';
-import { clinicalLaneName } from './results.ts';
+import { clinicalLaneName, formatDuration } from './results.ts';
 import type { SessionEndReason } from './types.ts';
 
 /**
@@ -178,6 +178,27 @@ export interface AchievementInput {
 export const FULL_RANGE_FRACTION = 0.9;
 /** A run of notes worth naming out loud. */
 export const STREAK_WORTH_NAMING = 8;
+/** Movements named one by one in the achievement's second line before it says "and N more". */
+export const ACHIEVEMENT_MAX_NAMED = 2;
+
+/**
+ * The measured lanes, each with the peak it reached as a fraction of ITS OWN calibrated range, in
+ * prescription order — and the clause that says what the percentages are of.
+ *
+ * THE CLAUSE IS NOT OPTIONAL AND IS NEVER SHORTENED. "95%" beside a limb name reads as 95 % of a
+ * normal joint, which is a different and far larger claim than 95 % of the range this patient's
+ * therapist calibrated for that movement this morning. `Highway` wraps this line rather than
+ * ellipsising it (`wrapFinaleNote`) precisely so the clause survives at 1024x768, where the old
+ * single fitted line rendered "— of the range calibrated fo…".
+ */
+function rangeNote(lanes: readonly { name: string; bestPeak: number | null }[]): string {
+  const named = lanes
+    .slice(0, ACHIEVEMENT_MAX_NAMED)
+    .map((l) => `${l.name} ${Math.round((l.bestPeak as number) * 100)}%`)
+    .join(' · ');
+  const rest = lanes.length - Math.min(lanes.length, ACHIEVEMENT_MAX_NAMED);
+  return `${named}${rest > 0 ? ` · and ${rest} more` : ''} — each of the range calibrated for THAT movement today.`;
+}
 
 /**
  * ONE TRUE, WARM SENTENCE ABOUT THIS SESSION — and its quieter second line.
@@ -191,22 +212,66 @@ export const STREAK_WORTH_NAMING = 8;
  * measured, and that is said plainly rather than dressed up.
  */
 export function sessionAchievement(input: AchievementInput): { text: string; note?: string } {
-  const best = input.lanes.reduce<{ name: string; bestPeak: number } | null>(
-    (acc, l) => (l.bestPeak !== null && (acc === null || l.bestPeak > acc.bestPeak) ? { name: l.name, bestPeak: l.bestPeak } : acc),
-    null,
-  );
-  if (best && best.bestPeak >= FULL_RANGE_FRACTION) {
+  /**
+   * NO LANE IS RANKED AGAINST ANOTHER, HERE OR ANYWHERE ELSE ON THIS SCREEN.
+   *
+   * This used to be `max(bestPeak)` over the lanes, which is the same mistake the Results headline
+   * was corrected out of one screen later: a hemiparetic prescription deliberately mixes the
+   * affected limb with an unaffected one, so the lane that gets furthest through its own calibrated
+   * range is the strong side essentially every time — and the last thing the game said before the
+   * report was the name of the limb the patient did not come about.
+   *
+   * A lane reaching the whole range calibrated for it is still worth saying, so it is said as a
+   * COUNT of the movements that got there, with each figure printed beside the movement it belongs
+   * to and in prescription order. A count is not a ranking and it cannot promote one limb over
+   * another.
+   */
+  const measured = input.lanes.filter((l) => l.bestPeak !== null);
+  const full = measured.filter((l) => (l.bestPeak as number) >= FULL_RANGE_FRACTION);
+  if (full.length > 0) {
+    /**
+     * AND THE SECOND LINE LISTS EVERY MEASURED MOVEMENT, NOT ONLY THE ONES THAT GOT THERE.
+     *
+     * The count in the headline already stops one limb standing in for the session. The note did
+     * not: it listed only the lanes at full range, so on the exact prescription this app is for —
+     * the affected limb plus an unaffected one — a session where the STRONG side reached its whole
+     * range printed "Right Knee extension 97%" and the reason the patient came ("Left Seated march",
+     * at 31 %) appeared nowhere at all. This was the one rung where a limb IS named, and it was the
+     * rung most likely to name the strong one.
+     *
+     * So the list is the same list the rung below prints: every movement that was measured, in
+     * prescription order, with its own figure against its own calibrated range. Which ones reached
+     * the whole of it is readable from the figures, and no limb is ranked against another.
+     */
     return {
-      text: `Full range reached — ${best.name}`,
-      note: `Best rep ${Math.round(best.bestPeak * 100)}% of the range you calibrated today.`,
+      text: measured.length > 1 ? `Full range reached — ${full.length} of ${measured.length} movements` : 'Full range reached',
+      note: rangeNote(measured),
     };
   }
+  /**
+   * THE RIBBON MAY NOT BE THE HERO FIGURE AGAIN.
+   *
+   * This rung used to read `${input.reps} movements performed`, and the card draws `stats[0]` —
+   * the same count — directly above it in a font more than twice the size. Observed at 1024x768 on
+   * a deliberately bad run: "4 MOVEMENTS" as the hero, and the gold ribbon positioned and styled as
+   * the point of the screen restating "4 movements performed" two lines below it. For the patient
+   * this ladder was written for — the one who answered six notes out of two hundred — the session's
+   * own achievement was a number they had just read, in a smaller font.
+   *
+   * The sentence that was doing the work was the quiet second line, so it IS the sentence now, and
+   * the second line carries what the card does not say anywhere else: the range each prescribed
+   * movement actually reached today, in prescription order, with the clause that says what those
+   * percentages are OF. No lane is ranked against another here either — the list is every measured
+   * movement in the order it was prescribed, not the best of them.
+   */
   if (input.reps > 0) {
     const note =
-      input.maxCombo >= STREAK_WORTH_NAMING
-        ? `${input.maxCombo} notes answered in a row at your best.`
-        : 'Every rep counted, whether or not it landed on a note.';
-    return { text: `${input.reps} movements performed`, note };
+      measured.length > 0
+        ? `Landed on a note or not. ${rangeNote(measured)}`
+        : input.maxCombo >= STREAK_WORTH_NAMING
+          ? `${input.maxCombo} notes answered in a row at your best — and every rep counted, on a note or not.`
+          : 'Landed on a note or not: the movement is the work.';
+    return { text: 'Every movement counted', note };
   }
   if (input.judged > 0) {
     return {
@@ -246,6 +311,22 @@ export function outroSecFor(windows: TimingWindows | TimingWindows[]): number {
   let widestMs = 0;
   for (const w of all) widestMs = Math.max(widestMs, w.goodMs);
   return widestMs / 1000 + OUTRO_TAIL_SEC;
+}
+
+/**
+ * A TAP THAT ALREADY MEANS SOMETHING IS NOT A TAP THAT MEANS "SKIP".
+ *
+ * The song-end sequence is skipped by anything at all — a tap anywhere, any key — because the
+ * patient's hands may be the thing being measured and there is no controller to press. The listener
+ * is on `window`, so it also caught the chrome drawn over the canvas: tapping PAUSE during the
+ * ending landed on the report in 77 ms (verified live at t≈3 s; the record itself was correct).
+ * Harmless to the data and wrong for the person holding the tablet — a control that does something
+ * other than what it says. A tap that lands on a real control is left to that control.
+ */
+function isOwnControl(target: EventTarget | null): boolean {
+  const el = target as { closest?: (sel: string) => unknown } | null;
+  if (!el || typeof el.closest !== 'function') return false;
+  return el.closest('button, a, input, select, textarea, summary, [role="button"]') !== null;
 }
 
 /**
@@ -336,6 +417,13 @@ export class GameRunner {
   private finaleSkipOff: Array<() => void> = [];
   /** Wall ms at the previous finale frame, so the sequence advances on real elapsed time. */
   private finaleLastWallMs: number | null = null;
+  /**
+   * The counts the card on screen was last built from, so the ending is re-rendered when — and only
+   * when — the patient has actually done something since. See `refreshFinale`.
+   */
+  private finaleStamp = '';
+  /** Rep events seen from the input source, for `finaleStamp` (the camera's stream, not the engine's). */
+  private repEvents = 0;
   private readonly lifecycle: PageLifecycle | null;
   /**
    * True while the run is paused BECAUSE THE PAGE WENT AWAY, as opposed to a therapist pause. Kept
@@ -481,10 +569,27 @@ export class GameRunner {
     }
   }
 
+  /**
+   * THE ENDING MAY NOT COST THE PATIENT A REP.
+   *
+   * This used to return early on `finale`, and `onRep` — the camera's rep stream, which feeds
+   * `laneReps` and through it every per-movement figure on the report — had no such guard. On a
+   * camera session the patient is mid-march when the music stops, so the two counters diverged for
+   * the whole 6.6 s payoff: the per-movement column kept climbing while "Movements performed" was
+   * frozen, and the report printed a headline its own table contradicted. Worse, a movement that
+   * matched no note is a rep by the project's oldest rule, and this line was throwing those away
+   * because of how the song ended.
+   *
+   * So the input path runs to `finish()`, exactly as `engine.tick()` and `onRep` already did. What
+   * it does NOT do during the ending is celebrate: the mixer has stopped, the card is up, and a
+   * combo cue over the payoff belongs to a song that is over. Nothing can be judged either — the
+   * chart does not end until the widest GOOD window of the last note has closed (`outroSecFor`) —
+   * so the only thing reaching scoring here is the rep itself.
+   */
   private onInput(e: LaneInputEvent): void {
-    if (this.phase === 'ended' || this.phase === 'idle' || this.phase === 'finale') return;
+    if (this.phase === 'ended' || this.phase === 'idle') return;
     const hit = this.engine.handleInput(e);
-    if (!hit) return;
+    if (!hit || this.phase === 'finale') return;
     this.pushRecent(hit);
     const state = this.engine.getScoreState();
     this.mixer?.onLaneHit(hit.lane, state.combo);
@@ -500,9 +605,25 @@ export class GameRunner {
     if (state.combo === 0) this.lastComboMilestone = 0;
   }
 
+  /**
+   * THE TWO STREAMS ACCEPT AND REJECT THE SAME MOVEMENTS.
+   *
+   * `onInput` is judged by the engine, which drops an event whose stamp falls inside a pause: the
+   * receptor row has been blanked to "no reading" and the screen has told the patient nothing is
+   * being measured, so a movement made then is not part of the session. This stream had no such
+   * rule at all, so a rep performed over a therapist pause landed in the per-movement table, the
+   * ROM peaks and the compensation counters of a session whose duration does not contain it.
+   *
+   * The test is the engine's own — `songTimeOf` returns null for exactly the stamps the engine
+   * refuses (idle, or inside a pause) — so the two can no longer disagree about one movement. A rep
+   * whose CROSSING happened before the pause and which finished after it still counts: it is the
+   * same stamp the input event carried, and the patient really performed it.
+   */
   private onRep(e: LaneRepEvent): void {
     const stats = this.laneReps[e.lane];
     if (!stats) return;
+    if (this.engine.clock.songTimeOf(e.ctxTime) === null) return;
+    this.repEvents++;
     stats.reps++;
     const peak = e.rawPeak ?? e.peak;
     if (Number.isFinite(peak)) stats.peaks.push(peak);
@@ -570,16 +691,38 @@ export class GameRunner {
       const wall = this.nowMs();
       const dt = this.finaleLastWallMs === null ? 0 : Math.max(0, wall - this.finaleLastWallMs) / 1000;
       this.finaleLastWallMs = wall;
+      this.refreshFinale();
       this.highway.advanceFinale(dt);
       if (this.highway.finaleDone()) this.finish('chart');
     }
   }
 
-  /** The song time at which the chart is over and the ending may start. */
+  /**
+   * The song time at which the chart is over and the ending may start.
+   *
+   * THE SONG'S LENGTH IS A CAP, BUT IT IS NOT ALLOWED TO CUT THE LAST NOTE'S WINDOW.
+   *
+   * This was `Math.min(durationSec, …)` with nothing under it, which silently broke the contract
+   * `outroSecFor` states two hundred lines up: the last note cannot be judged after its own GOOD
+   * window has closed. Measured in the app with a fine-motor prescription at the widest therapist
+   * window (`?difficulty=easy&scale=4`, two finger_opposition lanes): goodMs 1152, last note at
+   * 96.000 s, the window closing at 97.152 s, and this returning 97.000 — the curtain 152 ms before
+   * the patient's last rep could no longer be scored. The chart generator only guarantees a 1 s tail
+   * (charts/generate.ts), and 180 ms x 1.6 fine-motor x 4 is 1.152 s. The hit was still SCORED
+   * (`onInput` judges before the finale guard), so no figure lied — but the most impaired
+   * configuration, which is the one this widening exists for, lost the gem, the hit sound and the
+   * combo cue on its final rep, under the curtain.
+   *
+   * So the cap applies to the part of the tail that is presentation (the gem's own effect,
+   * `OUTRO_TAIL_SEC`) and never to the part that is judgment.
+   */
   chartEndsAt(): number {
     const notes = this.chart.notes;
     const lastNote = notes.length > 0 ? notes[notes.length - 1].time : 0;
-    return Math.min(this.chart.durationSec, Math.max(lastNote + this.outroSec, this.outroSec));
+    const wanted = Math.max(lastNote + this.outroSec, this.outroSec);
+    /** The instant after which nothing can be judged: the widest GOOD window of the last note. */
+    const lastJudgeableAt = lastNote + Math.max(0, this.outroSec - OUTRO_TAIL_SEC);
+    return Math.max(lastJudgeableAt, Math.min(this.chart.durationSec, wanted));
   }
 
   private endSongTime(): number {
@@ -604,17 +747,41 @@ export class GameRunner {
     this.chartEndSongTime = this.engine.songTime();
     this.phase = 'finale';
     this.finaleLastWallMs = null;
+    this.finaleStamp = this.countStamp();
     this.highway.startFinale(this.finaleSpec());
     this.watchFinaleSkip();
     this.emitHud(true);
+  }
+
+  /**
+   * MOVEMENTS PERFORMED, COUNTED EXACTLY AS THE REPORT COUNTS THEM.
+   *
+   * The card used to print `ScoreResults.reps` — the ENGINE's count, one per input event it was
+   * handed. `buildSessionResult` (session/results.ts) prints the sum over lanes of
+   * `max(engine lane reps, the reps the camera actually observed)`, and the two differ BY
+   * CONSTRUCTION whenever the camera reported a rep that produced no input event: a crossing
+   * swallowed by `VisionInput`'s 300 ms re-trigger guard reports the rep and emits nothing to
+   * score (src/input/VisionInput.ts, `emitted: false`), and `onRep` counts every one of them.
+   * That is the ordinary case for spasticity, clonus and tremor — this app's core population — so
+   * the payoff said "96 MOVEMENTS" and the report two seconds later said 131, under labels that
+   * mean the same thing. The comment at results.ts:139 says the headline must be the sum of the
+   * column under it; this is that same sum, computed from the same two sources.
+   */
+  private repsPerformed(r: ScoreResults): number {
+    let n = 0;
+    for (let i = 0; i < this.lanes.length; i++) {
+      n += Math.max(r.lanes[i]?.reps ?? 0, this.laneReps[i]?.reps ?? 0);
+    }
+    return n;
   }
 
   /** Everything the ending says, built from this run alone. See `Highway.FinaleSpec`. */
   private finaleSpec(): FinaleSpec {
     const r = this.engine.getScoreResults();
     const judged = r.hits + r.misses;
+    const reps = this.repsPerformed(r);
     const achievement = sessionAchievement({
-      reps: r.reps,
+      reps,
       hits: r.hits,
       judged,
       maxCombo: r.maxCombo,
@@ -623,7 +790,6 @@ export class GameRunner {
         return { name: clinicalLaneName(spec), bestPeak: peaks.length > 0 ? Math.max(...peaks) : null };
       }),
     });
-    const seconds = Math.max(0, Math.round(this.chartEndSongTime ?? this.engine.songTime()));
     return {
       title: 'SONG COMPLETE',
       subtitle: this.opts.songTitle,
@@ -633,15 +799,62 @@ export class GameRunner {
       stats: [
         // Short enough to fit a quarter of the card at 1024x768 — a label the layout has to clip
         // ("MOVEMENTS PERFOR…") is not a label.
-        { value: String(r.reps), label: 'MOVEMENTS' },
-        { value: `${r.hits}/${judged}`, label: 'NOTES ANSWERED' },
+        { value: String(reps), label: 'MOVEMENTS' },
+        /**
+         * NOTES ANSWERED IS ONE QUANTITY IN THIS CODEBASE, AND THIS IS IT.
+         *
+         * It was `hits/judged`, which is a DIFFERENT number wearing the same label. "Notes
+         * answered" is defined in engine/scoring.ts (`answerRateOf`) as every hit PLUS every
+         * missed note that had a movement land nearest to it — `ScoreResults.attempted` — and the
+         * Results screen prints exactly that ("a movement was made for 94 of the 95 notes
+         * offered"), the stored record stores exactly that (`SessionResult.answerRate`), and the
+         * gauge on this very canvas, captioned ANSWERED, shows exactly that. Measured on one run:
+         * this card read "50/95 NOTES ANSWERED" and the report read 94/95 two seconds later.
+         *
+         * The gap is not cosmetic and it is not random. `attempted - hits` is precisely the set of
+         * reps a patient performed and did not score — the patient whose latency offset is 200 ms
+         * out, which is the case `answerRateOf` was written for ("they DID the rep"). Printing
+         * hits under this label took that population's session away from them in the last sentence
+         * the game says to them.
+         */
+        { value: `${r.attempted}/${judged}`, label: 'NOTES ANSWERED' },
         { value: String(r.maxCombo), label: 'LONGEST RUN' },
-        { value: `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`, label: 'TIME MOVING' },
+        // The SONG's length, and `formatDuration` is what the report formats it with. It was
+        // labelled TIME MOVING — which this is not: the reps made over the celebration are counted
+        // into the session and are not in it — and rounded where the report floors, so a 4.7 s
+        // chart ended "0:05" here and "the song ran 0:04" on the next screen.
+        { value: formatDuration(this.chartEndSongTime ?? this.engine.songTime()), label: 'SONG LENGTH' },
       ],
       achievement: achievement.text,
       ...(achievement.note === undefined ? {} : { achievementNote: achievement.note }),
-      hint: 'Tap the screen or press any key for the report',
+      // AND THE PATIENT IS TOLD THE SONG IS OVER. A camera session has nothing that says "stop"
+      // except the music stopping, and the reps made over the payoff are counted into this session
+      // (`onInput`) — so the line that says the ending can be skipped also says they can ease off.
+      hint: 'Ease off when you\u2019re ready \u00b7 tap the screen or press any key for the report',
     };
+  }
+
+  /** Everything the card's figures are derived from, as a cheap equality key. */
+  private countStamp(): string {
+    const s = this.engine.getScoreState();
+    return `${s.reps}|${s.hits}|${s.misses}|${s.maxCombo}|${s.score}|${this.repEvents}`;
+  }
+
+  /**
+   * KEEP THE CARD TRUE WHILE IT IS ON SCREEN.
+   *
+   * The ending now counts the movements made during it (see `onInput`), so a card built once at the
+   * chart's end would have gone stale the first time the patient marched through the confetti — the
+   * payoff would say 126 movements and the report seven seconds later would say 131. Instead the
+   * spec is rebuilt whenever a count changes and handed back to the renderer, which keeps its own
+   * clock: the odometer the patient has been watching all song simply carries on counting them.
+   * Nothing else about the sequence moves.
+   */
+  private refreshFinale(): void {
+    const stamp = this.countStamp();
+    if (stamp === this.finaleStamp) return;
+    this.finaleStamp = stamp;
+    this.highway.updateFinale(this.finaleSpec());
   }
 
   /**
@@ -654,7 +867,10 @@ export class GameRunner {
    */
   private watchFinaleSkip(): void {
     if (typeof window === 'undefined' || this.finaleSkipOff.length > 0) return;
-    const skip = () => this.skipFinale();
+    const skip = (e: Event) => {
+      if (isOwnControl(e.target)) return;
+      this.skipFinale();
+    };
     for (const type of ['keydown', 'pointerdown', 'touchstart'] as const) {
       window.addEventListener(type, skip, { passive: true });
       this.finaleSkipOff.push(() => window.removeEventListener(type, skip));

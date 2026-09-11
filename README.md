@@ -108,6 +108,9 @@ npm run critic:smoke   # boots the app in headless Chromium and plays a session 
 npm run critic:frames  # captures 1080p gameplay frames for visual review
 npm run critic:motion  # frame bursts across a hit and a miss, plus frame pacing and clock drift
 npm run critic:audio   # proves the per-lane ducking end to end: real Web Audio gains in a browser
+npm run critic:uneven  # a seeded shared tablet whose latest session was tracked at 11.8 fps: no
+                       # comparison across it may render as a plain gain, at 1024/1280/1920
+npm run critic:firstnote  # throttled 8 Mbit/s: bytes after Start and Start → first note
 ```
 
 Each of these starts and stops its own dev server. `critic:smoke` drives the whole flow and
@@ -119,17 +122,32 @@ rest of the band keeps going.
 
 ### Time to the first note
 
-The stems are the whole weight of a session, and they used to be fetched after the therapist
-pressed Start, with the patient already in position. Measured against the production build over
-a throttled 8 Mbit/s link with 40 ms latency (Home → Leg → Start, autoplay, cold cache):
+A rhythm game is judged on how fast you get to play, and a therapist has about ninety seconds
+between patients on a shared tablet. The stems are the whole weight of a session and they used to
+be fetched after Start, with the patient already in position.
 
-| | bytes after Start | Start → first note |
+Everything below is the output of **`npm run critic:firstnote`** — production build served by
+`vite preview`, throttled to 8 Mbit/s with 40 ms latency, HTTP cache disabled, Home → Leg → Start
+with the autoplay bot, timed from the Start click to the bot answering note one. Re-run it; it
+prints this table (timings vary by a couple of tenths between runs).
+
+| when Start is pressed | bytes after Start | Start → first note |
 | --- | --- | --- |
-| before | 34.2 MB | 38.7 s |
-| after — stems at 16 kHz | 12.4 MB | 17.0 s |
-| after — and the song prefetched while the prescription is written (20 s on Setup) | 0 MB | 4.1 s |
+| first ever load on this tablet, Start pressed on sight | 12.51 MB | 16.4 s |
+| the same, after 6 s of writing the prescription | 7.04 MB | 10.6 s |
+| the same, after 20 s of writing the prescription | 0.00 MB | 4.0 s |
+| second session on the same tablet, stem cache emptied first (how this behaved before) | 12.65 MB | 16.3 s |
+| **second session on the same tablet** | **0.00 MB** | **4.4 s** |
 
-Two changes, both measured the same way:
+(The first row was 34.2 MB and 38.7 s before the stems were re-rendered at 16 kHz. That row is the
+one figure here the harness cannot reproduce on demand — rebuild the 44.1 kHz stems with
+`npm run gen-demo-stems -- --rate 44100` to see it again.)
+
+**4.0 s is the floor, and it is not loading.** It is the game's own lead-in: a 3 s count-in, two
+beats of musical lead before the first note, and that note's travel down the highway. Nothing that
+follows can go below it.
+
+Three changes, all measured the same way:
 
 1. **The committed demo stems are rendered at 16 kHz** (`node scripts/gen-demo-stems.mjs --rate
    16000`) instead of 44.1 kHz — 12.4 MB instead of 34.2 MB for demo-groove. What that trades:
@@ -141,15 +159,32 @@ Two changes, both measured the same way:
    (`rebalanceAfterResample`), so the mix the mastering chose — player stem 2 dB on top, which is
    what makes the ducking cue audible — is identical at either rate. `--rate 44100` builds the
    full-bandwidth version back.
-2. **The song downloads while the prescription is being written** (`runtime.prefetchSong`, called
-   from the Setup screen once the choice settles and again when Start is pressed). A camera
-   session then has a camera check and two calibrations to download inside, and the Play screen's
-   progress bar joins the load already running rather than starting a second one.
+2. **The song downloads while the prescription is being written** (`runtime.prefetchSong`). It now
+   fires immediately for the song the Setup screen opens on — there is nothing to debounce about a
+   choice already made, and the old 1.2 s settle delay was 1.2 s of a throttled link doing nothing
+   (6 s dwell: 11.8 s → 10.6 s) — and stays debounced for a CHANGE of song, so flicking through the
+   catalogue still starts one download. A camera session then has a camera check and two
+   calibrations to download inside, and the Play screen's progress bar joins the load already
+   running rather than starting a second one.
+3. **A tablet pays for a song once** (`src/session/stemCache.ts`). Whole, successful, same-origin
+   stem responses are kept in Cache Storage under the app's own key, bounded to the 16 most recent
+   files, so a reload, the next patient, or a therapist who pressed Start on sight starts the song
+   from disk whatever cache headers the clinic's server sends — 12.65 MB and 16.3 s become 0.00 MB
+   and 4.4 s, which is the floor above. Every failure path (no Cache Storage in an insecure context,
+   a quota refusal, a ranged audition request, a 206 or a 404) falls through to the plain network
+   fetch: this layer may make a session start faster, never wrong and never not at all.
 
-The remaining lever is a compressed format, which this repo cannot reach: Node ships no
-Vorbis/Opus/MP3 encoder, no dependency may be added, and the ranged audition
-(`src/session/audition.ts`) slices linear-PCM WAV arithmetically — a compressed container would
-send every "Listen" press back to a full download.
+**What is left, and why it was not taken.** The first-ever load on a tablet is bounded by the song
+itself: 12.5 MB over 8 Mbit/s is 12.5 s, and the only ways past that are to make the music worse or
+to start the session before it has all arrived. Halving the bytes again means 8-bit or µ-law PCM —
+quantisation noise in the stem the patient is being rewarded with, on top of the hi-hat air already
+traded away, and (for µ-law) a decode this repo can only test in one browser. A compressed container
+is not reachable at all: Node ships no Vorbis/Opus/MP3 encoder, no dependency may be added, and the
+ranged audition (`src/session/audition.ts`) slices linear-PCM WAV arithmetically, so every "Listen"
+press would become a full download. That leaves starting on a partial download — the player stem and
+the bed first, the rest spliced in as it arrives — which is real work inside `StemMixer` (lane→stem
+assignment is printed on the Setup screen before Start and may not change mid-song) and is the open
+item here, not a thing this change pretends to have done.
 
 Measured on this build: 59 fps median with one dropped frame in 118, audio-to-render clock
 drift under 4 ms over 3 seconds, and — on a two-lane session on a four-stem song — lane 1
@@ -190,7 +225,29 @@ the song plays):
 From that the screens state the uncertainty they can actually derive — never an invented error
 bar: **timing is resolved no finer than one camera frame** (33 ms at 30 fps, 83 ms at 12 fps),
 and **a range is the peak of the frames that arrived**, so it is a lower bound. Results and the
-session table grade each session `good` / `fair` / `poor`; the trend says how many of the
-sessions behind its lines were measured on a degraded stream, because a difference between two
-sessions measured differently is partly the equipment. A session with no tracking block (every
-record written before this existed) reads as *not recorded*, never as a clean stream.
+session table grade each session `good` / `fair` / `poor`. A session with no tracking block
+(every record written before this existed) reads as *not recorded*, never as a clean stream.
+
+**And the grade travels into every comparison, which is the only reason to record it.** A
+per-session block underneath a green "▲ +40 pts" chip changes nothing: comparison is where a
+change in the equipment is indistinguishable from a change in the patient, and a therapist with
+ninety seconds between patients reads the chip. So `compareTracking` (in `src/session/tracking.ts`)
+gates every number this app derives from two sessions:
+
+* a delta is **like-for-like** only when both sessions recorded tracking and both were graded
+  good. Different grades, or two degraded ones, is **uneven**; a missing block at either end is
+  **unknown** — absent reads as absent;
+* on anything but like-for-like the chip **loses the green and carries the reason inside its own
+  box** — "▲ +49 pts · measured unevenly" — on the ROM trend, the peak-angle trend, the accuracy
+  trend, each lane's gain on Results, the rep delta, and "biggest gain today", which becomes
+  "biggest change today";
+* the trend **marks the points themselves**: a session measured on a degraded (or unrecorded)
+  stream is drawn as a ringed dot and an outlined accuracy column, graded in the session-by-session
+  list, and counted in a line on its own card — counted over the sessions on screen, not over the
+  patient's whole history;
+* the exported record states the rule in words (`COMPARING SESSIONS:` in the text, and the
+  `fields.tracking` legend in the JSON), because the file is read with nothing else around it.
+
+`npm run critic:uneven` drives all of that in the real app at 1024x768, 1280x800 and 1920x1080
+against a seeded shared tablet whose latest session was tracked at 11.8 fps with the limb usable
+for 62 % of the session, and fails if any qualified chip is green or anything clips.

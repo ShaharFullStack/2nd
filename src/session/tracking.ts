@@ -178,26 +178,116 @@ export function trackingSentence(q: TrackingQuality): string {
 }
 
 /**
- * HOW MANY OF THE SESSIONS BEHIND THESE LINES WERE MEASURED WELL.
- *
- * A trend is the one view where a change in the EQUIPMENT is indistinguishable from a change in the
- * patient: two points measured at 30 fps with the limb in frame and at 12 fps with it drifting out
- * are drawn as the same kind of dot. So the sessions that could be plotted are counted by how well
- * they were tracked, and the count is stated under the cards.
+ * The grade of a stored session, or null when the record carries no tracking block — which is NOT
+ * the same as a clean stream and is never allowed to render as one.
  */
-export function trackingMix(history: readonly SessionResult[], patientId: string): {
+export function sessionTrackingGrade(s: Pick<SessionResult, 'tracking'>): TrackingGrade | null {
+  return s.tracking ? trackingGrade(s.tracking) : null;
+}
+
+/**
+ * HOW MANY OF THE SESSIONS BEHIND A SET OF LINES WERE MEASURED WELL.
+ *
+ * Takes the GRADES OF THE SESSIONS THAT ARE ON SCREEN, not a patient's whole stored history: the
+ * sentence this feeds sits under a plot of a chosen window ("Last 4"), and a count of twelve
+ * sessions under four drawn points is a number that does not match its own view. `null` in the list
+ * is a session with no tracking block.
+ */
+export function trackingMixOfGrades(grades: readonly (TrackingGrade | null)[]): {
   total: number;
   degraded: number;
   unrecorded: number;
 } {
-  const mine = history.filter((r) => r.patientId === patientId && r.inputMode === 'camera');
   let degraded = 0;
   let unrecorded = 0;
-  for (const r of mine) {
-    if (!r.tracking) unrecorded++;
-    else if (trackingGrade(r.tracking) !== 'good') degraded++;
+  for (const g of grades) {
+    if (g === null) unrecorded++;
+    else if (g !== 'good') degraded++;
   }
-  return { total: mine.length, degraded, unrecorded };
+  return { total: grades.length, degraded, unrecorded };
+}
+
+/**
+ * WHETHER TWO SESSIONS MAY BE SUBTRACTED FROM EACH OTHER.
+ *
+ * This is the point of recording tracking quality at all. A per-session block and a footnote tell a
+ * therapist how today was measured; they do not stop the screen printing a green "▲ +40 pts" chip
+ * across a 30 fps session and an 11.8 fps one — and COMPARISON is exactly where equipment noise
+ * masquerades as patient change. Every delta, gain badge and "biggest gain today" on any screen runs
+ * through this, so a change taken across two differently-measured sessions cannot render as a plain
+ * win anywhere.
+ *
+ * Three verdicts, and only the first is allowed to look like a clean result:
+ *  - `like-for-like` — both sessions recorded tracking and both were graded good;
+ *  - `uneven`        — the two grades differ, or both are degraded: part of the difference may be
+ *                      the camera;
+ *  - `unrecorded`    — at least one end has no tracking block, so the app CANNOT SAY the two were
+ *                      measured alike. Absent reads as absent, never as good.
+ */
+export type ComparabilityKind = 'like-for-like' | 'uneven' | 'unrecorded';
+
+export interface TrackingComparison {
+  kind: ComparabilityKind;
+  from: TrackingGrade | null;
+  to: TrackingGrade | null;
+  /** Short enough to sit INSIDE the delta chip. Null when nothing needs saying. */
+  tag: string | null;
+  /** The sentence that goes with it. Null when like-for-like. */
+  note: string | null;
+}
+
+export interface ComparisonLabels {
+  /** How the earlier session is named in the sentence. */
+  from: string;
+  /** How the later one is named. */
+  to: string;
+}
+
+const DEFAULT_LABELS: ComparisonLabels = { from: 'the earlier session', to: 'the later one' };
+
+export function compareTracking(
+  from: TrackingQuality | null | undefined,
+  to: TrackingQuality | null | undefined,
+  labels: ComparisonLabels = DEFAULT_LABELS,
+): TrackingComparison {
+  const a = from ? trackingGrade(from) : null;
+  const b = to ? trackingGrade(to) : null;
+  if (a === null || b === null) {
+    const which =
+      a === null && b === null
+        ? `Neither ${labels.from} nor ${labels.to} recorded how well the camera was tracking`
+        : a === null
+          ? `${cap(labels.from)} has no tracking quality recorded`
+          : `${cap(labels.to)} has no tracking quality recorded`;
+    return {
+      kind: 'unrecorded',
+      from: a,
+      to: b,
+      tag: 'tracking unknown',
+      note: `${which}, so there is no evidence these two sessions were measured under the same conditions. Read the change as a direction, not as a measured gain.`,
+    };
+  }
+  if (a === 'good' && b === 'good') return { kind: 'like-for-like', from: a, to: b, tag: null, note: null };
+  if (a !== b) {
+    return {
+      kind: 'uneven',
+      from: a,
+      to: b,
+      tag: 'measured unevenly',
+      note: `${cap(labels.from)} was tracked ${a} and ${labels.to} ${b}, so part of this difference may be the camera rather than the patient.`,
+    };
+  }
+  return {
+    kind: 'uneven',
+    from: a,
+    to: b,
+    tag: `both tracked ${a}`,
+    note: `Both sessions were tracked ${a}: ranges are lower bounds on a degraded stream, so a difference of this size may be the camera rather than the patient.`,
+  };
+}
+
+function cap(s: string): string {
+  return s.length === 0 ? s : s[0].toUpperCase() + s.slice(1);
 }
 
 /** What a screen or an export says when a record carries no tracking block at all. */

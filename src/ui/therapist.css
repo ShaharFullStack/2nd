@@ -171,6 +171,23 @@
 .lane-row:has(.tip-choice) > .btn { margin-left: auto; }
 
 .trend-card .badge { white-space: nowrap; }
+/*
+ * THE DELTA CHIP THAT CARRIES ITS OWN CAVEAT. It is longer than a bare "▲ +40 pts", so it is the one
+ * badge allowed to wrap inside itself rather than be cut off or push the card sideways on a 1024 px
+ * tablet; `.trend-row` wraps for the same reason. The tag is not dimmed — it is part of the claim,
+ * not a footnote to it.
+ */
+.badge.delta-qualified {
+  white-space: normal;
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0 4px;
+  max-width: 100%;
+  text-align: left;
+}
+.delta-tag { font-weight: 700; }
+.trend-row { flex-wrap: wrap; }
 /* "autoplay · not measured" must not wrap to three lines in a narrow session-table column. */
 .table .badge { white-space: nowrap; }
 .trend-card h4 { flex: 1 1 auto; }

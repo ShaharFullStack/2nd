@@ -4,17 +4,31 @@ import { DIFFICULTIES } from '../engine/difficulty.ts';
 import type { Chart, LaneSpec } from '../engine/types.ts';
 import { ReplayInput } from '../input/ReplayInput.ts';
 import type { ReplayEvent } from '../input/ReplayInput.ts';
+import type { InputSource, LaneInputEvent, LaneRepEvent, LaneState } from '../input/types.ts';
 import { createMockCanvas, mockCanvasFactory } from '../render/canvasMock.ts';
 import type { StemMixer } from '../audio/StemMixer.ts';
 import { FINALE_SEC, FINALE_SKIP_GUARD_SEC } from '../render/Highway.ts';
 import type { FinaleSpec } from '../render/Highway.ts';
 import { GameRunner, sessionAchievement } from './GameRunner.ts';
+import { buildSessionResult, formatDuration } from './results.ts';
+import type { SessionConfig } from './types.ts';
 import type { PageLifecycle, RunSummary } from './GameRunner.ts';
 
 const LANES: LaneSpec[] = [
   { index: 0, movement: 'seated_march', side: 'left' },
   { index: 1, movement: 'seated_march', side: 'right' },
 ];
+
+/** The same prescription as a `SessionConfig`, so a test can build the REPORT the card hands over to. */
+const REPORT_CONFIG: SessionConfig = {
+  patientId: 'p-test',
+  mode: 'leg',
+  lanes: LANES,
+  difficulty: 'easy',
+  windowScale: 1,
+  songId: 'test',
+  seed: 1,
+};
 
 /** A hand clock: the runner reads `currentTime` exactly like it reads an AudioContext. */
 class FakeClock {
@@ -502,6 +516,95 @@ describe('the song ends with a payoff, not a cut', () => {
   const notes = [1, 1.5, 2, 2.5];
   const hitAll: ReplayEvent[] = notes.map((t, i) => ({ lane: i % 2, songTime: t, strength: 1 }));
 
+  /**
+   * A CAMERA, AS THE RUNNER SEES ONE: a threshold crossing (`onEvent`, which scores) and then the
+   * completed rep (`onRep`, which carries the ROM peak and the compensation flags). `ReplayInput`
+   * emits only the first, so the divergence between the two streams — the whole bug — cannot be
+   * reproduced with it.
+   */
+  class RepInput implements InputSource {
+    private evs = new Set<(e: LaneInputEvent) => void>();
+    private reps = new Set<(e: LaneRepEvent) => void>();
+    private states: LaneState[] = LANES.map((l) => ({ lane: l.index, value: 0, armed: true, tracking: true }));
+    async start(): Promise<void> {}
+    stop(): void {}
+    onEvent(cb: (e: LaneInputEvent) => void): () => void {
+      this.evs.add(cb);
+      return () => this.evs.delete(cb);
+    }
+    onRep(cb: (e: LaneRepEvent) => void): () => void {
+      this.reps.add(cb);
+      return () => this.reps.delete(cb);
+    }
+    getLaneStates(): LaneState[] {
+      return this.states;
+    }
+    /** One whole movement: the crossing the engine judges, then the rep the camera reports. */
+    fire(lane: number, ctxTime: number, peak: number): void {
+      for (const cb of [...this.evs]) cb({ lane, ctxTime, strength: peak });
+      this.rep(lane, ctxTime, peak);
+    }
+
+    /**
+     * A REP THE ENGINE NEVER HEARS ABOUT — and the ordinary case for the population this app is
+     * for. `VisionInput` swallows a threshold crossing that falls inside its 300 ms re-trigger
+     * guard: the rep is still reported (`emitted: false`, VisionInput.test.ts asserts
+     * `reps.length > events.length` at 4 Hz) and it still reaches `laneReps`, but no
+     * `LaneInputEvent` is emitted, so the engine's own rep count never sees it. Spasticity, clonus
+     * and tremor produce these all session long.
+     */
+    rep(lane: number, ctxTime: number, peak: number): void {
+      for (const cb of [...this.reps]) {
+        cb({ lane, ctxTime, endCtxTime: ctxTime + 0.2, peak: Math.min(1, peak), rawPeak: peak });
+      }
+    }
+  }
+
+  /** The same hand-driven harness, with a camera-shaped input source. Countdown 0 ⇒ ctx time = song time. */
+  async function setupWithReps(noteTimes: number[]): Promise<{
+    runner: GameRunner;
+    clock: FakeClock;
+    summaries: RunSummary[];
+    advance: (to: number) => void;
+    repAt: (lane: number, songTime: number, peak: number) => void;
+    repOnlyAt: (lane: number, songTime: number, peak: number) => void;
+  }> {
+    const clock = new FakeClock();
+    const summaries: RunSummary[] = [];
+    const input = new RepInput();
+    const runner = new GameRunner({
+      canvas: createMockCanvas(1280, 720),
+      chart: chartOf(noteTimes),
+      lanes: LANES,
+      windows: windowsForLanes(LANES, 'easy'),
+      clock,
+      input,
+      thresholdFraction: 0.5,
+      countdownSec: 0,
+      missGraceMs: 0,
+      highwayOptions: { createCanvas: mockCanvasFactory() },
+      schedule: () => () => undefined,
+      nowMs: () => clock.currentTime * 1000,
+      lifecycle: new FakePage(),
+      onEnd: (s) => summaries.push(s),
+    });
+    await runner.start();
+    const advance = (to: number): void => {
+      for (let t = clock.currentTime; t <= to + 1e-9; t += 1 / 60) {
+        clock.currentTime = Math.round(t * 1e6) / 1e6;
+        runner.step();
+      }
+    };
+    return {
+      runner,
+      clock,
+      summaries,
+      advance,
+      repAt: (lane, songTime, peak) => input.fire(lane, songTime, peak),
+      repOnlyAt: (lane, songTime, peak) => input.rep(lane, songTime, peak),
+    };
+  }
+
   it('plays the ending on the highway before handing over to the report', async () => {
     const h = await setup(notes, hitAll);
     h.advance(4.2);
@@ -534,12 +637,18 @@ describe('the song ends with a payoff, not a cut', () => {
    */
   it('is skipped by any input, but not inside the opening guard', async () => {
     const h = await setup(notes, hitAll);
-    h.advance(4.05);
+    // THE CHART END IS ASKED FOR, NOT GUESSED. Advancing to a round 4.05 s put the sequence 0.85 s
+    // in — past the guard — so the one assertion that stops a palm on the glass eating the whole
+    // payoff had never once run inside the guard it is about. The chart ends at the last note plus
+    // the widest GOOD window plus the outro tail (`outroSecFor`), which is 3.18 s here.
+    const chartEnd = h.runner.chartEndsAt();
+    h.advance(chartEnd + 0.05);
+    expect(h.runner.getPhase()).toBe('finale');
     expect(h.runner.highway.finaleElapsed()).toBeLessThan(FINALE_SKIP_GUARD_SEC);
     expect(h.runner.skipFinale()).toBe(false);
     expect(h.summaries).toHaveLength(0);
 
-    h.advance(4.05 + FINALE_SKIP_GUARD_SEC + 0.1);
+    h.advance(chartEnd + FINALE_SKIP_GUARD_SEC + 0.1);
     expect(h.runner.skipFinale()).toBe(true);
     expect(h.runner.getPhase()).toBe('ended');
     expect(h.summaries).toHaveLength(1);
@@ -548,14 +657,92 @@ describe('the song ends with a payoff, not a cut', () => {
   });
 
   /**
+   * THE CURTAIN MAY NOT COME DOWN WHILE THE LAST NOTE IS STILL JUDGEABLE.
+   *
+   * `chartEndsAt` was `Math.min(durationSec, …)` with nothing under it, which silently broke the
+   * contract `outroSecFor` states: the last note cannot be judged after its own GOOD window has
+   * closed. Measured in the app with a fine-motor prescription at the widest therapist window
+   * (`?difficulty=easy&scale=4`, two finger_opposition lanes): goodMs 1152, last note 96.000 s,
+   * window closing 97.152 s, `chartEndsAt()` 97.000 — the ending starting 152 ms early. The hit was
+   * still scored, so no figure lied, but the most impaired configuration (the one the widening
+   * exists for) lost the gem, the hit sound and the combo cue on its final rep.
+   */
+  it('never starts the ending before the last note can no longer be judged', async () => {
+    const clock = new FakeClock();
+    const lanes: LaneSpec[] = [
+      { index: 0, movement: 'finger_opposition', side: 'left' },
+      { index: 1, movement: 'finger_opposition', side: 'right' },
+    ];
+    // The therapist's widest window on the widest difficulty: 180 ms x 1.6 fine motor x 4.
+    const windows = windowsForLanes(lanes, 'easy', 4);
+    const goodSec = Math.max(...windows.map((w) => w.goodMs)) / 1000;
+    expect(goodSec).toBeCloseTo(1.152, 3);
+    // A chart whose generated tail (1 s, charts/generate.ts) is SHORTER than that window.
+    const chart: Chart = {
+      songId: 'test', lanes: 2, bpm: 120, offset: 0, difficulty: DIFFICULTIES.easy,
+      notes: [{ id: 1, lane: 0, time: 10 }, { id: 2, lane: 1, time: 12 }],
+      durationSec: 13,
+    };
+    const runner = new GameRunner({
+      canvas: createMockCanvas(1280, 720),
+      chart,
+      lanes,
+      windows,
+      clock,
+      input: new RepInput(),
+      thresholdFraction: 0.5,
+      countdownSec: 0,
+      missGraceMs: 0,
+      highwayOptions: { createCanvas: mockCanvasFactory() },
+      schedule: () => () => undefined,
+      nowMs: () => clock.currentTime * 1000,
+      lifecycle: new FakePage(),
+      onEnd: () => undefined,
+    });
+    await runner.start();
+    // The song is 13 s and the last note's window does not close until 13.152 s.
+    expect(chart.durationSec).toBeLessThan(12 + goodSec);
+    expect(runner.chartEndsAt()).toBeGreaterThanOrEqual(12 + goodSec - 1e-9);
+    runner.dispose();
+  });
+
+  /**
+   * A TAP THAT ALREADY MEANS SOMETHING IS NOT A TAP THAT MEANS "SKIP".
+   *
+   * The skip listener is on `window`, so it also caught the play screen's own chrome drawn over the
+   * canvas: tapping PAUSE at t≈3 s of the ending landed on the report in 77 ms. Harmless to the
+   * record and wrong for the person holding the tablet.
+   */
+  it('leaves a tap that lands on a control to that control', async () => {
+    const h = await setup(notes, hitAll);
+    const chartEnd = h.runner.chartEndsAt();
+    h.advance(chartEnd + FINALE_SKIP_GUARD_SEC + 0.2);
+    expect(h.runner.getPhase()).toBe('finale');
+
+    const button = document.createElement('button');
+    document.body.appendChild(button);
+    button.dispatchEvent(new window.Event('pointerdown', { bubbles: true }));
+    expect(h.runner.getPhase()).toBe('finale');
+    expect(h.summaries).toHaveLength(0);
+
+    // …and anywhere else still skips it, which is the whole affordance.
+    document.body.dispatchEvent(new window.Event('pointerdown', { bubbles: true }));
+    expect(h.runner.getPhase()).toBe('ended');
+    expect(h.summaries).toHaveLength(1);
+    button.remove();
+  });
+
+  /**
    * THE STORED SESSION IS THE CHART'S LENGTH, NOT THE CELEBRATION'S. `RunSummary.songTime` becomes
    * the duration on the record, which is the denominator of every reps-per-minute a therapist reads.
    */
   it('records the session length as of the chart ending, not the end of the sequence', async () => {
     const h = await setup(notes, hitAll);
-    h.advance(4.05);
+    const chartEnd = h.runner.chartEndsAt();
+    h.advance(chartEnd + 0.05);
     const atChartEnd = h.runner.songTime();
-    h.advance(4.05 + FINALE_SEC + 0.4);
+    expect(atChartEnd).toBeCloseTo(chartEnd, 1);
+    h.advance(chartEnd + FINALE_SEC + 0.4);
     expect(h.summaries[0].songTime).toBeCloseTo(atChartEnd, 1);
     expect(h.summaries[0].songTime).toBeLessThan(atChartEnd + 1);
   });
@@ -600,6 +787,7 @@ describe('the song ends with a payoff, not a cut', () => {
     const card = seen as FinaleSpec;
     expect(card.stats[0].label).toBe('MOVEMENTS');
     expect(Number(card.stats[0].value)).toBe(h.runner.hud().reps);
+    expect(card.achievement).not.toContain(card.stats[0].value);
     // The score is present (the patient watched it all song) but it is not a stat column and it is
     // certainly not the first one.
     expect(card.stats.map((x) => x.label)).not.toContain('SCORE');
@@ -625,6 +813,191 @@ describe('the song ends with a payoff, not a cut', () => {
     expect(skipped.runner.skipFinale()).toBe(true);
     expect(skipped.summaries[0].results.reps).toBe(atChartEnd);
     expect(skipped.summaries[0].completed).toBe(true);
+  });
+
+  /**
+   * THE BIGGEST WAY THIS ENDING COULD GO WRONG — AND DID.
+   *
+   * `onInput` returned early on the `finale` phase and `onRep` did not. On a camera session the
+   * patient is mid-march when the music stops, so for the whole 6.6 s payoff the camera's rep
+   * stream kept feeding `laneReps` — every per-movement rep count, every ROM peak, every
+   * compensation flag on the report — while the session's headline count was frozen. The report
+   * could then print "Movements performed 126" over a per-movement column adding up to more than
+   * 126, and a rep the patient really performed was discarded because of HOW THE SONG ENDED, which
+   * is the one thing `finish()` exists to prevent.
+   */
+  it('counts the movements made during the ending in the headline as well as the table', async () => {
+    const h = await setupWithReps(notes);
+    const chartEnd = h.runner.chartEndsAt();
+    // Four marches during the song, on the notes.
+    for (let i = 0; i < notes.length; i++) {
+      h.advance(notes[i] + 0.05);
+      h.repAt(i % 2, notes[i], 0.9);
+    }
+    h.advance(chartEnd + 0.05);
+    expect(h.runner.getPhase()).toBe('finale');
+    const before = h.runner.hud().reps;
+    expect(before).toBe(4);
+
+    // Three more marches over the celebration, on both prescribed lanes.
+    h.repAt(0, chartEnd + 0.4, 0.7);
+    h.repAt(1, chartEnd + 0.9, 0.6);
+    h.repAt(0, chartEnd + 1.4, 0.8);
+    h.advance(chartEnd + 1.6);
+
+    expect(h.runner.hud().reps).toBe(before + 3);
+    h.advance(chartEnd + FINALE_SEC + 0.3);
+    const s = h.summaries[0];
+    expect(s.completed).toBe(true);
+    // THE TWO COUNTERS COVER THE SAME WINDOW. The headline is never less than its own column.
+    const laneTotal = s.laneReps.reduce((n, l) => n + l.reps, 0);
+    expect(s.results.reps).toBeGreaterThanOrEqual(laneTotal);
+    expect(s.results.reps).toBe(before + 3);
+    expect(laneTotal).toBe(before + 3);
+    // And the range those reps reached is on the record beside them, not orphaned.
+    expect(s.laneReps[0].peaks).toEqual([0.9, 0.9, 0.7, 0.8]);
+  });
+
+  /** The same agreement when a therapist taps through the payoff rather than letting it run. */
+  it('keeps the two counts in step when the ending is skipped mid-way', async () => {
+    const h = await setupWithReps(notes);
+    const chartEnd = h.runner.chartEndsAt();
+    h.advance(chartEnd + FINALE_SKIP_GUARD_SEC + 0.1);
+    const before = h.runner.hud().reps;
+    h.repAt(0, chartEnd + FINALE_SKIP_GUARD_SEC + 0.15, 0.5);
+    h.advance(chartEnd + FINALE_SKIP_GUARD_SEC + 0.2);
+    expect(h.runner.skipFinale()).toBe(true);
+    const s = h.summaries[0];
+    expect(s.results.reps).toBe(before + 1);
+    expect(s.laneReps.reduce((n, l) => n + l.reps, 0)).toBe(1);
+    // Skipping the celebration does not shorten the session that was filed.
+    expect(s.songTime).toBeCloseTo(chartEnd, 1);
+  });
+
+  /**
+   * AND THE CARD DOES NOT GO STALE WHILE IT IS BEING READ. If the ending counts those movements,
+   * the figure on the ending has to be the figure on the report — or the payoff says 126 and the
+   * grid seven seconds later says 129.
+   */
+  it('keeps the card\'s hero figure equal to the reps the report will print', async () => {
+    const h = await setupWithReps(notes);
+    const specs: FinaleSpec[] = [];
+    const start = h.runner.highway.startFinale.bind(h.runner.highway);
+    const update = h.runner.highway.updateFinale.bind(h.runner.highway);
+    h.runner.highway.startFinale = (spec: FinaleSpec) => { specs.push(spec); start(spec); };
+    h.runner.highway.updateFinale = (spec: FinaleSpec) => { specs.push(spec); update(spec); };
+
+    const chartEnd = h.runner.chartEndsAt();
+    h.advance(chartEnd + 0.05);
+    h.repAt(0, chartEnd + 0.3, 0.9);
+    h.repAt(1, chartEnd + 0.7, 0.9);
+    h.advance(chartEnd + FINALE_SEC + 0.3);
+
+    const last = specs[specs.length - 1];
+    expect(specs.length).toBeGreaterThan(1);
+    expect(last.stats[0].label).toBe('MOVEMENTS');
+    expect(Number(last.stats[0].value)).toBe(h.summaries[0].results.reps);
+    // SONG LENGTH is the CHART's length throughout — the celebration is not song time, and the
+    // label no longer claims it is time spent moving (the reps made over the payoff are not in it).
+    expect(last.stats[3].label).toBe('SONG LENGTH');
+    expect(last.stats[3].value).toBe(specs[0].stats[3].value);
+    expect(last.stats[3].value).toBe(formatDuration(h.summaries[0].songTime));
+  });
+
+  /**
+   * THE PAYOFF AND THE REPORT ARE THE SAME SESSION, TWO SECONDS APART.
+   *
+   * Two labels on this card named quantities the report names differently, which is the one thing
+   * clinical software may not do:
+   *
+   *   NOTES ANSWERED was `hits/judged`. "Notes answered" is `ScoreResults.attempted` everywhere
+   *   else in this codebase — every hit PLUS every missed note a movement landed on
+   *   (engine/scoring.ts `answerRateOf`) — and the difference is exactly the set of reps a patient
+   *   performed and did not score. Measured on one live run: the card said "50/95" and the report
+   *   said "a movement was made for 94 of the 95 notes offered". The patient whose latency is
+   *   200 ms out is the patient `answerRateOf` exists for, and this card handed them a number less
+   *   than half the one in their own record.
+   *
+   *   MOVEMENTS was the ENGINE's rep count, one per input event. The report prints the sum over
+   *   lanes of `max(engine lane reps, the reps the camera observed)`, and a crossing swallowed by
+   *   the camera's re-trigger guard reports the rep and emits no event at all — so on a session
+   *   with tremor or clonus the two diverge by construction.
+   *
+   * Driven here with both: a note answered late enough to miss but close enough to be attributed
+   * to it, and reps the camera reported with no crossing behind them.
+   */
+  it('prints the same notes-answered and movement counts the report will print', async () => {
+    const h = await setupWithReps(notes);
+
+    // Note 1 is hit. Note 2 is answered far too late to score — but the movement was made, which is
+    // what "answered" counts. Notes 3 and 4 are never answered at all.
+    h.advance(notes[0] + 0.02);
+    h.repAt(0, notes[0], 0.95);
+    h.advance(notes[1] + 0.4);
+    h.repAt(1, notes[1] + 0.35, 0.8);
+    // Two reps the camera saw and the engine never did (the refractory guard swallowed them).
+    h.advance(notes[2] + 0.1);
+    h.repOnlyAt(0, notes[2] + 0.05, 0.6);
+    h.repOnlyAt(1, notes[2] + 0.08, 0.55);
+
+    const specs: FinaleSpec[] = [];
+    const start = h.runner.highway.startFinale.bind(h.runner.highway);
+    const update = h.runner.highway.updateFinale.bind(h.runner.highway);
+    h.runner.highway.startFinale = (spec: FinaleSpec) => { specs.push(spec); start(spec); };
+    h.runner.highway.updateFinale = (spec: FinaleSpec) => { specs.push(spec); update(spec); };
+
+    h.advance(h.runner.chartEndsAt() + FINALE_SEC + 0.3);
+    const card = specs[specs.length - 1];
+    const report = buildSessionResult({
+      summary: h.summaries[0],
+      config: REPORT_CONFIG,
+      inputMode: 'camera',
+      latencyOffsetSec: 0,
+    });
+
+    // The engine really did see fewer reps than the camera — without that this test proves nothing.
+    expect(h.summaries[0].results.reps).toBeLessThan(report.reps);
+    expect(card.stats[0].label).toBe('MOVEMENTS');
+    expect(card.stats[0].value).toBe(String(report.reps));
+
+    // NOTES ANSWERED, on the card and in the record, is the same fraction.
+    const judged = report.hits + report.misses;
+    const answered = report.lanes.reduce((n, l) => n + (l.attempted ?? 0), 0);
+    expect(card.stats[1].label).toBe('NOTES ANSWERED');
+    expect(card.stats[1].value).toBe(`${answered}/${judged}`);
+    // And it is the quantity the Results screen prints, not hits: the late-but-made movement counts.
+    expect(answered).toBeGreaterThan(report.hits);
+    expect(Math.round((report.answerRate ?? 0) * judged)).toBe(answered);
+  });
+
+  /**
+   * AND NOT THE MOVEMENTS MADE WHILE THE SESSION IS STOPPED. The engine drops an input stamped
+   * inside a pause, the receptor row is blanked to "no reading", and the rep stream now agrees:
+   * a session's duration does not contain the pause, so its figures must not either.
+   */
+  it('does not count a rep performed while the session is paused', async () => {
+    const h = await setupWithReps(notes);
+    h.advance(1.05);
+    h.repAt(0, 1.0, 0.9);
+    expect(h.runner.hud().reps).toBe(1);
+
+    h.runner.pause();
+    const pausedAt = h.clock.currentTime;
+    h.clock.currentTime = pausedAt + 3;
+    h.repAt(1, pausedAt + 1.5, 0.9);
+    h.runner.step();
+    expect(h.runner.hud().reps).toBe(1);
+
+    await h.runner.resume();
+    h.advance(h.clock.currentTime + 0.4);
+    h.repAt(1, h.clock.currentTime - 0.1, 0.5);
+    // Ctx time, not song time: the pause pushed the two apart by three seconds.
+    h.advance(20);
+    const s = h.summaries[0];
+    expect(s.completed).toBe(true);
+    expect(s.laneReps[1].reps).toBe(1);
+    expect(s.laneReps[1].peaks).toEqual([0.5]);
+    expect(s.results.reps).toBe(2);
   });
 
   /** Nothing can be judged once the chart has run out, so the receptors say so. */
@@ -653,21 +1026,117 @@ describe('the session achievement is warm to somebody who scored badly', () => {
         { name: 'Right Knee extension', bestPeak: 0.4 },
       ],
     });
-    expect(a.text).toContain('Left Seated march');
+    // NO LANE IS RANKED. The headline counts the movements that got there; the names and their own
+    // figures sit in the note, in prescription order.
     expect(a.text).toContain('Full range');
+    expect(a.text).toContain('1 of 2 movements');
+    expect(a.text).not.toContain('Left Seated march');
+    expect(a.text).not.toContain('Right Knee extension');
+    expect(a.note).toContain('Left Seated march');
     expect(a.note).toContain('94%');
+    // EVERY MEASURED MOVEMENT IS LISTED, not only the ones that got there. Listing only the full
+    // lanes made this line name one limb and not the other — see the test below for the case where
+    // the one it named was the unaffected side.
+    expect(a.note).toContain('Right Knee extension 40%');
   });
 
-  it('falls back to the work performed, never to the score', () => {
-    const a = sessionAchievement({ reps: 142, hits: 6, judged: 200, maxCombo: 2, lanes: [{ name: 'Left Seated march', bestPeak: 0.3 }] });
-    expect(a.text).toBe('142 movements performed');
-    expect(a.note).toContain('Every rep counted');
-    // Nothing on this screen may read as a mark out of ten.
-    expect(`${a.text} ${a.note}`).not.toMatch(/star|%|score|accuracy|grade/i);
+  /**
+   * THE ENDING MAY NOT HAND THE UNAFFECTED SIDE THE SESSION'S ONE SENTENCE.
+   *
+   * This was a `max(bestPeak)` across the lanes. On the prescription this app is for — the affected
+   * limb plus an unaffected one so the patient has a lane they can score in — the maximum is the
+   * strong side essentially every time, so the last thing the game said before the report was the
+   * name of the leg the patient did not come about. Results refuses to rank limbs seven seconds
+   * later; this now agrees with it.
+   */
+  it('never names one limb as better than another, whatever the peaks are', () => {
+    const a = sessionAchievement({
+      reps: 88,
+      hits: 4,
+      judged: 120,
+      maxCombo: 1,
+      lanes: [
+        { name: 'Left Seated march', bestPeak: 0.31 },
+        { name: 'Right Knee extension', bestPeak: 0.97 },
+      ],
+    });
+    // The strong side reached its whole range: that is said, as a COUNT, with the figure beside the
+    // movement it belongs to — and the sentence itself names no limb.
+    expect(a.text).toBe('Full range reached — 1 of 2 movements');
+    expect(a.text).not.toMatch(/left|right|knee|march/i);
+    expect(`${a.text} ${a.note}`).not.toMatch(/best|strongest|top|winner|better/i);
+    expect(a.note).toContain('Right Knee extension 97%');
+    // AND THE AFFECTED SIDE IS IN THE SENTENCE TOO. The note used to list only the lanes at full
+    // range, so on exactly this prescription — the strong leg reaching its whole calibrated range,
+    // the weak one at 31 % — the last line the game showed named the limb the patient did NOT come
+    // about, and the one they did was absent from the ending entirely.
+    expect(a.note).toContain('Left Seated march 31%');
+    // The order is the prescription's, not the peaks': the weak lane is first because it is lane 0.
+    expect(a.note!.indexOf('Left Seated march')).toBeLessThan(a.note!.indexOf('Right Knee extension'));
   });
 
-  it('names a run of notes when there was one worth naming', () => {
-    const a = sessionAchievement({ reps: 30, hits: 20, judged: 40, maxCombo: 12, lanes: [{ name: 'L', bestPeak: 0.5 }] });
+  it('says "every movement" rather than a count when they all got there', () => {
+    const a = sessionAchievement({
+      reps: 60,
+      hits: 30,
+      judged: 40,
+      maxCombo: 9,
+      lanes: [
+        { name: 'Left Seated march', bestPeak: 0.95 },
+        { name: 'Right Knee extension', bestPeak: 0.92 },
+      ],
+    });
+    expect(a.text).toBe('Full range reached — 2 of 2 movements');
+    expect(a.note).toContain('Left Seated march 95%');
+    expect(a.note).toContain('Right Knee extension 92%');
+  });
+
+  /**
+   * THE RIBBON IS NEVER THE HERO FIGURE AGAIN.
+   *
+   * `Highway` draws `stats[0]` — movements performed — as the biggest thing on the card, and this
+   * sentence sits on a gold ribbon directly beneath it, positioned and styled as the point of the
+   * screen. It used to read "142 movements performed": the same number the patient had just read,
+   * in a smaller font, on the one run this ladder exists for.
+   */
+  it('falls back to the work performed without restating the count above it', () => {
+    const reps = 142;
+    const a = sessionAchievement({ reps, hits: 6, judged: 200, maxCombo: 2, lanes: [{ name: 'Left Seated march', bestPeak: 0.3 }] });
+    expect(a.text).toBe('Every movement counted');
+    expect(a.text).not.toContain(String(reps));
+    expect(a.note).not.toContain(String(reps));
+    // The sentence that was doing the work is the sentence now, and the second line says something
+    // the card does not say anywhere else.
+    expect(a.note).toContain('Landed on a note or not');
+    expect(a.note).toContain('Left Seated march 30%');
+    // Nothing on this screen may read as a mark out of ten. A ROM figure is not one — but it is
+    // only honest with the clause that says what it is a fraction OF, so the clause is required.
+    expect(`${a.text} ${a.note}`).not.toMatch(/star|score|accuracy|grade|rank/i);
+    expect(a.note).toContain('of the range calibrated for THAT movement today');
+  });
+
+  /** Every measured movement, in prescription order — an unranked list, exactly like the top rung. */
+  it('lists every measured movement in prescription order when none reached full range', () => {
+    const a = sessionAchievement({
+      reps: 51,
+      hits: 9,
+      judged: 90,
+      maxCombo: 3,
+      lanes: [
+        { name: 'Left Seated march', bestPeak: 0.42 },
+        { name: 'Right Knee extension', bestPeak: 0.88 },
+      ],
+    });
+    expect(a.note).toContain('Left Seated march 42%');
+    expect(a.note).toContain('Right Knee extension 88%');
+    expect(a.note?.indexOf('Left Seated march')).toBeLessThan(a.note?.indexOf('Right Knee extension') as number);
+    expect(`${a.text} ${a.note}`).not.toMatch(/best|strongest|top|winner|better|worse/i);
+  });
+
+  /** A keyboard or replay run measures no range at all; the streak is then what there is to say. */
+  it('names a run of notes when there was one worth naming and no range was measured', () => {
+    const a = sessionAchievement({ reps: 30, hits: 20, judged: 40, maxCombo: 12, lanes: [{ name: 'L', bestPeak: null }] });
+    expect(a.text).toBe('Every movement counted');
     expect(a.note).toContain('12 notes answered in a row');
   });
 

@@ -11,6 +11,7 @@ import {
   laneRangeSummaries,
   laneTrendKey,
   mostImprovedRange,
+  rangeChange,
 } from './results.ts';
 import type { LaneResultSummary, SessionConfig, SessionResult } from './types.ts';
 
@@ -119,6 +120,27 @@ describe('buildSessionResult', () => {
     // Lane 1 performed two movements that never scored — they must still appear.
     expect(r.lanes[1].reps).toBe(2);
     expect(r.lanes[1].hits).toBe(0);
+  });
+
+  /**
+   * THE HEADLINE IS THE SUM OF THE COLUMN UNDER IT.
+   *
+   * Each lane's `reps` is `max(the engine's count, the reps the camera actually observed)` — a
+   * crossing swallowed by the camera's refractory window reports a rep and emits no input event, so
+   * the observed count is sometimes the larger and it is the right one. The session headline was
+   * the engine's total regardless, so the report could print "Movements performed 126" over a
+   * per-movement column that added up to more than 126.
+   */
+  it('never prints a headline rep count smaller than its own per-movement column', () => {
+    const s = summary();
+    // The camera saw four movements in lane 1 that the engine was never handed (refractory window).
+    s.laneReps[1] = repStats(1, { reps: 6 });
+    const r = buildSessionResult({ summary: s, config: CONFIG, inputMode: 'camera', latencyOffsetSec: 0 });
+    expect(r.lanes[1].reps).toBe(6);
+    expect(r.reps).toBe(r.lanes.reduce((n, l) => n + l.reps, 0));
+    expect(r.reps).toBe(30);
+    // And the movements that answered no note are counted off the same total, not the smaller one.
+    expect(r.surplusMovements).toBe(30);
   });
 
   it('carries ROM achieved as a fraction of the calibrated range, with the uncertain count', () => {
@@ -504,5 +526,43 @@ describe('laneRangeSummaries', () => {
     const previous = new Map([[laneTrendKey(weak), { ...weak, romBest: 0.6 }]]);
     expect(mostImprovedRange(laneRangeSummaries([weak], previous))).toBeNull();
     expect(mostImprovedRange(laneRangeSummaries([weak]))).toBeNull();
+  });
+
+  /**
+   * "SAME AS LAST TIME" AND "BIGGEST GAIN TODAY" MAY NOT BE SAID ABOUT ONE NUMBER.
+   *
+   * The ranking accepted any `gainPct > 0` with no resolution floor while the tile beside it printed
+   * "same as last time" for anything under both the movement's unit resolution and half a point of
+   * range. A knee that moved 0.15° therefore rendered both verdicts, one under the other, and the
+   * card header announced that limb as the day's achievement — on a mixed prescription, the
+   * unaffected one, which is the exact failure the per-limb headline exists to end.
+   */
+  it('will not rank a change it has just called unmeasurable', () => {
+    // +0.15° on a 60° knee range: under 1° (so not printable in degrees) and under half a point of
+    // its own range (0.0025). The march is flat and the ankle went backwards.
+    const previous = new Map([
+      [laneTrendKey(weak), { ...weak, romBest: 0.4 }],
+      [laneTrendKey(strong), { ...strong, romBest: 0.95 - 0.15 / 60 }],
+    ]);
+    const out = laneRangeSummaries([weak, strong], previous);
+    expect(rangeChange(out[1]).kind).toBe('same');
+    expect(mostImprovedRange(out)).toBeNull();
+  });
+
+  it('still ranks a change that is real but only visible as a share of the range', () => {
+    // +0.4° on a 60° range is 0.67 points: it rounds to 0° in the movement’s own units, but it is
+    // over the half-point floor, so it is a real change said in the unit that can show it.
+    const previous = new Map([[laneTrendKey(strong), { ...strong, romBest: 0.95 - 0.4 / 60 }]]);
+    const out = laneRangeSummaries([strong], previous);
+    const change = rangeChange(out[0]);
+    expect(change.kind).toBe('up');
+    expect(change.inUnits).toBe(false);
+    expect(mostImprovedRange(out)?.movementName).toBe('Right Knee extension');
+  });
+
+  it('calls a drop a drop, so nothing green is drawn over a loss', () => {
+    const previous = new Map([[laneTrendKey(weak), { ...weak, romBest: 0.8 }]]);
+    expect(rangeChange(laneRangeSummaries([weak], previous)[0]).kind).toBe('down');
+    expect(rangeChange({ gain: null, gainPct: null, unit: 'deg' }).kind).toBe('none');
   });
 });

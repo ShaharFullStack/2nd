@@ -9,6 +9,8 @@
 import { describe, expect, it } from 'vitest';
 import type { VisionStatus } from '../input/types.ts';
 import {
+  compareTracking,
+  trackingMixOfGrades,
   GOOD_DETECT_FPS,
   TRACKING_SAMPLE_MS,
   TrackingRecorder,
@@ -126,5 +128,62 @@ describe('what the grade and the sentence claim', () => {
   it('mentions the dip only when the stream actually dipped', () => {
     expect(trackingConditions(q({ fpsMedian: 30, fpsLow: 29 }))).not.toContain('dipping');
     expect(trackingConditions(q({ fpsMedian: 30, fpsLow: 9 }))).toContain('dipping to 9');
+  });
+});
+
+/**
+ * THE REASON TRACKING QUALITY IS RECORDED AT ALL.
+ *
+ * A per-session block on a record nobody subtracts anything from changes no decision. The screens
+ * subtract sessions from each other constantly — a gain chip, a trend delta, "biggest gain today" —
+ * and this is the gate every one of those runs through.
+ */
+describe('whether two sessions may be compared', () => {
+  const good = { samples: 100, fpsMedian: 30, fpsLow: 28, inferenceMsMedian: 12, trackedFraction: 1, lowFpsFraction: 0, delegate: 'GPU' as const, worstReason: null };
+  const fair = { ...good, fpsMedian: 20 };
+  const poor = { ...good, fpsMedian: 11.8, trackedFraction: 0.62 };
+
+  it('calls two clean streams like-for-like and says nothing further', () => {
+    const c = compareTracking(good, good);
+    expect(c.kind).toBe('like-for-like');
+    expect(c.tag).toBeNull();
+    expect(c.note).toBeNull();
+  });
+
+  it('will not call a poor session against a good one a plain gain', () => {
+    const c = compareTracking(good, poor);
+    expect(c.kind).toBe('uneven');
+    expect(c.tag).toBe('measured unevenly');
+    expect(c.note).toContain('tracked good');
+    expect(c.note).toContain('poor');
+    expect(c.note).toContain('may be the camera rather than the patient');
+  });
+
+  it('qualifies two degraded sessions even though they match each other', () => {
+    const c = compareTracking(fair, fair);
+    expect(c.kind).toBe('uneven');
+    expect(c.tag).toBe('both tracked fair');
+  });
+
+  it('treats a missing tracking block as absent, never as a clean stream', () => {
+    expect(compareTracking(null, good).kind).toBe('unrecorded');
+    expect(compareTracking(good, undefined).kind).toBe('unrecorded');
+    const c = compareTracking(null, null);
+    expect(c.tag).toBe('tracking unknown');
+    expect(c.note).toContain('no evidence');
+  });
+
+  it('names the two ends the way the calling screen names them', () => {
+    const c = compareTracking(good, poor, { from: 'the Feb 3 session', to: "today's session" });
+    expect(c.note).toContain('The Feb 3 session was tracked good');
+    expect(c.note).toContain("today's session poor");
+  });
+});
+
+describe('the mix stated under a set of plotted sessions', () => {
+  it('counts exactly the grades it was handed, with absent counted as absent', () => {
+    expect(trackingMixOfGrades(['good', 'good'])).toEqual({ total: 2, degraded: 0, unrecorded: 0 });
+    expect(trackingMixOfGrades(['good', 'fair', 'poor', null])).toEqual({ total: 4, degraded: 2, unrecorded: 1 });
+    expect(trackingMixOfGrades([])).toEqual({ total: 0, degraded: 0, unrecorded: 0 });
   });
 });

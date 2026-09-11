@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { endReasonLabel } from './results.ts';
 import { DEFAULT_TREND_WINDOW, movementTrends, patientSessions, trendCoverage } from './trends.ts';
-import type { LaneResultSummary, SessionResult } from './types.ts';
+import type { LaneResultSummary, SessionResult, TrackingQuality } from './types.ts';
 
 function lane(patch: Partial<LaneResultSummary> = {}): LaneResultSummary {
   return {
@@ -378,5 +378,36 @@ describe('runs that were cut short', () => {
     expect(endReasonLabel(trend.points[0].endReason)).toBe('ended early');
     expect(endReasonLabel('quit')).toBe('stopped by therapist');
     expect(endReasonLabel('abandoned')).toBe('interrupted');
+  });
+});
+
+/**
+ * THE FIELD THAT MAKES A TREND ANSWERABLE.
+ *
+ * Without tracking on the POINT, every dot on the chart is drawn identically by construction and the
+ * card cannot tell a therapist which session was measured badly — which is the only reason the app
+ * records tracking quality at all.
+ */
+describe('every point carries how well it was measured', () => {
+  const good: TrackingQuality = {
+    samples: 100, fpsMedian: 30, fpsLow: 28, inferenceMsMedian: 12,
+    trackedFraction: 1, lowFpsFraction: 0, delegate: 'GPU', worstReason: null,
+  };
+  const poor: TrackingQuality = { ...good, fpsMedian: 11.8, trackedFraction: 0.62 };
+
+  it('carries the stored block and the grade the screens colour by', () => {
+    const history = [
+      { ...session('b', 2, [lane()]), tracking: poor },
+      { ...session('a', 1, [lane()]), tracking: good },
+    ];
+    const [trend] = movementTrends(history, PATIENT);
+    expect(trend.points.map((p) => p.trackingGrade)).toEqual(['good', 'poor']);
+    expect(trend.points[1].tracking).toEqual(poor);
+  });
+
+  it('says NOT RECORDED rather than assuming a clean stream', () => {
+    const [trend] = movementTrends([session('a', 1, [lane()])], PATIENT);
+    expect(trend.points[0].tracking).toBeNull();
+    expect(trend.points[0].trackingGrade).toBeNull();
   });
 });

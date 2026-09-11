@@ -76,6 +76,16 @@ describe('the exported record states how well each session was measured', () => 
     expect(out.text).not.toContain('fps');
   });
 
+  it('states the rule for subtracting one session from another, in the file itself', () => {
+    // The export is read off the device, in a note or on paper, by somebody who will compare two
+    // dates with a ruler. The per-session conditions are necessary; the rule for using them is too.
+    const out = buildPatientExport({ patient: PATIENT, sessions: [session({ tracking: TRACKING }), session()], now: () => 2 });
+    expect(out.text).toContain('COMPARING SESSIONS');
+    expect(out.text).toContain('is partly the equipment, not the patient');
+    const json = JSON.parse(out.json) as { fields: Record<string, string> };
+    expect(json.fields.tracking).toContain('LIKE-FOR-LIKE');
+  });
+
   it('says nothing about tracking for a run with no camera', () => {
     const out = buildPatientExport({
       patient: PATIENT,
