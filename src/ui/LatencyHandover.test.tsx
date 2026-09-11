@@ -6,7 +6,7 @@ import LatencyHandover from './LatencyHandover.tsx';
 
 function lane(movement: LaneResultSummary['movement'] = 'seated_march'): LaneResultSummary {
   return {
-    lane: 0, movement, side: 'left', label: 'L march',
+    lane: 0, movement, side: 'left', movementName: 'Left Seated march',
     hits: 20, perfects: 8, goods: 12, misses: 10, judged: 30, accuracy: 0.66, reps: 34,
     timingBiasMs: 90, timingBiasMadMs: 15, romMean: 0.7, romBest: 0.9, romSamples: 30, romUncertain: 0,
     calibratedMin: 0, calibratedMax: 1, calibrationManual: false,
@@ -16,11 +16,11 @@ function lane(movement: LaneResultSummary['movement'] = 'seated_march'): LaneRes
 
 function result(patch: Partial<SessionResult> = {}): SessionResult {
   return {
-    id: 's1', startedAt: 1_700_000_000_000, endedAt: 1_700_000_100_000, durationSec: 120,
+    id: 's1', patientId: 'p-test', patientName: 'Test Patient', startedAt: 1_700_000_000_000, endedAt: 1_700_000_100_000, durationSec: 120,
     mode: 'leg', difficulty: 'medium', windowScale: 1, inputMode: 'camera',
     songId: 'demo-groove', songTitle: 'Demo Groove', artist: 'A', attribution: '',
     score: 1000, stars: 3, accuracy: 0.66, starAccuracy: 0.7, maxCombo: 12, totalNotes: 40,
-    hits: 20, perfects: 8, goods: 12, misses: 10, reps: 34, health: 1,
+    hits: 20, perfects: 8, goods: 12, misses: 10, reps: 34, answerRate: 1,
     timingBiasMs: 90, timingBiasMadMs: 15,
     latencyOffsetMs: 120, suggestedLatencyMs: 320,
     completed: true, lanes: [lane()],

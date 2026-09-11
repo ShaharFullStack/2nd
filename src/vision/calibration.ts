@@ -98,6 +98,18 @@ export interface RomCalibration {
   mirrored?: boolean;
   /** Session it was captured in, when the caller supplies one (localStorage history / therapist notes). */
   sessionId?: string;
+  /**
+   * WHOSE BODY this range was measured on (Patient.id).
+   *
+   * The last thing in this list that selects what the numbers mean, and the one that was missing.
+   * `movement`, `fingertip` and `mirrored` establish WHICH QUANTITY and WHICH LIMB; none of them
+   * establishes WHOSE. A clinic tablet is shared, ranges are offered back as "last session's range",
+   * and one hemiparetic patient's calibrated knee extension handed to the next patient normalizes one
+   * person's movement by another person's range: every percentage in the record is then wrong, the
+   * lane is unplayable or trivially playable, and nothing on screen says why. Absent on a legacy /
+   * hand-built calibration, which is warned about, not refused.
+   */
+  patient?: string;
 }
 
 /**
@@ -110,6 +122,30 @@ export interface CalibrationContext {
   fingertip?: Fingertip;
   /** The mirror convention the lane plays under (default DEFAULT_MIRRORED = false). Selects the LIMB. */
   mirrored?: boolean;
+  /**
+   * The patient this session is recorded against (Patient.id) — WHOSE body the lane is measuring.
+   *
+   * Unlike `fingertip` and `mirrored` this cannot be derived from the feature options: nothing about a
+   * landmark stream says who the person in front of the camera is. It is attached by the screen that
+   * knows (`withPatient`), and left undefined by every caller that does not — an undefined context
+   * patient means "the caller did not say", which can never refuse anything.
+   */
+  patient?: string;
+}
+
+/**
+ * The lane's context WITH the patient it is being measured for attached.
+ *
+ * The one place a patient joins a CalibrationContext. `calibrationContext()` derives a context from
+ * the feature options an extractor runs with, and the patient is not one of them (see above), so a
+ * screen that knows the patient wraps the derived context here rather than assembling a literal —
+ * which is the drift this file exists to prevent.
+ */
+export function withPatient(ctx: CalibrationContext | null | undefined, patient: string | null | undefined): CalibrationContext {
+  const base: CalibrationContext = { ...(ctx ?? {}) };
+  if (patient) base.patient = patient;
+  else delete base.patient;
+  return base;
 }
 
 /** The mirror convention assumed when nothing says otherwise: raw (un-flipped) camera frames. */
@@ -170,8 +206,18 @@ function mirrorLabel(mirrored: boolean): string {
   return mirrored ? 'a mirrored (selfie-flipped) camera image' : 'a raw (un-mirrored) camera image';
 }
 
+/**
+ * The patient mismatch between a stored calibration and the session about to use it, or null when
+ * there is none (nothing recorded on either side — a legacy range, or a caller that did not say who
+ * this is — or the two agree).
+ */
+export function patientMismatch(cal: CalibrationRange | null | undefined, ctx?: CalibrationContext): { calibrated: string; playing: string } | null {
+  if (!cal || cal.patient === undefined || !ctx?.patient) return null;
+  return cal.patient === ctx.patient ? null : { calibrated: cal.patient, playing: ctx.patient };
+}
+
 /** Which lane configuration option a stored calibration disagrees with. */
-export type CalibrationMismatchField = 'movement' | 'fingertip' | 'mirrored';
+export type CalibrationMismatchField = 'patient' | 'movement' | 'fingertip' | 'mirrored';
 
 /**
  * A stored calibration that measures a DIFFERENT QUANTITY (or a different limb) from the lane about to
@@ -193,6 +239,18 @@ export interface CalibrationMismatch {
  */
 export function calibrationMismatch(cal: CalibrationRange | null | undefined, movement: Movement, ctx?: CalibrationContext): CalibrationMismatch | null {
   if (!cal) return null;
+  // WHOSE BODY, first: a range measured on another person is not a degraded measurement of this one,
+  // and no amount of agreement about movement, digit and mirror convention makes it one.
+  const who = patientMismatch(cal, ctx);
+  if (who) {
+    return {
+      field: 'patient',
+      reason:
+        'it was measured on a different patient, and a range of motion is one person\u2019s — normalizing this ' +
+        'patient\u2019s movement by another patient\u2019s range makes every percentage in the record wrong. ' +
+        'Re-calibrate this lane for the patient this session is recorded against',
+    };
+  }
   const tip = fingertipMismatch(cal, movement, ctx);
   if (tip) {
     // Same class of error as a range measured for another movement: the two numbers are ranges of
@@ -239,6 +297,176 @@ export function calibrationMismatch(cal: CalibrationRange | null | undefined, mo
  * At 3 the still-window auto path is unchanged (3 × 0.35 × minRom ≈ minRom); only the unbounded paths
  * and the clean small-ROM patient move.
  */
+/**
+ * Default step of the therapist's Easier/Harder buttons: 5 % OF THE MEASURED RANGE (max − min), in
+ * whatever units the movement is in. See `RomCalibrator.previewNudgeTop`.
+ */
+export const ROM_NUDGE_FRACTION = 0.05;
+
+/** Why a nudge stopped short of what was asked for. */
+export type RomNudgeLimit = 'ok' | 'patient_best' | 'minimum_range' | 'no_range';
+
+/** What an Easier/Harder press would do — everything the button needs to label itself. */
+export interface RomNudgePreview {
+  /** Signed change in feature units that would actually be applied (0 when `disabled`). */
+  delta: number;
+  currentMax: number;
+  nextMax: number;
+  /** The largest value this patient actually produced, or null when nothing was measured. */
+  patientBest: number | null;
+  /** The lowest top that still leaves a range distinguishable from rest noise. */
+  floorMax: number;
+  limit: RomNudgeLimit;
+  /** True when pressing would change nothing (already at a bound, or no range yet). */
+  disabled: boolean;
+  /** Button-ready text: what the press will do, in the movement's own units. */
+  label: string;
+  /** Why it is capped, when it is. */
+  note: string | null;
+}
+
+/**
+ * The Easier/Harder maths, with no calibrator attached.
+ *
+ * Shared by `RomCalibrator.previewNudgeTop` (a range being measured now) and `previewRomNudge` (a
+ * range already accepted for a lane — including one reused from a previous session, which no live
+ * calibrator holds). Both must answer identically: the therapist presses ONE button and cannot know
+ * which object is behind it.
+ */
+function buildNudgePreview(opts: {
+  min: number | null;
+  max: number | null;
+  movement: Movement;
+  patientBest: number | null;
+  requiredRange: number;
+  fraction: number;
+}): RomNudgePreview {
+  const { min, max, movement, patientBest, requiredRange, fraction } = opts;
+  const unit = MOVEMENT_INFO[movement].unit;
+  if (min === null || max === null || !Number.isFinite(min) || !Number.isFinite(max) || !Number.isFinite(fraction) || fraction === 0) {
+    return {
+      delta: 0,
+      currentMax: max ?? Number.NaN,
+      nextMax: max ?? Number.NaN,
+      patientBest,
+      floorMax: Number.NaN,
+      limit: 'no_range',
+      disabled: true,
+      label: fraction < 0 ? 'Easier' : 'Harder',
+      note: 'No range has been measured for this lane yet.',
+    };
+  }
+  const span = max - min;
+  const wanted = max + fraction * span;
+  const floorMax = min + requiredRange;
+  let next = wanted;
+  // RAISING IS BOUNDED BY EVIDENCE. With peaks on record the ceiling is the best rep the patient
+  // actually produced; with NO peaks on record (a range typed in by hand, or a legacy stored one)
+  // there is no evidence of anything above the current top, so the top is the ceiling and the button
+  // says why. A target nobody has ever reached is not a harder exercise, it is an unplayable lane.
+  if (fraction > 0) next = patientBest === null ? max : Math.min(wanted, Math.max(patientBest, max));
+  if (fraction < 0) next = Math.max(wanted, floorMax);
+  const eps = Math.max(1e-9, Math.abs(span) * 1e-9);
+  const disabled = Math.abs(next - max) <= eps;
+  const pct = `${Math.abs(Math.round(fraction * 100))}%`;
+  const verb = fraction < 0 ? 'Easier' : 'Harder';
+  let limit: RomNudgeLimit = 'ok';
+  if (fraction > 0 && next < wanted - eps) limit = 'patient_best';
+  else if (fraction < 0 && next > wanted + eps) limit = 'minimum_range';
+  const noEvidence = fraction > 0 && patientBest === null;
+  const label = disabled
+    ? `${verb} — ${
+        noEvidence
+          ? `no rep on record above ${formatFeature(max, unit)}`
+          : limit === 'patient_best'
+            ? `already at this patient's best (${formatFeature(patientBest ?? max, unit)})`
+            : `already at the smallest usable range (${formatFeature(floorMax, unit)})`
+      }`
+    : `${verb} — target ${formatFeature(max, unit)} → ${formatFeature(next, unit)} (${fraction < 0 ? '−' : '+'}${pct} of the measured range)`;
+  const note = noEvidence
+    ? `This range carries no record of the reps behind it (it was set by hand or saved by an older version), so there is nothing above ${formatFeature(max, unit)} that this patient is known to have reached. Re-measure the lane to raise the target.`
+    : limit === 'patient_best'
+      ? `Capped at ${formatFeature(patientBest ?? max, unit)} — the most this patient reached during calibration. A target above that has never been produced.`
+      : limit === 'minimum_range'
+        ? `Held at ${formatFeature(floorMax, unit)} — any smaller and the range cannot be told from rest noise.`
+        : null;
+  return { delta: next - max, currentMax: max, nextMax: next, patientBest, floorMax, limit, disabled, label, note };
+}
+
+/** The best rep evidenced by a STORED range: the largest detected peak, or null when none was kept. */
+export function calibrationPatientBest(cal: Pick<RomCalibration, 'peaks'>): number | null {
+  let best = -Infinity;
+  for (const p of cal.peaks ?? []) if (p > best) best = p;
+  return Number.isFinite(best) ? best : null;
+}
+
+/**
+ * What Easier/Harder would do to a range THE LANE ALREADY HOLDS — the form the Calibration screen
+ * uses, because the accepted range may have been reused from a previous session (no live calibrator
+ * ever measured it) and the therapist may nudge the same lane several times.
+ *
+ * `fraction` is a fraction OF THE MEASURED RANGE (max − min), never an absolute feature delta: the
+ * old buttons added ±0.05 in feature units to every movement alike, which is a sixth of a
+ * hemiparetic seated march and a twentieth of a degree of knee extension under the same "5 %" label.
+ */
+export function previewRomNudge(
+  cal: RomCalibration,
+  movement: Movement,
+  fraction: number = ROM_NUDGE_FRACTION,
+): RomNudgePreview {
+  // A legacy / hand-built range carries no movement of its own; the LANE always knows what it is
+  // measuring, and the units of the label come from that.
+  const mv = cal.movement ?? movement;
+  return buildNudgePreview({
+    min: cal.min,
+    max: cal.max,
+    movement: mv,
+    patientBest: calibrationPatientBest(cal),
+    requiredRange: requiredRom(mv, cal.rest),
+    fraction,
+  });
+}
+
+/**
+ * Apply `previewRomNudge` to a stored range, returning a NEW calibration (the input is never
+ * mutated) marked `manual` — a therapist-set target is not a measured one and the record says so.
+ * When the preview is disabled the calibration is returned unchanged.
+ */
+export function applyRomNudge(
+  cal: RomCalibration,
+  movement: Movement,
+  fraction: number = ROM_NUDGE_FRACTION,
+): { calibration: RomCalibration; preview: RomNudgePreview } {
+  const preview = previewRomNudge(cal, movement, fraction);
+  if (preview.disabled) return { calibration: cal, preview };
+  return { calibration: { ...cal, max: preview.nextMax, manual: true }, preview };
+}
+
+/** A feature value in the movement's own units, for a therapist to read. */
+export function formatFeature(value: number, unit: 'deg' | 'ratio'): string {
+  if (!Number.isFinite(value)) return '—';
+  return unit === 'deg' ? `${Math.round(value)}°` : value.toFixed(2);
+}
+
+/**
+ * WHAT THE NUMBER IS, for any screen that prints a bare feature value.
+ *
+ * `formatFeature` puts a degree sign on an angle and nothing at all on a ratio, because a ratio has
+ * no symbol — which left a Results headline reading "0.34" with no statement anywhere of what 0.34
+ * is a measure of. Every screen that shows a feature must be able to say it in words; this is the
+ * words.
+ */
+export const FEATURE_UNIT_NOTE: Readonly<Record<'deg' | 'ratio', string>> = Object.freeze({
+  deg: 'degrees at the joint',
+  ratio: 'body-scaled ratio — the movement measured against this patient’s own torso (or palm) size, so it is comparable across sessions and cameras',
+});
+
+/** Short form of the above, for a caption that has no room for the sentence. */
+export const FEATURE_UNIT_SHORT: Readonly<Record<'deg' | 'ratio', string>> = Object.freeze({
+  deg: 'degrees',
+  ratio: 'body-scaled ratio',
+});
+
 export const MIN_ROM_SNR = 3;
 
 /**
@@ -356,6 +584,13 @@ export interface CalibratorOptions {
   now?: () => number;
   /** Session id stamped on the produced calibration (provenance for the localStorage history). */
   sessionId?: string;
+  /**
+   * The patient whose body is being measured (Patient.id), stamped on the produced calibration so a
+   * later session for a DIFFERENT patient is refused instead of normalizing one person's movement by
+   * another person's range. A calibration screen passes the lane's context with the patient attached:
+   * `new RomCalibrator(m, { ...withPatient(ctx, patientId) })`.
+   */
+  patient?: string;
 }
 
 /** What the calibrator consumes per frame (LanePipeline's LaneSample satisfies this). */
@@ -451,6 +686,12 @@ export function calibrationWarnings(cal: CalibrationRange | null | undefined, mo
   if (cal.mirrored === undefined && (ctx?.mirrored ?? DEFAULT_MIRRORED) !== DEFAULT_MIRRORED) {
     out.push('This range does not record whether the camera image was mirrored when it was measured, and this session mirrors it. If it was measured un-mirrored it describes the other limb — re-run the calibration.');
   }
+  // A range with no patient stamp was measured before this device tracked patients (or by hand). It
+  // cannot be refused — there is nothing to compare — but it must not read as "checked", because the
+  // one thing it does not record is whose body it came from.
+  if (cal.patient === undefined && ctx?.patient) {
+    out.push('This range does not record which patient it was measured on. If it was measured on someone else it describes their range, not this patient\u2019s — re-run the calibration.');
+  }
   const fmt = (v: number) => (info.unit === 'deg' ? `${Math.abs(v).toFixed(1)}°` : `${(Math.abs(v) * 100).toFixed(1)}%`);
   const rest = cal.rest;
   if (rest && !rest.still) {
@@ -489,6 +730,8 @@ export class RomCalibrator {
   readonly fingertip: Fingertip | undefined;
   /** The mirror convention of the frames being measured (undefined = the caller did not say). */
   readonly mirrored: boolean | undefined;
+  /** The patient this range is being measured on (undefined = the caller did not say). */
+  readonly patient: string | undefined;
   private readonly nowMs: () => number;
 
   private phase: CalibrationPhase = 'rest';
@@ -540,6 +783,7 @@ export class RomCalibrator {
     this.sessionId = opts.sessionId;
     this.fingertip = movement === 'finger_opposition' ? opts.fingertip ?? DEFAULT_FINGERTIP : undefined;
     this.mirrored = opts.mirrored;
+    this.patient = opts.patient;
   }
 
   getPhase(): CalibrationPhase {
@@ -789,12 +1033,87 @@ export class RomCalibrator {
 
   /* ---------- therapist adjustment ---------- */
 
-  /** Shift min and/or max by feature-unit deltas (clamped so max stays above min). */
+  /**
+   * Shift min and/or max by feature-unit deltas.
+   *
+   * RAISING the top is BOUNDED by what the patient actually reached (`patientBest`): a raw delta from
+   * a UI button must not be able to put the target above a value they have never produced. Lowering
+   * stays raw, so the therapist-override flow (`setRange` then `nudge` down) can still produce — and
+   * be told about — a range that is too small to score. Prefer `nudgeTop`, which is proportional to
+   * the measured range and can tell the therapist what the button will do before they press it.
+   */
   nudge(minDelta: number, maxDelta: number): void {
     if (this.min !== null) this.min += minDelta;
-    if (this.max !== null) this.max += maxDelta;
+    if (this.max !== null) this.max = maxDelta > 0 ? this.boundedMax(this.max + maxDelta, 1) : this.max + maxDelta;
     this.manualAdjusted = true;
     this.reconcile();
+  }
+
+  /**
+   * The largest value this patient actually produced during calibration: the biggest detected peak,
+   * or (when the peak detector never fired) the largest feature seen in the move phase. Null when
+   * nothing was measured at all — a range typed in by hand has no such evidence behind it.
+   */
+  patientBest(): number | null {
+    let best = -Infinity;
+    for (const p of this.peaks) if (p > best) best = p;
+    if (this.moveMax > best) best = this.moveMax;
+    return Number.isFinite(best) ? best : null;
+  }
+
+  /**
+   * What "Easier"/"Harder" would do, WITHOUT doing it — the label the button should carry.
+   *
+   * `fraction` is a fraction OF THE MEASURED RANGE (max − min), not an absolute feature delta. The
+   * old buttons added ±0.05 in feature units to every movement alike: on knee extension (degrees,
+   * a ~40° range) that is a twentieth of a degree — invisible; on finger opposition (a ratio with a
+   * range around 0.4) it is an eighth of the patient's entire range in one click. Proportional is
+   * the only version of this control that means the same thing on every movement.
+   *
+   * Bounded at both ends: never above what the patient actually reached (`patientBest`), and never
+   * so low that the range stops being distinguishable from rest noise (`requiredRange`).
+   */
+  previewNudgeTop(fraction: number = ROM_NUDGE_FRACTION): RomNudgePreview {
+    return buildNudgePreview({
+      min: this.min,
+      max: this.max,
+      movement: this.movement,
+      patientBest: this.patientBest(),
+      requiredRange: this.requiredRange(),
+      fraction,
+    });
+  }
+
+  /**
+   * Move the top of the range by `fraction` of the measured range, bounded by what the patient
+   * achieved. Returns the same preview object `previewNudgeTop` would have returned; when
+   * `disabled` is true nothing was changed.
+   */
+  nudgeTop(fraction: number = ROM_NUDGE_FRACTION): RomNudgePreview {
+    const preview = this.previewNudgeTop(fraction);
+    if (preview.disabled) return preview;
+    this.max = preview.nextMax;
+    this.manualAdjusted = true;
+    this.reconcile();
+    return preview;
+  }
+
+  /**
+   * Clamp a proposed top: never above what the patient reached (raising only), never below the
+   * smallest range that can still be told from rest noise (lowering only).
+   */
+  private boundedMax(wanted: number, direction: number): number {
+    const min = this.min;
+    const max = this.max;
+    if (min === null || max === null || !Number.isFinite(wanted)) return wanted;
+    if (direction > 0) {
+      const best = this.patientBest();
+      // A ceiling below where the range already is must not DRAG the top down: it just means
+      // "no further".
+      return best === null ? wanted : Math.min(wanted, Math.max(best, max));
+    }
+    if (direction < 0) return Math.max(wanted, min + this.requiredRange());
+    return wanted;
   }
 
   /** Set min/max directly (either may be null to keep the current value). */
@@ -835,6 +1154,7 @@ export class RomCalibrator {
     if (this.sessionId !== undefined) cal.sessionId = this.sessionId;
     if (this.fingertip !== undefined) cal.fingertip = this.fingertip;
     if (this.mirrored !== undefined) cal.mirrored = this.mirrored;
+    if (this.patient !== undefined) cal.patient = this.patient;
     return cal;
   }
 

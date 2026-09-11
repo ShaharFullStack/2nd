@@ -3,11 +3,20 @@ import { DIFFICULTIES } from '../engine/difficulty.ts';
 import type { InvalidCalibration } from '../input/VisionInput.ts';
 import { runtime } from '../session/runtime.ts';
 import { calibrationKey, laneFingertip, useStore } from '../state/store.ts';
-import { RomCalibrator, calibrationMismatch } from '../vision/calibration.ts';
-import type { CalibrationMismatch, CalibrationStatus, RomCalibration } from '../vision/calibration.ts';
+import {
+  ROM_NUDGE_FRACTION,
+  RomCalibrator,
+  applyRomNudge,
+  calibrationMismatch,
+  formatFeature,
+  previewRomNudge,
+  withPatient,
+} from '../vision/calibration.ts';
+import type { CalibrationMismatch, CalibrationStatus, RomCalibration, RomNudgePreview } from '../vision/calibration.ts';
 import { FINGERTIP_NAME, MOVEMENT_INFO, movementCalibrationInstruction } from '../vision/features.ts';
 import { CameraPreview } from './CameraPreview.tsx';
 import { Meter, ProgressRing, Screen, Toast, TopBar, laneName } from './common.tsx';
+import PatientBanner from './PatientBanner.tsx';
 
 /** "little finger" for a lane that has a prescribed tip, "" for a movement with no tip dimension. */
 function tipName(spec: Parameters<typeof laneFingertip>[0]): string {
@@ -47,6 +56,9 @@ export default function RomCalibrationScreen() {
   const setCalibration = useStore((s) => s.setCalibration);
   const savedCalibrations = useStore((s) => s.savedCalibrations);
   const persistenceFailed = useStore((s) => s.persistenceFailed);
+  // WHOSE BODY is being measured. It is stamped on every range captured here and checked against every
+  // range offered back, because `movement:side[:fingertip]` says what was measured and not on whom.
+  const patientId = useStore((s) => s.activePatientId);
 
   const [laneIndex, setLaneIndex] = useState(0);
   const [live, setLive] = useState<Live | null>(null);
@@ -84,7 +96,9 @@ export default function RomCalibrationScreen() {
     // actually measured, so a later session can check it instead of guessing. A bare
     // `new RomCalibrator(movement)` produces a range no boundary check can validate; it is only the
     // fallback for the (dev) case where no vision input exists.
-    const cal = vision?.createCalibrator(laneIndex) ?? new RomCalibrator(lane.movement);
+    const cal =
+      vision?.createCalibrator(laneIndex, patientId ? { patient: patientId } : {}) ??
+      new RomCalibrator(lane.movement, patientId ? { patient: patientId } : {});
     calibrator.current = cal;
 
     if (!vision) return;
@@ -110,7 +124,7 @@ export default function RomCalibrationScreen() {
       // meter for the frames before its own first poll lands.
       setLive(null);
     };
-  }, [lane, laneIndex, generation]);
+  }, [lane, laneIndex, generation, patientId]);
 
   /**
    * Hand a measured range to the runtime and BELIEVE ITS ANSWER.
@@ -175,7 +189,10 @@ export default function RomCalibrationScreen() {
       const refusals = vision?.getInvalidCalibrations() ?? [];
       // The lane's OWN context, derived by VisionInput from the very feature options its extractor
       // runs with — never rebuilt here from the fields this screen happens to remember.
-      const ctx = vision?.getCalibrationContext(laneIndex) ?? undefined;
+      // The lane's derived context, PLUS the patient — which no feature option can tell it (see
+      // `withPatient`). Without the patient attached here, a range measured on somebody else passes
+      // every check this screen makes.
+      const ctx = withPatient(vision?.getCalibrationContext(laneIndex), patientId);
       const previousProblem = lane && previous ? calibrationMismatch(previous, lane.movement, ctx) : null;
       setVetting((v) =>
         v.previousProblem?.reason === previousProblem?.reason &&
@@ -188,7 +205,7 @@ export default function RomCalibrationScreen() {
     read();
     const poll = setInterval(read, 300);
     return () => clearInterval(poll);
-  }, [lane, laneIndex, previous, generation]);
+  }, [lane, laneIndex, previous, generation, patientId]);
 
   // "Done" means the RUNTIME holds a usable range for this lane, not that this screen measured one.
   const laneRefused = vetting.refusals.some((r) => r.lane === laneIndex) || rejectedReason !== null;
@@ -205,13 +222,45 @@ export default function RomCalibrationScreen() {
     setGeneration((g) => g + 1);
   };
 
-  const nudge = (delta: number) => {
-    const cal = calibrator.current;
-    if (!cal) return;
-    cal.nudge(0, delta);
-    const result = cal.getResult();
-    if (result) finishLane(result);
+  /**
+   * EASIER / HARDER, IN THE UNITS THE MOVEMENT IS IN.
+   *
+   * These two buttons used to call `cal.nudge(0, ±0.05)` — an ABSOLUTE feature-unit step — under
+   * labels that said "5 %". On seated march (a torso-normalised ratio whose whole hemiparetic range
+   * is around 0.3) one press moved the hit threshold by about a sixth of everything the patient has;
+   * on knee extension (degrees) the same press moved it 0.05°, so the therapist pressed a dead
+   * button twenty times to gain one degree. They now go through `previewNudgeTop`/`nudgeTop`, which
+   * step by a fraction OF THIS PATIENT'S MEASURED RANGE, refuse to put the target above the best rep
+   * the patient actually produced, refuse to shrink the range below what can be told from rest
+   * noise, and hand back the sentence the button carries — so the label states the target it is
+   * about to set, in degrees or in ratio, before it is pressed.
+   */
+  const nudge = (fraction: number) => {
+    // The range ACTUALLY IN FORCE for this lane is nudged — which may be one reused from a previous
+    // session that no live calibrator ever measured. Nudging the calibrator instead would be a dead
+    // button on exactly that path, and would disagree with the label (which reads the same range).
+    const current = done[laneIndex];
+    if (!current) return;
+    const { calibration, preview } = applyRomNudge(current, lane.movement, fraction);
+    if (preview.disabled) return;
+    // Keep the live calibrator in step so a Redo-free re-finish cannot resurrect the old top.
+    calibrator.current?.setRange(null, calibration.max);
+    finishLane(calibration);
   };
+
+  /**
+   * What each button WILL do to this lane, recomputed whenever the lane, the measured range or a
+   * previous nudge changes. `laneDone` is in the dependency list because `getResult()` builds a fresh
+   * object on every accepted range, so a re-measure and a nudge both change identity here.
+   */
+  const nudgeDown: RomNudgePreview | null = useMemo(
+    () => (laneDone && lane ? previewRomNudge(laneDone, lane.movement, -ROM_NUDGE_FRACTION) : null),
+    [laneDone, lane],
+  );
+  const nudgeUp: RomNudgePreview | null = useMemo(
+    () => (laneDone && lane ? previewRomNudge(laneDone, lane.movement, ROM_NUDGE_FRACTION) : null),
+    [laneDone, lane],
+  );
 
   const next = () => {
     if (laneIndex + 1 < lanes.length) {
@@ -275,6 +324,8 @@ export default function RomCalibrationScreen() {
           </button>
         }
       />
+
+      <PatientBanner blocking />
 
       <div className="row" style={{ alignItems: 'stretch', gap: 24 }}>
         <div className="card stack grow" style={{ gap: 20 }}>
@@ -365,11 +416,23 @@ export default function RomCalibrationScreen() {
             <button className="btn" onClick={retry} data-testid="rom-redo">
               Redo this lane
             </button>
-            <button className="btn" onClick={() => nudge(-0.05)} disabled={!laneDone}>
-              Easier (−5% top)
+            <button
+              className="btn"
+              onClick={() => nudge(-ROM_NUDGE_FRACTION)}
+              disabled={!laneDone || nudgeDown === null || nudgeDown.disabled}
+              title={nudgeDown?.note ?? undefined}
+              data-testid="rom-nudge-easier"
+            >
+              {nudgeDown?.label ?? 'Easier'}
             </button>
-            <button className="btn" onClick={() => nudge(0.05)} disabled={!laneDone}>
-              Harder (+5% top)
+            <button
+              className="btn"
+              onClick={() => nudge(ROM_NUDGE_FRACTION)}
+              disabled={!laneDone || nudgeUp === null || nudgeUp.disabled}
+              title={nudgeUp?.note ?? undefined}
+              data-testid="rom-nudge-harder"
+            >
+              {nudgeUp?.label ?? 'Harder'}
             </button>
             {previous && !laneDone && (
               <button
@@ -382,6 +445,21 @@ export default function RomCalibrationScreen() {
               </button>
             )}
           </div>
+
+          {/* WHY a button is refusing to move any further — the bound, stated in the movement's own
+              units. A capped "Harder" is not a broken button: it is the patient's best rep. */}
+          {(nudgeUp?.note || nudgeDown?.note) && (
+            <span className="dim" data-testid="rom-nudge-note">
+              {[nudgeUp?.note, nudgeDown?.note].filter(Boolean).join(' ')}
+            </span>
+          )}
+          {laneDone && (
+            <span className="dim">
+              Easier / Harder move the top of the range by {Math.round(ROM_NUDGE_FRACTION * 100)}% OF THIS PATIENT'S
+              MEASURED RANGE — the same proportion on a movement measured in degrees and one measured as a body-scaled
+              ratio — and can never set a target above the best rep they actually produced.
+            </span>
+          )}
         </div>
 
         <div className="card stack" style={{ width: 'min(340px, 100%)' }}>
@@ -411,8 +489,11 @@ export default function RomCalibrationScreen() {
                   <div className="grow" />
                   {refused && <span className="dim">not calibrated</span>}
                   {cal && (
-                    <span className="dim mono">
-                      {cal.min.toFixed(2)}→{cal.max.toFixed(2)}
+                    // IN THE UNITS THE MOVEMENT IS IN: a knee range is degrees and read "20° → 60°",
+                    // not a bare "20.00→60.00" that means nothing next to a ratio lane's "0.08→0.40".
+                    <span className="dim mono" data-testid={`rom-lane-range-${i}`}>
+                      {formatFeature(cal.min, MOVEMENT_INFO[l.movement].unit)} →{' '}
+                      {formatFeature(cal.max, MOVEMENT_INFO[l.movement].unit)}
                     </span>
                   )}
                 </li>
@@ -420,9 +501,10 @@ export default function RomCalibrationScreen() {
             })}
           </ul>
           <span className="dim">
-            Each range is stored with the movement, the side, the mirror convention — and, for finger opposition, the
-            fingertip — it was measured on. A repeat session offers a range back only when all of those still match, and
-            says so here when they do not, so one finger's (or one limb's) range is never handed to another.
+            Each range is stored with the PATIENT, the movement, the side, the mirror convention — and, for finger
+            opposition, the fingertip — it was measured on. A repeat session offers a range back only when all of those
+            still match, and says so here when they do not, so one person's (or one finger's, or one limb's) range is
+            never handed to another.
           </span>
         </div>
       </div>

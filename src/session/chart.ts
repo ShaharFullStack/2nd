@@ -6,7 +6,7 @@
  */
 import { findOffGridTimes } from '../audio/manifest.ts';
 import type { SongManifest } from '../audio/manifest.ts';
-import { generateChartDetailed } from '../charts/generate.ts';
+import { clampLaneRestSec, generateChartDetailed } from '../charts/generate.ts';
 import type { SongGrid } from '../charts/generate.ts';
 import type { Chart } from '../engine/types.ts';
 import type { SessionConfig } from './types.ts';
@@ -29,7 +29,12 @@ export function songGridOf(manifest: SongManifest): SongGrid {
 export const SILENT_GRID: SongGrid = { id: 'silent', bpm: 120, offset: 0, durationSec: 90 };
 
 export function buildSessionChart(grid: SongGrid, config: SessionConfig, manifest?: SongManifest | null): BuiltChart {
-  const result = generateChartDetailed(grid, config.lanes.length, config.difficulty, config.seed);
+  // The therapist's pacing floor overrides the difficulty's own spacing: a difficulty is a statement
+  // about timing windows and ROM threshold, not about how long an impaired limb needs to return to
+  // rest (see charts/generate.ts DEFAULT_LANE_REST_SEC).
+  const result = generateChartDetailed(grid, config.lanes.length, config.difficulty, config.seed, {
+    minLaneSpacingSec: config.laneRestSec === undefined ? undefined : clampLaneRestSec(config.laneRestSec),
+  });
   const warnings = [...result.warnings];
   if (manifest && manifest.swing) {
     // The generator works on a half-beat grid, which is swing-invariant — but if that ever changes,

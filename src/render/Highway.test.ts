@@ -760,7 +760,7 @@ describe('the board reads as a shipped highway', () => {
     };
     const mult = centreOf('x3');
     const combo = centreOf('COMBO');
-    const rock = centreOf('ROCK');
+    const rock = centreOf('ANSWERED'); // the notes-answered gauge (was the rock meter)
     expect(mult).not.toBeNull();
     expect(combo).not.toBeNull();
     expect(rock).not.toBeNull();
@@ -768,7 +768,7 @@ describe('the board reads as a shipped highway', () => {
     const right = roadEdgeX(g, 1, 0);
     expect((mult as { x: number }).x, 'multiplier badge is in the right flank').toBeGreaterThan(right);
     expect((combo as { x: number }).x, 'combo is in the right flank').toBeGreaterThan(right);
-    expect((rock as { x: number }).x, 'rock meter is in the left flank').toBeLessThan(left);
+    expect((rock as { x: number }).x, 'effort gauge is in the left flank').toBeLessThan(left);
     // Multiplier reads as part of the streak group, directly under the combo, not in a far corner.
     expect((mult as { y: number }).y).toBeGreaterThan((combo as { y: number }).y);
     expect((mult as { y: number }).y - (combo as { y: number }).y).toBeLessThan(g.height * 0.15);
@@ -4476,5 +4476,34 @@ describe('while the session is not accepting input, the row says so', () => {
     expect(glyph(scratch, '!')).toBe(true);
     expect(glyph(scratch, '?')).toBe(false);
     hw.setLaneFaults(null);
+  });
+});
+
+describe('the effort gauge is not a failure alarm', () => {
+  /** Colours the gauge arc is stroked in, at a given effort value. */
+  const gaugeStrokes = (health: number, songTime: number): string[] => {
+    const { canvas, hw } = setup();
+    hw.draw(makeFrame({ lanes: LANES, songTime, health, beatPhase: 0.5, combo: 0, multiplier: 1, thresholdFraction: 0.6 }));
+    return canvas.ctx.calls
+      .map((c, i) => (c.name === 'stroke' ? String(canvas.ctx.propBefore(i, 'strokeStyle')) : null))
+      .filter((c): c is string => c !== null);
+  };
+
+  it('never paints the old alarm red, however low the reading', () => {
+    for (const h of [0, 0.05, 0.1, 0.29]) {
+      expect(gaugeStrokes(h, 3).some((c) => c.toLowerCase() === '#ff3b3b')).toBe(false);
+    }
+  });
+
+  it('does not pulse: a low reading is drawn identically at any phase of the old 1.6 Hz blink', () => {
+    // The alarm was `0.5 + 0.5*sin(t*10)`: t = 3 and t = 3.314 are its opposite extremes.
+    const alphasAt = (songTime: number): number[] => {
+      const { canvas, hw } = setup();
+      hw.draw(makeFrame({ lanes: LANES, songTime, health: 0.1, beatPhase: 0.5, combo: 0, multiplier: 1, thresholdFraction: 0.6 }));
+      return canvas.ctx.calls
+        .map((c, i) => (c.name === 'stroke' ? Number(canvas.ctx.propBefore(i, 'globalAlpha')) : null))
+        .filter((a): a is number => a !== null);
+    };
+    expect(alphasAt(3)).toEqual(alphasAt(3 + Math.PI / 10));
   });
 });

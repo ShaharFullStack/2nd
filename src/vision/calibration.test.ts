@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import type { Movement, Side } from '../engine/types.ts';
 import {
-  CALIBRATION_STALE_MS, MIN_ROM_SNR, RomCalibrator, calibrationProblem, calibrationWarnings,
-  isCalibrationValid, normalizeFeature, percentile, requiredRom,
+  CALIBRATION_STALE_MS, MIN_ROM_SNR, RomCalibrator, applyRomNudge, calibrationProblem, calibrationWarnings,
+  isCalibrationValid, normalizeFeature, percentile, previewRomNudge, requiredRom,
 } from './calibration.ts';
 import type { RomCalibration } from './calibration.ts';
 import { captureCompensationBaseline, extractFeature } from './features.ts';
@@ -584,5 +584,133 @@ describe('finger_opposition calibrations carry the fingertip they were measured 
     expect(w[0]).toMatch(/ring/);
     // Recorded and matching: nothing to say.
     expect(calibrationWarnings({ ...legacy, fingertip: 'ring' }, 'finger_opposition', Date.now(), { fingertip: 'ring' })).toEqual([]);
+  });
+});
+
+describe('the Easier / Harder nudge is proportional, bounded and self-describing', () => {
+  /** A finished calibration: rest at `rest`, three reps peaking at `peak`. */
+  const measured = (movement: Movement, rest: number, peak: number): RomCalibrator => {
+    const cal = new RomCalibrator(movement, { autoAdvance: false });
+    for (let i = 0; i < 90; i++) cal.push(rest + (i % 2) * 1e-3, i / 30);
+    cal.beginMove();
+    let t = 3;
+    for (let rep = 0; rep < 3; rep++) {
+      for (let i = 0; i <= 20; i++) cal.push(rest + (peak - rest) * Math.sin((i / 20) * Math.PI), t += 1 / 30);
+    }
+    cal.finish();
+    return cal;
+  };
+
+  it('steps by a fraction of the MEASURED RANGE, so it means the same on degrees and on ratios', () => {
+    // knee_extension is degrees: a 40 degree range steps by 2 degrees, not by the old 0.05 (invisible)
+    const knee = measured('knee_extension', 90, 130);
+    const kneeMax = knee.getResult()!.max;
+    const easier = knee.previewNudgeTop(-0.05);
+    expect(easier.delta).toBeCloseTo(-0.05 * (kneeMax - knee.getResult()!.min), 6);
+    expect(Math.abs(easier.delta)).toBeGreaterThan(1); // degrees, and visible
+    expect(easier.label).toMatch(/Easier — target \d+° → \d+° \(−5% of the measured range\)/);
+
+    // finger_opposition is a ratio around 0.6: the old absolute 0.05 was an eighth of the range
+    const pinch = measured('finger_opposition', 0.1, 0.7);
+    const p = pinch.previewNudgeTop(-0.05);
+    expect(Math.abs(p.delta)).toBeLessThan(0.05);
+    expect(p.label).toMatch(/Easier — target 0\.\d\d → 0\.\d\d/);
+  });
+
+  it('never raises the target above what the patient actually reached', () => {
+    const cal = measured('knee_extension', 90, 130);
+    const best = cal.patientBest()!;
+    for (let i = 0; i < 20; i++) cal.nudgeTop(0.05);
+    expect(cal.getResult()!.max).toBeLessThanOrEqual(best + 1e-9);
+    const at = cal.previewNudgeTop(0.05);
+    expect(at.disabled).toBe(true);
+    expect(at.limit).toBe('patient_best');
+    expect(at.label).toMatch(/already at this patient's best/);
+    expect(at.note).toMatch(/never been produced/);
+    // and the raw nudge() the old buttons called is bounded upward too
+    cal.nudge(0, 500);
+    expect(cal.getResult()!.max).toBeLessThanOrEqual(best + 1e-9);
+  });
+
+  it('never lowers the target into a range that cannot be told from rest noise', () => {
+    const cal = measured('knee_extension', 90, 130);
+    const min = cal.getResult()!.min;
+    for (let i = 0; i < 60; i++) cal.nudgeTop(-0.05);
+    const res = cal.getResult();
+    expect(res).not.toBeNull(); // still a usable calibration, not an error state
+    expect(res!.max - min).toBeGreaterThanOrEqual(cal.requiredRange() - 1e-9);
+    const at = cal.previewNudgeTop(-0.05);
+    expect(at.disabled).toBe(true);
+    expect(at.limit).toBe('minimum_range');
+    expect(at.label).toMatch(/already at the smallest usable range/);
+  });
+
+  it('applies exactly what it previewed, and marks the range as therapist-adjusted', () => {
+    const cal = measured('seated_march', 0.05, 0.6);
+    const before = cal.getResult()!.max;
+    const preview = cal.previewNudgeTop(-0.05);
+    expect(cal.getResult()!.max).toBe(before); // a preview changes nothing
+    const applied = cal.nudgeTop(-0.05);
+    expect(applied.nextMax).toBe(preview.nextMax);
+    expect(cal.getResult()!.max).toBeCloseTo(preview.nextMax, 12);
+    expect(cal.isManual()).toBe(true);
+  });
+
+  /**
+   * THE FORM THE SCREEN ACTUALLY CALLS. The buttons a therapist presses sit on the lane's ACCEPTED
+   * range, which may have been reused from a previous session and have no live calibrator behind it
+   * at all. Both forms must answer identically or the label and the press disagree.
+   */
+  it('answers the same on a stored range as on the calibrator that measured it', () => {
+    const cal = measured('seated_march', 0.05, 0.6);
+    const stored = cal.getResult()!;
+    for (const f of [-0.05, 0.05]) {
+      const fromClass = cal.previewNudgeTop(f);
+      const fromStored = previewRomNudge(stored, 'seated_march', f);
+      expect(fromStored.nextMax).toBeCloseTo(fromClass.nextMax, 12);
+      expect(fromStored.label).toBe(fromClass.label);
+      expect(fromStored.disabled).toBe(fromClass.disabled);
+    }
+    const { calibration, preview } = applyRomNudge(stored, 'seated_march', -0.05);
+    expect(calibration.max).toBeCloseTo(preview.nextMax, 12);
+    expect(calibration.manual).toBe(true);
+    expect(stored.max).toBe(cal.getResult()!.max); // the input is never mutated
+  });
+
+  it('will not raise a target above a range with no reps on record behind it', () => {
+    // A hand-built / legacy stored range: nothing says this patient ever reached anything above it.
+    const handBuilt: RomCalibration = { min: 20, max: 60, samples: 0, movement: 'knee_extension', peaks: [] };
+    const up = previewRomNudge(handBuilt, 'knee_extension', 0.05);
+    expect(up.disabled).toBe(true);
+    expect(up.label).toMatch(/no rep on record above 60°/);
+    expect(up.note).toMatch(/Re-measure the lane to raise the target/);
+    // Lowering is always available: it only ever asks for less than the patient has already done.
+    const down = previewRomNudge(handBuilt, 'knee_extension', -0.05);
+    expect(down.disabled).toBe(false);
+    expect(down.nextMax).toBeCloseTo(58, 6);
+  });
+
+  it('steps by the same PROPORTION on a degree lane and a ratio lane, in each one’s own units', () => {
+    // The defect this control had: one absolute 0.05 step meant 0.25 % of a knee-extension range and
+    // ~16 % of a hemiparetic seated-march range, under one label that said "5 %".
+    const knee: RomCalibration = { min: 20, max: 60, samples: 0, movement: 'knee_extension', peaks: [80] };
+    const march: RomCalibration = { min: 0.08, max: 0.4, samples: 0, movement: 'seated_march', peaks: [0.5] };
+    const k = previewRomNudge(knee, 'knee_extension', 0.05);
+    const m = previewRomNudge(march, 'seated_march', 0.05);
+    expect(k.delta).toBeCloseTo(0.05 * 40, 9); // 2°, not 0.05°
+    expect(m.delta).toBeCloseTo(0.05 * 0.32, 9); // 0.016, not 0.05
+    expect(k.delta / (knee.max - knee.min)).toBeCloseTo(m.delta / (march.max - march.min), 9);
+    expect(k.label).toContain('°');
+    expect(m.label).toContain('0.4');
+  });
+
+  it('says so instead of throwing when there is no range to nudge', () => {
+    const fresh = new RomCalibrator('knee_extension');
+    const p = fresh.previewNudgeTop(0.05);
+    expect(p.disabled).toBe(true);
+    expect(p.limit).toBe('no_range');
+    expect(p.note).toMatch(/No range/);
+    expect(fresh.nudgeTop(0.05).disabled).toBe(true);
+    expect(fresh.previewNudgeTop(0).disabled).toBe(true);
   });
 });

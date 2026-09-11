@@ -6,9 +6,44 @@ export const GOOD_SCORE = 50;
 export const COMBO_THRESHOLDS: readonly number[] = [0, 10, 20, 30];
 export const MAX_MULTIPLIER = COMBO_THRESHOLDS.length;
 
-export const HEALTH_START = 0.5;
-export const HEALTH_PER_HIT = 0.02;
-export const HEALTH_PER_MISS = -0.03;
+/**
+ * NOTES ANSWERED — what the HUD gauge shows, and what `ScoreState.health` now holds.
+ *
+ * TWO WRONG ANSWERS PRECEDED THIS ONE, and both lied to the same patient.
+ *  1. A ROCK METER: 0.5 at the start, −0.03 a miss, pulsing red below 0.3 in a game whose engine and
+ *     README promise a song can never be failed. A failure alarm wired to nothing.
+ *  2. MOVEMENTS PER NOTE OFFERED, clamped to 1. A patient with a tremor produced 280 movements against
+ *     189 notes and 12 hits, and the gauge — and the Results card — read a full, green 100 %, over a
+ *     caption that said "movements made for 280 of the 189 notes offered". An impossible sentence, and
+ *     a session that was a latency or calibration fault presented as a perfect one. A quantity that is
+ *     only bounded by a clamp is not bounded: the clamp hides exactly the case that mattered.
+ *
+ * The quantity is now bounded BY CONSTRUCTION. A note is ANSWERED when the patient produced a
+ * movement for it: every hit, plus every missed note that had a movement land nearest to it (tracked
+ * by note id — see `Scoring.recordUnmatchedInput`). A note can be answered at most once, so
+ * `attempted <= judged` is a fact about the counting, not a `Math.min`. Movements that answered no
+ * note at all are NOT discarded and NOT folded in: they are reported separately as `surplus`, because
+ * "the patient moved 91 more times than there were notes" is a clinical finding (tremor, clonus, a
+ * latency offset that is badly out) and averaging it into a success rate destroys it.
+ *
+ * It stays the truth about the part the patient controls: a patient whose timing scores nothing
+ * because the latency is 200 ms out still reads near 1.0 — they DID the rep — while a patient who
+ * stops moving reads it fall. Nothing here can fail, and nothing here can saturate for a patient who
+ * is flailing.
+ */
+export function answerRateOf(attempted: number, judged: number, warmup: number = ANSWER_WARMUP_NOTES): number {
+  const j = Number.isFinite(judged) ? Math.max(0, judged) : 0;
+  const a = Number.isFinite(attempted) ? Math.max(0, Math.min(attempted, j)) : 0;
+  // WARM-UP. The rate is judged-note-relative from the very first note, so one missed opening note
+  // used to read 0/1 = 0 and empty the gauge seconds after the count-in. The first `warmup` notes are
+  // treated as answered until they have actually been judged, so the needle starts full and settles
+  // onto the real number over the opening bars instead of slamming to empty on note one.
+  const pad = Math.max(0, warmup - j);
+  return (a + pad) / (j + pad || 1);
+}
+
+/** Notes that must be judged before the gauge reads the raw rate (see `answerRateOf`). */
+export const ANSWER_WARMUP_NOTES = 6;
 
 /** Guitar-Hero style: multiplier = number of thresholds reached by the current combo. */
 export function multiplierForCombo(combo: number): number {
@@ -29,15 +64,22 @@ export function starAccuracyOf(perfects: number, goods: number, judged: number):
   return judged > 0 ? (perfects + GOOD_STAR_WEIGHT * goods) / judged : 0;
 }
 
-/** Star rating 0..5 from an accuracy in 0..1 (feed it `starAccuracy`, see `starAccuracyOf`). */
+/**
+ * Star rating 1..5 from an accuracy in 0..1 (feed it `starAccuracy`, see `starAccuracyOf`).
+ *
+ * ZERO IS NOT A BAND. The old scale gave 0 of 5 stars below 25 % — so a hemiparetic patient whose
+ * weak side scored 10 % was handed a nil return on a screen they had just worked through, which is a
+ * grade on their impairment and not a measurement of anything. 0 is now reserved for "no accuracy was
+ * measured at all" (a non-finite input); a session that was played is at least one star, and the
+ * Results screen no longer leads with this number anyway (see ui/Results.tsx).
+ */
 export function starsForAccuracy(accuracy: number): number {
   if (!Number.isFinite(accuracy)) return 0;
   if (accuracy >= 0.95) return 5;
   if (accuracy >= 0.85) return 4;
   if (accuracy >= 0.7) return 3;
-  if (accuracy >= 0.5) return 2;
-  if (accuracy >= 0.25) return 1;
-  return 0;
+  if (accuracy >= 0.45) return 2;
+  return 1;
 }
 
 /**
@@ -90,6 +132,17 @@ export interface LaneStats {
    * is the rep count the Results screen should show.
    */
   reps: number;
+  /**
+   * Notes in this lane the patient ANSWERED with a movement: hits plus missed notes that had a
+   * movement land nearest to them. Bounded by `judged` by construction (a note is answered at most
+   * once) — see `answerRateOf`.
+   */
+  attempted: number;
+  /**
+   * Movements in this lane that answered no note of their own: `reps - attempted`. Reported, never
+   * folded into a success rate — a patient producing three movements per note is a clinical finding.
+   */
+  surplus: number;
 }
 
 /**
@@ -118,7 +171,11 @@ export interface ScoreState {
   maxCombo: number;
   /** Multiplier that the *next* hit will receive. */
   multiplier: number;
-  /** Rock meter 0..1 (never fails the song). */
+  /**
+   * NOTES ANSWERED per note judged, 0..1 (`answerRateOf`). Named `health` for the render frame it
+   * feeds; it is no longer a rock meter, nothing can fail on it, and it cannot saturate for a
+   * patient who is moving constantly without answering notes (that is `surplus`).
+   */
   health: number;
   totalNotes: number;
   hits: number;
@@ -151,6 +208,10 @@ export interface ScoreState {
    * The honest rep count for the Results screen. See `outOfRange` for the unattributable rest.
    */
   reps: number;
+  /** Notes answered with a movement, summed over lanes (<= `judged` by construction). */
+  attempted: number;
+  /** Movements that answered no note, summed over lanes (`reps - attempted`). */
+  surplus: number;
   lanes: LaneStats[];
 }
 
@@ -166,6 +227,7 @@ export interface ScoreDelta {
   points: number;
   multiplier: number;
   combo: number;
+  /** Notes answered per note judged after this event (`answerRateOf`) — see `ScoreState.health`. */
   health: number;
   judgment: Judgment;
 }
@@ -272,12 +334,22 @@ interface Acc {
   m2: number;
   /** inputs that matched no note */
   unmatched: number;
+  /**
+   * Note ids judged as a MISS in this lane, and note ids that had a movement land nearest to them.
+   * Their intersection is the set of missed notes the patient ANSWERED — see `answerRateOf`. Ids,
+   * not counters, so a flurry of movements around one note answers one note and no more.
+   */
+  missedIds: Set<number>;
+  answeredIds: Set<number>;
   /** RAW signed distance (ms) to the nearest note — latency-offset free, see `Scoring` */
   nearest: NearestPool;
 }
 
 function newAcc(): Acc {
-  return { hits: 0, perfects: 0, goods: 0, misses: 0, n: 0, mean: 0, m2: 0, unmatched: 0, nearest: new NearestPool() };
+  return {
+    hits: 0, perfects: 0, goods: 0, misses: 0, n: 0, mean: 0, m2: 0, unmatched: 0,
+    missedIds: new Set<number>(), answeredIds: new Set<number>(), nearest: new NearestPool(),
+  };
 }
 
 function resetAcc(a: Acc): void {
@@ -289,7 +361,28 @@ function resetAcc(a: Acc): void {
   a.mean = 0;
   a.m2 = 0;
   a.unmatched = 0;
+  a.missedIds.clear();
+  a.answeredIds.clear();
   a.nearest.clear();
+}
+
+/** Missed notes in this lane the patient answered with a movement (the two id sets' intersection). */
+function answeredMisses(a: Acc): number {
+  // Iterate the smaller set; both are bounded by the chart's note count.
+  const [small, large] = a.answeredIds.size <= a.missedIds.size ? [a.answeredIds, a.missedIds] : [a.missedIds, a.answeredIds];
+  let n = 0;
+  for (const id of small) if (large.has(id)) n++;
+  return n;
+}
+
+/** Notes ANSWERED in this lane: hits plus missed notes a movement was made for. Never exceeds judged. */
+function attemptedOf(a: Acc): number {
+  return a.hits + answeredMisses(a);
+}
+
+/** Movements that answered no note of their own (extra reps, tremor, a badly-out latency offset). */
+function surplusOf(a: Acc): number {
+  return Math.max(0, a.hits + a.unmatched - attemptedOf(a));
 }
 
 function pushDelta(a: Acc, x: number): void {
@@ -339,7 +432,6 @@ export class Scoring {
   private score = 0;
   private combo = 0;
   private maxCombo = 0;
-  private health = HEALTH_START;
   private readonly total: Acc = newAcc();
   private readonly lanes: Acc[] = [];
   private readonly totalNotes: number;
@@ -368,8 +460,36 @@ export class Scoring {
     return this.score;
   }
 
+  /** Notes answered per note judged, 0..1 — see `answerRateOf`. (`health` is the frame's name for it.) */
+  getEffort(): number {
+    return answerRateOf(this.getAttempted(), this.total.hits + this.total.misses);
+  }
+
+  /** Notes ANSWERED with a movement (hits + missed notes a movement was made for), overall or in a lane. */
+  getAttempted(lane?: number): number {
+    if (lane === undefined) {
+      let n = 0;
+      for (const a of this.lanes) n += attemptedOf(a);
+      return n;
+    }
+    const a = this.lanes[lane];
+    return a ? attemptedOf(a) : 0;
+  }
+
+  /** Movements that answered no note (see `ScoreState.surplus`), overall or in a lane. */
+  getSurplus(lane?: number): number {
+    if (lane === undefined) {
+      let n = 0;
+      for (const a of this.lanes) n += surplusOf(a);
+      return n;
+    }
+    const a = this.lanes[lane];
+    return a ? surplusOf(a) : 0;
+  }
+
+  /** @deprecated Alias of `getEffort()`; there is no health and nothing to lose. */
   getHealth(): number {
-    return this.health;
+    return this.getEffort();
   }
 
   getLaneCount(): number {
@@ -408,16 +528,15 @@ export class Scoring {
     let points = 0;
     if (e.judgment === 'miss') {
       this.combo = 0;
-      this.health = clamp01(this.health + HEALTH_PER_MISS);
       this.total.misses++;
       laneAcc.misses++;
+      if (Number.isFinite(e.noteId)) laneAcc.missedIds.add(e.noteId);
     } else {
       const mult = multiplierForCombo(this.combo);
       points = (e.judgment === 'perfect' ? PERFECT_SCORE : GOOD_SCORE) * mult;
       this.score += points;
       this.combo++;
       if (this.combo > this.maxCombo) this.maxCombo = this.combo;
-      this.health = clamp01(this.health + HEALTH_PER_HIT);
       this.total.hits++;
       laneAcc.hits++;
       if (e.judgment === 'perfect') {
@@ -436,7 +555,7 @@ export class Scoring {
       }
     }
     this.stateCache = null;
-    return { points, multiplier: multiplierForCombo(this.combo), combo: this.combo, health: this.health, judgment: e.judgment };
+    return { points, multiplier: multiplierForCombo(this.combo), combo: this.combo, health: this.getEffort(), judgment: e.judgment };
   }
 
   /**
@@ -450,11 +569,15 @@ export class Scoring {
    *        the rep still counts, it just carries no timing information.
    * @throws RangeError when `lane` is out of range (per-lane rehab metrics must not be misattributed).
    */
-  recordUnmatchedInput(lane: number, nearestDeltaMs: number | null): void {
+  recordUnmatchedInput(lane: number, nearestDeltaMs: number | null, nearestNoteId: number | null = null): void {
     const laneAcc = this.lanes[lane];
     if (laneAcc === undefined) throw new RangeError(`Scoring: lane ${lane} out of range [0, ${this.lanes.length})`);
     this.total.unmatched++;
     laneAcc.unmatched++;
+    // WHICH note the movement was for, not just how far off it was: this is what makes "notes
+    // answered" countable and bounded (`answerRateOf`). A movement with no nearest note (an empty
+    // lane) still counts as a rep — it just answers nothing.
+    if (nearestNoteId !== null && Number.isFinite(nearestNoteId)) laneAcc.answeredIds.add(nearestNoteId);
     if (nearestDeltaMs !== null) this.pushNearest(laneAcc, nearestDeltaMs);
     this.stateCache = null;
   }
@@ -536,6 +659,12 @@ export class Scoring {
     const accuracy = judged > 0 ? t.hits / judged : 0;
     const starAccuracy = starAccuracyOf(t.perfects, t.goods, judged);
     const off = this.latencyOffsetMs;
+    let attemptedTotal = 0;
+    let surplusTotal = 0;
+    for (const a of this.lanes) {
+      attemptedTotal += attemptedOf(a);
+      surplusTotal += surplusOf(a);
+    }
     const lanes: LaneStats[] = new Array<LaneStats>(this.lanes.length);
     for (let lane = 0; lane < this.lanes.length; lane++) {
       const a = this.lanes[lane];
@@ -553,6 +682,8 @@ export class Scoring {
         stdDeltaMs: std(a),
         unmatched: a.unmatched,
         reps: a.hits + a.unmatched,
+        attempted: attemptedOf(a),
+        surplus: surplusOf(a),
       });
     }
     const state: ScoreState = Object.freeze({
@@ -560,7 +691,7 @@ export class Scoring {
       combo: this.combo,
       maxCombo: this.maxCombo,
       multiplier: multiplierForCombo(this.combo),
-      health: this.health,
+      health: answerRateOf(attemptedTotal, judged),
       totalNotes: this.totalNotes,
       hits: t.hits,
       perfects: t.perfects,
@@ -576,6 +707,8 @@ export class Scoring {
       unmatched: t.unmatched,
       outOfRange: this.outOfRange,
       reps: t.hits + t.unmatched,
+      attempted: attemptedTotal,
+      surplus: surplusTotal,
       lanes: Object.freeze(lanes) as LaneStats[],
     });
     this.stateCache = state;
@@ -597,7 +730,6 @@ export class Scoring {
     this.score = 0;
     this.combo = 0;
     this.maxCombo = 0;
-    this.health = HEALTH_START;
     resetAcc(this.total);
     for (const a of this.lanes) resetAcc(a);
     this.outOfRange = 0;
@@ -637,6 +769,3 @@ function biasOf(a: Acc, offsetMs: number): TimingBias {
   return Object.freeze({ timingBiasMs: s.median - offsetMs, timingBiasMadMs: s.mad, timingBiasSamples: a.nearest.size });
 }
 
-function clamp01(x: number): number {
-  return x < 0 ? 0 : x > 1 ? 1 : x;
-}

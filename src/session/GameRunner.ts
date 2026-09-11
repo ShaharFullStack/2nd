@@ -21,8 +21,22 @@ import type { Chart, HitEvent, LaneSpec, Note, TimingWindows } from '../engine/t
 import type { CompensationKindName, InputSource, LaneInputEvent, LaneRepEvent, SongTimeSource } from '../input/types.ts';
 import { Highway } from '../render/Highway.ts';
 import type { CanvasLike, HighwayOptions, RenderFrame, RenderNote } from '../render/types.ts';
+import type { SessionEndReason } from './types.ts';
 
 export type RunnerPhase = 'idle' | 'countdown' | 'playing' | 'paused' | 'ended';
+
+/**
+ * WHY THE RUN STOPPED. Every one of these persists a RunSummary — the reps the patient actually
+ * performed are a clinical record whatever ended the song, and the only dishonest outcome is a run
+ * that reports nothing.
+ *
+ *   'chart'     — the chart finished (or the mixer reported the song had). The only complete run.
+ *   'quit'      — the therapist pressed "End & see results".
+ *   'abandoned' — the session was taken away from the patient: the play screen was left (Back, a
+ *                 deep link, a remount), or the page itself went away (tab closed, tablet slept).
+ *                 Recorded exactly like a quit, and marked incomplete just as honestly.
+ */
+export type RunEndReason = SessionEndReason;
 
 /** What the React chrome is allowed to know, at ~10 Hz. */
 export interface HudSnapshot {
@@ -45,6 +59,8 @@ export interface HudSnapshot {
   notesRemaining: number;
   /** True when the audio clock has stopped advancing (suspended context / no audio device). */
   clockStalled: boolean;
+  /** Paused because the PAGE went away (tab hidden / tablet locked), not because a human asked. */
+  pausedByPage: boolean;
 }
 
 /** Rep-level rehab metrics accumulated per lane during the run (camera sessions produce these). */
@@ -66,8 +82,10 @@ export interface LaneRepStats {
 export interface RunSummary {
   results: ScoreResults;
   laneReps: LaneRepStats[];
-  /** False when the therapist quit before the chart finished. */
+  /** False when the run did not reach the end of the chart (`endReason` says what did happen). */
   completed: boolean;
+  /** What stopped the run. `completed === (endReason === 'chart')`. */
+  endReason: RunEndReason;
   /** Song seconds played. */
   songTime: number;
   startedAt: number;
@@ -127,6 +145,11 @@ export interface GameRunnerOptions {
   startInput?: boolean;
   /** Stop the input source on dispose() (default false — the camera outlives one song). */
   stopInputOnDispose?: boolean;
+  /**
+   * The page-lifecycle source the runner watches, or null to watch nothing (tests, headless use).
+   * Defaults to the real `document` + `window` when they exist. See `watchPageLifecycle`.
+   */
+  lifecycle?: PageLifecycle | null;
   /** rAF replacement (tests drive frames by hand). Returns a cancel function. */
   schedule?: (cb: () => void) => () => void;
   /** Wall clock in ms for HUD throttling (default performance.now). */
@@ -140,6 +163,37 @@ const MISS_CUE_COOLDOWN_SEC = 0.15;
 const DEFAULT_COUNTDOWN_SEC = 3;
 /** Song seconds of silence after the last note before the results screen. */
 const OUTRO_SEC = 1.5;
+
+/**
+ * The page-lifecycle facts the runner acts on, as an interface so a test can be the page.
+ *
+ * `hidden` is `document.visibilityState === 'hidden'`: the tab was backgrounded, the tablet was
+ * locked, the therapist switched app. `onPageGone` is `pagehide` — the last moment at which anything
+ * can be written to localStorage.
+ */
+export interface PageLifecycle {
+  isHidden(): boolean;
+  onVisibilityChange(cb: () => void): () => void;
+  onPageGone(cb: () => void): () => void;
+}
+
+/** The real page, when there is one. */
+export function browserLifecycle(): PageLifecycle | null {
+  const doc = typeof document !== 'undefined' ? document : null;
+  const win = typeof window !== 'undefined' ? window : null;
+  if (!doc || !win) return null;
+  return {
+    isHidden: () => doc.visibilityState === 'hidden',
+    onVisibilityChange: (cb) => {
+      doc.addEventListener('visibilitychange', cb);
+      return () => doc.removeEventListener('visibilitychange', cb);
+    },
+    onPageGone: (cb) => {
+      win.addEventListener('pagehide', cb);
+      return () => win.removeEventListener('pagehide', cb);
+    },
+  };
+}
 
 function defaultSchedule(cb: () => void): () => void {
   if (typeof requestAnimationFrame === 'function') {
@@ -183,6 +237,13 @@ export class GameRunner {
   private laneReps: LaneRepStats[];
   private ended = false;
   private disposed = false;
+  private readonly lifecycle: PageLifecycle | null;
+  /**
+   * True while the run is paused BECAUSE THE PAGE WENT AWAY, as opposed to a therapist pause. Kept
+   * so a run that is interrupted and never comes back is honest about it, and so the automatic
+   * pause is not mistaken for one a human asked for.
+   */
+  private pausedByPage = false;
 
   constructor(options: GameRunnerOptions) {
     this.opts = options;
@@ -195,6 +256,7 @@ export class GameRunner {
     this.hudIntervalMs = options.hudIntervalMs ?? 100;
     this.nowMs = options.nowMs ?? (() => (typeof performance !== 'undefined' ? performance.now() : Date.now()));
     this.schedule = options.schedule ?? defaultSchedule;
+    this.lifecycle = options.lifecycle === undefined ? browserLifecycle() : options.lifecycle;
 
     this.engine = new RhythmEngine({
       chart: options.chart,
@@ -250,6 +312,15 @@ export class GameRunner {
     return this.phase;
   }
 
+  /**
+   * True when the run is paused because the PAGE went away (tab hidden, tablet locked, app switched)
+   * rather than because a human pressed pause. The play screen says so on the pause overlay: a
+   * therapist who comes back to a stopped session is owed the reason it stopped.
+   */
+  isPausedByPage(): boolean {
+    return this.phase === 'paused' && this.pausedByPage;
+  }
+
   /** Song time now (the timeline notes are judged against). */
   songTime(): number {
     return this.engine.songTime();
@@ -264,6 +335,9 @@ export class GameRunner {
 
     const lead = Math.max(0, this.countdownSec);
     if (this.mixer && this.mixer.isLoaded) {
+      // Wire the lanes to stems BEFORE the first note: a miss must dim the instrument of the limb
+      // that missed, not the whole band (see ducking.ts `assignLaneStems`).
+      this.mixer.setLaneCount(this.chart.lanes);
       this.mixer.play(this.clock.currentTime + lead);
       this.engine.start(this.mixer.getSongStartCtxTime());
     } else {
@@ -283,7 +357,28 @@ export class GameRunner {
     if (typeof rep === 'function') {
       this.unsubscribe.push(rep.call(this.input, (e: LaneRepEvent) => this.onRep(e)));
     }
-    if (this.mixer) this.unsubscribe.push(this.mixer.onEnded(() => this.finish(true)));
+    if (this.mixer) this.unsubscribe.push(this.mixer.onEnded(() => this.finish('chart')));
+
+    // NOTHING PAUSED WHEN THE THERAPIST LOOKED AWAY. A backgrounded tab stops getting animation
+    // frames while the AudioContext clock keeps running, so the song ran on without the board: on
+    // return, every note that went by in the meantime was judged in one tick as a wall of misses the
+    // patient never had a chance at, and the mixer had been playing to an empty room. The tab going
+    // hidden is the patient not being able to play, so the run stops exactly as it does for the
+    // pause button — audio and chart clock together — and waits for a human to resume it.
+    if (this.lifecycle) {
+      this.unsubscribe.push(
+        this.lifecycle.onVisibilityChange(() => {
+          if (!this.lifecycle?.isHidden()) return;
+          if (this.phase !== 'playing' && this.phase !== 'countdown') return;
+          this.pausedByPage = true;
+          this.pause(true);
+        }),
+      );
+      // THE LAST MOMENT ANYTHING CAN BE SAVED. `pagehide` is the only event that fires for a closed
+      // tab, a navigation away and a tablet that discards the page — and localStorage is synchronous,
+      // so the run's record is written here rather than evaporating with the page.
+      this.unsubscribe.push(this.lifecycle.onPageGone(() => this.finish('abandoned')));
+    }
   }
 
   private onInput(e: LaneInputEvent): void {
@@ -292,7 +387,7 @@ export class GameRunner {
     if (!hit) return;
     this.pushRecent(hit);
     const state = this.engine.getScoreState();
-    this.mixer?.onHit(state.combo);
+    this.mixer?.onLaneHit(hit.lane, state.combo);
     if (this.sfx) {
       if (hit.judgment === 'perfect') this.sfx.perfect(undefined, hit.lane);
       else this.sfx.hit(undefined, hit.lane);
@@ -349,8 +444,12 @@ export class GameRunner {
 
     const { songTime, misses } = this.engine.tick(ctxNow);
     if (misses.length > 0) {
-      for (const m of misses) this.pushRecent(m);
-      this.mixer?.onMiss();
+      for (const m of misses) {
+        this.pushRecent(m);
+        // Per lane, one step per miss: the weak side dims its own stem only, and only in proportion
+        // to the run of misses. A single miss anywhere used to drop the player's instrument to 5 %.
+        this.mixer?.onLaneMiss(m.lane);
+      }
       if (this.sfx && songTime - this.lastMissCueSongTime > MISS_CUE_COOLDOWN_SEC) {
         this.lastMissCueSongTime = songTime;
         this.sfx.miss();
@@ -363,7 +462,7 @@ export class GameRunner {
     this.draw(songTime);
     this.emitHud(false);
 
-    if (this.phase === 'playing' && songTime >= this.endSongTime()) this.finish(true);
+    if (this.phase === 'playing' && songTime >= this.endSongTime()) this.finish('chart');
   }
 
   private endSongTime(): number {
@@ -461,12 +560,20 @@ export class GameRunner {
       reps: s.reps,
       notesRemaining: s.totalNotes - s.judged,
       clockStalled: this.stalledFrames > 60,
+      pausedByPage: this.isPausedByPage(),
     };
   }
 
-  /** Therapist pause (Esc / the pause button). Audio and the song clock stop together. */
-  pause(): void {
-    if (this.phase !== 'playing') return;
+  /**
+   * Pause (Esc, the pause button, or the page going away). Audio and the song clock stop together,
+   * so nothing drifts across the gap.
+   *
+   * A count-in is pausable too — only from the page path, which is the one case where the patient
+   * genuinely cannot see the screen. The button stays disabled for it (the mixer transport is
+   * already scheduled and there is nothing yet to lose).
+   */
+  pause(includeCountdown = false): void {
+    if (this.phase !== 'playing' && !(includeCountdown && this.phase === 'countdown')) return;
     const at = this.mixer?.pause();
     this.engine.pause(at ?? undefined);
     this.phase = 'paused';
@@ -476,6 +583,7 @@ export class GameRunner {
   /** Resume, keeping audio and the chart in sync (the mixer decides the restart time). */
   async resume(): Promise<void> {
     if (this.phase !== 'paused') return;
+    this.pausedByPage = false;
     let at: number | null = null;
     if (this.mixer) at = await this.mixer.resume();
     if (this.disposed) return;
@@ -486,16 +594,23 @@ export class GameRunner {
 
   /** Give up on the run (therapist quit). The results so far are still reported. */
   quit(): void {
-    this.finish(false);
+    this.finish('quit');
   }
 
-  private finish(completed: boolean): void {
+  /**
+   * End the run and report it. EVERY exit path comes through here — the chart ending, the therapist
+   * quitting, the play screen being left, the page being closed — because a RunSummary is the only
+   * thing that reaches the patient's history, and reps that were actually performed must not
+   * evaporate because of how the session ended.
+   */
+  private finish(reason: RunEndReason): void {
     if (this.ended || this.phase === 'idle') {
       if (this.phase === 'idle') this.phase = 'ended';
       return;
     }
     this.ended = true;
     const songTime = this.engine.songTime();
+    const completed = reason === 'chart';
     this.phase = 'ended';
     this.endedAt = Date.now();
     if (this.cancelFrame) {
@@ -513,6 +628,7 @@ export class GameRunner {
       results: this.engine.getScoreResults(),
       laneReps: this.laneReps,
       completed,
+      endReason: reason,
       songTime,
       startedAt: this.startedAt,
       endedAt: this.endedAt,
@@ -532,8 +648,17 @@ export class GameRunner {
     this.highway.setOptions(patch);
   }
 
+  /**
+   * Tear the run down. A run that was started and never ended is FINISHED first, as 'abandoned': the
+   * play screen unmounting (Back, a deep link, a remount, a fatal error) is the commonest way a
+   * session is interrupted, and it used to be the way a patient's reps were silently thrown away —
+   * `finish()` ran only from `quit()` or from the chart ending. `onEnd` therefore fires during
+   * teardown; see Play.tsx, which records the result but does NOT navigate if the screen has already
+   * moved on.
+   */
   dispose(): void {
     if (this.disposed) return;
+    this.finish('abandoned');
     this.disposed = true;
     if (this.cancelFrame) {
       this.cancelFrame();

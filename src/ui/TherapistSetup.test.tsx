@@ -47,6 +47,10 @@ beforeEach(() => {
   localStorage.clear();
   useStore.setState({
     screen: 'setup',
+    // A session is prescribed FOR somebody: with no patient selected the start button is (correctly)
+    // disabled, so every test here runs with the one the therapist would have chosen.
+    patients: [{ id: 'p-test', name: 'Test Patient', createdAt: 1, lastUsedAt: 1 }],
+    activePatientId: 'p-test',
     mode: 'hand',
     lanes: defaultLanes('hand'),
     calibrations: [null, null],
@@ -76,7 +80,8 @@ describe('song audition', () => {
     await act(async () => {
       fireEvent.click(button);
     });
-    expect(fake.previewSong).toHaveBeenCalledWith('demo-sunrise');
+    // The options carry the cost report and the cancel signal (see "an audition can be backed out of").
+    expect(fake.previewSong).toHaveBeenCalledWith('demo-sunrise', undefined, expect.objectContaining({ signal: expect.anything() }));
     // Auditioning does not change the prescription.
     expect(useStore.getState().songId).toBe('demo-groove');
     await waitFor(() => expect(screen.getByTestId('preview-demo-sunrise').textContent).toContain('Stop'));
@@ -272,5 +277,37 @@ describe('fingertip choice', () => {
     });
     await waitFor(() => expect(screen.queryByTestId('lane-0-tip-ring')).toBeNull());
     expect(useStore.getState().lanes[0].fingertip).toBeUndefined();
+  });
+});
+
+/**
+ * A CAMERA SESSION MEASURES A BODY, so it needs a person to be about.
+ *
+ * The built-in device-test record is where keyboard and autoplay runs go. Left selected after a demo
+ * it used to accept a full camera session, dropping a real patient's measured ROM into a bucket every
+ * future demo also writes to — a pooled trend across everybody who has ever been demoed on the tablet.
+ */
+describe('the device-test record is not a patient', () => {
+  it('refuses to start a camera session against it, with the way out on screen', () => {
+    useStore.setState({
+      patients: [{ id: 'device-test', name: 'Device test (not a patient)', createdAt: 1, lastUsedAt: 1, deviceTest: true }],
+      activePatientId: 'device-test',
+      inputMode: 'camera',
+    });
+    render(<TherapistSetup />);
+    expect(screen.getByTestId('setup-start').hasAttribute('disabled')).toBe(true);
+    expect(screen.getByTestId('setup-device-test-block').textContent).toContain('not a patient');
+    expect(screen.getByTestId('setup-choose-patient')).toBeTruthy();
+  });
+
+  it('still allows the dev-input run it exists for', () => {
+    useStore.setState({
+      patients: [{ id: 'device-test', name: 'Device test (not a patient)', createdAt: 1, lastUsedAt: 1, deviceTest: true }],
+      activePatientId: 'device-test',
+      inputMode: 'autoplay',
+    });
+    render(<TherapistSetup />);
+    expect(screen.getByTestId('setup-start').hasAttribute('disabled')).toBe(false);
+    expect(screen.queryByTestId('setup-device-test-block')).toBeNull();
   });
 });

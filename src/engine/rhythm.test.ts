@@ -231,7 +231,8 @@ describe('a patient whose latency offset is 180 ms out', () => {
     const a = eng.getScoreState();
     const b = clean.getScoreState();
     expect(a.score).toBe(b.score);
-    expect(a.health).toBe(b.health);
+    // effort COUNTS those movements (they happened); it is never reduced by them
+    expect(a.health).toBeGreaterThanOrEqual(b.health);
     expect(a.misses).toBe(b.misses);
     expect(a.combo).toBe(b.combo);
     expect(a.unmatched).toBe(5);
@@ -334,7 +335,7 @@ describe('RhythmEngine: the advertised calibration workflow leaves ONE timeline 
     expect(st.unmatched).toBe(0); // not misattributed to a real lane either
     expect(st.reps).toBe(0);
     expect(st.score).toBe(0);
-    expect(st.health).toBe(0.5); // never penalised
+    expect(st.health).toBe(1); // effort: nothing was judged, and nothing is ever penalised
     expect(eng.scoring.getLastOutOfRangeLane()).toBe(1.5);
     // and the bare Judge still throws for the same lane, so the bug is loud where it is a bug
     expect(() => eng.judge.onInput(5, 1)).toThrow(RangeError);

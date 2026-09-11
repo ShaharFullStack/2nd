@@ -47,7 +47,7 @@
  *
  * Degenerate input degrades gracefully. A non-finite `songTime`, `score`, `health`, `combo`,
  * `multiplier`, `beatPhase` or `energy` is treated as a missing value for that frame and cannot
- * reach the smoothed accumulators (receptor glow, rock meter, rolling score): the renderer keeps
+ * reach the smoothed accumulators (receptor glow, effort gauge, rolling score): the renderer keeps
  * drawing at the last good song time and recovers completely on the next healthy frame. "Missing"
  * really means missing — a non-finite `beatPhase` goes *flat* (like reduced motion) rather than
  * landing on phase 0, which is the maximum-pulse value, and a non-finite `multiplier` holds tier 1
@@ -127,7 +127,6 @@ import {
 import {
   BOARD_LINE_ALPHA,
   JUDGMENT_STYLE,
-  ROCK_METER_COLORS,
   UI_COLORS,
   getPalette,
   laneColor,
@@ -208,6 +207,13 @@ const POPUP_SEC = 0.5;
 const POPUP_MIN_ALPHA = 0.38;
 
 /** Song seconds the title / attribution block stays at full strength before it fades out. */
+/**
+ * Effort-gauge ramp. Deliberately NOT the old rock-meter palette (which started at alarm red): the
+ * bottom of this scale means "few movements so far", which is information, not an emergency. Cool
+ * blue → amber → green, so a low reading reads as early/quiet rather than as a warning.
+ */
+const EFFORT_METER_COLORS = { low: '#4aa3ff', mid: '#ffd23a', high: '#41e06a' };
+
 const META_HOLD_SEC = 7;
 /** Seconds the title / attribution block takes to fade out once `META_HOLD_SEC` has passed. */
 const META_FADE_SEC = 1.6;
@@ -2902,9 +2908,9 @@ export class Highway {
     if (s) return s;
     const u = this.u;
     // Every HUD size has a floor. `u` bottoms out at 0.35, so an unfloored `Math.round(12 * u)`
-    // rendered the attribution at 4 px and 'SCORE' / 'ROCK' / 'COMBO' at 5 px on a 400x800 canvas.
-    // Attribution is a CC-BY licence obligation (docs/ARCHITECTURE.md), not decoration, and a rock
-    // meter nobody can read is not a clinical safety control either.
+    // rendered the attribution at 4 px and 'SCORE' / 'ANSWERED' / 'COMBO' at 5 px on a 400x800 canvas.
+    // Attribution is a CC-BY licence obligation (docs/ARCHITECTURE.md), not decoration, and a gauge
+    // nobody can read tells the patient nothing about the work they are doing.
     const px = (n: number, min = 11) => Math.max(min, Math.round(n * u));
     switch (name) {
       // Popup text is deliberately small (Clone Hero scale, not a splash screen): it sits just
@@ -2964,7 +2970,7 @@ export class Highway {
   }
 
   /**
-   * Combo counter. Lives in the right side panel (opposite the rock meter), off the note path so
+   * Combo counter. Lives in the right side panel (opposite the effort gauge), off the note path so
    * judgment popups never draw through it. When the side panel is too narrow (portrait / 4 lanes
    * on a narrow canvas) it moves to the top centre above the horizon.
    */
@@ -3022,12 +3028,12 @@ export class Highway {
   }
 
   /**
-   * Rock gauge placement (centre + radius, CSS px): the one piece of HUD furniture that lives in the
+   * Effort gauge placement (centre + radius, CSS px): the one piece of HUD furniture that lives in the
    * board's LEFT GUTTER, which is also the only place an app can put an overlay panel. Extracted
    * from `drawHud` so `overlayPanel` reads the same numbers the gauge is drawn from rather than a
    * copy that can drift out of step with it.
    */
-  private rockGaugeBox(): { x: number; y: number; r: number } {
+  private effortGaugeBox(): { x: number; y: number; r: number } {
     const g = this.geom;
     const pad = 16 * this.u;
     const leftPanelW = Math.max(0, roadEdgeX(g, -1, 0));
@@ -3041,7 +3047,7 @@ export class Highway {
    *
    * THE RENDERER HAS TO ANSWER THIS BECAUSE ONLY THE RENDERER KNOWS. The board is drawn in canvas
    * coordinates from the canvas size and the lane count: the strike line, the receptor radius, the
-   * width of the gutter beside the road and the rock gauge standing in it all move with both. A
+   * width of the gutter beside the road and the effort gauge standing in it all move with both. A
    * panel pinned in CSS to `left: 18px; bottom: 18px` therefore has no way to know that at
    * 1280x800 it is sitting exactly on lane 0's receptor and on the label that names the limb — and
    * it was: the default bilateral prescription read "knee lift" against a fully legible
@@ -3050,11 +3056,11 @@ export class Highway {
    *
    * `boardHardwareTop` is the hard constraint (nothing over the receptor row or its labels); the
    * gutter width at the panel's own bottom edge sets how wide it may be; the gauge keeps it from
-   * landing on the rock meter. See `overlayPanelBox` for the rules and for what gives way first.
+   * landing on the effort gauge. See `overlayPanelBox` for the rules and for what gives way first.
    * Call it after `resize()` and whenever the lane count changes.
    */
   overlayPanel(req: { margin?: number; minWidth?: number; maxWidth?: number } = {}): OverlayPanelBox {
-    const gauge = this.rockGaugeBox();
+    const gauge = this.effortGaugeBox();
     return overlayPanelBox(this.geom, {
       floorY: Math.min(boardHardwareTop(this.geom), gauge.y - gauge.r),
       margin: req.margin ?? Math.max(10, Math.round(16 * this.u)),
@@ -3116,14 +3122,24 @@ export class Highway {
       }
     }
 
-    // Rock meter (left, arc gauge)
+    // Notes-answered gauge (left, arc gauge) — NOT a rock meter, and NOT a participation trophy.
+    //
+    // It used to be a rock meter: health started at 0.5, a miss took 0.03, and below 0.3 this gauge
+    // pulsed red at ~1.6 Hz. In a game that can never be failed (see engine/rhythm.ts and the README)
+    // that pulse was a failure alarm wired to nothing — a patient four weeks post-stroke was told,
+    // urgently, that they were failing at a thing that has no failure. Its replacement (movements per
+    // note offered, clamped to 1) went wrong the other way: a tremor session with 280 movements and
+    // 12 hits pinned it full green. `frame.health` is now NOTES ANSWERED per note judged
+    // (engine/scoring.ts `answerRateOf`) — bounded by the notes that were offered, so it can neither
+    // alarm nor saturate for a patient who is flailing. No danger pulse, no alarm colour at the
+    // bottom of the scale, and the gauge says what it counts.
     const health = clamp(frame.health, 0, 1);
     if (!Number.isFinite(this.healthSmooth)) this.healthSmooth = health;
     this.healthSmooth += (health - this.healthSmooth) * clamp(dt * 6, 0, 1);
     const hv = this.healthSmooth;
     // Size and place the gauge from the free space left of the road at the strike line (see
-    // `rockGaugeBox` — `overlayPanel` reads the same numbers, so a DOM panel cannot land on it).
-    const gauge = this.rockGaugeBox();
+    // `effortGaugeBox` — `overlayPanel` reads the same numbers, so a DOM panel cannot land on it).
+    const gauge = this.effortGaugeBox();
     const gaugeR = gauge.r;
     const gx = gauge.x;
     const gy = gauge.y;
@@ -3135,10 +3151,9 @@ export class Highway {
     ctx.beginPath();
     ctx.arc(gx, gy, gaugeR, a0, a1);
     ctx.stroke();
-    const hcol = hv < 0.5 ? mixHex(ROCK_METER_COLORS.low, ROCK_METER_COLORS.mid, hv * 2) : mixHex(ROCK_METER_COLORS.mid, ROCK_METER_COLORS.high, (hv - 0.5) * 2);
-    const danger = hv < 0.3 ? (this.opts.reducedMotion ? 0.5 : 0.5 + 0.5 * Math.sin(this.stNow * 10)) : 0;
+    const hcol = hv < 0.5 ? mixHex(EFFORT_METER_COLORS.low, EFFORT_METER_COLORS.mid, hv * 2) : mixHex(EFFORT_METER_COLORS.mid, EFFORT_METER_COLORS.high, (hv - 0.5) * 2);
     ctx.globalCompositeOperation = 'lighter';
-    ctx.globalAlpha = clamp(0.25 + beatPulse * 0.2 + danger * 0.3, 0, 1);
+    ctx.globalAlpha = clamp(0.25 + beatPulse * 0.2, 0, 1);
     ctx.strokeStyle = hcol;
     ctx.lineWidth = gaugeR * 0.34;
     ctx.beginPath();
@@ -3163,8 +3178,11 @@ export class Highway {
     ctx.beginPath();
     ctx.arc(gx, gy, gaugeR * 0.12, 0, Math.PI * 2);
     ctx.fill();
-    // Label in the arc's bottom gap.
-    this.text.draw(ctx, 'ROCK', gx, gy + gaugeR * 0.95, this.style('hudLabel'), 1, 0.9);
+    // Label in the arc's bottom gap. It names what the needle counts — notes answered with a
+    // movement — because a dial nobody can name is how the rock meter got away with meaning nothing.
+    // (A live percentage would be a fresh text sprite per value; the Results screen carries the
+    // number.)
+    this.text.draw(ctx, 'ANSWERED', gx, gy + gaugeR * 0.95, this.style('hudLabel'), 1, 0.9);
 
     // Multiplier badge under the gauge. A non-finite multiplier is a *missing* value: without the
     // guard `Math.floor(NaN)` made `mult !== lastMultiplier` true on every frame (the pop timer

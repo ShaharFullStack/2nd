@@ -76,7 +76,7 @@
 import type { FetchLike, SongManifest, StemSpec } from './manifest';
 import { stemUrl } from './manifest';
 import type { SongTimeSource } from '../input/types';
-import { DuckController, MIN_GAIN, SmoothGain, rampValueAt, scheduleRamp, type DuckOptions, type RampState } from './ducking';
+import { DuckController, MIN_GAIN, SmoothGain, assignLaneStems, rampValueAt, scheduleRamp, type DuckOptions, type LaneStemAssignment, type RampState } from './ducking';
 import { Sfx, type SfxLevels } from './sfx';
 import { LatencyProbe, type LatencyProbeOptions } from './latencyProbe';
 
@@ -316,6 +316,14 @@ export class StemMixer implements SongTimeSource {
   private currentManifest: SongManifest | null = null;
   private playerStemId: string | null = null;
   private duckController: DuckController | null = null;
+  /**
+   * Per-lane ducking (see `setLaneCount`): one DuckController per lane, each on its own stem where
+   * the song has enough stems. Lane 0's controller IS `duckController` whenever it sits on the player
+   * stem, so the legacy lane-agnostic `onHit`/`onMiss` and the per-lane calls stay on one state.
+   */
+  private laneControllers: DuckController[] = [];
+  private laneAssign: LaneStemAssignment | null = null;
+  private laneCount = 0;
 
   private mixerState: MixerState = 'idle';
   /** Song time the current segment started from (while paused/stopped/ended: the position). */
@@ -497,6 +505,8 @@ export class StemMixer implements SongTimeSource {
     this.currentManifest = null;
     this.playerStemId = null;
     this.duckController = null;
+    this.laneControllers = [];
+    this.laneAssign = null;
     this.offsetSec = 0;
     this.songStartCtx = this.ctx.currentTime;
     this.mixerState = 'idle';
@@ -569,7 +579,7 @@ export class StemMixer implements SongTimeSource {
       // above), only a zero-length buffer set can land here. End right away rather than pretend.
       this.startCtxTime = now;
       this.songStartCtx = now - this.offsetSec;
-      this.duckController?.reset(now, wasAudible ? STOP_FADE_SEC : 0);
+      this.resetDucking(now, wasAudible ? STOP_FADE_SEC : 0);
       this.finishPlayback();
       return now;
     }
@@ -580,7 +590,7 @@ export class StemMixer implements SongTimeSource {
     this.rampTransportIn(startAt, this.offsetSec > 0);
     // Anchored ramp, not a hard write: the sources stopped above are still audible for
     // STOP_FADE_SEC, and a ducked player stem stepping 0.05 → 1.0 in one sample would click.
-    this.duckController?.reset(now, wasAudible ? STOP_FADE_SEC : 0);
+    this.resetDucking(now, wasAudible ? STOP_FADE_SEC : 0);
     longest.source!.onended = () => {
       if (gen !== this.playGeneration || this.mixerState !== 'playing') return;
       this.finishPlayback();
@@ -661,7 +671,7 @@ export class StemMixer implements SongTimeSource {
         this.clearPreviewTimer();
         this.startCtxTime = now;
         this.songStartCtx = now - t;
-        this.duckController?.reset(now, wasAudible ? STOP_FADE_SEC : 0);
+        this.resetDucking(now, wasAudible ? STOP_FADE_SEC : 0);
         this.finishPlayback();
         return null;
       }
@@ -682,7 +692,7 @@ export class StemMixer implements SongTimeSource {
     this.songStartCtx = now;
     if (this.stems.size > 0) this.mixerState = 'ready';
     // ramped while the stopped sources are still fading out (see play())
-    this.duckController?.reset(now, wasAudible ? STOP_FADE_SEC : 0);
+    this.resetDucking(now, wasAudible ? STOP_FADE_SEC : 0);
   }
 
   /**
@@ -810,14 +820,83 @@ export class StemMixer implements SongTimeSource {
     if (this.duckController) this.duckController.rebind(stem.duck.gain, now);
     else this.duckController = new DuckController(stem.duck.gain, this.duckOptions);
     this.playerStemId = id;
+    if (this.laneCount > 0) this.setLaneCount(this.laneCount);
   }
 
-  /** Restore the player stem (60 ms ramp); `combo` = consecutive hits including this one. */
-  onHit(combo: number = 0): void { this.duckController?.hit(this.ctx.currentTime, combo); }
-  /** Duck the player stem to missGain (40 ms ramp); stays ducked until the next hit. */
-  onMiss(): void { this.duckController?.miss(this.ctx.currentTime); }
+  /**
+   * Wire `lanes` lanes to stems so a miss dims only the lane that missed, where the song has enough
+   * stems for it (`assignLaneStems`). Call it once per session, after the song is loaded; the
+   * returned assignment is what the Setup screen tells the therapist. Lanes beyond the stems the song
+   * has share the player stem — with the PROPORTIONATE depth (`duckGainForMisses`), so the shared
+   * case is still a dip per miss and not a mute.
+   */
+  setLaneCount(lanes: number): LaneStemAssignment {
+    const n = Math.max(0, Math.floor(lanes));
+    this.laneCount = n;
+    const player = this.playerStemId ?? this.stemOrder[0] ?? '';
+    const assign = assignLaneStems(this.stemOrder, player, n);
+    const now = this.ctx.currentTime;
+    // Any stem that stops being a lane's stem must not be left parked at a ducked level.
+    for (const c of this.laneControllers) if (c !== this.duckController) c.reset(now, this.isPlaying ? (this.duckOptions.hitRampMs ?? 60) / 1000 : 0);
+    const byStem = new Map<string, DuckController>();
+    if (this.duckController && this.playerStemId) byStem.set(this.playerStemId, this.duckController);
+    this.laneControllers = assign.perLane.map((stemId) => {
+      const existing = byStem.get(stemId);
+      if (existing) return existing;
+      const stem = this.stems.get(stemId);
+      if (!stem) return this.duckController ?? new DuckController(this.ctx.createGain().gain, this.duckOptions);
+      const c = new DuckController(stem.duck.gain, this.duckOptions);
+      byStem.set(stemId, c);
+      return c;
+    });
+    this.laneAssign = assign;
+    return assign;
+  }
+
+  /** The lane→stem mapping in force, or null until `setLaneCount` has run. */
+  get laneStems(): LaneStemAssignment | null { return this.laneAssign; }
+
+  /** Restore this lane's stem (60 ms ramp); `combo` = consecutive hits including this one. */
+  onLaneHit(lane: number, combo: number = 0): void {
+    (this.laneControllers[lane] ?? this.duckController)?.hit(this.ctx.currentTime, combo);
+  }
+
+  /**
+   * One miss in `lane`: step that lane's stem down by `missStepDb`, bottoming out at `missGain`.
+   * The run — and therefore the depth — is counted per lane, so a weak limb missing cannot mute the
+   * instrument a strong limb is earning.
+   */
+  onLaneMiss(lane: number): void {
+    (this.laneControllers[lane] ?? this.duckController)?.miss(this.ctx.currentTime);
+  }
+
+  /** Lane-agnostic hit (no per-lane mapping): restores every lane's stem. */
+  onHit(combo: number = 0): void {
+    const now = this.ctx.currentTime;
+    this.duckController?.hit(now, combo);
+    for (const c of this.laneControllers) if (c !== this.duckController) c.hit(now, combo);
+  }
+
+  /** Lane-agnostic miss: steps every lane's stem down once. Prefer `onLaneMiss`. */
+  onMiss(): void {
+    const now = this.ctx.currentTime;
+    this.duckController?.miss(now);
+    for (const c of this.laneControllers) if (c !== this.duckController) c.miss(now);
+  }
+
   /** Analytic gain of the player stem right now (for a UI meter). */
   getPlayerStemGain(): number { return this.duckController?.valueAt(this.ctx.currentTime) ?? 1; }
+
+  /** Analytic gain of a lane's stem right now (for a per-lane UI meter). */
+  getLaneStemGain(lane: number): number {
+    return (this.laneControllers[lane] ?? this.duckController)?.valueAt(this.ctx.currentTime) ?? 1;
+  }
+
+  /** Reset the player stem and every per-lane stem to the nominal level. */
+  private resetDucking(now: number, rampSec: number): void {
+    this.duckController?.reset(now, rampSec);
+    for (const c of this.laneControllers) if (c !== this.duckController) c.reset(now, rampSec);
+  }
 
   // ------------------------------------------------------------------ sfx
 
@@ -984,7 +1063,7 @@ export class StemMixer implements SongTimeSource {
     this.startCtxTime = now;
     this.songStartCtx = now - this.offsetSec;
     if (this.stems.size > 0) this.mixerState = 'ready';
-    this.duckController?.reset(now, wasAudible ? STOP_FADE_SEC : 0);
+    this.resetDucking(now, wasAudible ? STOP_FADE_SEC : 0);
   }
 
   private finishPlayback(): void {

@@ -2,12 +2,19 @@
  * Verify the central promise of the game end to end, in a real browser:
  *
  *   hit your notes  -> your instrument plays in the mix
- *   miss them       -> your instrument drops out, the rest of the band keeps going
+ *   miss them       -> THAT LANE's instrument dips, in proportion to the run of misses, and the
+ *                      rest of the band — including every other lane's instrument — keeps going
+ *
+ * The old promise here was "miss -> your instrument drops out" (to 5 %, until the next hit,
+ * whichever lane missed). In a hemiparesis session the weak side IS the therapy: that rule let one
+ * missed left-leg note silence the instrument a patient was earning with every right-leg rep. The
+ * consequence is now proportionate (a step per miss, with a floor) and per lane.
  *
  * Unit tests cover the ducking maths; this drives the actual app, plays real notes on the
  * keyboard input, then stops, and samples the live Web Audio gain of every stem to prove
- * that (a) the player stem really falls away on a miss, (b) it comes back on the next hit,
- * and (c) no other stem ever moves.
+ * that (a) the player stem really dips on a miss but is never silenced, (b) it comes back on the
+ * next hit, (c) a miss in one lane never touches another lane's instrument, and (d) no stem's
+ * volume control ever moves.
  *
  *   node critic/audio-reactivity.mjs
  *   node critic/audio-reactivity.mjs --url http://localhost:5173
@@ -135,8 +142,12 @@ async function main() {
     report.whileMissing = missing;
     log('while missing', JSON.stringify(missing.gains));
 
-    if (!(missing.playerStemGain < 0.2)) {
-      report.failures.push(`player stem "${player}" duck gain was ${missing.playerStemGain} after ${missing.misses} misses — should have ducked out`);
+    // Proportionate: a run of misses DIPS the instrument and never mutes it.
+    if (!(missing.playerStemGain < 0.95)) {
+      report.failures.push(`player stem "${player}" duck gain was ${missing.playerStemGain} after ${missing.misses} misses — should have dipped`);
+    }
+    if (!(missing.playerStemGain >= 0.3)) {
+      report.failures.push(`player stem "${player}" fell to ${missing.playerStemGain} after ${missing.misses} misses — a miss must never take the instrument away`);
     }
     if (!missing.ducked) report.failures.push('mixer does not report ducked after misses');
     for (const s of others) {
@@ -154,7 +165,7 @@ async function main() {
       const before = mixer.getPlayerStemGain();
       // onHit is exactly what GameRunner calls when a note is judged; call it directly so the
       // recovery ramp is exercised without waiting for the bot to be restarted.
-      mixer.onHit(1);
+      mixer.onLaneHit(0, 1);
       await new Promise((r) => setTimeout(r, 250));
       return { before, after: mixer.getPlayerStemGain(), ducked: mixer.isDucked };
     });
@@ -162,6 +173,30 @@ async function main() {
     log('recovery', JSON.stringify(recovered));
     if (!(recovered.after > 0.5)) {
       report.failures.push(`player stem did not come back after a hit: ${recovered.before} -> ${recovered.after}`);
+    }
+
+    // --- 4. the hemiparesis case: the weak lane's misses must not touch the strong lane ---
+    const perLane = await page.evaluate(async () => {
+      const mixer = window.__beatRehab.runtime.peekAudio().mixer;
+      const assignment = mixer.laneStems;
+      mixer.onLaneHit(0, 6);                       // the strong leg hits everything
+      for (let i = 0; i < 5; i++) mixer.onLaneMiss(1); // the weak leg misses everything
+      await new Promise((r) => setTimeout(r, 250));
+      return { assignment, strong: mixer.getLaneStemGain(0), weak: mixer.getLaneStemGain(1) };
+    });
+    report.perLane = perLane;
+    log('per lane', JSON.stringify(perLane));
+    if (perLane.assignment?.mode !== 'per-lane') {
+      report.failures.push(`expected a per-lane stem assignment for this song, got ${JSON.stringify(perLane.assignment)}`);
+    }
+    if (!(perLane.strong > 0.95)) {
+      report.failures.push(`the strong lane's instrument was at ${perLane.strong} while the WEAK lane missed — a miss must only dim the lane that missed`);
+    }
+    if (!(perLane.weak < 0.6)) {
+      report.failures.push(`the weak lane's instrument was at ${perLane.weak} after 5 misses — a run of misses should be audible`);
+    }
+    if (!(perLane.weak >= 0.3)) {
+      report.failures.push(`the weak lane's instrument fell to ${perLane.weak} — it must stay in the mix`);
     }
   } catch (e) {
     report.failures.push(`threw: ${e && e.stack ? e.stack : e}`);

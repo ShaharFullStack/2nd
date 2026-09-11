@@ -6,9 +6,12 @@
  * one session is on screen at once. That makes it an OUTCOME RECORD, and it is held to the rule an
  * outcome record is held to:
  *
- *  - EVERY NUMBER HERE WAS MEASURED ON THE PATIENT. Keyboard and autoplay runs are the system, not
- *    the patient, producing the input; they are excluded from every line, every count and every
- *    delta (see session/trends.ts) and the exclusion is stated on the card rather than being silent.
+ *  - EVERY NUMBER HERE WAS MEASURED ON THIS PATIENT. Two separate rules, and both had to be added:
+ *    the series are built for ONE `patientId` (a shared tablet's history holds several people's
+ *    sessions, and a chart that pooled them answered "is this patient improving?" with somebody
+ *    else's reps); and keyboard/autoplay runs are the system, not the patient, producing the input,
+ *    so they are excluded from every line, every count and every delta (see session/trends.ts) and
+ *    the exclusion is stated on the card rather than being silent.
  *
  * Legibility decisions, all for a tablet at arm's length:
  *  - One card per movement, never one chart with four lines. Movements have different ranges and
@@ -41,7 +44,7 @@
  *    make it true.
  */
 import { useMemo, useState } from 'react';
-import { formatPercent } from '../session/results.ts';
+import { endReasonLabel, formatPercent } from '../session/results.ts';
 import { DEFAULT_TREND_WINDOW, movementTrends, trendCoverage } from '../session/trends.ts';
 import type { MovementTrend, TrendPoint } from '../session/trends.ts';
 import type { SessionResult } from '../session/types.ts';
@@ -110,6 +113,13 @@ function TrendCard({ trend }: { trend: MovementTrend }) {
         <h4>{trend.label}</h4>
         <span className="badge">
           {plural(sessions, 'camera session')}
+          {/* SAID ON THE CARD, NOT ONLY IN THE TABLE UNDERNEATH IT. Sessions are now recorded from
+              every exit, so a 12-second abort sits in this window next to a full 97-second run. The
+              count is the one figure that stops a therapist reading three sessions' worth of
+              progress off two sessions and a walk-out. */}
+          {trend.incompleteSessions > 0 && (
+            <span data-testid={`trend-incomplete-${trend.key}`}> · {trend.incompleteSessions} ended early</span>
+          )}
         </span>
       </div>
 
@@ -229,6 +239,7 @@ function TrendCard({ trend }: { trend: MovementTrend }) {
                     <td>
                       {shortDate(p.at)}
                       {p.recalibrated && <span className="badge badge-warn">re-calibrated</span>}
+                      {!p.completed && <span className="badge badge-warn">{endReasonLabel(p.endReason)}</span>}
                     </td>
                     {/* "not measured", never 0 %. */}
                     <td className="mono">{p.rom === null ? <span className="dim">not measured</span> : formatPercent(p.rom)}</td>
@@ -253,6 +264,12 @@ function TrendCard({ trend }: { trend: MovementTrend }) {
           from the patient.
         </div>
       )}
+      {trend.changeIncludesIncomplete && (
+        <div className="dim" data-testid={`trend-incomplete-change-${trend.key}`}>
+          There are not two full sessions to compare, so the change above is measured across a run that
+          ended early. Fewer reps, not a different patient — read it as a direction, not a result.
+        </div>
+      )}
       {trend.anyRecalibration && (
         <div className="dim">
           The calibrated range changed during this window, so the percentages above are against different
@@ -268,12 +285,13 @@ function TrendCard({ trend }: { trend: MovementTrend }) {
   );
 }
 
-export default function RomTrend({ history }: { history: readonly SessionResult[] }) {
+export default function RomTrend({ history, patientId }: { history: readonly SessionResult[]; patientId: string }) {
   // NOT `window`: a state variable of that name shadows the global for the whole component body, so
   // the next `window.matchMedia('(prefers-reduced-motion)')` added in here would silently read 8.
   const [windowSize, setWindowSize] = useState(DEFAULT_TREND_WINDOW);
-  const trends = useMemo(() => movementTrends(history, windowSize), [history, windowSize]);
-  const coverage = useMemo(() => trendCoverage(history), [history]);
+  // `history` is the whole device's; `patientId` is what makes these series this patient's.
+  const trends = useMemo(() => movementTrends(history, patientId, windowSize), [history, patientId, windowSize]);
+  const coverage = useMemo(() => trendCoverage(history, patientId), [history, patientId]);
 
   // Nothing the patient drove: say so plainly rather than plotting the bot's keypresses as progress.
   if (trends.length === 0) {
@@ -297,7 +315,7 @@ export default function RomTrend({ history }: { history: readonly SessionResult[
       <div className="row">
         <h3 style={{ margin: 0 }}>Progress by movement</h3>
         <span className="dim">
-          Range of motion and accuracy across <b>camera</b> sessions — most recently worked first.
+          Range of motion and accuracy across <b>this patient's camera</b> sessions — most recently worked first.
         </span>
         <div className="grow" />
         <div className="seg seg-sm" role="group" aria-label="Sessions shown per movement">

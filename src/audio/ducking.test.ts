@@ -1,8 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import {
-  DEFAULT_DUCK_OPTIONS, DuckController, MIN_GAIN, dbToGain, gainToDb, rampGain, rampValueAt, scheduleRamp, targetGainForCombo,
+  DEFAULT_DUCK_OPTIONS, DuckController, MIN_GAIN, assignLaneStems, dbToGain, duckGainForMisses, gainToDb, rampGain, rampValueAt,
+  scheduleRamp, targetGainForCombo,
   type GainParamLike, type RampState,
 } from './ducking';
+
+/** One miss = one step (−3 dB); the run bottoms out at `missGain` after three. */
+const D1 = duckGainForMisses(1);
+const D2 = duckGainForMisses(2);
+const D3 = duckGainForMisses(3);
 
 type Call = ['cancel', number] | ['set', number, number] | ['exp', number, number];
 
@@ -79,32 +85,46 @@ describe('scheduleRamp / rampGain', () => {
 });
 
 describe('DuckController', () => {
-  it('miss ducks to 0.05 in 40 ms; hit restores to 1.0 in 60 ms', () => {
+  it('one miss dips by one step (−3 dB) in 40 ms, never to silence; hit restores to 1.0 in 60 ms', () => {
     const p = new FakeAudioParam(1);
     const d = new DuckController(p);
     d.miss(5);
     expect(d.ducked).toBe(true);
-    expect(p.calls).toEqual([['cancel', 5], ['set', 1, 5], ['exp', 0.05, 5.04]]);
+    expect(D1).toBeCloseTo(0.7079, 4); // the patient still hears their instrument
+    expect(p.calls).toEqual([['cancel', 5], ['set', 1, 5], ['exp', expect.closeTo(D1, 12), 5.04]]);
     p.calls = [];
     p.now = 6;
     d.hit(6, 1);
     expect(d.ducked).toBe(false);
-    expect(p.calls).toEqual([['cancel', 6], ['set', 0.05, 6], ['exp', 1, 6.06]]);
+    expect(d.missRun).toBe(0);
+    expect(p.calls).toEqual([['cancel', 6], ['set', expect.closeTo(D1, 12), 6], ['exp', 1, 6.06]]);
+  });
+
+  it('the duck is proportionate: it deepens per consecutive miss and stops at the floor', () => {
+    expect(duckGainForMisses(0)).toBe(1);
+    expect(gainToDb(D1)).toBeCloseTo(-3, 9);
+    expect(gainToDb(D2)).toBeCloseTo(-6, 9);
+    expect(gainToDb(D3)).toBeCloseTo(-9, 9);
+    // the floor is a floor: an endless run of misses never silences the instrument
+    for (const n of [4, 10, 500]) expect(duckGainForMisses(n)).toBe(DEFAULT_DUCK_OPTIONS.missGain);
+    expect(DEFAULT_DUCK_OPTIONS.missGain).toBeGreaterThan(0.3);
+    expect(duckGainForMisses(-2)).toBe(1);
+    expect(duckGainForMisses(Number.NaN)).toBe(1);
   });
 
   it('a hit in the middle of a miss ramp anchors at the analytic mid-ramp value (no click)', () => {
     const p = new FakeAudioParam(1);
     const d = new DuckController(p);
-    d.miss(10); // 1 → 0.05 over [10, 10.04]
+    d.miss(10); // 1 → D1 over [10, 10.04]
     p.now = 10.02;
-    const mid = Math.sqrt(0.05);
+    const mid = Math.sqrt(D1);
     expect(d.valueAt(10.02)).toBeCloseTo(mid, 12);
     expect(p.value).toBeCloseTo(mid, 12); // the faithful fake agrees
     p.calls = [];
     d.hit(10.02, 1);
     expect(p.calls[0]).toEqual(['cancel', 10.02]);
     expect(p.calls[1][0]).toBe('set');
-    expect(p.calls[1][1]).toBeCloseTo(mid, 12); // anchored mid-ramp, not at 0.05 and not at 1
+    expect(p.calls[1][1]).toBeCloseTo(mid, 12); // anchored mid-ramp, not at D1 and not at 1
     expect(p.calls[2]).toEqual(['exp', 1, 10.08]);
     expect(d.currentRamp).toEqual({ from: expect.closeTo(mid, 12), to: 1, t0: 10.02, t1: 10.08 });
   });
@@ -120,27 +140,35 @@ describe('DuckController', () => {
     };
     const d = new DuckController(stale);
     d.miss(0);
-    d.hit(1, 1); // 0.05 → 1 over [1, 1.06]
+    d.hit(1, 1); // D1 → 1 over [1, 1.06]
     stale.calls = [];
     d.miss(1.03);
-    const expected = 0.05 * Math.pow(1 / 0.05, 0.5);
+    const expected = D1 * Math.pow(1 / D1, 0.5);
     expect(stale.calls[1][0]).toBe('set');
     expect(stale.calls[1][1]).toBeCloseTo(expected, 12);
-    expect(stale.calls[2]).toEqual(['exp', 0.05, expect.closeTo(1.07, 12)]);
+    expect(stale.calls[2]).toEqual(['exp', expect.closeTo(D1, 12), expect.closeTo(1.07, 12)]);
   });
 
-  it('ducking persists across consecutive misses until the next hit', () => {
+  it('ducking deepens step by step across consecutive misses and one hit restores it fully', () => {
     const p = new FakeAudioParam(1);
     const d = new DuckController(p);
-    d.miss(1); p.now = 2; d.miss(2); p.now = 3; d.miss(3);
+    d.miss(1);
+    expect(p.lastRamp()[1]).toBeCloseTo(D1, 12);
+    p.now = 2; d.miss(2);
+    expect(p.lastRamp()[1]).toBeCloseTo(D2, 12);
+    p.now = 3; d.miss(3);
     expect(d.ducked).toBe(true);
-    expect(p.lastRamp()[1]).toBe(0.05);
+    expect(d.missRun).toBe(3);
+    expect(p.lastRamp()[1]).toBeCloseTo(D3, 12);
     p.now = 4;
-    expect(p.value).toBe(0.05);
-    expect(d.valueAt(4)).toBe(0.05);
+    expect(p.value).toBeCloseTo(D3, 12);
+    expect(d.valueAt(4)).toBeCloseTo(D3, 12);
     d.hit(4, 1);
     p.now = 5;
     expect(p.value).toBe(1);
+    // an explicit run length (a replay/critic) overrides the controller's own count
+    d.miss(5, 3);
+    expect(p.lastRamp()[1]).toBeCloseTo(D3, 12);
   });
 
   it('a streak of 8+ raises the restored level by +2 dB, then drops back when the combo resets', () => {
@@ -153,7 +181,7 @@ describe('DuckController', () => {
     expect(d.target).toBeCloseTo(1.2589, 3);
     p.now = 9;
     d.miss(9);
-    expect(p.lastRamp()[1]).toBe(0.05);
+    expect(p.lastRamp()[1]).toBeCloseTo(D1, 12);
     p.now = 10;
     d.hit(10, 1);
     expect(p.lastRamp()[1]).toBe(1);
@@ -161,9 +189,9 @@ describe('DuckController', () => {
 
   it('honours custom options', () => {
     const p = new FakeAudioParam(1);
-    const d = new DuckController(p, { missGain: 0.2, missRampMs: 100, hitRampMs: 10, hitGain: 0.8 });
+    const d = new DuckController(p, { missGain: 0.2, missStepDb: -20, missRampMs: 100, hitRampMs: 10, hitGain: 0.8 });
     d.miss(0);
-    expect(p.lastRamp()).toEqual(['exp', 0.2, 0.1]);
+    expect(p.lastRamp()).toEqual(['exp', 0.2, 0.1]); // one −20 dB step is already past the 0.2 floor
     p.now = 1;
     d.hit(1, 0);
     expect(p.lastRamp()).toEqual(['exp', 0.8, 1.01]);
@@ -188,9 +216,10 @@ describe('DuckController', () => {
     p.calls = [];
     d.reset(1.06, 0.008); // transport fade length: the stem is still audible for 8 ms
     expect(d.ducked).toBe(false);
-    expect(p.calls).toEqual([['cancel', 1.06], ['set', 0.05, 1.06], ['exp', 1, 1.068]]);
-    expect(d.valueAt(1.06)).toBeCloseTo(0.05, 12); // continuous: no step at the anchor
-    expect(d.valueAt(1.064)).toBeCloseTo(Math.sqrt(0.05), 12);
+    expect(d.missRun).toBe(0);
+    expect(p.calls).toEqual([['cancel', 1.06], ['set', expect.closeTo(D1, 12), 1.06], ['exp', 1, 1.068]]);
+    expect(d.valueAt(1.06)).toBeCloseTo(D1, 12); // continuous: no step at the anchor
+    expect(d.valueAt(1.064)).toBeCloseTo(Math.sqrt(D1), 12);
     expect(d.valueAt(1.068)).toBe(1);
     // mid-ramp interruption anchors on the analytic value, exactly like hit()/miss()
     const q = new FakeAudioParam(1);
@@ -198,7 +227,7 @@ describe('DuckController', () => {
     e.miss(0);
     q.calls = [];
     e.reset(0.02, 0.008); // half way down the 40 ms miss ramp
-    expect(q.calls[1]).toEqual(['set', Math.pow(0.05, 0.5), 0.02]);
+    expect(q.calls[1]).toEqual(['set', expect.closeTo(Math.pow(D1, 0.5), 12), 0.02]);
     // already at the nominal level: nothing to ramp, the hard write stays (and is a no-op)
     const r = new FakeAudioParam(1);
     const f = new DuckController(r);
@@ -211,16 +240,16 @@ describe('DuckController', () => {
     const a = new FakeAudioParam(1);
     const b = new FakeAudioParam(1);
     const d = new DuckController(a);
-    d.miss(1); // a is ducked to 0.05 by t = 1.04
+    d.miss(1); // a is ducked one step by t = 1.04
     a.now = b.now = 2;
     d.rebind(b, 2);
     // the outgoing stem must be RAMPED back over the hit ramp, not hard-written: a
-    // setValueAtTime(1) here would jump 0.05 → 1.0 in one sample.
-    expect(a.calls.slice(-3)).toEqual([['cancel', 2], ['set', 0.05, 2], ['exp', 1, 2.06]]);
-    expect(a.value).toBe(0.05); // anchored at where the miss ramp actually left it
+    // setValueAtTime(1) here would jump the ducked level → 1.0 in one sample.
+    expect(a.calls.slice(-3)).toEqual([['cancel', 2], ['set', expect.closeTo(D1, 12), 2], ['exp', 1, 2.06]]);
+    expect(a.value).toBeCloseTo(D1, 12); // anchored at where the miss ramp actually left it
     b.now = 3;
     d.miss(3);
-    expect(b.lastRamp()[1]).toBe(0.05);
+    expect(b.lastRamp()[1]).toBeCloseTo(D1, 12);
     expect(b.calls.slice(0, 2)).toEqual([['cancel', 2], ['set', 1, 2]]); // rebind pins the new stem at the nominal level
     expect(b.calls[3]).toEqual(['set', 1, 3]); // the miss ramp anchors on that level
     // exactly two ramps on a: the miss duck and the rebind restore — nothing after the handover
@@ -257,12 +286,12 @@ describe('scheduleRamp with cancelAndHoldAtTime', () => {
     const p = new FakeHoldParam(1);
     const d = new DuckController(p);
     d.miss(10);
-    expect(p.calls).toEqual([['hold', 10], ['exp', 0.05, 10.04]]); // no cancel/set pair
+    expect(p.calls).toEqual([['hold', 10], ['exp', expect.closeTo(D1, 12), 10.04]]); // no cancel/set pair
     d.hit(10.02, 1);
     expect(p.calls.slice(2)).toEqual([['hold', 10.02], ['exp', 1, 10.08]]);
     // the controller's own tracking is unchanged: anchored at the analytic mid-ramp value
-    expect(d.currentRamp.from).toBeCloseTo(Math.sqrt(0.05), 12);
-    expect(d.valueAt(10.05)).toBeCloseTo(Math.sqrt(0.05) * Math.pow(1 / Math.sqrt(0.05), 0.5), 12);
+    expect(d.currentRamp.from).toBeCloseTo(Math.sqrt(D1), 12);
+    expect(d.valueAt(10.05)).toBeCloseTo(Math.sqrt(D1) * Math.pow(1 / Math.sqrt(D1), 0.5), 12);
     // reset/rebind pin the nominal level explicitly (they are not ramps)
     d.reset(11);
     expect(p.calls.slice(-2)).toEqual([['cancel', 11], ['set', 1, 11]]);
@@ -304,5 +333,63 @@ describe('linear ramps / SmoothGain', () => {
     // negatives are clamped and the ramp never shorter than 1 ms
     expect(h.set(-1, 1, 0).to).toBe(0);
     expect(h.currentRamp.t1).toBeCloseTo(1.001, 12);
+  });
+});
+
+describe('assignLaneStems (the weak side must not mute the whole band)', () => {
+  const stems = ['drums', 'bass', 'keys', 'gtr'];
+
+  it('gives every lane its own stem while one stem is left to carry the song', () => {
+    const a = assignLaneStems(stems, 'drums', 2);
+    expect(a.mode).toBe('per-lane');
+    expect(a.perLane).toEqual(['drums', 'bass']);
+    expect(a.bed).toEqual(['keys', 'gtr']);
+    const b = assignLaneStems(stems, 'keys', 3);
+    expect(b.perLane).toEqual(['keys', 'drums', 'bass']); // the player stem is always lane 1's
+    expect(b.bed).toEqual(['gtr']);
+    expect(b.summary).toContain('own instrument');
+  });
+
+  it('never assigns the last stem, so a total miss run cannot silence the song', () => {
+    const a = assignLaneStems(stems, 'drums', 4);
+    expect(a.mode).toBe('shared');
+    expect(a.perLane).toEqual(['drums', 'drums', 'drums', 'drums']);
+    expect(a.bed).toEqual(['bass', 'keys', 'gtr']);
+    expect(a.summary).toContain('too few');
+    const two = assignLaneStems(['drums', 'bass'], 'drums', 2);
+    expect(two.mode).toBe('shared');
+    expect(two.bed).toEqual(['bass']);
+  });
+
+  it('survives a missing player stem and an empty song', () => {
+    expect(assignLaneStems(stems, 'nope', 2).perLane).toEqual(['drums', 'bass']);
+    const empty = assignLaneStems([], 'drums', 2);
+    expect(empty.mode).toBe('shared');
+    expect(empty.bed).toEqual([]);
+  });
+});
+
+
+describe('the mix summary names which limb has which instrument', () => {
+  const stems = ['drums', 'bass', 'keys', 'lead'];
+
+  it('maps lane → instrument, so a therapist knows what to listen for on the weak side', () => {
+    const a = assignLaneStems(stems, 'drums', 2, ['Left · Seated march', 'Right · Seated march']);
+    expect(a.mode).toBe('per-lane');
+    // The set of instruments is not enough: "drums, bass" cannot tell you which one is the weak leg.
+    expect(a.summary).toContain('Left · Seated march → drums');
+    expect(a.summary).toContain('Right · Seated march → bass');
+    expect(a.summary).toMatch(/never take the reward away from the limb that is working/);
+  });
+
+  it('names the lanes in the shared-stem case too, where they all duck the same instrument', () => {
+    const a = assignLaneStems(['drums', 'bass'], 'drums', 3, ['L march', 'R march', 'L toe lift']);
+    expect(a.mode).toBe('shared');
+    expect(a.summary).toContain('L march → drums');
+    expect(a.summary).toContain('L toe lift → drums');
+  });
+
+  it('falls back to lane numbers when no labels are supplied', () => {
+    expect(assignLaneStems(stems, 'drums', 2).summary).toContain('lane 1 → drums');
   });
 });

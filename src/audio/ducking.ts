@@ -2,9 +2,16 @@
  * Player-stem ducking logic, kept independent of Web Audio so it can be unit-tested
  * against a fake AudioParam.
  *
- * Contract (docs/ARCHITECTURE.md): miss → ramp to `missGain` (0.05) in 40 ms; hit → restore
- * to 1.0 in 60 ms; ducking persists until the next hit. Streak bonus: at `streakThreshold`
- * (8) combo or more the restored level is raised by `streakBoostDb` (+2 dB).
+ * PROPORTIONATE, PER-LANE DUCKING (diverges from docs/ARCHITECTURE.md's flat `missGain` 0.05 — see
+ * `duckGainForMisses`). A miss lowers the stem by ONE STEP (`missStepDb`, −3 dB), a second
+ * consecutive miss by another, and the run bottoms out at `missGain` (0.35, −9 dB) — audibly quieter,
+ * never silent. The old contract ducked to 5 % on the first miss and held it until the next hit, so
+ * in a hemiparesis session the weak side — which IS the therapy — muted the instrument for the whole
+ * body: a patient hitting every note with the strong leg heard nothing because the weak leg missed.
+ * The miss run is per DuckController, and `assignLaneStems` gives each lane its own stem (and so its
+ * own controller) whenever the song has enough of them, so the weak lane dims its own instrument only.
+ * Hit → restore to 1.0 in 60 ms. Streak bonus: at `streakThreshold` (8) combo or more the restored
+ * level is raised by `streakBoostDb` (+2 dB).
  *
  * Anchoring: a new ramp must start from the value the previous ramp has *reached* at `now`,
  * otherwise a hit 20 ms into a 40 ms miss-ramp jumps (click). `AudioParam.value` only reflects
@@ -42,7 +49,13 @@ export function supportsCancelAndHold(param: { cancelAndHoldAtTime?: unknown }):
 }
 
 export interface DuckOptions {
+  /**
+   * FLOOR of the duck — the quietest the stem ever gets, however long the miss run (default 0.35,
+   * −9 dB). It is not the level of a single miss any more: see `missStepDb` and `duckGainForMisses`.
+   */
   missGain: number;
+  /** dB removed per consecutive miss on this controller's stem (default −3, i.e. half power). */
+  missStepDb: number;
   missRampMs: number;
   hitGain: number;
   hitRampMs: number;
@@ -51,13 +64,98 @@ export interface DuckOptions {
 }
 
 export const DEFAULT_DUCK_OPTIONS: DuckOptions = {
-  missGain: 0.05,
+  missGain: 0.35,
+  missStepDb: -3,
   missRampMs: 40,
   hitGain: 1.0,
   hitRampMs: 60,
   streakThreshold: 8,
   streakBoostDb: 2,
 };
+
+/**
+ * Level for a run of `misses` consecutive misses: one step of `missStepDb` each, bottoming out at
+ * `missGain`. 0 misses = the nominal level.
+ *
+ * Proportionate by construction: the first miss is a dip a patient hears as "that one did not land"
+ * (−3 dB), not a mute. Only a sustained run — three misses in a row in that lane — reaches the floor,
+ * and even the floor keeps the instrument in the mix.
+ */
+export function duckGainForMisses(misses: number, opts: DuckOptions = DEFAULT_DUCK_OPTIONS): number {
+  const n = Number.isFinite(misses) ? Math.max(0, Math.floor(misses)) : 0;
+  if (n === 0) return opts.hitGain;
+  const floor = Math.min(Math.max(opts.missGain, MIN_GAIN), opts.hitGain);
+  return Math.max(floor, opts.hitGain * dbToGain(opts.missStepDb * n));
+}
+
+/** Which stem each lane ducks, and which stems never duck at all. See `assignLaneStems`. */
+export interface LaneStemAssignment {
+  /** 'per-lane': every lane has its own stem. 'shared': every lane ducks the player stem. */
+  mode: 'per-lane' | 'shared';
+  /** Stem id per lane index (length = lane count). */
+  perLane: string[];
+  /** Stems no lane ducks — the bed, which always plays at full level. Never empty. */
+  bed: string[];
+  /** One sentence a therapist can read: the rule AND which lane has which instrument. */
+  summary: string;
+  /**
+   * The rule alone, with no lane→instrument mapping in it — for a screen that lists the mapping
+   * beside it and would otherwise print the same pairs twice.
+   */
+  rule: string;
+}
+
+/**
+ * Give each lane its own stem to duck, if the song has enough stems to keep a bed playing.
+ *
+ * Rehab rule: a miss must never take away the reward for the parts of the body that are working.
+ * With enough stems, the weak side dims its own instrument and the strong side's keeps playing; with
+ * too few, every lane shares the player stem and the depth is still only proportional to the miss run
+ * (`duckGainForMisses`), so one miss is a dip and not a silence. At least one stem is always left out
+ * of the assignment, so the song itself never stops.
+ */
+export function assignLaneStems(
+  stemIds: readonly string[],
+  playerStem: string,
+  lanes: number,
+  /**
+   * What each lane IS, in the therapist's words ("Left · Seated march"). Without it the summary can
+   * only name the instruments as a set — "each lane has its own instrument (drums, bass)" — which
+   * leaves the one question a hemiparesis session needs answered unanswerable: is the weak left leg
+   * the drums or the bass? A therapist listening for whether the weak side is being rewarded has to
+   * know which instrument to listen for.
+   */
+  laneLabels?: readonly string[],
+): LaneStemAssignment {
+  const n = Math.max(0, Math.floor(lanes));
+  const named = (perLane: readonly string[]): string =>
+    perLane.map((stem, i) => `${laneLabels?.[i] ?? `lane ${i + 1}`} → ${stem}`).join('; ');
+  const ordered = stemIds.includes(playerStem) ? [playerStem, ...stemIds.filter((id) => id !== playerStem)] : [...stemIds];
+  if (ordered.length === 0 || n === 0) {
+    const none = 'No stems are loaded, so nothing is ducked.';
+    return { mode: 'shared', perLane: new Array<string>(n).fill(playerStem), bed: [], summary: none, rule: none };
+  }
+  const capacity = ordered.length - 1; // one stem always stays out of the assignment
+  if (n <= capacity) {
+    const perLane = ordered.slice(0, n);
+    const bed = ordered.slice(n);
+    return {
+      mode: 'per-lane',
+      perLane,
+      bed,
+      summary: `Each lane has its own instrument — ${named(perLane)}. ${bed.join(', ')} play throughout. A miss dips only that lane's instrument, so a weak limb's misses never take the reward away from the limb that is working.`,
+      rule: `Each lane has its own instrument; ${bed.join(', ')} play throughout. A miss dips only that lane's instrument, so a weak limb's misses never take the reward away from the limb that is working.`,
+    };
+  }
+  const perLane = new Array<string>(n).fill(ordered[0]);
+  return {
+    mode: 'shared',
+    perLane,
+    bed: ordered.slice(1),
+    summary: `This song has ${ordered.length} stem${ordered.length === 1 ? '' : 's'} — too few for ${n} lanes — so every lane shares "${ordered[0]}" (${named(perLane)}). A miss in any lane dips it one step; the rest of the band plays on.`,
+    rule: `This song has ${ordered.length} stem${ordered.length === 1 ? '' : 's'} — too few for ${n} lanes — so every lane shares "${ordered[0]}". A miss in any lane dips it one step; the rest of the band plays on.`,
+  };
+}
 
 /** Exponential ramps cannot reach 0, so gains are clamped to this floor. */
 export const MIN_GAIN = 1e-4;
@@ -169,6 +267,8 @@ export class DuckController {
   private param: GainParamLike;
   private readonly opts: DuckOptions;
   private isDucked = false;
+  /** Consecutive misses on this stem — the depth of the duck, reset by any hit. */
+  private missRunCount = 0;
   private ramp: RampState;
 
   constructor(param: GainParamLike, opts: Partial<DuckOptions> = {}) {
@@ -179,6 +279,8 @@ export class DuckController {
   }
 
   get ducked(): boolean { return this.isDucked; }
+  /** Consecutive misses currently ducking this stem (0 = at the nominal level). */
+  get missRun(): number { return this.missRunCount; }
   /** Last level this controller scheduled (the ramp destination). */
   get target(): number { return this.ramp.to; }
   get options(): DuckOptions { return this.opts; }
@@ -201,14 +303,22 @@ export class DuckController {
     this.reset(now);
   }
 
-  miss(now: number): number {
-    this.isDucked = true;
-    this.ramp = scheduleRamp(this.param, this.valueAt(now), now, this.opts.missGain, this.opts.missRampMs / 1000);
+  /**
+   * One miss on this controller's stem: step DOWN by `missStepDb`, bottoming out at `missGain`.
+   * Pass `misses` to set the run length explicitly (a replay/critic); by default the controller
+   * counts its own consecutive misses, which any hit resets.
+   */
+  miss(now: number, misses?: number): number {
+    this.missRunCount = misses === undefined ? this.missRunCount + 1 : Math.max(0, Math.floor(misses));
+    this.isDucked = this.missRunCount > 0;
+    const target = duckGainForMisses(this.missRunCount, this.opts);
+    this.ramp = scheduleRamp(this.param, this.valueAt(now), now, target, this.opts.missRampMs / 1000);
     return this.ramp.to;
   }
 
   hit(now: number, combo: number = 0): number {
     this.isDucked = false;
+    this.missRunCount = 0;
     this.ramp = scheduleRamp(this.param, this.valueAt(now), now, targetGainForCombo(combo, this.opts), this.opts.hitRampMs / 1000);
     return this.ramp.to;
   }
@@ -224,6 +334,7 @@ export class DuckController {
    */
   reset(now: number, rampSec: number = 0): void {
     this.isDucked = false;
+    this.missRunCount = 0;
     const v = Math.max(this.opts.hitGain, MIN_GAIN);
     const from = this.valueAt(now);
     if (rampSec > 0 && Math.abs(from - v) > 1e-9) {

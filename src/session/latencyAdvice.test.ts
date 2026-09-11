@@ -5,7 +5,7 @@ import type { LaneResultSummary, SessionResult } from './types.ts';
 
 function lane(movement: LaneResultSummary['movement']): LaneResultSummary {
   return {
-    lane: 0, movement, side: 'left', label: 'L x',
+    lane: 0, movement, side: 'left', movementName: 'Left Seated march',
     hits: 1, perfects: 1, goods: 0, misses: 0, judged: 1, accuracy: 1, reps: 1,
     timingBiasMs: null, timingBiasMadMs: null, romMean: null, romBest: null, romSamples: 0, romUncertain: 0,
     calibratedMin: null, calibratedMax: null, calibrationManual: false,

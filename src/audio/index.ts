@@ -24,9 +24,10 @@
  * // …and on the therapist's pause button:
  * engine.pause(mixer.pause()!);  engine.resume((await mixer.resume())!);
  *
- * // 5. per judgment
- * mixer.onHit(combo);  sfx.play('perfect', undefined, { lane });
- * mixer.onMiss();      sfx.play('miss');
+ * // 5. lanes → stems (once, after loadSong), then per judgment
+ * mixer.setLaneCount(chart.lanes);               // each lane ducks its own stem where it can
+ * mixer.onLaneHit(lane, combo);  sfx.play('perfect', undefined, { lane });
+ * mixer.onLaneMiss(lane);        sfx.play('miss');   // dips THAT lane one step, never mutes it
  *
  * // 6. clocks
  * mixer.songTime()        // what the graph is producing — judge against this

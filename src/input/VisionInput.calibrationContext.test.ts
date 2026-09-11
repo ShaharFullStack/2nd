@@ -260,14 +260,24 @@ describe('a calibration saved by the store survives localStorage and is re-vette
 
   beforeEach(() => {
     localStorage.clear();
+    // Ranges are filed PER PATIENT now: with nobody selected the store deliberately keeps a measured
+    // range for the session in progress but writes it nowhere, because there is no honest key for it.
+    useStore.getState().addPatient('Round Trip');
     useStore.getState().setLanes([laneSpec, { index: 1, movement: 'hand_open_close', side: 'right' }]);
   });
 
-  /** What a NEXT session reads back: the raw JSON, parsed exactly as the store parses it on boot. */
+  /**
+   * What a NEXT session reads back: the raw JSON, parsed exactly as the store parses it on boot —
+   * `{ patientId: { movement:side[:tip]: range } }`, scoped to the patient it was measured on.
+   */
   function reloadSaved(): Record<string, RomCalibration> {
     const raw = localStorage.getItem(`${STORAGE_PREFIX}calibrations`);
     expect(raw).not.toBeNull();
-    return JSON.parse(raw as string) as Record<string, RomCalibration>;
+    const byPatient = JSON.parse(raw as string) as Record<string, Record<string, RomCalibration>>;
+    const patient = useStore.getState().activePatientId as string;
+    // The range is under the patient it was measured on, and nowhere else.
+    expect(Object.keys(byPatient)).toContain(patient);
+    return byPatient[patient];
   }
 
   it('keeps the context through JSON and accepts the range on an identically configured lane', () => {
@@ -320,9 +330,15 @@ describe('a calibration saved by the store survives localStorage and is re-vette
  * ------------------------------------------------------------------ */
 
 describe('the store drops a saved range that is filed under a key it does not describe', () => {
-  /** Re-import the store with localStorage already seeded, i.e. the way a later session boots. */
+  /**
+   * Re-import the store with localStorage already seeded, i.e. the way a later session boots — with a
+   * patient selected, because that is the only state in which a stored range is offered to a lane.
+   */
   async function bootWith(saved: Record<string, unknown>): Promise<Record<string, RomCalibration>> {
-    localStorage.setItem(`${STORAGE_PREFIX}calibrations`, JSON.stringify(saved));
+    const patient = { id: 'p-boot', name: 'Boot', createdAt: 1, lastUsedAt: 1 };
+    localStorage.setItem(`${STORAGE_PREFIX}patients`, JSON.stringify([patient]));
+    localStorage.setItem(`${STORAGE_PREFIX}activePatient`, JSON.stringify(patient.id));
+    localStorage.setItem(`${STORAGE_PREFIX}calibrations`, JSON.stringify({ [patient.id]: saved }));
     vi.resetModules();
     const fresh = await import('../state/store.ts');
     return fresh.useStore.getState().savedCalibrations;

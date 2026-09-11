@@ -40,6 +40,7 @@ vi.mock('../session/runtime.ts', () => ({
     loadSong: async () => null,
     ensureVision: async () => vision,
     peekVision: () => vision,
+    releaseVisionUnless: () => false,
     runner: null,
   },
 }));

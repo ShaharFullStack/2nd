@@ -1,26 +1,26 @@
 {
-  "capturedAt": "2026-09-11T07:48:15.994Z",
+  "capturedAt": "2026-09-11T11:11:34.991Z",
   "notes": [],
   "pacing": {
-    "frames": 120,
-    "meanMs": 16.665833333333335,
+    "frames": 115,
+    "meanMs": 17.53565217391304,
     "medianMs": 16.699999999999818,
-    "p95Ms": 16.700000000000728,
-    "worstMs": 16.800000000000182,
-    "over33ms": 0
+    "p95Ms": 33.29999999999927,
+    "worstMs": 33.400000000000546,
+    "over33ms": 6
   },
   "clockDrift": {
-    "songElapsed": 3.009886621315193,
-    "wallElapsed": 3.013699999999255,
-    "driftMs": -3.813378684061952
+    "songElapsed": 3.0273015873015874,
+    "wallElapsed": 3.0288000000044697,
+    "driftMs": -1.4984127028823124
   },
   "responsiveness": {
-    "hudUpdateWithinMs": 69
+    "hudUpdateWithinMs": 353.5
   },
   "hud": {
-    "score": 2400,
-    "hits": 17,
-    "misses": 8,
+    "score": 2800,
+    "hits": 19,
+    "misses": 10,
     "combo": 0,
     "multiplier": 1
   }

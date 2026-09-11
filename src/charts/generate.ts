@@ -68,6 +68,94 @@ export function defaultCrossLaneGapSec(difficulty: DifficultyName, bpm: number):
   return Math.min(pref, beatSec);
 }
 
+/**
+ * THE PACING FLOOR A THERAPIST SETS, not a side effect of the difficulty they picked.
+ *
+ * `MIN_LANE_SPACING_SEC` is keyed on difficulty, so choosing "medium" for the timing windows also
+ * chose 0.6 s between reps of the same limb — a number that came from rhythm-game feel, not from
+ * physiology, and that moved whenever the therapist changed their mind about the windows. A seated
+ * march or a knee extension on an impaired limb needs time to come back to rest before the next rep,
+ * and that requirement does not change because the windows got tighter.
+ *
+ * So the session carries its own floor (`SessionConfig.laneRestSec`), defaulting to this: 1.2 s
+ * between two notes in ONE lane, i.e. at most 50 reps per minute per limb. Raise it for a patient
+ * who needs longer to return to rest; lower it (down to `MIN_LANE_REST_SEC`) for a fast, mild case.
+ */
+export const DEFAULT_LANE_REST_SEC = 1.2;
+/** Bounds of the therapist's pacing control (seconds between two reps in the same lane). */
+export const MIN_LANE_REST_SEC = 0.35;
+export const MAX_LANE_REST_SEC = 6;
+
+/** Clamp a therapist pacing floor; a non-finite value falls back to the default. */
+export function clampLaneRestSec(sec: number): number {
+  if (!Number.isFinite(sec)) return DEFAULT_LANE_REST_SEC;
+  return Math.min(MAX_LANE_REST_SEC, Math.max(MIN_LANE_REST_SEC, sec));
+}
+
+/** Reps per minute a pacing floor allows in one lane. */
+export function repsPerMinuteAt(restSec: number): number {
+  const s = clampLaneRestSec(restSec);
+  return 60 / s;
+}
+
+/**
+ * THE THERAPEUTIC DOSE of a generated chart: how many reps of each movement the patient is about to
+ * be asked for, and how fast. A therapist prescribing exercise has to see this BEFORE the session —
+ * it is the prescription — and until this existed the only way to know was to count the notes on the
+ * highway afterwards.
+ */
+export interface ChartDose {
+  notes: number;
+  lanes: number;
+  /** Notes (= reps asked for) in each lane, indexed by lane. */
+  perLane: number[];
+  /** Seconds from the first note to the last: the working part of the song. */
+  spanSec: number;
+  /** Mean reps asked of one lane. */
+  repsPerLane: number;
+  /** Reps per minute in the busiest lane — the rate ONE limb works at. */
+  repsPerMinPerLane: number;
+  /** Reps per minute across every lane — the rate the patient works at. */
+  totalRepsPerMin: number;
+  /** Shortest gap between two notes in the same lane (seconds); Infinity when no lane has two. */
+  minLaneGapSec: number;
+}
+
+/** Measure the dose of a chart (see `ChartDose`). Pure; safe to call from a render. */
+export function chartDose(chart: Pick<Chart, 'notes' | 'lanes'>): ChartDose {
+  const lanes = Math.max(1, Math.floor(chart.lanes));
+  const perLane = new Array<number>(lanes).fill(0);
+  const lastTime = new Array<number>(lanes).fill(Number.NaN);
+  let minGap = Infinity;
+  let first = Infinity;
+  let last = -Infinity;
+  const sorted = [...chart.notes].sort((a, b) => a.time - b.time);
+  for (const n of sorted) {
+    if (!Number.isFinite(n.time)) continue;
+    if (n.time < first) first = n.time;
+    if (n.time > last) last = n.time;
+    if (n.lane < 0 || n.lane >= lanes) continue;
+    perLane[n.lane]++;
+    const prev = lastTime[n.lane];
+    if (Number.isFinite(prev)) minGap = Math.min(minGap, n.time - prev);
+    lastTime[n.lane] = n.time;
+  }
+  const notes = sorted.length;
+  const spanSec = Number.isFinite(first) && last > first ? last - first : 0;
+  const minutes = spanSec / 60;
+  const busiest = perLane.reduce((a, b) => Math.max(a, b), 0);
+  return {
+    notes,
+    lanes,
+    perLane,
+    spanSec,
+    repsPerLane: perLane.reduce((a, b) => a + b, 0) / lanes,
+    repsPerMinPerLane: minutes > 0 ? busiest / minutes : 0,
+    totalRepsPerMin: minutes > 0 ? notes / minutes : 0,
+    minLaneGapSec: minGap,
+  };
+}
+
 export const CHART_FORMAT_VERSION = 1;
 
 /** Lane share imbalance (max/min) above which a warning is emitted. */

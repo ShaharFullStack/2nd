@@ -233,3 +233,69 @@ describe('the instruction names the prescribed digit', () => {
     expect((await screen.findByTestId('rom-instruction')).textContent).toMatch(/Open your hand as wide as is comfortable/i);
   });
 });
+
+
+/**
+ * THE BUTTONS A THERAPIST ACTUALLY PRESSES.
+ *
+ * The proportional nudge API existed, was tested, and reached nobody: the screen still rendered
+ * "Easier (−5% top)" / "Harder (+5% top)" over `cal.nudge(0, ±0.05)` — an ABSOLUTE feature-unit step
+ * that moves a hemiparetic seated march by a sixth of the patient's whole range and a knee extension
+ * by a twentieth of a degree, under one label claiming 5 %. These tests pin the wiring, so the API
+ * cannot drift back out of the UI silently.
+ */
+describe('Easier / Harder say what they will do, in the movement’s own units', () => {
+  const reuseMeasuredRange = async (over: Partial<RomCalibration> = {}) => {
+    useStore.setState({
+      savedCalibrations: {
+        [calibrationKey(LANES[0])]: {
+          min: 0.1,
+          max: 0.5,
+          samples: 120,
+          movement: 'finger_opposition',
+          fingertip: 'pinky',
+          mirrored: false,
+          peaks: [0.48, 0.5, 0.52],
+          capturedAt: Date.now(),
+          ...over,
+        } as RomCalibration,
+      },
+    });
+    render(<RomCalibrationScreen />);
+    fireEvent.click(await screen.findByTestId('rom-reuse'));
+    await waitFor(() => expect(screen.getByTestId('rom-lane-badge-0').textContent).toBe('✓'));
+  };
+
+  it('labels each button with the target it will set, not with a percentage of nothing', async () => {
+    await reuseMeasuredRange();
+    const easier = screen.getByTestId('rom-nudge-easier');
+    const harder = screen.getByTestId('rom-nudge-harder');
+    // 5 % of the MEASURED range (0.5 − 0.1 = 0.4) is 0.02 — the label states both ends of the move.
+    expect(easier.textContent).toContain('0.50 → 0.48');
+    expect(easier.textContent).toContain('of the measured range');
+    expect(harder.textContent).toContain('0.50 → 0.52');
+  });
+
+  it('applies exactly what the label promised, and records the range as therapist-adjusted', async () => {
+    await reuseMeasuredRange();
+    fireEvent.click(screen.getByTestId('rom-nudge-easier'));
+    await waitFor(() => {
+      const cal = useStore.getState().calibrations[0];
+      expect(cal?.max).toBeCloseTo(0.48, 6);
+      expect(cal?.manual).toBe(true);
+    });
+    // The label re-reads the new range rather than repeating the old promise.
+    await waitFor(() => expect(screen.getByTestId('rom-nudge-easier').textContent).toContain('0.48 → 0.46'));
+  });
+
+  it('refuses to set a target above the best rep this patient produced, and says why', async () => {
+    await reuseMeasuredRange({ max: 0.52 }); // already at the best peak on record
+    const harder = screen.getByTestId('rom-nudge-harder') as HTMLButtonElement;
+    expect(harder.disabled).toBe(true);
+    expect(harder.textContent).toMatch(/already at this patient's best/);
+    expect(screen.getByTestId('rom-nudge-note').textContent).toMatch(/never been produced/);
+    // and nothing above it can be reached by pressing repeatedly
+    fireEvent.click(harder);
+    expect(useStore.getState().calibrations[0]?.max).toBeCloseTo(0.52, 6);
+  });
+});

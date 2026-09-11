@@ -3,7 +3,10 @@ import {
   DEFAULT_MASTER_GAIN, DEFAULT_START_LEAD_SEC, LIMITER_SETTINGS, RESUME_FADE_SEC, START_GUARD_QUANTA, STOP_FADE_SEC, StemMixer,
   aggregateProgress, readBodyWithProgress, type LoadProgress,
 } from './StemMixer';
-import { MIN_GAIN } from './ducking';
+import { MIN_GAIN, duckGainForMisses } from './ducking';
+
+/** One miss = one proportionate step down (see ducking.ts). */
+const D1 = duckGainForMisses(1);
 import { parseManifest, type FetchLike, type SongManifest } from './manifest';
 import { SongClock } from '../engine/scheduler';
 
@@ -510,7 +513,7 @@ describe('StemMixer', () => {
     ctx.currentTime = 2;
     mixer.onMiss();
     expect(mixer.isDucked).toBe(true);
-    expect(drumDuck.gain.log).toEqual(['cancel@2', 'set 1@2', 'exp 0.05@2.04']);
+    expect(drumDuck.gain.log).toEqual(['cancel@2', 'set 1@2', `exp ${D1}@2.04`]);
     ctx.currentTime = 3;
     mixer.onHit(8);
     expect(mixer.isDucked).toBe(false);
@@ -523,8 +526,74 @@ describe('StemMixer', () => {
     expect(mixer.playerStem).toBe('bass');
     expect(drumDuck.gain.value).toBe(1);
     mixer.onMiss();
-    expect(bassDuck.gain.log.slice(-1)[0]).toBe('exp 0.05@4.04');
+    expect(bassDuck.gain.log.slice(-1)[0]).toBe(`exp ${D1}@4.04`);
     expect(() => mixer.setPlayerStem('nope')).toThrow(/unknown stem/);
+  });
+
+  it('ducks PER LANE: a weak lane dims its own stem and leaves the rest of the band playing', async () => {
+    const { ctx, mixer } = setup();
+    await mixer.loadSong(manifest, '/songs');
+    ctx.currentTime = 1;
+    mixer.play();
+    const assign = mixer.setLaneCount(2);
+    expect(assign.mode).toBe('per-lane');
+    expect(assign.perLane).toEqual(['drums', 'bass']);
+    expect(assign.bed).toEqual(['keys']);
+    expect(mixer.laneStems).toEqual(assign);
+    const drumDuck = ctx.sources[0].connections[0] as FakeGain;
+    const bassDuck = ctx.sources[1].connections[0] as FakeGain;
+    const keysDuck = ctx.sources[2].connections[0] as FakeGain;
+    drumDuck.gain.log = [];
+    bassDuck.gain.log = [];
+    keysDuck.gain.log = [];
+
+    // the weak left leg misses three times in a row while the strong right leg hits everything
+    ctx.currentTime = 2;
+    mixer.onLaneMiss(1);
+    ctx.currentTime = 2.5;
+    mixer.onLaneMiss(1);
+    ctx.currentTime = 3;
+    mixer.onLaneMiss(1);
+    ctx.currentTime = 3.2;
+    mixer.onLaneHit(0, 12);
+    expect(mixer.getLaneStemGain(1)).toBeCloseTo(duckGainForMisses(3), 12);
+    expect(mixer.getLaneStemGain(1)).toBeGreaterThan(0.3); // audible, not silenced
+    expect(mixer.getLaneStemGain(0)).toBeGreaterThanOrEqual(1); // the strong side keeps its reward
+    expect(keysDuck.gain.log).toEqual([]); // the bed is never touched
+
+    // one hit in the weak lane restores it fully
+    ctx.currentTime = 4;
+    mixer.onLaneHit(1, 1);
+    ctx.currentTime = 4.1;
+    expect(mixer.getLaneStemGain(1)).toBe(1);
+
+    // stop() restores every lane's stem, not just the player stem
+    ctx.currentTime = 5;
+    mixer.onLaneMiss(1);
+    ctx.currentTime = 5.1;
+    mixer.stop();
+    expect(bassDuck.gain.log.slice(-1)[0]).toBe(`exp 1@${5.1 + STOP_FADE_SEC}`);
+  });
+
+  it('falls back to a shared stem when the song has too few, and still only steps', async () => {
+    const { ctx, mixer } = setup();
+    await mixer.loadSong(manifest, '/songs');
+    ctx.currentTime = 1;
+    mixer.play();
+    const assign = mixer.setLaneCount(4);
+    expect(assign.mode).toBe('shared');
+    expect(assign.perLane).toEqual(['drums', 'drums', 'drums', 'drums']);
+    const drumDuck = ctx.sources[0].connections[0] as FakeGain;
+    drumDuck.gain.log = [];
+    ctx.currentTime = 2;
+    mixer.onLaneMiss(3);
+    expect(drumDuck.gain.log.slice(-1)[0]).toBe(`exp ${D1}@2.04`);
+    ctx.currentTime = 2.04; // the ramp has landed
+    expect(mixer.getLaneStemGain(0)).toBeCloseTo(D1, 12); // shared: every lane reads the same stem
+    ctx.currentTime = 2.1;
+    mixer.onLaneHit(0, 1);
+    ctx.currentTime = 2.2;
+    expect(mixer.getLaneStemGain(3)).toBe(1);
   });
 
   it('seek/stop/replay while ducked restore the player stem with a ramp, never a step (click-free)', async () => {
@@ -535,12 +604,12 @@ describe('StemMixer', () => {
     const drumDuck = ctx.sources[0].connections[0] as FakeGain;
     ctx.currentTime = 2;
     mixer.onMiss();
-    ctx.currentTime = 2.1; // the miss ramp has landed: the stem is at 0.05 and audible
+    ctx.currentTime = 2.1; // the miss ramp has landed: the stem is one step down and audible
     drumDuck.gain.log = [];
 
     mixer.seek(4); // sources fade out over STOP_FADE_SEC — restoring in one sample would click here
-    expect(drumDuck.gain.log).toEqual(['cancel@2.1', 'set 0.05@2.1', `exp 1@${2.1 + STOP_FADE_SEC}`]);
-    expect(mixer.getPlayerStemGain()).toBeCloseTo(0.05, 12); // anchored on the ducked value
+    expect(drumDuck.gain.log).toEqual(['cancel@2.1', `set ${D1}@2.1`, `exp 1@${2.1 + STOP_FADE_SEC}`]);
+    expect(mixer.getPlayerStemGain()).toBeCloseTo(D1, 12); // anchored on the ducked value
     ctx.currentTime = 2.1 + STOP_FADE_SEC;
     expect(mixer.getPlayerStemGain()).toBe(1);
 

@@ -178,6 +178,12 @@
 
 /* The per-movement session list. Collapsed by default so the card stays a glance, expandable because
    a clinic tablet has no hover and a dip in a line must still be traceable to a date. */
+/* A FOLD-AWAY BLOCK. Detail that has to be keepable — a generator diagnostic, a stack message — but
+   that must not out-weigh the sentence beside it. The summary is a 44 px touch target because on a
+   clinic tablet it is the only way back to the thing that was folded. */
+.fold { border-top: 1px solid rgba(42, 53, 80, 0.6); padding-top: 8px; }
+.fold > summary { cursor: pointer; padding: 10px 0; min-height: 44px; }
+
 .trend-points { border-top: 1px solid rgba(42, 53, 80, 0.6); padding-top: 8px; }
 .trend-points > summary { cursor: pointer; padding: 6px 0; min-height: 32px; }
 /* Five columns inside a ~470 px card: the wide uppercase tracking of the main session table pushed
@@ -191,3 +197,13 @@
 .trend-points table.table td { padding: 6px 8px; font-size: 0.92rem; }
 .trend-points table.table th:first-child, .trend-points table.table td:first-child { padding-left: 0; }
 .trend-points table.table td .badge { margin-left: 8px; }
+
+/* A compact action INSIDE a table row (the per-session delete). The full-size .btn is 56 px tall and
+   would set the row height of every row in the history table; this keeps the row readable while
+   staying inside the 44 px touch target a tablet needs. */
+.btn-sm {
+  min-height: 44px;
+  padding: 0 12px;
+  font-size: 0.85rem;
+  border-radius: 10px;
+}

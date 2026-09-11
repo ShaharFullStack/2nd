@@ -6,8 +6,13 @@
  * into one series PER MOVEMENT, which is the unit a therapist actually reasons about — "left knee
  * extension", not "Tuesday's session".
  *
- * Four rules the History screen must not have to remember:
+ * Five rules the History screen must not have to remember:
  *
+ *  - ONE PATIENT, ALWAYS. `patientId` is a REQUIRED argument of every function here, not an optional
+ *    filter, because the history array these are handed is device-wide: a clinic tablet is shared, and
+ *    a series keyed on movement alone pooled every patient who had ever used it into one "is this
+ *    patient improving?" line. A required argument is the only version of this that cannot be
+ *    forgotten at a call site.
  *  - ONLY CAMERA SESSIONS COUNT. A keyboard or autoplay run is the SYSTEM producing the input, not the
  *    patient producing a movement: its accuracy is a property of the bot or of whoever held the
  *    keyboard. Averaging that into a progress display would put a green "improving" badge on work the
@@ -20,14 +25,21 @@
  *  - ROM is only plotted where it was MEASURED (`romSamples > 0`). A keyboard/autoplay session, or a
  *    camera session whose reps were all truncated, carries `romMean: null` — plotting that as 0 %
  *    would draw a collapse in range that never happened. Accuracy is always known, so it is separate.
+ *  - A RUN THAT WAS CUT SHORT IS SAID SO, AND NEVER ANCHORS A CHANGE FIGURE. Sessions now persist
+ *    from every exit — a patient who stopped at 40 s, a tab that was closed, a tablet that slept — so
+ *    the history contains 12-second aborted runs alongside full ones. Their reps are real and are
+ *    plotted, because the patient performed them; what they are not is a comparable MEASUREMENT of a
+ *    session. So `completed` rides on every point, the incomplete ones are counted on the card, and
+ *    the first/latest deltas are taken from the complete sessions whenever two of them exist —
+ *    otherwise "no change" gets printed off a nine-rep abort standing in for a session.
  *  - `romMean` is a fraction of the range calibrated THAT DAY. A patient re-calibrated to a wider
  *    range can improve while their percentage falls, so the calibrated span is carried on every point
  *    and a change of span is flagged (`recalibrated`) rather than silently averaged away.
  */
 import type { Fingertip, Movement, Side } from '../engine/types.ts';
-import { laneLabel } from '../render/palette.ts';
 import { MOVEMENT_INFO } from '../vision/features.ts';
-import type { InputMode, LaneResultSummary, SessionResult } from './types.ts';
+import { clinicalLaneName } from './results.ts';
+import type { InputMode, LaneResultSummary, SessionEndReason, SessionResult } from './types.ts';
 
 /** One session's contribution to one movement's trend. */
 export interface TrendPoint {
@@ -63,6 +75,10 @@ export interface TrendPoint {
   recalibrated: boolean;
   /** Compensation flags in this lane (0 when clean or unmonitored). */
   compensationFlags: number;
+  /** False when the run did not reach the end of the chart. */
+  completed: boolean;
+  /** What stopped it, when the record says (older records do not). */
+  endReason: SessionEndReason | null;
 }
 
 export interface MovementTrend {
@@ -104,6 +120,14 @@ export interface MovementTrend {
   excludedSessions: number;
   /** Which kinds ('keyboard' | 'autoplay' | 'unknown'), in first-seen order. */
   excludedModes: string[];
+  /** Points in this window whose run was cut short. Plotted, counted, and named on the card. */
+  incompleteSessions: number;
+  /**
+   * True when a change figure above had to be taken across a cut-short run because fewer than two
+   * complete sessions were available. The card says so rather than presenting it as a like-for-like
+   * comparison.
+   */
+  changeIncludesIncomplete: boolean;
 }
 
 /** How much of the stored history a trend can honestly draw on. */
@@ -113,6 +137,8 @@ export interface TrendCoverage {
   /** Sessions excluded because the input was a keyboard, the autoplay bot, or unrecorded. */
   excludedSessions: number;
   excludedModes: string[];
+  /** Of `cameraSessions`, how many did not reach the end of their chart. */
+  incompleteSessions: number;
 }
 
 /** A session counts as the patient's performance only when the camera measured it. */
@@ -120,25 +146,38 @@ export function isPatientDriven(s: Pick<SessionResult, 'inputMode'>): boolean {
   return s.inputMode === 'camera';
 }
 
+/**
+ * This patient's sessions, out of the device-wide history.
+ *
+ * Every other function in this file runs on the output of this one. A record with no `patientId` at
+ * all (written before patients existed) belongs to whoever the migration filed it under and to nobody
+ * else — it is matched only when that same id is asked for, never folded into the patient on screen.
+ */
+export function patientSessions(history: readonly SessionResult[], patientId: string): SessionResult[] {
+  return history.filter((s) => s.patientId === patientId);
+}
+
 function excludedMode(s: Pick<SessionResult, 'inputMode'>): string {
   return s.inputMode === 'keyboard' || s.inputMode === 'autoplay' ? s.inputMode : 'unknown';
 }
 
 /** Camera vs non-camera split of the whole stored history, for the header of the trend view. */
-export function trendCoverage(history: readonly SessionResult[]): TrendCoverage {
+export function trendCoverage(history: readonly SessionResult[], patientId: string): TrendCoverage {
   let cameraSessions = 0;
   let excludedSessions = 0;
+  let incompleteSessions = 0;
   const excludedModes: string[] = [];
-  for (const s of history) {
+  for (const s of patientSessions(history, patientId)) {
     if (isPatientDriven(s)) {
       cameraSessions++;
+      if (!s.completed) incompleteSessions++;
       continue;
     }
     excludedSessions++;
     const kind = excludedMode(s);
     if (!excludedModes.includes(kind)) excludedModes.push(kind);
   }
-  return { cameraSessions, excludedSessions, excludedModes };
+  return { cameraSessions, excludedSessions, excludedModes, incompleteSessions };
 }
 
 /** Default number of sessions a trend looks back over — enough to see a direction on a tablet. */
@@ -152,15 +191,16 @@ function laneKey(l: Pick<LaneResultSummary, 'movement' | 'side' | 'fingertip'>):
 }
 
 /**
- * The card's title, DERIVED rather than read back from `lane.label`.
+ * The card's title, DERIVED rather than read back from the stored name.
  *
- * Records written before the fingertip reached the label carry a stored `label` of "L pinch" for
- * every digit, so two cards for two different fingers would arrive identically titled — which is the
- * one thing a per-movement outcome record may not do. The key already distinguishes them; the title
- * is rebuilt from the same three fields so it always agrees with the key.
+ * Records written before the fingertip reached the name carry "L pinch" for every digit, so two cards
+ * for two different fingers would arrive identically titled — which is the one thing a per-movement
+ * outcome record may not do. The key already distinguishes them; the title is rebuilt from the same
+ * three fields so it always agrees with the key. It is the FULL clinical name, not the canvas
+ * abbreviation: this card is the outcome record.
  */
 function trendLabel(l: Pick<LaneResultSummary, 'movement' | 'side' | 'fingertip'>): string {
-  return laneLabel({ movement: l.movement, side: l.side, fingertip: l.fingertip });
+  return clinicalLaneName({ movement: l.movement, side: l.side, fingertip: l.fingertip });
 }
 
 /** Mean peak expressed in the movement's own units, or null when either half is unknown. */
@@ -182,11 +222,17 @@ function change(first: number | null, latest: number | null, count: number): num
 }
 
 /**
- * Per-movement trends over the most recent `window` sessions that contain each movement, newest
- * session first in `history` (the order the store keeps it in). Movements are returned in the order
- * they were most recently worked, so today's prescription is at the top.
+ * Per-movement trends for ONE PATIENT over the most recent `window` sessions that contain each
+ * movement, newest session first in `history` (the order the store keeps it in). Movements are
+ * returned in the order they were most recently worked, so today's prescription is at the top.
+ *
+ * `patientId` is required and applied first: the history handed in is the whole device's.
  */
-export function movementTrends(history: readonly SessionResult[], window: number = DEFAULT_TREND_WINDOW): MovementTrend[] {
+export function movementTrends(
+  history: readonly SessionResult[],
+  patientId: string,
+  window: number = DEFAULT_TREND_WINDOW,
+): MovementTrend[] {
   const limit = Math.max(1, Math.floor(window));
   const order: string[] = [];
   const byKey = new Map<string, { lane: LaneResultSummary; session: SessionResult }[]>();
@@ -194,7 +240,7 @@ export function movementTrends(history: readonly SessionResult[], window: number
 
   // history is newest-first: walking it forward keeps `order` in most-recently-worked order and gives
   // each key its newest entries first, which is what the per-movement window has to be taken from.
-  for (const session of history) {
+  for (const session of patientSessions(history, patientId)) {
     // A session the patient did not drive contributes NOTHING to any series — not a ROM point, not an
     // accuracy point, not a rep. It is only tallied, so the card can name what it left out.
     if (!isPatientDriven(session)) {
@@ -246,6 +292,8 @@ export function movementTrends(history: readonly SessionResult[], window: number
         absoluteBest: absolute(romBest, lane.calibratedMin, s),
         recalibrated,
         compensationFlags: lane.compensationMonitored ? lane.compensationFlags : 0,
+        completed: session.completed !== false,
+        endReason: session.endReason ?? null,
       });
       if (s !== null) previousSpan = s;
     }
@@ -255,12 +303,32 @@ export function movementTrends(history: readonly SessionResult[], window: number
     const first = rows[0]?.lane;
     const latest = rows[rows.length - 1]?.lane;
     const spec = latest ?? first;
-    const firstRom = romPoints[0]?.rom ?? null;
-    const latestRom = romPoints[romPoints.length - 1]?.rom ?? null;
-    const firstAccuracy = points[0]?.accuracy ?? null;
-    const latestAccuracy = points[points.length - 1]?.accuracy ?? null;
-    const firstAbsolute = absolutePoints[0]?.absoluteMean ?? null;
-    const latestAbsolute = absolutePoints[absolutePoints.length - 1]?.absoluteMean ?? null;
+
+    /**
+     * THE TWO POINTS A DELTA IS READ OFF.
+     *
+     * "72 %, no change" is the sentence a therapist changes a prescription on, and a run the patient
+     * left after nine reps is not the other end of a like-for-like comparison with a full session.
+     * Where two COMPLETE sessions exist, the delta is taken across those; where they do not, it is
+     * taken across everything and `changeIncludesIncomplete` makes the card say so. Nothing is
+     * dropped from the plot either way — the reps happened.
+     */
+    let changeIncludesIncomplete = false;
+    const basis = (series: TrendPoint[]): TrendPoint[] => {
+      const whole = series.filter((p) => p.completed);
+      if (whole.length >= 2) return whole;
+      if (series.length >= 2 && whole.length !== series.length) changeIncludesIncomplete = true;
+      return series;
+    };
+    const romBasis = basis(romPoints);
+    const accuracyBasis = basis(points);
+    const absoluteBasis = basis(absolutePoints);
+    const firstRom = romBasis[0]?.rom ?? null;
+    const latestRom = romBasis[romBasis.length - 1]?.rom ?? null;
+    const firstAccuracy = accuracyBasis[0]?.accuracy ?? null;
+    const latestAccuracy = accuracyBasis[accuracyBasis.length - 1]?.accuracy ?? null;
+    const firstAbsolute = absoluteBasis[0]?.absoluteMean ?? null;
+    const latestAbsolute = absoluteBasis[absoluteBasis.length - 1]?.absoluteMean ?? null;
     // The denominator that was in force most recently — disclosed on the card, because every
     // percentage above is a fraction of it.
     const withRange = rows.filter((r) => r.lane.calibratedMin !== null && r.lane.calibratedMax !== null);
@@ -277,19 +345,21 @@ export function movementTrends(history: readonly SessionResult[], window: number
       absolutePoints,
       firstRom,
       latestRom,
-      romChange: change(firstRom, latestRom, romPoints.length),
+      romChange: change(firstRom, latestRom, romBasis.length),
       firstAccuracy,
       latestAccuracy,
-      accuracyChange: change(firstAccuracy, latestAccuracy, points.length),
+      accuracyChange: change(firstAccuracy, latestAccuracy, accuracyBasis.length),
       firstAbsolute,
       latestAbsolute,
-      absoluteChange: change(firstAbsolute, latestAbsolute, absolutePoints.length),
+      absoluteChange: change(firstAbsolute, latestAbsolute, absoluteBasis.length),
       latestCalibratedMin: latestRange?.calibratedMin ?? null,
       latestCalibratedMax: latestRange?.calibratedMax ?? null,
       totalReps: points.reduce((n, p) => n + p.reps, 0),
       anyRecalibration: points.some((p) => p.recalibrated),
       excludedSessions: excluded.length,
       excludedModes: excluded.filter((m, i) => excluded.indexOf(m) === i),
+      incompleteSessions: points.filter((p) => !p.completed).length,
+      changeIncludesIncomplete,
     };
   });
 }

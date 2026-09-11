@@ -15,7 +15,9 @@
     "critic:smoke": "node critic/smoke.mjs",
     "critic:frames": "node critic/frames.mjs",
     "critic:motion": "node critic/motion.mjs",
-    "critic:audio": "node critic/audio-reactivity.mjs"
+    "critic:audio": "node critic/audio-reactivity.mjs",
+    "critic:audition": "node critic/audition-cost.mjs",
+    "critic:record": "node critic/honest-record.mjs"
   },
   "dependencies": {
     "@mediapipe/tasks-vision": "^1.0.1",

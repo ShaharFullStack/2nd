@@ -16,8 +16,11 @@ import { DIFFICULTIES } from '../engine/difficulty.ts';
 import type { DifficultyName, Fingertip, LaneSpec, Mode } from '../engine/types.ts';
 import { VisionInput } from '../input/VisionInput.ts';
 import type { RomCalibration } from '../vision/calibration.ts';
-import { laneFingertip } from '../state/store.ts';
+import { laneFingertip, useStore } from '../state/store.ts';
+import type { Screen } from '../state/store.ts';
 import type { GameRunner } from './GameRunner.ts';
+import { AUDITION_SEC, Audition } from './audition.ts';
+import type { AuditionProgress } from './audition.ts';
 
 /** How long to wait for the audio clock before calling it a missing-gesture failure. */
 const AUDIO_CLOCK_TIMEOUT_MS = 4000;
@@ -76,14 +79,69 @@ export function laneFeatureOptions(lanes: readonly LaneSpec[]): ({ fingertip?: F
   });
 }
 
+/**
+ * THE SCREENS THAT ARE ALLOWED TO HOLD THE CAMERA OPEN, and nothing else is.
+ *
+ * A camera session used to keep the device streaming for the rest of the visit: the runner was built
+ * with `stopInputOnDispose: inputMode !== 'camera'` ("camera sessions keep the camera open for the
+ * next song"), and nothing on the way out of play ever closed it. So after the last song the camera
+ * light stayed on, MediaPipe kept inferring on every frame, and the tablet kept burning battery in a
+ * room the patient had already left — with a recording indicator lit over a clinical session that had
+ * ended. On a shared device that is both a privacy problem and a flat battery by the afternoon.
+ *
+ * The fast path it was bought for is real but narrow: these four screens hand over to each other
+ * inside a single prescription (camera check → ROM → latency → play, and back for a re-calibration),
+ * and re-opening the device between them costs seconds and throws away the smoothing filters' warm
+ * state mid-session. THOSE are the screens that need frames within seconds of arriving. Every other
+ * destination — results, history, setup, the patient list, home — means the session is over or has
+ * not been prescribed yet, and the camera is released.
+ *
+ * "Play again" from the results screen re-opens it, which is the right trade: a second song starts
+ * with a song load and a 3-2-1 count-in anyway, and the alternative is the light staying on through
+ * every gap between patients.
+ */
+const CAMERA_SCREENS: ReadonlySet<Screen> = new Set<Screen>(['camera', 'rom', 'latency', 'play']);
+
+/** True when `screen` consumes camera frames within seconds of being shown. */
+export function screenNeedsCamera(screen: Screen): boolean {
+  return CAMERA_SCREENS.has(screen);
+}
+
+/**
+ * Call `onScreen` with every screen the app navigates TO. Exported (rather than inlined in the
+ * runtime) so the release rule can be exercised without a camera: the rule is "release on arriving
+ * anywhere that does not need frames", and the arrival is the half that a unit test can reach.
+ */
+export function watchScreenChanges(onScreen: (screen: Screen) => void): () => void {
+  return useStore.subscribe((state, prev) => {
+    if (state.screen !== prev.screen) onScreen(state.screen);
+  });
+}
+
+/** What an audition may report and how it is cancelled. */
+export interface PreviewOptions {
+  /** Bytes and stems of the cheap audition, so a screen can show what it is costing. */
+  onProgress?: (p: AuditionProgress) => void;
+  /** Byte progress of the FALLBACK full load (the expensive path). */
+  onLoadProgress?: (p: LoadProgress) => void;
+  /** Cancel: aborts the fetches in flight. `stopPreview()` does the same thing. */
+  signal?: AbortSignal;
+}
+
 class SessionRuntime {
   private audio: AudioHandles | null = null;
   private vision: VisionInput | null = null;
   private visionKey = '';
   private catalog: Promise<SongEntry[]> | null = null;
+  private screenWatch: (() => void) | null = null;
+  private audition: Audition | null = null;
   private loadedSongId: string | null = null;
   private loading: Promise<SongManifest | null> | null = null;
   private loadingId: string | null = null;
+  /** Cancels the audition in flight — its ranged fetches AND its whole-song fallback. */
+  private previewAbort: AbortController | null = null;
+  /** True when the load `this.loading` refers to was cancelled and will resolve to nothing. */
+  private loadCancelled = false;
 
   /** The runner for the session in progress (exposed on window.__beatRehab for critics). */
   runner: GameRunner | null = null;
@@ -113,28 +171,54 @@ class SessionRuntime {
    * stems — the session then runs silently rather than refusing to start.
    */
   async loadSong(songId: string, onProgress?: (p: LoadProgress) => void): Promise<SongManifest | null> {
-    const { mixer } = await this.ensureAudio();
+    await this.ensureAudio();
     // A song-select audition must never survive into the load of another song (its fade-out timer and
     // its held-aside position both belong to the song being replaced).
     this.stopPreview();
+    return this.loadSongNow(songId, onProgress);
+  }
+
+  /**
+   * The load itself, WITHOUT stopping the audition first.
+   *
+   * `previewSong`'s fallback path is a load that belongs to an audition rather than replacing one:
+   * routing it through the public `loadSong` would have the load cancel the very request that
+   * started it (`stopPreview` aborts the in-flight preview), so the therapist's press would abort
+   * itself the moment it fell back.
+   */
+  private async loadSongNow(songId: string, onProgress?: (p: LoadProgress) => void): Promise<SongManifest | null> {
+    const { mixer } = await this.ensureAudio();
     if (this.loadedSongId === songId && mixer.isLoaded) return mixer.manifest;
-    if (this.loading && this.loadingId === songId) return this.loading;
-    this.loadingId = songId;
-    this.loading = (async () => {
+    // Share a load already running for this song — UNLESS it has been cancelled. A cancelled load is
+    // a promise that will resolve to nothing, and handing it to the Start button (a therapist who
+    // stopped an audition of the song they then prescribed) would start the session in silence.
+    if (this.loading && this.loadingId === songId && !this.loadCancelled) return this.loading;
+    this.loadCancelled = false;
+    const load = (async () => {
       const entry = await loadSongEntry(songId);
       if (entry.status !== 'ready' || !entry.manifest) {
         this.loadedSongId = null;
         return null;
       }
       await mixer.loadSong(entry.manifest, '/songs', onProgress);
-      this.loadedSongId = songId;
-      return entry.manifest;
+      // A load that was cancelled (`mixer.unload()` from a cancelled audition, or a newer load)
+      // resolves QUIETLY with nothing in the mixer. Claiming the song is loaded would make the next
+      // `loadSong` for it a no-op and start a session against an empty mixer.
+      this.loadedSongId = mixer.isLoaded ? songId : null;
+      return mixer.isLoaded ? entry.manifest : null;
     })();
+    this.loading = load;
+    this.loadingId = songId;
     try {
-      return await this.loading;
+      return await load;
     } finally {
-      this.loading = null;
-      this.loadingId = null;
+      // Identity-guarded: a cancelled load that settles late must not clear the bookkeeping of the
+      // load that replaced it.
+      if (this.loading === load) {
+        this.loading = null;
+        this.loadingId = null;
+        this.loadCancelled = false;
+      }
     }
   }
 
@@ -155,22 +239,94 @@ class SessionRuntime {
    * back when the preview ends, so pressing Start straight after an audition begins the prescribed
    * session at song time 0 — not 30 s in. See StemMixer.playPreview and previewFlow.test.ts.
    */
-  async previewSong(songId: string, durationSec?: number): Promise<SongManifest | null> {
-    const { mixer } = await this.ensureAudio();
-    const manifest = await this.loadSong(songId);
-    if (!manifest || !mixer.isLoaded) return null;
-    mixer.playPreview(durationSec);
-    return manifest;
+  async previewSong(songId: string, durationSec?: number, options: PreviewOptions = {}): Promise<SongManifest | null> {
+    const { mixer, ctx } = await this.ensureAudio();
+    const seconds = durationSec ?? AUDITION_SEC;
+
+    // ALREADY IN MEMORY: the song this session is about to play is loaded whole, so auditioning it
+    // from the mixer's own buffers costs nothing and keeps the well-worn transport path (which holds
+    // the session position aside and restores it — see previewFlow.test.ts).
+    if (this.loadedSongId === songId && mixer.isLoaded) {
+      this.stopPreview();
+      mixer.playPreview(seconds);
+      return mixer.manifest;
+    }
+
+    const entry = await loadSongEntry(songId);
+    if (options.signal?.aborted) return null;
+    if (entry.status !== 'ready' || !entry.manifest) return null;
+    const manifest = entry.manifest;
+
+    // ONE CANCEL FOR THE WHOLE PRESS. Everything the audition may do — ranged stem windows, and the
+    // whole-song fallback underneath them — hangs off this controller, so `stopPreview()` and the
+    // caller's own signal are the same escape hatch, whichever half of the work is in flight.
+    this.stopPreview();
+    const abort = new AbortController();
+    this.previewAbort = abort;
+    const onOuterAbort = (): void => abort.abort();
+    options.signal?.addEventListener('abort', onOuterAbort, { once: true });
+
+    try {
+      // THE CHEAP PATH: fetch only the seconds that will be heard (src/session/audition.ts). It plays
+      // on its own sources into the master bus, so the session transport is never moved at all.
+      if (!this.audition) this.audition = new Audition(ctx, mixer.master);
+      const played = await this.audition.play(manifest, {
+        durationSec: seconds,
+        onProgress: options.onProgress,
+        signal: abort.signal,
+      });
+      if (played) return manifest;
+      if (abort.signal.aborted) return null;
+
+      // THE FALLBACK, for a stem that cannot be sliced (not linear-PCM WAV) or a server that ignores
+      // range requests: load the song whole, exactly as before. Slower, never broken — and the load is
+      // not wasted if this is the song the therapist prescribes.
+      //
+      // THIS is the expensive path, so this is the one that must be stoppable: `mixer.unload()`
+      // aborts the in-flight stem downloads, which is what a cancel during a 34 MB load has to mean.
+      // 90 seconds between patients is not enough to sit through a download nobody wants any more.
+      const onAbortLoad = (): void => {
+        try {
+          mixer.unload();
+        } catch (err) {
+          console.warn('[runtime] cancelling the song load failed', err);
+        }
+      };
+      abort.signal.addEventListener('abort', onAbortLoad, { once: true });
+      try {
+        const loaded = await this.loadSongNow(songId, options.onLoadProgress);
+        if (abort.signal.aborted || !loaded || !mixer.isLoaded) return null;
+        mixer.playPreview(seconds);
+        return loaded;
+      } finally {
+        abort.signal.removeEventListener('abort', onAbortLoad);
+      }
+    } finally {
+      options.signal?.removeEventListener('abort', onOuterAbort);
+      if (this.previewAbort === abort) this.previewAbort = null;
+    }
   }
 
-  /** Stop a running audition and put the transport back where it was (no-op otherwise). */
+  /**
+   * Stop a running audition — including cancelling one that is still downloading, whether that is the
+   * ranged windows or the whole-song fallback underneath them (no-op when nothing is in flight).
+   */
   stopPreview(): void {
+    if (this.previewAbort) {
+      // Whatever this abort takes down may include a whole-song load in flight; the next caller that
+      // wants that song must start its own rather than await this one's corpse.
+      this.loadCancelled = true;
+      this.previewAbort.abort();
+    }
+    this.previewAbort = null;
+    this.audition?.stop();
     const mixer = this.audio?.mixer;
     if (mixer?.isPreviewing) mixer.pause();
   }
 
   /** The song currently being auditioned, or null when nothing is. */
   previewingSongId(): string | null {
+    if (this.audition?.songId) return this.audition.songId;
     const mixer = this.audio?.mixer;
     return mixer?.isPreviewing ? (mixer.manifest?.id ?? this.loadedSongId) : null;
   }
@@ -181,6 +337,7 @@ class SessionRuntime {
    * state). Changing the lanes / mirror convention rebuilds it.
    */
   async ensureVision(req: VisionRequest): Promise<VisionInput> {
+    this.watchScreens();
     const key = visionLaneKey(req);
     if (this.vision && this.visionKey === key) {
       // Hand EVERY lane's calibration over, including a null one. `visionLaneKey` deliberately does not
@@ -233,6 +390,29 @@ class SessionRuntime {
     return this.vision;
   }
 
+  /**
+   * Release the camera unless `screen` is one that needs it within seconds (`screenNeedsCamera`).
+   * Returns true when the device was actually released. The rule in one function so every caller —
+   * and every test — is arguing with the same statement of it.
+   */
+  releaseVisionUnless(screen: Screen): boolean {
+    if (screenNeedsCamera(screen)) return false;
+    if (!this.vision) return false;
+    this.disposeVision();
+    return true;
+  }
+
+  /**
+   * Arm the rule for the whole visit, from the moment a camera first exists. Installed here rather
+   * than in a screen because the screen that OPENS the camera is never the one that is standing
+   * there when it should be closed — a fatal error, a Back button on the ROM screen and a deep link
+   * home all leave play without unmounting anything that knows about the device.
+   */
+  private watchScreens(): void {
+    if (this.screenWatch) return;
+    this.screenWatch = watchScreenChanges((screen) => this.releaseVisionUnless(screen));
+  }
+
   disposeVision(): void {
     if (!this.vision) return;
     try {
@@ -244,10 +424,20 @@ class SessionRuntime {
     this.visionKey = '';
   }
 
-  /** Release everything (leaving the app / a fatal error). */
+  /**
+   * Release everything (leaving the app / a fatal error).
+   *
+   * Called by the app's error boundary (src/App.tsx): a render that throws does not change `screen`,
+   * so neither the screen watch nor the Play screen's effect cleanup fires — and without this the
+   * camera light would stay on above a crashed page for as long as the tab is open.
+   */
   dispose(): void {
+    this.stopPreview();
+    this.audition = null;
     this.runner?.dispose();
     this.runner = null;
+    this.screenWatch?.();
+    this.screenWatch = null;
     this.disposeVision();
     if (this.audio) {
       try {

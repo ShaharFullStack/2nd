@@ -6,16 +6,22 @@
  * held a mixer would tempt exactly that.
  */
 import { create } from 'zustand';
+import { DEFAULT_LANE_REST_SEC, clampLaneRestSec } from '../charts/generate.ts';
 import { DIFFICULTIES, clampWindowScale } from '../engine/difficulty.ts';
 import type { DifficultyName, Fingertip, LaneSpec, Mode, Movement, Side } from '../engine/types.ts';
 import { FINGERTIPS, HAND_MOVEMENTS, LEG_MOVEMENTS } from '../engine/types.ts';
 import type { RomCalibration } from '../vision/calibration.ts';
 import { LATENCY_MAX_MS, LATENCY_MIN_MS, clampLatencyMs } from '../session/latencyAdvice.ts';
-import type { InputMode, SessionConfig, SessionResult } from '../session/types.ts';
-import { readJson, writeJson } from './persist.ts';
+import { clinicalLaneName } from '../session/results.ts';
+import type { InputMode, Patient, SessionConfig, SessionResult } from '../session/types.ts';
+import { DEVICE_TEST_PATIENT_ID, UNASSIGNED_PATIENT_ID } from '../session/types.ts';
+import type { CalibrationsByPatient } from './patients.ts';
+import { deviceTestPatient, makePatient, migrateToPatients, normalizePatientName, unassignedPatient, validatePatients } from './patients.ts';
+import { createListSync, createMapSync, onExternalChange, readJson, writeJson } from './persist.ts';
 
 export type Screen =
   | 'home'
+  | 'patients'
   | 'mode'
   | 'setup'
   | 'camera'
@@ -78,6 +84,18 @@ const LATENCY_KEY = 'latency';
 const LATENCY_META_KEY = 'latencyMeta';
 const CONFIG_KEY = 'lastConfig';
 const CALIBRATION_KEY = 'calibrations';
+/** The patient list. Its ABSENCE is what tells the loader this device predates patient identity. */
+const PATIENTS_KEY = 'patients';
+/** The patient the next session will be recorded against, or absent when nobody has been chosen. */
+const ACTIVE_PATIENT_KEY = 'activePatient';
+/**
+ * How many sessions the retention limit has already deleted, per patient.
+ *
+ * Kept because the deletion itself is invisible: a therapist who sees 100 sessions cannot tell whether
+ * that is all of them. This is what lets the History screen say "and 7 older ones have been deleted"
+ * instead of quietly presenting a truncated record as the whole record.
+ */
+const HISTORY_DROPPED_KEY = 'historyDropped';
 
 /**
  * Input latency used when NOTHING has ever been measured or applied on this device (seconds).
@@ -186,13 +204,29 @@ function validateSettings(raw: unknown): Settings | null {
   };
 }
 
+/**
+ * Reload the stored sessions, repairing the two fields a record written by an older build lacks.
+ *
+ * `movementName` used to be `label`, the renderer's 46-pixel canvas abbreviation ("L knee ext"). The
+ * full clinical name is REBUILT here from the structured fields that were always stored (movement,
+ * side, fingertip) rather than parsed back out of the abbreviation — so an old record gains the right
+ * name, not a guess at one. `patientId` is left alone here; the patient migration owns it.
+ */
 function validateHistory(raw: unknown): SessionResult[] | null {
   if (!Array.isArray(raw)) return null;
   const ok = raw.filter((r) => {
     const v = r as Partial<SessionResult> | null;
     return !!v && typeof v.id === 'string' && typeof v.score === 'number' && Array.isArray(v.lanes);
   }) as SessionResult[];
-  return ok;
+  return ok.map((r) => ({
+    ...r,
+    patientName: typeof r.patientName === 'string' ? r.patientName : '',
+    lanes: r.lanes.map((l) =>
+      typeof l.movementName === 'string' && l.movementName.length > 0
+        ? l
+        : { ...l, movementName: clinicalLaneName({ movement: l.movement, side: l.side, fingertip: l.fingertip }) },
+    ),
+  }));
 }
 
 function validateConfig(raw: unknown): Partial<SessionConfig> | null {
@@ -204,6 +238,7 @@ function validateConfig(raw: unknown): Partial<SessionConfig> | null {
     lanes: lanes.length >= MIN_LANES ? normalizeLanes(lanes.slice(0, MAX_LANES)) : undefined,
     difficulty: r.difficulty === 'easy' || r.difficulty === 'hard' ? r.difficulty : 'medium',
     windowScale: Number.isFinite(r.windowScale) ? clampWindowScale(r.windowScale as number) : 1,
+    laneRestSec: Number.isFinite(r.laneRestSec) ? clampLaneRestSec(r.laneRestSec as number) : DEFAULT_LANE_REST_SEC,
     songId: typeof r.songId === 'string' ? r.songId : DEFAULT_SONG_ID,
   };
 }
@@ -221,8 +256,8 @@ function validateConfig(raw: unknown): Partial<SessionConfig> | null {
  * there. The mirror convention is NOT in the key (it is session-wide, not per-lane), so it stays a
  * boundary check against the lane's live context, not a filing check.
  */
-function validateCalibrations(raw: unknown): Record<string, RomCalibration> | null {
-  if (!raw || typeof raw !== 'object') return null;
+function validateCalibrationMap(raw: unknown): Record<string, RomCalibration> {
+  if (!raw || typeof raw !== 'object') return {};
   const out: Record<string, RomCalibration> = {};
   for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
     const c = v as Partial<RomCalibration> | null;
@@ -238,6 +273,13 @@ function validateCalibrations(raw: unknown): Record<string, RomCalibration> | nu
     }
     out[k] = c as RomCalibration;
   }
+  return out;
+}
+
+/** The same filing check, applied inside each patient's own store of ranges. */
+function validateCalibrationsByPatient(raw: CalibrationsByPatient): CalibrationsByPatient {
+  const out: CalibrationsByPatient = {};
+  for (const [patientId, map] of Object.entries(raw)) out[patientId] = validateCalibrationMap(map);
   return out;
 }
 
@@ -260,6 +302,21 @@ export interface LatencyChange {
 
 export interface AppState {
   screen: Screen;
+  /**
+   * Everyone this device keeps records for. Local only; nothing here ever leaves the browser except
+   * through the therapist's own export.
+   */
+  patients: Patient[];
+  /**
+   * WHO the next session is recorded against, or null when nobody has been chosen.
+   *
+   * Null is a real state and the app is expected to stop there: a device that has just been migrated,
+   * or one whose last patient was deleted, has no honest answer to "whose session is this", and
+   * guessing is the exact failure this identity work exists to prevent.
+   */
+  activePatientId: string | null;
+  /** Sessions already deleted by the retention limit, per patient — what the record is missing. */
+  historyDropped: Record<string, number>;
   /** Screen the user came from, so Back on a leaf screen is not a guess. */
   previousScreen: Screen | null;
   inputMode: InputMode;
@@ -268,13 +325,24 @@ export interface AppState {
   lanes: LaneSpec[];
   difficulty: DifficultyName;
   windowScale: number;
+  /**
+   * THE PRESCRIBED PACING: minimum seconds between two reps in one lane. A therapist control, not a
+   * difficulty side effect — see charts/generate.ts `DEFAULT_LANE_REST_SEC`.
+   */
+  laneRestSec: number;
   songId: string;
   seed: number;
 
   /** Per-lane ROM calibration for the CURRENT prescription (same order as `lanes`). */
   calibrations: (RomCalibration | null)[];
-  /** Every calibration ever captured, keyed movement:side, so a repeat session can offer it. */
+  /**
+   * The ACTIVE PATIENT's stored ranges, keyed movement:side(:fingertip), so their next session can
+   * offer them back. A view of `calibrationsByPatient[activePatientId]`, swapped whole when the
+   * patient changes — a range measured on one person is never in the map another person is offered.
+   */
   savedCalibrations: Record<string, RomCalibration>;
+  /** Every patient's ranges. The persisted shape; `savedCalibrations` is the slice on screen. */
+  calibrationsByPatient: CalibrationsByPatient;
 
   latencyOffsetSec: number;
   /** True when the offset in force came from a measurement (the probe, or a whole run's crossings). */
@@ -296,6 +364,25 @@ export interface AppState {
 
   goto: (screen: Screen) => void;
   setInputMode: (m: InputMode) => void;
+  /** Create a patient and make them the one the next session is recorded against. Returns the id. */
+  addPatient: (name: string) => string;
+  /** Switch patients: swaps in their stored ranges and clears the lane ranges measured for the last. */
+  selectPatient: (id: string) => void;
+  renamePatient: (id: string, name: string) => void;
+  /** Delete a patient. Refused (returns false) while any session is still filed under them. */
+  deletePatient: (id: string) => boolean;
+  /**
+   * Move every session AND every stored range from one patient to another — the fix for the
+   * "unassigned" record once the therapist works out whose those sessions were.
+   */
+  reassignSessions: (fromId: string, toId: string) => number;
+  /**
+   * Select the built-in device-test record, creating it if needed, and return its id.
+   *
+   * The escape hatch for keyboard / autoplay runs, which are the system driving the lanes rather than
+   * a person moving: they need somewhere to go that is not a patient's clinical record.
+   */
+  selectDeviceTestPatient: () => string;
   setMode: (m: Mode) => void;
   setLanes: (lanes: LaneSpec[]) => void;
   setLane: (index: number, patch: Partial<Pick<LaneSpec, 'movement' | 'side' | 'fingertip'>>) => void;
@@ -303,6 +390,8 @@ export interface AppState {
   removeLane: (index: number) => void;
   setDifficulty: (d: DifficultyName) => void;
   setWindowScale: (s: number) => void;
+  /** Set the pacing floor (seconds of rest between reps in one lane); clamped to the safe range. */
+  setLaneRestSec: (sec: number) => void;
   setSong: (id: string) => void;
   setSeed: (seed: number) => void;
   setCalibration: (lane: number, cal: RomCalibration | null) => void;
@@ -316,45 +405,220 @@ export interface AppState {
   applySuggestedLatency: (suggestedMs: number, source?: string) => LatencyChange | null;
   updateSettings: (patch: Partial<Settings>) => void;
   addResult: (r: SessionResult) => void;
+  /** Delete ONE stored session (the therapist's undo for a run that was not a session). */
+  deleteResult: (id: string) => void;
+  /**
+   * Re-file ONE stored session onto another patient. Returns false when there was nothing to move.
+   *
+   * The way back from the likeliest real error in this app: a session recorded against the wrong
+   * person. Without it the only correction is `deleteResult` — destroying a record of work the
+   * patient actually did in order to fix a label — which is not a correction a clinical system may
+   * require. The stored `patientName` is re-stamped with the receiving patient's current name so an
+   * export carries the name the session is now filed under, and `historyDropped` is untouched: what
+   * the retention limit already deleted stayed deleted for the patient it was deleted from.
+   *
+   * A non-camera run can only be moved to the device-test record: the correction must not become the
+   * route by which a bot's score reaches a person's history.
+   */
+  moveResult: (resultId: string, toPatientId: string) => boolean;
+  /** Delete every session belonging to the ACTIVE patient. Other patients are untouched. */
   clearHistory: () => void;
   config: () => SessionConfig;
 }
 
 const persistedSettings = readJson<Settings>(SETTINGS_KEY, DEFAULT_SETTINGS, validateSettings);
-const persistedHistory = readJson<SessionResult[]>(HISTORY_KEY, [], validateHistory);
+const rawHistory = readJson<SessionResult[]>(HISTORY_KEY, [], validateHistory);
 // `null` when the key is absent: "no offset has ever been set on this device" is a different state
 // from "the offset is 0 ms", and the latency screen's skip path turns on the difference.
 const persistedLatency = readJson<number | null>(LATENCY_KEY, null, (raw) => (Number.isFinite(raw) ? (raw as number) : null));
 const persistedLatencyMeta = readJson<LatencyMeta | null>(LATENCY_META_KEY, null, validateLatencyMeta);
 const persistedConfig = readJson<Partial<SessionConfig>>(CONFIG_KEY, {}, validateConfig);
-const persistedCalibrations = readJson<Record<string, RomCalibration>>(CALIBRATION_KEY, {}, validateCalibrations);
+// Read RAW: the shape decides whether this device predates patients, and `migrateToPatients` is the
+// one place allowed to decide what that means. Validation of the ranges themselves happens after.
+const rawCalibrations = readJson<unknown>(CALIBRATION_KEY, {});
+const persistedPatients = readJson<Patient[]>(PATIENTS_KEY, [], validatePatients);
+const persistedActivePatient = readJson<string | null>(ACTIVE_PATIENT_KEY, null, (raw) =>
+  typeof raw === 'string' && raw.length > 0 ? raw : null,
+);
+function validateDropped(raw: unknown): Record<string, number> | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const out: Record<string, number> = {};
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (Number.isFinite(v) && (v as number) > 0) out[k] = Math.floor(v as number);
+  }
+  return out;
+}
+
+const persistedDropped = readJson<Record<string, number>>(HISTORY_DROPPED_KEY, {}, validateDropped);
+
+/**
+ * WHAT HAPPENS TO THE RECORDS THAT WERE ALREADY HERE.
+ *
+ * Sessions and ranges written before this device tracked patients have exactly one honest owner:
+ * "we do not know". They are filed under a visible `unassigned` patient that the therapist can rename
+ * (if these really are one person's) or whose sessions they can move onto a real patient — and,
+ * critically, that record is NOT made active. The next session cannot start until a human says whose
+ * it is, so nothing old is ever re-attributed to whoever opens the app next.
+ */
+const migration = migrateToPatients(rawHistory, rawCalibrations, persistedPatients);
+const persistedHistory = migration.history;
+const persistedCalibrations = validateCalibrationsByPatient(migration.calibrations);
+const initialPatients = migration.patients;
+// A stored selection that no longer names a real patient is not a selection.
+const initialActivePatient = initialPatients.some((p) => p.id === persistedActivePatient) ? persistedActivePatient : null;
+
+/**
+ * THE SHARED COLLECTIONS, AND WHY THEY ARE NOT WRITTEN WITH A BARE `writeJson` ANY MORE.
+ *
+ * Everything below this line is read ONCE, at module load, and every write replays the whole
+ * in-memory copy over the key. With two tabs open on one clinic tablet — the therapist keeps
+ * yesterday's tab open, or opens History beside a running session — the second tab's copy is a
+ * snapshot from before the first tab recorded anything, so its next write DELETED every session,
+ * patient and range the other tab had added since. Silently.
+ *
+ * Each collection now goes through a sync channel (src/state/persist.ts): the write re-reads the key
+ * and carries over anything this tab has never seen, and a `storage` event from another tab is
+ * adopted (see `adoptExternalRecords` at the foot of this file). The STORED SHAPES ARE UNCHANGED —
+ * this is the write mechanism, not the schema.
+ *
+ * Sessions are re-sorted newest-first when a merge brings another tab's runs in, because that is the
+ * order `addResult` maintains and the order every screen reads them in.
+ */
+/**
+ * A repair ran (src/state/persist.ts): another tab's simultaneous write had taken records off disk
+ * and they were put back, alongside that tab's own. The list handed over IS what is on disk, so the
+ * store adopts it — the in-memory copy and the disk copy diverging is the bug this whole mechanism
+ * exists to prevent. `useStore` is defined below and these fire from a lock callback (never during
+ * module evaluation), so the reference is live by the time it is used.
+ */
+function adoptRepaired(patch: () => Partial<AppState>): void {
+  try {
+    useStore.setState(patch());
+  } catch (err) {
+    console.warn('[store] adopting a repaired record list failed', err);
+  }
+}
+
+const historySync = createListSync<SessionResult>(HISTORY_KEY, {
+  idOf: (r) => r.id,
+  validate: validateHistory,
+  order: (a, b) => b.startedAt - a.startedAt,
+  onRepaired: (history) => adoptRepaired(() => ({ history })),
+});
+const patientsSync = createListSync<Patient>(PATIENTS_KEY, {
+  idOf: (p) => p.id,
+  validate: validatePatients,
+  onRepaired: (patients) => adoptRepaired(() => ({ patients })),
+});
+/**
+ * Ranges are merged PER LANE, and the newer capture wins: two tabs calibrating the same patient is
+ * the same therapist working, and the range they measured last is the one they meant. A range with
+ * no `capturedAt` (hand-built, or written by a build that predates the stamp) never displaces a
+ * stamped one.
+ */
+const calibrationSync = createMapSync<Record<string, RomCalibration>>(CALIBRATION_KEY, {
+  validate: (raw) => (raw && typeof raw === 'object' ? validateCalibrationsByPatient(raw as CalibrationsByPatient) : null),
+  mergeValue: (mine, theirs) => {
+    const out: Record<string, RomCalibration> = { ...theirs, ...mine };
+    let changed = false;
+    for (const [lane, cal] of Object.entries(theirs)) {
+      const ours = mine[lane];
+      if (!ours) { changed = true; continue; }
+      if ((cal.capturedAt ?? 0) > (ours.capturedAt ?? 0)) {
+        out[lane] = cal;
+        changed = true;
+      }
+    }
+    return changed ? out : mine;
+  },
+  onRepaired: (map) =>
+    adoptRepaired(() => {
+      const calibrationsByPatient = map as CalibrationsByPatient;
+      const active = useStore.getState().activePatientId;
+      return { calibrationsByPatient, savedCalibrations: (active && calibrationsByPatient[active]) || {} };
+    }),
+});
+/** Deletion counters: the honest reconciliation of "how many were trimmed" is the larger count. */
+const droppedSync = createMapSync<number>(HISTORY_DROPPED_KEY, {
+  validate: validateDropped,
+  mergeValue: (mine, theirs) => Math.max(mine, theirs),
+  onRepaired: (historyDropped) => adoptRepaired(() => ({ historyDropped })),
+});
+
+// What THIS tab has seen. Anything on disk outside these sets belongs to another tab and is kept.
+historySync.know(persistedHistory);
+patientsSync.know(initialPatients);
+calibrationSync.know(persistedCalibrations);
+droppedSync.know(persistedDropped);
+
+if (migration.migrated) {
+  patientsSync.write(initialPatients);
+  historySync.write(persistedHistory);
+  calibrationSync.write(persistedCalibrations);
+  if (initialActivePatient !== persistedActivePatient) writeJson(ACTIVE_PATIENT_KEY, initialActivePatient);
+}
 
 const initialMode: Mode = persistedConfig.mode ?? 'leg';
 const initialLanes = persistedConfig.lanes ?? defaultLanes(initialMode);
 
-/** Keep at most this many sessions in localStorage (a clinic tablet is shared and quota is small). */
+/**
+ * Sessions kept per patient. Older ones are deleted on write — and the deletion is COUNTED
+ * (`historyDropped`) and stated on the History screen, because a record that silently stops at 100 is
+ * indistinguishable from a complete one. The per-patient limit also means a busy patient can never
+ * evict another patient's record, which a device-wide cap did.
+ */
 export const MAX_HISTORY = 100;
 
 export const useStore = create<AppState>((set, get) => {
   const persistSettings = (s: Settings): void => {
     if (!writeJson(SETTINGS_KEY, s)) set({ persistenceFailed: true });
   };
+  /**
+   * Sessions, reconciled with whatever another tab has recorded since this one loaded. When the
+   * merge brings runs in, the store ADOPTS the merged list: the in-memory copy and the disk copy
+   * must not diverge, or the next write would drop the other tab's runs again.
+   *
+   * Safe to call from anywhere `set` is legal — never from inside a `set` updater.
+   */
   const persistHistory = (h: SessionResult[]): void => {
-    if (!writeJson(HISTORY_KEY, h)) set({ persistenceFailed: true });
+    const { ok, merged, changed } = historySync.write(h);
+    if (!ok) set({ persistenceFailed: true });
+    if (changed) set({ history: merged });
   };
   // Calibrations are persisted through the same failure-reporting path as settings and history: on a
   // shared clinic tablet the quota is small, and a write that silently fails loses every range the
   // therapist just measured with nothing on screen to say so (see `persistenceFailed`, surfaced on the
   // ROM calibration screen).
   // Returns the flag rather than calling `set` because its only caller is inside a `set` updater.
-  const persistCalibrations = (c: Record<string, RomCalibration>): boolean => writeJson(CALIBRATION_KEY, c);
+  // Returns the reconciled map alongside the verdict rather than calling `set`, because one of its
+  // callers is inside a `set` updater (`setCalibration`) and must fold the result into its own return.
+  const persistCalibrations = (c: CalibrationsByPatient): { ok: boolean; merged: CalibrationsByPatient } => {
+    const { ok, merged } = calibrationSync.write(c);
+    return { ok, merged };
+  };
+  /**
+   * The patient list, reconciled with the other tabs'. Returns what was actually written so a caller
+   * inside a `set` updater can put the merged list into state; callers outside one can ignore it (the
+   * store adopts it here).
+   *
+   * `activePatientId` is deliberately NOT reconciled: it is this tab's selection, not a shared record.
+   */
+  const persistPatients = (list: Patient[], activeId: string | null): Patient[] => {
+    const { ok, merged, changed } = patientsSync.write(list);
+    if (!ok || !writeJson(ACTIVE_PATIENT_KEY, activeId)) set({ persistenceFailed: true });
+    return changed ? merged : list;
+  };
+  const persistDropped = (d: Record<string, number>): Record<string, number> => droppedSync.write(d).merged;
   const persistConfig = (): void => {
     const s = get();
-    writeJson(CONFIG_KEY, { mode: s.mode, lanes: s.lanes, difficulty: s.difficulty, windowScale: s.windowScale, songId: s.songId });
+    writeJson(CONFIG_KEY, { mode: s.mode, lanes: s.lanes, difficulty: s.difficulty, windowScale: s.windowScale, laneRestSec: s.laneRestSec, songId: s.songId });
   };
 
   return {
     screen: 'home',
+    patients: initialPatients,
+    activePatientId: initialActivePatient,
+    historyDropped: persistedDropped,
     previousScreen: null,
     inputMode: 'camera',
 
@@ -362,11 +626,13 @@ export const useStore = create<AppState>((set, get) => {
     lanes: initialLanes,
     difficulty: persistedConfig.difficulty ?? 'medium',
     windowScale: persistedConfig.windowScale ?? 1,
+    laneRestSec: persistedConfig.laneRestSec ?? DEFAULT_LANE_REST_SEC,
     songId: persistedConfig.songId ?? DEFAULT_SONG_ID,
     seed: 1,
 
     calibrations: initialLanes.map(() => null),
-    savedCalibrations: persistedCalibrations,
+    savedCalibrations: (initialActivePatient && persistedCalibrations[initialActivePatient]) || {},
+    calibrationsByPatient: persistedCalibrations,
 
     latencyOffsetSec: persistedLatency ?? 0,
     // Provenance survives the reload with the number it describes. It used to be reset to
@@ -383,6 +649,120 @@ export const useStore = create<AppState>((set, get) => {
 
     goto: (screen) => set((s) => (s.screen === screen ? s : { screen, previousScreen: s.screen })),
     setInputMode: (inputMode) => set({ inputMode }),
+
+    addPatient: (name) => {
+      const patient = makePatient(name);
+      set((s) => ({ patients: [...s.patients, patient] }));
+      get().selectPatient(patient.id);
+      return patient.id;
+    },
+
+    /**
+     * Switching patients swaps the WHOLE calibration context, not just a name in a header.
+     *
+     * The per-lane ranges in `calibrations` were measured on the person who is leaving the chair, so
+     * they are dropped and re-seeded from the new patient's own stored ranges — nothing measured on
+     * one body can survive into a session recorded against another. (The calibration screen refuses
+     * such a range as well: two independent defences, because this is the one that must not fail.)
+     */
+    selectPatient: (id) =>
+      set((s) => {
+        const patient = s.patients.find((p) => p.id === id);
+        if (!patient) return s;
+        const saved = s.calibrationsByPatient[id] ?? {};
+        const patients = persistPatients(s.patients.map((p) => (p.id === id ? { ...p, lastUsedAt: Date.now() } : p)), id);
+        return {
+          patients,
+          activePatientId: id,
+          savedCalibrations: saved,
+          calibrations: s.lanes.map((l) => saved[calibrationKey(l)] ?? null),
+        };
+      }),
+
+    renamePatient: (id, name) =>
+      set((s) => {
+        const clean = normalizePatientName(name);
+        if (!clean) return s;
+        // A renamed "unassigned" record is a claim about whose those sessions are, so the badge goes:
+        // the therapist has just answered the question the record was holding open.
+        const patients = persistPatients(
+          s.patients.map((p) => (p.id === id ? { ...p, name: clean, unassigned: undefined } : p)),
+          s.activePatientId,
+        );
+        return { patients };
+      }),
+
+    deletePatient: (id) => {
+      const s = get();
+      // Refused while sessions remain: deleting a patient must never be a way to lose a record by
+      // accident. The therapist deletes the sessions (or exports them) first, deliberately.
+      if (s.history.some((r) => r.patientId === id)) return false;
+      const patients = s.patients.filter((p) => p.id !== id);
+      const calibrationsByPatient = { ...s.calibrationsByPatient };
+      delete calibrationsByPatient[id];
+      const activePatientId = s.activePatientId === id ? null : s.activePatientId;
+      const stored = persistCalibrations(calibrationsByPatient);
+      set({
+        patients: persistPatients(patients, activePatientId),
+        calibrationsByPatient: stored.merged,
+        activePatientId,
+        savedCalibrations: (activePatientId && stored.merged[activePatientId]) || {},
+        calibrations: activePatientId === s.activePatientId ? s.calibrations : s.lanes.map(() => null),
+        persistenceFailed: s.persistenceFailed || !stored.ok,
+      });
+      return true;
+    },
+
+    reassignSessions: (fromId, toId) => {
+      const s = get();
+      if (fromId === toId || !s.patients.some((p) => p.id === toId)) return 0;
+      const target = s.patients.find((p) => p.id === toId);
+      const moved = s.history.filter((r) => r.patientId === fromId);
+      if (moved.length === 0 && !s.calibrationsByPatient[fromId]) return 0;
+      const history = s.history.map((r) =>
+        r.patientId === fromId ? { ...r, patientId: toId, patientName: target?.name ?? r.patientName } : r,
+      );
+      // The ranges move with the sessions: they were measured on the same body, and leaving them
+      // behind would mean the receiving patient is offered nothing while an orphan map keeps a range
+      // nobody can be handed.
+      const calibrationsByPatient = { ...s.calibrationsByPatient };
+      const from = calibrationsByPatient[fromId];
+      if (from) {
+        // RE-STAMPED, not just re-filed. Each range carries the patient it was measured on, and the
+        // ROM screen refuses one stamped with anybody else (vision/calibration.ts `patientMismatch`).
+        // A reassignment is a therapist ASSERTING that this body is that person; leaving the old stamp
+        // on would have the app answer that assertion with "measured on a different patient" and force
+        // a re-calibration it cannot justify — the stamp, not the body, is what disagreed.
+        const restamped: Record<string, RomCalibration> = {};
+        for (const [k, cal] of Object.entries(from)) restamped[k] = { ...cal, patient: toId };
+        calibrationsByPatient[toId] = { ...restamped, ...(calibrationsByPatient[toId] ?? {}) };
+        delete calibrationsByPatient[fromId];
+      }
+      const dropped = { ...s.historyDropped };
+      if (dropped[fromId]) {
+        dropped[toId] = (dropped[toId] ?? 0) + dropped[fromId];
+        delete dropped[fromId];
+      }
+      const stored = persistCalibrations(calibrationsByPatient);
+      set({
+        history,
+        calibrationsByPatient: stored.merged,
+        historyDropped: persistDropped(dropped),
+        savedCalibrations: (s.activePatientId && stored.merged[s.activePatientId]) || {},
+        persistenceFailed: s.persistenceFailed || !stored.ok,
+      });
+      persistHistory(history);
+      return moved.length;
+    },
+
+    selectDeviceTestPatient: () => {
+      const s = get();
+      if (!s.patients.some((p) => p.id === DEVICE_TEST_PATIENT_ID)) {
+        set({ patients: [...s.patients, deviceTestPatient()] });
+      }
+      get().selectPatient(DEVICE_TEST_PATIENT_ID);
+      return DEVICE_TEST_PATIENT_ID;
+    },
 
     setMode: (mode) =>
       set((s) => {
@@ -450,6 +830,11 @@ export const useStore = create<AppState>((set, get) => {
       persistConfig();
     },
 
+    setLaneRestSec: (sec) => {
+      set({ laneRestSec: clampLaneRestSec(sec) });
+      persistConfig();
+    },
+
     setSong: (songId) => {
       set({ songId });
       persistConfig();
@@ -464,8 +849,23 @@ export const useStore = create<AppState>((set, get) => {
         calibrations[lane] = cal;
         const savedCalibrations = { ...s.savedCalibrations };
         if (cal) savedCalibrations[calibrationKey(s.lanes[lane])] = cal;
-        const stored = persistCalibrations(savedCalibrations);
-        return { calibrations, savedCalibrations, persistenceFailed: s.persistenceFailed || !stored };
+        // Filed under the patient it was measured on. With no patient selected the range is used for
+        // this session but NOT stored: there is no honest key to store it under, and a range in the
+        // wrong patient's drawer is exactly what "reuse last session's range" would hand over next.
+        const calibrationsByPatient = s.activePatientId
+          ? { ...s.calibrationsByPatient, [s.activePatientId]: savedCalibrations }
+          : s.calibrationsByPatient;
+        const stored = s.activePatientId
+          ? persistCalibrations(calibrationsByPatient)
+          : { ok: true, merged: calibrationsByPatient };
+        return {
+          calibrations,
+          // The merged map is what is on disk, so it is what this tab holds: another tab's ranges for
+          // other patients (and for lanes this one has not measured) survive here too.
+          savedCalibrations: s.activePatientId ? (stored.merged[s.activePatientId] ?? savedCalibrations) : savedCalibrations,
+          calibrationsByPatient: stored.merged,
+          persistenceFailed: s.persistenceFailed || !stored.ok,
+        };
       }),
 
     clearCalibrations: () => set((s) => ({ calibrations: s.lanes.map(() => null) })),
@@ -503,20 +903,150 @@ export const useStore = create<AppState>((set, get) => {
       persistSettings(settings);
     },
 
-    addResult: (r) => {
-      const history = [r, ...get().history].slice(0, MAX_HISTORY);
-      set({ history, lastResult: r });
+    addResult: (record) => {
+      const s = get();
+      // A record with no patient on it is not a record of anybody. It cannot be dropped (the patient
+      // did the work) and it must not be attributed to whoever is selected NOW, so it goes where every
+      // other ownerless record goes: the unassigned bucket, visible and re-assignable.
+      //
+      // AND: a run the SYSTEM drove is not this person's record, whoever was selected when it started.
+      // A keyboard or autoplay run is the bot's score, its reps and its ROM; filed under a patient it
+      // inflates their session count, spends their retention budget and sits inside their clinical
+      // history reading "not measured". Those runs go to the built-in device-test record — which is
+      // exactly what patients.ts `deviceTestPatient` says they do, now enforced rather than asserted.
+      const devInput = record.inputMode !== 'camera';
+      const needsDeviceTest = devInput && !s.patients.some((p) => p.id === DEVICE_TEST_PATIENT_ID);
+      const needsUnassigned = !devInput && !record.patientId && !s.patients.some((p) => p.id === UNASSIGNED_PATIENT_ID);
+      const r = devInput
+        ? { ...record, patientId: DEVICE_TEST_PATIENT_ID, patientName: 'Device test (not a patient)' }
+        : record.patientId
+          ? record
+          : { ...record, patientId: UNASSIGNED_PATIENT_ID, patientName: record.patientName || 'Unassigned records' };
+      if (needsDeviceTest || needsUnassigned) {
+        const patients = [...s.patients, needsDeviceTest ? deviceTestPatient() : unassignedPatient()];
+        set({ patients: persistPatients(patients, s.activePatientId) });
+      }
+      const all = [r, ...get().history];
+      // The cap is PER PATIENT: one patient's twentieth session must not push another patient's
+      // first one off the device. Everything trimmed is counted, and the History screen says so.
+      const mine = all.filter((x) => x.patientId === r.patientId);
+      const drop = new Set(mine.slice(MAX_HISTORY).map((x) => x.id));
+      const history = drop.size > 0 ? all.filter((x) => !drop.has(x.id)) : all;
+      const historyDropped = drop.size > 0
+        ? { ...s.historyDropped, [r.patientId]: (s.historyDropped[r.patientId] ?? 0) + drop.size }
+        : s.historyDropped;
+      set({ history, lastResult: r, historyDropped: drop.size > 0 ? persistDropped(historyDropped) : historyDropped });
+      persistHistory(history);
+      // Recording a session is what makes a patient "recent" — the picker orders on it. Read the
+      // list back out of the store: the unassigned fallback above may have just added to it.
+      const after = get();
+      const patients = after.patients.map((p) => (p.id === r.patientId ? { ...p, lastUsedAt: Date.now() } : p));
+      set({ patients: persistPatients(patients, after.activePatientId) });
+    },
+
+    deleteResult: (id) => {
+      const s = get();
+      const history = s.history.filter((r) => r.id !== id);
+      if (history.length === s.history.length) return;
+      set({ history, lastResult: s.lastResult?.id === id ? null : s.lastResult });
       persistHistory(history);
     },
 
+    moveResult: (resultId, toPatientId) => {
+      const s = get();
+      const target = s.patients.find((p) => p.id === toPatientId);
+      const current = s.history.find((r) => r.id === resultId);
+      if (!target || !current || current.patientId === toPatientId) return false;
+      // The correction may not undo the invariant above: a keyboard/autoplay run is the bot's score
+      // and cannot be moved INTO a person's clinical record, only between non-person records.
+      if (current.inputMode !== 'camera' && !target.deviceTest) return false;
+      const moved = { ...current, patientId: toPatientId, patientName: target.name };
+      const history = s.history.map((r) => (r.id === resultId ? moved : r));
+      set({ history, lastResult: s.lastResult?.id === resultId ? moved : s.lastResult });
+      persistHistory(history);
+      return true;
+    },
+
     clearHistory: () => {
-      set({ history: [] });
-      persistHistory([]);
+      const s = get();
+      // Scoped to the patient on screen. A device-wide wipe behind one confirm dialog is how one
+      // patient's tidy-up deletes another patient's record.
+      const active = s.activePatientId;
+      // NO PATIENT IS A NO-OP, not "everybody". There is no confirm dialog in this app worded for a
+      // device-wide wipe, and the only one that reaches here is worded for a single patient; a
+      // fallback that deleted every patient's sessions behind it is a data-loss bug waiting for a
+      // refactor to expose it.
+      if (active === null) return;
+      const history = s.history.filter((r) => r.patientId !== active);
+      const historyDropped = { ...s.historyDropped };
+      delete historyDropped[active];
+      set({ history, historyDropped: persistDropped(historyDropped), lastResult: null });
+      persistHistory(history);
     },
 
     config: () => {
       const s = get();
-      return { mode: s.mode, lanes: s.lanes, difficulty: s.difficulty, windowScale: s.windowScale, songId: s.songId, seed: s.seed };
+      return {
+        patientId: s.activePatientId ?? '',
+        mode: s.mode,
+        lanes: s.lanes,
+        difficulty: s.difficulty,
+        windowScale: s.windowScale,
+        laneRestSec: s.laneRestSec,
+        songId: s.songId,
+        seed: s.seed,
+      };
     },
   };
 });
+
+/**
+ * ANOTHER TAB JUST WROTE. Adopt it.
+ *
+ * The other tab's write already reconciled in everything of ours it could see (see the sync channels
+ * above), so what is on disk now is the union of both tabs — which makes adopting it wholesale the
+ * thing that both brings its new sessions here AND propagates a deletion it made. Without this, two
+ * tabs diverge until one of them overwrites the other.
+ *
+ * WHAT IS NOT ADOPTED, and why:
+ *   - `activePatientId` / `calibrations`: the patient in the chair and the ranges the run in progress
+ *     is being judged against belong to THIS tab's session. A therapist looking something up in a
+ *     second tab must not re-point the session running in the first one.
+ *   - `settings`, the last config, the latency offset: device preferences, last-write-wins, and
+ *     changing scroll speed or judgment offset under a running session would be worse than stale.
+ *   - `lastResult`: the results screen shows the run this tab just finished.
+ * Only the RECORDS — the things that cannot be reconstructed if they are lost — are adopted.
+ */
+function adoptExternalRecords(name: string): void {
+  const s = useStore.getState();
+  if (name === HISTORY_KEY) {
+    useStore.setState({ history: historySync.read() });
+  } else if (name === PATIENTS_KEY) {
+    useStore.setState({ patients: patientsSync.read() });
+  } else if (name === CALIBRATION_KEY) {
+    const calibrationsByPatient = calibrationSync.read() as CalibrationsByPatient;
+    useStore.setState({
+      calibrationsByPatient,
+      savedCalibrations: (s.activePatientId && calibrationsByPatient[s.activePatientId]) || {},
+    });
+  } else if (name === HISTORY_DROPPED_KEY) {
+    useStore.setState({ historyDropped: droppedSync.read() });
+  }
+}
+
+/**
+ * Resolves once every clobber repair scheduled so far has run (src/state/persist.ts). Exported for
+ * tests, which need a deterministic point after a simulated two-tab collision; nothing in the app
+ * waits on it — the repair is fire-and-forget by design.
+ */
+export function recordsSettled(): Promise<void> {
+  return Promise.all([historySync.settled(), patientsSync.settled(), calibrationSync.settled(), droppedSync.settled()]).then(
+    () => undefined,
+  );
+}
+
+/** Live in the browser only; the unsubscribe is exported for tests. */
+export const stopCrossTabSync = onExternalChange(
+  [HISTORY_KEY, PATIENTS_KEY, CALIBRATION_KEY, HISTORY_DROPPED_KEY],
+  adoptExternalRecords,
+);

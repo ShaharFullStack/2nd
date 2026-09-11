@@ -181,7 +181,9 @@ export class RhythmEngine {
     }
     const r = this.judge.onInputDetailed(e.lane, songTime);
     if (r.hit) this.lastHit = this.scoring.apply(r.hit);
-    else this.scoring.recordUnmatchedInput(e.lane, r.nearestDeltaMs);
+    // WHICH note the movement was nearest, not only how far off it was: `Scoring` counts a missed
+    // note as ANSWERED when a movement landed on it, and that count is what the HUD gauge shows.
+    else this.scoring.recordUnmatchedInput(e.lane, r.nearestDeltaMs, r.nearestNoteId);
     return r;
   }
 

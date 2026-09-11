@@ -1,13 +1,25 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { DEFAULT_DUCK_OPTIONS, assignLaneStems, duckGainForMisses, gainToDb } from '../audio/ducking.ts';
 import { attributionText } from '../audio/manifest.ts';
 import type { SongEntry } from '../audio/manifest.ts';
+import {
+  MAX_LANE_REST_SEC,
+  MIN_LANE_REST_SEC,
+  chartDose,
+  clampLaneRestSec,
+  generateChartDetailed,
+  repsPerMinuteAt,
+} from '../charts/generate.ts';
 import { DIFFICULTIES, DIFFICULTY_NAMES, windowsFor } from '../engine/difficulty.ts';
 import { FINGERTIPS } from '../engine/types.ts';
 import type { DifficultyName, Fingertip, LaneSpec, Side } from '../engine/types.ts';
+import { SILENT_GRID, songGridOf } from '../session/chart.ts';
+import { formatDuration } from '../session/results.ts';
 import { runtime } from '../session/runtime.ts';
 import { MAX_LANES, MIN_LANES, laneFingertip, movementsFor, useStore } from '../state/store.ts';
 import { MOVEMENT_INFO, laneConflicts, movementInstructions } from '../vision/features.ts';
 import { Screen, Toast, TopBar } from './common.tsx';
+import PatientBanner from './PatientBanner.tsx';
 
 const DIFFICULTY_BLURB: Record<DifficultyName, string> = {
   easy: 'Half the range counts as a hit, one note every other beat. Start here.',
@@ -16,6 +28,27 @@ const DIFFICULTY_BLURB: Record<DifficultyName, string> = {
 };
 
 const FINGERTIP_LABEL: Record<Fingertip, string> = { index: 'Index', middle: 'Middle', ring: 'Ring', pinky: 'Little' };
+
+/** Bytes as a therapist reads them: "4.3 MB", "812 kB". */
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 kB';
+  if (bytes < 1_000_000) return `${Math.max(1, Math.round(bytes / 1000))} kB`;
+  return `${(bytes / 1_000_000).toFixed(1)} MB`;
+}
+
+/**
+ * The one line under a Listen button that is mid-download. It says which of the two paths the press
+ * took, because they differ by an order of magnitude: the ranged audition fetches the twelve seconds
+ * it plays, and the fallback fetches the entire song because the server refused to send less.
+ */
+function previewCostLabel(cost: { bytes: number; total: number | null; full: boolean } | null): string {
+  // Nothing has arrived yet — "0 kB" would be a figure pretending to be progress. No "press to
+  // cancel" hint on any of these: the button beside them reads Stop, which is the affordance itself.
+  if (!cost || (!cost.full && cost.bytes <= 0)) return 'Loading the preview…';
+  if (!cost.full) return `Loading 12 s · ${formatBytes(cost.bytes)}`;
+  const of = cost.total ? ` of ${formatBytes(cost.total)}` : '';
+  return `Whole song · ${formatBytes(cost.bytes)}${of} — this server will not send just the preview`;
+}
 
 function laneLabel(l: LaneSpec): string {
   const tip = laneFingertip(l);
@@ -37,6 +70,9 @@ export default function TherapistSetup() {
   const songId = useStore((s) => s.songId);
   const setSong = useStore((s) => s.setSong);
   const inputMode = useStore((s) => s.inputMode);
+  const seed = useStore((s) => s.seed);
+  const laneRestSec = useStore((s) => s.laneRestSec);
+  const setLaneRestSec = useStore((s) => s.setLaneRestSec);
 
   const [catalog, setCatalog] = useState<SongEntry[] | null>(null);
   const [catalogError, setCatalogError] = useState<string | null>(null);
@@ -71,6 +107,22 @@ export default function TherapistSetup() {
   const [previewLoading, setPreviewLoading] = useState<string | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
 
+  /**
+   * WHAT THIS AUDITION IS COSTING, AND HOW TO STOP IT.
+   *
+   * An audition is normally 4 MB of ranged requests and a quarter of a second. But the moment the
+   * server (or a proxy) refuses `Range`, it falls back to loading the whole song — 34 MB for the demo
+   * tracks — and on clinic wi-fi that is a button that says "… loading" for a minute with every
+   * Listen disabled and no way out. The therapist has ninety seconds between patients; a press they
+   * cannot take back is the expensive failure here, not the megabytes.
+   *
+   * So the press reports itself: bytes so far, which path it took, and the button that started it
+   * stays LIVE as its own Stop. `cancel` aborts the ranged fetches and, on the fallback, unloads the
+   * mixer mid-download.
+   */
+  const previewAbort = useRef<AbortController | null>(null);
+  const [previewCost, setPreviewCost] = useState<{ bytes: number; total: number | null; full: boolean } | null>(null);
+
   // The audition stops itself after ~12 s (and on any transport call), so the button state has to be
   // read back from the mixer rather than assumed. Cheap poll, no per-frame React work.
   useEffect(() => {
@@ -88,56 +140,129 @@ export default function TherapistSetup() {
   useEffect(
     () => () => {
       previewSeq.current++;
+      previewAbort.current?.abort();
+      previewAbort.current = null;
       runtime.stopPreview();
     },
     [],
   );
 
   const stopPreview = useCallback(() => {
+    previewAbort.current?.abort();
+    previewAbort.current = null;
     runtime.stopPreview();
     setPreviewing(null);
     setPreviewLoading(null);
+    setPreviewCost(null);
   }, []);
 
   const togglePreview = useCallback(
     (entry: SongEntry) => {
       setPreviewError(null);
-      if (previewing === entry.id) {
+      // The same button is the stop, whether the audition is PLAYING or still downloading. A press
+      // that cannot be taken back is the thing this screen must never have.
+      if (previewing === entry.id || previewLoading === entry.id) {
         previewSeq.current++;
         stopPreview();
         return;
       }
       const seq = ++previewSeq.current;
+      const abort = new AbortController();
+      previewAbort.current = abort;
       setPreviewLoading(entry.id);
+      setPreviewCost({ bytes: 0, total: null, full: false });
+      const fresh = (): boolean => previewSeq.current === seq;
       // Called straight from the click handler: this is the gesture that creates the AudioContext.
       runtime
-        .previewSong(entry.id)
+        .previewSong(entry.id, undefined, {
+          signal: abort.signal,
+          // The cheap path: bytes of the ranged windows, counted as each stem lands.
+          onProgress: (p) => fresh() && setPreviewCost({ bytes: p.bytes, total: null, full: false }),
+          // The expensive path. Receiving ANY of these means the audition fell back to the whole
+          // song, which is the fact the therapist is owed before they wait for it.
+          onLoadProgress: (p) =>
+            fresh() && setPreviewCost({ bytes: p.bytesLoaded, total: p.bytesTotalKnown ? p.bytesTotal : null, full: true }),
+        })
         .then((manifest) => {
-          if (previewSeq.current !== seq) {
+          if (!fresh()) {
             // Superseded by a stop or by leaving the screen — but the load may still have reached the
             // mixer, so silence it rather than leaving a song playing on an abandoned screen.
             if (runtime.previewingSongId() === entry.id) runtime.stopPreview();
             return;
           }
           setPreviewLoading(null);
+          setPreviewCost(null);
           if (!manifest) {
+            // A cancel is a decision, not a failure: it says nothing on screen beyond going quiet.
+            if (abort.signal.aborted) return;
             setPreviewError(`"${entry.manifest?.title ?? entry.id}" has no downloaded stems to play.`);
             return;
           }
           setPreviewing(entry.id);
         })
         .catch((err: unknown) => {
-          if (previewSeq.current !== seq) return;
+          if (!fresh()) return;
           setPreviewLoading(null);
+          setPreviewCost(null);
+          if (abort.signal.aborted || (err as Error)?.name === 'AbortError') return;
           setPreviewError(err instanceof Error ? err.message : String(err));
         });
     },
-    [previewing, stopPreview],
+    [previewing, previewLoading, stopPreview],
   );
 
   const conflicts = useMemo(() => laneConflicts(lanes), [lanes]);
+  // No patient is as blocking as a lane conflict: this is the last screen before a recording, and a
+  // session with nobody to record it against has nowhere honest to go.
+  const activePatientId = useStore((s) => s.activePatientId);
+  const activePatient = useStore((s) => s.patients).find((p) => p.id === activePatientId) ?? null;
+  const noPatient = activePatientId === null;
+  // The built-in device-test record is not a person. A keyboard/autoplay run belongs there; a CAMERA
+  // run measures somebody's range of motion and must never be filed into a bucket shared by every
+  // demo this tablet has ever run. Refused here exactly as a missing patient is.
+  const deviceTestCamera = inputMode === 'camera' && !!activePatient?.deviceTest;
   const blocking = conflicts.filter((c) => c.severity === 'error');
+  const cannotStart = blocking.length > 0 || noPatient || deviceTestCamera;
   const movements = movementsFor(mode);
+
+  const selected = catalog?.find((e) => e.id === songId) ?? null;
+
+  /**
+   * THE DOSE, measured with the app's own generator on the song that is actually prescribed.
+   *
+   * A therapist prescribing exercise is prescribing a number of repetitions at a rate, and until this
+   * card existed the Setup screen never said either one: "medium, 2 lanes" silently meant 189 notes,
+   * ~95 reps per limb at ~58 reps/min, and the figure moved whenever the difficulty, the lane count
+   * or the song changed for unrelated reasons. Generating the real chart (same seed, same pacing) is
+   * the only honest way to answer it — the density budget is not a closed form.
+   */
+  const dose = useMemo(() => {
+    const grid = selected?.manifest ? songGridOf(selected.manifest) : SILENT_GRID;
+    try {
+      const result = generateChartDetailed(grid, lanes.length, difficulty, seed, {
+        minLaneSpacingSec: clampLaneRestSec(laneRestSec),
+      });
+      return { ...chartDose(result.chart), warnings: result.warnings, silent: !selected?.manifest };
+    } catch {
+      return null;
+    }
+  }, [selected, lanes.length, difficulty, seed, laneRestSec]);
+
+  /** Which stem each lane's misses dim (audio/ducking.ts) — the mix the patient will hear. */
+  const mix = useMemo(() => {
+    const m = selected?.manifest;
+    if (!m) return null;
+    return assignLaneStems(m.stems.map((st) => st.id), m.playerStem, lanes.length, lanes.map(laneLabel));
+  }, [selected, lanes]);
+  const stepDb = Math.round(-gainToDb(duckGainForMisses(1)));
+  const floorDb = Math.round(-gainToDb(DEFAULT_DUCK_OPTIONS.missGain));
+
+  /** One place that clamps and quantises the pacing, whichever control moved it. */
+  const setPacing = (value: number) => {
+    if (!Number.isFinite(value)) return;
+    setLaneRestSec(clampLaneRestSec(Math.round(value * 10) / 10));
+  };
+  const stepPacing = (delta: number) => setPacing(laneRestSec + delta);
 
   const start = () => {
     // The audition is a temporary segment the mixer unwinds; stopping it here is belt-and-braces so
@@ -154,11 +279,30 @@ export default function TherapistSetup() {
         title={mode === 'leg' ? 'Prescribe the leg session' : 'Prescribe the hand session'}
         onBack={() => goto('mode')}
         right={
-          <button className="btn btn-primary btn-lg" disabled={blocking.length > 0} onClick={start} data-testid="setup-start">
+          <button className="btn btn-primary btn-lg" disabled={cannotStart} onClick={start} data-testid="setup-start">
             {inputMode === 'camera' ? 'Set up camera →' : 'Start session →'}
           </button>
         }
       />
+
+      {/* WHOSE SESSION THIS IS, on the screen where it is prescribed — the last place to catch a
+          wrong patient before the record exists. */}
+      <PatientBanner blocking />
+      {deviceTestCamera && (
+        <div className="toast toast-bad" data-testid="setup-device-test-block">
+          <div className="row">
+            <span>
+              <b>This is the device-test record, not a patient.</b> Keyboard and autoplay runs are filed
+              here; a camera session measures a real range of motion and cannot be. Choose the patient
+              this session is for.
+            </span>
+            <div className="grow" />
+            <button className="btn btn-primary" onClick={() => goto('patients')} data-testid="setup-choose-patient">
+              Choose patient
+            </button>
+          </div>
+        </div>
+      )}
 
       <div className="card stack">
         <div className="row">
@@ -285,6 +429,163 @@ export default function TherapistSetup() {
         </div>
       </div>
 
+      <div className="card stack" data-testid="setup-dose">
+        <div className="row">
+          <h3>Dose</h3>
+          <span className="dim">What this prescription asks the patient's body to do, before you start it.</span>
+        </div>
+
+        {dose === null ? (
+          <Toast kind="bad">This song's beat grid cannot be charted, so the dose cannot be measured.</Toast>
+        ) : (
+          <>
+            <div className="card-grid">
+              <div className="stack" style={{ gap: 4 }}>
+                <div className="eyebrow">Reps per lane</div>
+                <div className="big-number mono" data-testid="dose-reps-per-lane">{Math.round(dose.repsPerLane)}</div>
+                <div className="dim">{dose.notes} notes over {formatDuration(dose.spanSec)} of movement</div>
+              </div>
+              <div className="stack" style={{ gap: 4 }}>
+                <div className="eyebrow">Reps per minute, each limb</div>
+                <div className="big-number mono" data-testid="dose-reps-per-min">{Math.round(dose.repsPerMinPerLane)}</div>
+                <div className="dim">the rate ONE limb is asked to work at</div>
+              </div>
+              <div className="stack" style={{ gap: 4 }}>
+                <div className="eyebrow">Reps per minute, whole body</div>
+                <div className="big-number mono">{Math.round(dose.totalRepsPerMin)}</div>
+                <div className="dim">{lanes.length} lanes together</div>
+              </div>
+            </div>
+
+            <ul className="list-reset dim" style={{ display: 'flex', gap: 18, flexWrap: 'wrap' }}>
+              {lanes.map((l, i) => (
+                <li key={i} data-testid={`dose-lane-${i}`}>
+                  <b>{dose.perLane[i] ?? 0}</b> × {laneLabel(l)}
+                </li>
+              ))}
+            </ul>
+
+            {dose.silent && (
+              <span className="dim">
+                No audio is downloaded for this song, so the dose is measured on its beat grid — the reps are real, the
+                music is not.
+              </span>
+            )}
+          </>
+        )}
+
+        <div className="stack" style={{ gap: 6 }} data-testid="setup-pacing">
+          <div className="row">
+            <h4 style={{ margin: 0 }}>Pacing — rest between two reps of the SAME limb</h4>
+            <div className="grow" />
+            {/* A specific 1.5 s on a shared tablet cannot depend on landing a drag: the value is
+                typed or stepped, and the slider is the coarse control beside it. */}
+            <button
+              className="btn btn-ghost"
+              onClick={() => stepPacing(-0.1)}
+              disabled={laneRestSec <= MIN_LANE_REST_SEC + 1e-6}
+              aria-label="Less rest between reps (0.1 s faster)"
+              data-testid="pacing-down"
+            >
+              − 0.1 s
+            </button>
+            <input
+              className="control mono"
+              type="number"
+              min={MIN_LANE_REST_SEC}
+              max={MAX_LANE_REST_SEC}
+              step={0.1}
+              style={{ width: 96, textAlign: 'right' }}
+              value={laneRestSec.toFixed(1)}
+              aria-label="Minimum rest between reps in one lane, seconds"
+              data-testid="pacing-number"
+              onChange={(e) => setPacing(Number(e.target.value))}
+            />
+            <span className="dim">s</span>
+            <button
+              className="btn btn-ghost"
+              onClick={() => stepPacing(0.1)}
+              disabled={laneRestSec >= MAX_LANE_REST_SEC - 1e-6}
+              aria-label="More rest between reps (0.1 s slower)"
+              data-testid="pacing-up"
+            >
+              + 0.1 s
+            </button>
+            {/* The pacing AND the ceiling it implies, in one badge — the dose itself is the card above. */}
+            <span className="badge" data-testid="pacing-value">
+              {laneRestSec.toFixed(1)} s · ≤{Math.round(repsPerMinuteAt(laneRestSec))} reps/min
+            </span>
+          </div>
+          <input
+            type="range"
+            /* A tenth-second grid starting at 0.4 s: the clamp floor (MIN_LANE_REST_SEC) is not on a
+               0.1 s step, and a range input off its own step sequence rejects values. */
+            min={Math.max(0.4, MIN_LANE_REST_SEC)}
+            max={MAX_LANE_REST_SEC}
+            step={0.1}
+            value={laneRestSec}
+            aria-label="Minimum rest between reps in one lane, seconds (slider)"
+            data-testid="pacing-slider"
+            onChange={(e) => setPacing(Number(e.target.value))}
+          />
+          <div className="row dim" style={{ justifyContent: 'space-between' }}>
+            <span>{Math.max(0.4, MIN_LANE_REST_SEC).toFixed(1)} s — fastest (little time to return to rest)</span>
+            <span>{(MAX_LANE_REST_SEC / 2).toFixed(1)} s</span>
+            <span>{MAX_LANE_REST_SEC.toFixed(1)} s — slowest</span>
+          </div>
+          {/* The pacing floor is PHYSIOLOGY, and it used to be a side effect of the difficulty preset:
+              picking "medium" for the timing windows also picked 0.6 s between reps of the same limb.
+              ONE reps-per-minute figure is the dose (the card above, measured on the real chart); the
+              figure here is the CEILING this pacing allows. They were shown side by side as two bare
+              "reps/min" numbers, which invites reading the ceiling as the prescription. */}
+          <span className="dim" data-testid="pacing-explainer">
+            An impaired leg needs to come back to rest before the next rep — set this for the patient in front of you,
+            not for the feel of the song. It is not part of the difficulty: changing the windows above does not move it.
+            At {laneRestSec.toFixed(1)} s no limb can be asked for more than {Math.round(repsPerMinuteAt(laneRestSec))}{' '}
+            reps/min; this song and difficulty actually deliver{' '}
+            <b>{dose === null ? '—' : Math.round(dose.repsPerMinPerLane)} reps/min per limb</b>, which is the dose above.
+          </span>
+          {dose && dose.warnings.some((w) => w.startsWith('note density reduced')) && (
+            <span className="dim">
+              This pacing is the binding constraint on this song: the chart has been thinned to honour it, which is the
+              intended behaviour — the dose above is what will actually be asked for.
+            </span>
+          )}
+        </div>
+      </div>
+
+      <div className="card stack" data-testid="setup-mix">
+        <div className="row">
+          <h3>What the patient hears</h3>
+          <span className="dim">A missed note changes the mix. This is exactly how much.</span>
+        </div>
+        <span className="dim" data-testid="mix-summary">
+          {mix
+            ? mix.rule
+            : 'This song has no downloaded stems, so nothing is ducked — the session runs silently against the same clock.'}
+        </span>
+        {/* WHICH INSTRUMENT IS THE WEAK SIDE. The set of instruments is not enough: a therapist
+            listening for whether the affected limb is being rewarded has to know what to listen for. */}
+        {mix && (
+          <ul className="list-reset dim" style={{ display: 'flex', gap: 18, flexWrap: 'wrap' }}>
+            {lanes.map((l, i) => (
+              <li key={i} data-testid={`mix-lane-${i}`}>
+                <b>{laneLabel(l)}</b> → {mix.perLane[i] ?? '—'}
+                {mix.mode === 'shared' ? ' (shared)' : ''}
+              </li>
+            ))}
+          </ul>
+        )}
+        {/* The weak side IS the therapy. A miss used to drop the player's instrument to 5 % and hold it
+            there until the next hit, anywhere on the board — so one missed left-leg note silenced the
+            reward a patient was earning with every right-leg rep. */}
+        <span className="dim">
+          A missed note lowers that lane's instrument by about {stepDb} dB, and a run of misses by at most {floorDb} dB.
+          It is never silenced, a miss in one lane never touches another lane's instrument, and the next hit in that lane
+          brings it straight back.
+        </span>
+      </div>
+
       <div className="card stack">
         <div className="row">
           <h3>Timing window</h3>
@@ -357,19 +658,29 @@ export default function TherapistSetup() {
                   <button
                     className="btn btn-preview"
                     aria-pressed={isPreviewing}
-                    disabled={!ready || previewLoading !== null}
+                    // ONLY THE OTHER buttons go dead while a press is in flight. The one that started
+                    // it stays live, because it is the only way to stop it.
+                    disabled={!ready || (previewLoading !== null && !isLoading)}
                     onClick={() => togglePreview(entry)}
                     data-testid={`preview-${entry.id}`}
-                    aria-label={isPreviewing ? `Stop the preview of ${m?.title ?? entry.id}` : `Hear ${m?.title ?? entry.id}`}
+                    aria-label={
+                      isLoading
+                        ? `Stop loading ${m?.title ?? entry.id}${previewCost ? ` — ${formatBytes(previewCost.bytes)} downloaded so far` : ''}`
+                        : isPreviewing
+                          ? `Stop the preview of ${m?.title ?? entry.id}`
+                          : `Hear ${m?.title ?? entry.id}`
+                    }
                   >
-                    {isLoading ? '… loading' : isPreviewing ? '■ Stop' : '▶ Listen'}
+                    {isLoading ? '■ Stop' : isPreviewing ? '■ Stop' : '▶ Listen'}
                   </button>
-                  <span className="dim">
-                    {isPreviewing
-                      ? 'Playing — stops itself'
-                      : ready
-                        ? `12 s from ${Math.floor(from / 60)}:${Math.floor(from % 60).toString().padStart(2, '0')}`
-                        : 'no audio yet'}
+                  <span className="dim" data-testid={`preview-status-${entry.id}`}>
+                    {isLoading
+                      ? previewCostLabel(previewCost)
+                      : isPreviewing
+                        ? 'Playing — stops itself'
+                        : ready
+                          ? `12 s from ${Math.floor(from / 60)}:${Math.floor(from % 60).toString().padStart(2, '0')}`
+                          : 'no audio yet'}
                   </span>
                   {songId === entry.id && (
                     <>
@@ -402,7 +713,7 @@ export default function TherapistSetup() {
       </div>
 
       <div className="row" style={{ paddingBottom: 24 }}>
-        <button className="btn btn-primary btn-lg grow" disabled={blocking.length > 0} onClick={start}>
+        <button className="btn btn-primary btn-lg grow" disabled={cannotStart} onClick={start}>
           {inputMode === 'camera' ? 'Set up camera →' : 'Start session →'}
         </button>
       </div>

@@ -1,10 +1,21 @@
 // @vitest-environment node
 import { describe, expect, it } from 'vitest';
-import { GOOD_STAR_WEIGHT, HEALTH_START, MAX_DELTA_SAMPLES, Scoring, multiplierForCombo, starAccuracyOf, starsForAccuracy } from './scoring.ts';
+import {
+  ANSWER_WARMUP_NOTES,
+  GOOD_STAR_WEIGHT,
+  MAX_DELTA_SAMPLES,
+  Scoring,
+  answerRateOf,
+  multiplierForCombo,
+  starAccuracyOf,
+  starsForAccuracy,
+} from './scoring.ts';
 import type { HitEvent, Judgment } from './types.ts';
 
-function ev(judgment: Judgment, lane = 0, deltaMs = 0): HitEvent {
-  return { noteId: 0, lane, judgment, deltaMs, time: 0 };
+/** Every event gets its OWN note id: a note is answered at most once, so ids must be distinct. */
+let nextNoteId = 1;
+function ev(judgment: Judgment, lane = 0, deltaMs = 0, noteId = nextNoteId++): HitEvent {
+  return { noteId, lane, judgment, deltaMs, time: 0 };
 }
 
 describe('multiplierForCombo', () => {
@@ -35,22 +46,87 @@ describe('Scoring', () => {
     for (let i = 0; i < 10; i++) expect(s2.apply(ev('perfect')).points).toBe(100);
     expect(s2.apply(ev('perfect')).points).toBe(200);
   });
-  it('miss resets combo but keeps maxCombo; health clamps and never fails', () => {
+  it('miss resets combo but keeps maxCombo; the gauge counts notes answered and never fails', () => {
     const s = new Scoring(1);
-    expect(s.getHealth()).toBe(HEALTH_START);
+    expect(s.getEffort()).toBe(1); // nothing judged yet
     for (let i = 0; i < 12; i++) s.apply(ev('perfect'));
     expect(s.getMultiplier()).toBe(2);
-    expect(s.getHealth()).toBeCloseTo(0.74, 9);
+    expect(s.getEffort()).toBe(1);
     const d = s.apply(ev('miss'));
     expect(d.points).toBe(0);
     expect(d.combo).toBe(0);
     expect(d.multiplier).toBe(1);
-    expect(s.getHealth()).toBeCloseTo(0.71, 9);
+    // 12 notes answered of 13: the miss did not take away the reps that happened
+    expect(s.getEffort()).toBeCloseTo(12 / 13, 9);
     expect(s.getState().maxCombo).toBe(12);
-    for (let i = 0; i < 100; i++) s.apply(ev('miss'));
-    expect(s.getHealth()).toBe(0);
-    for (let i = 0; i < 100; i++) s.apply(ev('good'));
-    expect(s.getHealth()).toBe(1);
+    // a patient who stops moving altogether: the gauge falls to 12/213, and nothing fails
+    for (let i = 0; i < 200; i++) s.apply(ev('miss'));
+    expect(s.getEffort()).toBeCloseTo(12 / 213, 9);
+    // a patient who moves for every note reads full however their timing scores
+    const moving = new Scoring(1);
+    for (let i = 0; i < 20; i++) {
+      const note = 1000 + i;
+      moving.apply(ev('miss', 0, 0, note));
+      moving.recordUnmatchedInput(0, 300, note);
+    }
+    expect(moving.getState().accuracy).toBe(0);
+    expect(moving.getEffort()).toBe(1);
+    expect(moving.getState().surplus).toBe(0);
+  });
+
+  /**
+   * THE CASE THAT FAILED REVIEW. A tremor session: 189 notes offered, 12 hits, and 280 movements
+   * made. The old gauge divided movements by notes and clamped at 1, so it read a full green 100 %
+   * over the caption "movements made for 280 of the 189 notes offered" — an impossible sentence, and
+   * a latency/calibration fault presented as a perfect session.
+   */
+  it('cannot be saturated by movements that answered no note', () => {
+    const s = new Scoring(1, 189);
+    for (let i = 0; i < 189; i++) {
+      const note = i;
+      if (i < 12) s.apply(ev('perfect', 0, 0, note));
+      else s.apply(ev('miss', 0, 0, note));
+      // 280 movements in total: the 12 that scored, plus a tremor firing repeatedly at the same note
+      if (i >= 12) {
+        s.recordUnmatchedInput(0, 400, note < 60 ? note : null);
+        s.recordUnmatchedInput(0, 900, null);
+      }
+    }
+    const st = s.getState();
+    expect(st.hits).toBe(12);
+    expect(st.reps).toBe(12 + 2 * 177);
+    // answered = 12 hits + the 48 missed notes a movement actually landed nearest to
+    expect(st.attempted).toBe(60);
+    expect(st.attempted).toBeLessThanOrEqual(st.judged);
+    expect(st.surplus).toBe(st.reps - st.attempted);
+    expect(st.health).toBeCloseTo(60 / 189, 9);
+    expect(st.health).toBeLessThan(0.35);
+  });
+
+  it('answers at most once per note, however many movements land on it', () => {
+    const s = new Scoring(1, 2);
+    s.apply(ev('miss', 0, 0, 7));
+    for (let i = 0; i < 9; i++) s.recordUnmatchedInput(0, 120, 7);
+    const st = s.getState();
+    expect(st.attempted).toBe(1);
+    expect(st.reps).toBe(9);
+    expect(st.surplus).toBe(8);
+  });
+
+  it('holds the needle up over the opening notes instead of emptying on note one', () => {
+    const s = new Scoring(1, 100);
+    s.apply(ev('miss'));
+    // one missed opening note used to read 0/1 = 0 seconds after the count-in
+    expect(s.getEffort()).toBeCloseTo((ANSWER_WARMUP_NOTES - 1) / ANSWER_WARMUP_NOTES, 9);
+    for (let i = 1; i < ANSWER_WARMUP_NOTES; i++) s.apply(ev('miss'));
+    expect(s.getEffort()).toBe(0); // the warm-up is spent; the number is now the real one
+  });
+
+  it('answerRateOf is bounded by the notes offered, with no clamp hiding the surplus', () => {
+    expect(answerRateOf(0, 0)).toBe(1);
+    expect(answerRateOf(5, 10, 0)).toBe(0.5);
+    expect(answerRateOf(30, 10, 0)).toBe(1); // an impossible input still cannot exceed 1
+    expect(answerRateOf(0, 100, 0)).toBe(0);
   });
   it('tracks per-lane stats, accuracy and timing bias', () => {
     const s = new Scoring(2);
@@ -73,7 +149,7 @@ describe('Scoring', () => {
     expect(st.stars).toBe(2);
     expect(JSON.parse(JSON.stringify(st))).toEqual(st); // plain snapshot
     s.reset();
-    expect(s.getState()).toMatchObject({ score: 0, combo: 0, hits: 0, misses: 0, health: HEALTH_START, accuracy: 0 });
+    expect(s.getState()).toMatchObject({ score: 0, combo: 0, hits: 0, misses: 0, health: 1, accuracy: 0 });
   });
   it('rejects out-of-range lanes instead of misattributing them', () => {
     const s = new Scoring(2);
@@ -83,7 +159,8 @@ describe('Scoring', () => {
     expect(s.getState().hits).toBe(0);
   });
   it('star rating', () => {
-    expect([0, 0.2, 0.25, 0.5, 0.7, 0.85, 0.95, 1, Number.NaN].map(starsForAccuracy)).toEqual([0, 0, 1, 2, 3, 4, 5, 5, 0]);
+    // 0 stars only when no accuracy was measured at all: a session that was played is never a nil return
+    expect([0, 0.2, 0.25, 0.45, 0.7, 0.85, 0.95, 1, Number.NaN].map(starsForAccuracy)).toEqual([1, 1, 1, 2, 3, 4, 5, 5, 0]);
     expect(GOOD_STAR_WEIGHT).toBe(0.75);
     expect(starAccuracyOf(0, 0, 0)).toBe(0);
   });

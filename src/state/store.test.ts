@@ -5,9 +5,11 @@ import type { RomCalibration } from '../vision/calibration.ts';
 
 const CAL: RomCalibration = { min: 0, max: 1, samples: 90, movement: 'seated_march' };
 
-function fakeResult(id: string, score = 100): SessionResult {
+function fakeResult(id: string, score = 100, patientId = 'p-test'): SessionResult {
   return {
     id,
+    patientId,
+    patientName: 'Test Patient',
     startedAt: 1,
     endedAt: 2,
     durationSec: 10,
@@ -30,7 +32,7 @@ function fakeResult(id: string, score = 100): SessionResult {
     goods: 2,
     misses: 5,
     reps: 7,
-    health: 0.5,
+    answerRate: 0.5,
     timingBiasMs: 10,
     timingBiasMadMs: 4,
     latencyOffsetMs: 120,

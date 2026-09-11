@@ -30,6 +30,8 @@ const vision = {
 const camera = { failures: 1, attempts: 0, error: (() => new DOMException('Permission denied', 'NotAllowedError'))() };
 
 const disposeVision = vi.fn();
+/** The camera-release rule (src/session/runtime.ts): called with the screen the app has arrived at. */
+const releaseVisionUnless = vi.fn();
 
 vi.mock('../session/runtime.ts', () => ({
   runtime: {
@@ -46,6 +48,7 @@ vi.mock('../session/runtime.ts', () => ({
     },
     peekVision: () => vision,
     disposeVision,
+    releaseVisionUnless,
     runner: null,
   },
 }));
@@ -56,6 +59,7 @@ beforeEach(() => {
   camera.attempts = 0;
   camera.failures = 1;
   disposeVision.mockClear();
+  releaseVisionUnless.mockClear();
   cleanup();
   useStore.setState({
     screen: 'play',

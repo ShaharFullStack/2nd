@@ -664,25 +664,47 @@ export default function PlayScreen() {
           effectIntensity: settings.effectIntensity,
           showMissPopup: settings.showMissPopup,
         },
-        // Camera sessions keep the camera open for the next song; dev inputs are ours to stop.
+        // The runner does not own the camera: it is shared with the camera-check and calibration
+        // screens and outlives one song, so stopping it is `runtime.releaseVisionUnless` below (which
+        // is the one place the release rule is written down). A dev input source IS the runner's to
+        // stop — nothing else holds a keyboard listener or an autoplay bot.
         stopInputOnDispose: inputMode !== 'camera',
         hudIntervalMs: 200,
         onHud: (h) => {
           setHud(h);
           setPaused(h.phase === 'paused');
         },
+        /**
+         * EVERY WAY A RUN CAN END ARRIVES HERE — the chart finishing, "End & see results", the screen
+         * being left, the tab being closed (see `GameRunner.finish`). The reps the patient performed
+         * are recorded on all of them; only the NAVIGATION is conditional.
+         */
         onEnd: (summary) => {
           const store = useStore.getState();
+          // A run that was abandoned before anything happened is not a session: it is a therapist
+          // opening the screen and going back. Nothing was judged and no movement was made, so there
+          // is nothing to file, and filing it would spend the patient's retention budget on it.
+          if (summary.endReason === 'abandoned' && summary.results.judged === 0 && summary.results.reps === 0) return;
           const result = buildSessionResult({
             summary,
             config,
             manifest: songManifest,
+            // The NAME as it is now, copied onto the record so an exported file is readable off the
+            // device. The ID it is filed under comes from `config`, captured when the run started —
+            // switching patient mid-song cannot re-attribute the run in progress.
+            patientName: store.patients.find((p) => p.id === config.patientId)?.name ?? '',
             inputMode: store.inputMode,
             latencyOffsetSec: inputMode === 'camera' ? store.latencyOffsetSec : 0,
             calibrations: store.calibrations,
           });
           store.addResult(result);
-          store.goto('results');
+          // NOT an unconditional `goto`. Only a run that ENDED WHILE THE SCREEN WAS ALIVE hands over
+          // to the results: the chart finishing, or "End & see results". An abandoned run finishes
+          // during teardown — the therapist has already pressed Back, or the page itself is going
+          // away — and yanking them onto the results screen out of a navigation they made themselves
+          // is a bug, not a hand-over. The run is recorded either way, and `lastResult` is on the
+          // store for the results screen whenever they do go there.
+          if (summary.endReason !== 'abandoned' && useStore.getState().screen === 'play') store.goto('results');
         },
       });
 
@@ -726,10 +748,16 @@ export default function PlayScreen() {
       alive = false;
       window.removeEventListener('resize', onResize);
       window.removeEventListener('keydown', onKey);
+      // Disposing the runner FINISHES an unfinished run (as 'abandoned'), so the reps performed are
+      // recorded before anything is torn down. See `onEnd` above.
       runnerRef.current?.dispose();
       runnerRef.current = null;
       runtime.runner = null;
       ownedInput?.stop();
+      // …and the camera goes unless the screen we have arrived at genuinely needs it within seconds
+      // (a re-calibration). The store has already been navigated by the time a cleanup runs, so this
+      // reads the DESTINATION. A retry / remount is still on 'play' and keeps the device.
+      runtime.releaseVisionUnless(useStore.getState().screen);
     };
   }, [inputMode, attempt, rearmFraction, syncPipBox]);
 
@@ -927,6 +955,21 @@ export default function PlayScreen() {
           <div className="overlay" data-testid="pause-overlay">
             <div className="card stack">
               <h2>Paused</h2>
+              {/* WHO PRESSED PAUSE. A session that stopped on its own is a different fact from one a
+                  therapist stopped, and the therapist coming back to a stopped screen is owed the
+                  reason. The run pauses itself the moment the tab is hidden — a locked tablet, a
+                  switch to another app, another tab brought forward — because a backgrounded page
+                  gets no animation frames while the audio clock keeps running, and the song would
+                  otherwise play on to an empty room and return as a wall of misses nobody could have
+                  hit. */}
+              {hud?.pausedByPage && (
+                <div data-testid="paused-by-page">
+                  <Toast kind="bad">
+                    This tab was hidden, so the session paused itself. Nothing was scored while it was away and
+                    nothing was missed — the song is waiting exactly where the patient left it.
+                  </Toast>
+                </div>
+              )}
               <p className="muted">The song and the chart restart together — the patient will not lose their place.</p>
               {/* THE WORDS FOR THE MARK THE PAUSE PUTS ON EVERY METER. While the session is stopped the
                   camera keeps running and the patient keeps moving, but the engine discards every input
@@ -937,16 +980,33 @@ export default function PlayScreen() {
                 Movement is not being scored while paused, so every receptor and every bar shows{' '}
                 <strong>no reading</strong> (❚❚) — including any rep the patient makes now. Resume first.
               </p>
-              {warnings.map((w, i) => (
-                <Toast key={i}>{w}</Toast>
-              ))}
-              {/* The live input-layer warnings again, at full width: a therapist who pauses to work
-                  out why a lane is not scoring should not have to read them out of a 200 px panel. */}
+              {/* The live input-layer warnings, at full width: a therapist who pauses to work out why
+                  a lane is not scoring should not have to read them out of a 200 px panel. These are
+                  about the patient IN FRONT OF THEM right now, so they stay in the open. */}
               {liveWarnings.map((w) => (
                 <Toast kind="bad" key={w}>
                   {w}
                 </Toast>
               ))}
+              {/* THE CHART NOTES ARE FOLDED AWAY, and that is a decision about what this dialog is for.
+                  They are generator diagnostics — "note density reduced from 1 to 0.500 notes/beat: at
+                  120 bpm with 2 lane(s), lane spacing 1.2s and cross-lane gap 0.25s…" — written for
+                  whoever tunes the prescription, and they are four lines long. Left in the open they
+                  were the biggest block on the one dialog a therapist reads when they come back to a
+                  tablet that paused itself, out-weighing the sentence saying WHY it paused. They are
+                  one tap away, worded the same, and nothing is hidden: the summary counts them. */}
+              {warnings.length > 0 && (
+                <details className="fold" data-testid="pause-chart-notes">
+                  <summary className="dim">
+                    {warnings.length === 1 ? 'Note about this chart' : `${warnings.length} notes about this chart`}
+                  </summary>
+                  <div className="stack" style={{ marginTop: 8 }}>
+                    {warnings.map((w, i) => (
+                      <Toast key={i}>{w}</Toast>
+                    ))}
+                  </div>
+                </details>
+              )}
               <div className="row">
                 <button className="btn btn-primary btn-lg grow" onClick={() => void runnerRef.current?.resume()}>
                   Resume

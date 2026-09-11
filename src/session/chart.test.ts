@@ -17,6 +17,7 @@ const MANIFEST: SongManifest = {
 };
 
 const CONFIG: SessionConfig = {
+  patientId: 'p-test',
   mode: 'leg',
   lanes: [
     { index: 0, movement: 'seated_march', side: 'left' },
