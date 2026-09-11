@@ -1,5 +1,5 @@
 {
- "updated": "2026-09-11T01:45Z",
+ "updated": "2026-09-11T08:36Z",
  "pieces": {
   "engine": {
    "round": 5,
@@ -17,9 +17,9 @@
    "note": "Calibration hand-over passed a fresh critic at 8.5/10: a range measured under one camera convention or fingertip can no longer be silently r"
   },
   "render": {
-   "round": 5,
-   "status": "round 6",
-   "note": "Receptor biofeedback at 8/10 after 5 rounds — still looping. Open: the picture-in-picture lane meters do not latch the goal state the way th"
+   "round": 8,
+   "status": "8/10, narrowing",
+   "note": "Receptor ran 8 fix-and-critique rounds, ending at 8/10. Each round a fresh critic drove the real vision pipeline and found a different real "
   },
   "highway": {
    "round": 3,
@@ -30,6 +30,11 @@
    "round": 4,
    "status": "passed 9/10",
    "note": "Therapist screens passed clinical-usability critic at 9/10: song preview, per-finger choice for opposition, latency hand-over to the next se"
+  },
+  "review": {
+   "round": 1,
+   "status": "blockers open",
+   "note": "Final review by four independent lenses (patient, therapist, clinical-safety, engineer). All four said they would not ship, and all four ind"
   }
  },
  "entries": [
@@ -165,6 +170,18 @@
    "piece": "render",
    "kind": "info",
    "text": "Receptor biofeedback at 8/10 after 5 rounds — still looping. Open: the picture-in-picture lane meters do not latch the goal state the way the receptor does, so the two meters disagree at the moment of crossing."
+  },
+  {
+   "time": "2026-09-11T08:36Z",
+   "piece": "render",
+   "kind": "info",
+   "text": "Receptor ran 8 fix-and-critique rounds, ending at 8/10. Each round a fresh critic drove the real vision pipeline and found a different real defect: goal cue unreachable on the scripted input path; goal latch outliving the re-arm; the picture-in-picture panel covering the label naming the limb; tracking loss hidden by a mostly-dead stream."
+  },
+  {
+   "time": "2026-09-11T08:36Z",
+   "piece": "review",
+   "kind": "fail",
+   "text": "Final review by four independent lenses (patient, therapist, clinical-safety, engineer). All four said they would not ship, and all four independently named the same top blocker: no patient identity anywhere, so a shared clinic tablet pools two people's history, trends and saved ranges. Also: camera never released after a session, two tabs overwriting each other, an interrupted session recording nothing, one weak limb's misses muting the patient's whole instrument, a red failure alarm in a game that cannot be failed, and a results screen that reads as a grade."
   }
  ]
 }
