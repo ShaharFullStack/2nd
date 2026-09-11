@@ -112,8 +112,12 @@
  *
  * `receptorLookInto` collapses one `RenderLaneState` into what the receptor should read;
  * `ReceptorHistory.update` adds the two things a single frame cannot know (the crossing latch and
- * the tracking hold). `Highway.drawReceptors` renders each state as a different SET OF MARKS (see
- * its doc comment): (a) one continuous level line + a fixed target line and two ticks, (b) those
+ * the tracking hold). The renderer positions every mark on ONE LINEAR ROM AXIS (`Highway.meterPos`:
+ * full ROM at the top of the well, the target line at `thresholdFraction` of it, the re-arm line at
+ * `thresholdFraction * rearmFraction`), so a given movement is the same distance on screen wherever
+ * in the range it is made — during the rise and during the return alike. What differs between the
+ * states is not the scale but the SET OF MARKS (see `Highway.drawReceptors`):
+ * (a) one continuous level line + the target line and two ticks, (b) those
  * plus liquid above the target line, a level cap SPLIT into two white-hot segments, two additive
  * rings, and the ticks replaced by two solid arrowheads, (c) a desaturated ring whose column stands
  * at the patient's true height and travels down through the target height as they lower, with a
@@ -147,31 +151,25 @@ export const DEFAULT_REARM_FRACTION = 0.6;
 export const DEFAULT_MAX_GAP_SEC = 0.5;
 
 /**
- * MINIMUM overshoot headroom, as a fraction of the threshold. See `meterOverSpan`: the band above
- * the target line normally spans the rest of the patient's calibrated ROM (`1 - thresholdFraction`),
- * and this is the floor that keeps the band from collapsing when the threshold is set near full ROM.
- *
- * The headroom exists so the target line is a mark the level can sit *above*, which is how a ROM
- * gauge shows that a rep cleared the target rather than merely reached the top of the widget.
+ * MINIMUM span for the overshoot READOUT (`ReceptorLook.over`), as a fraction of the threshold —
+ * the floor that keeps `over` from dividing by a vanishing range when the threshold is set at or
+ * near full ROM. See `meterOverSpan`.
  */
 export const METER_OVER_RANGE = 0.5;
 
 /**
- * The ROM distance the meter's overshoot band (everything above the target line) covers.
+ * The ROM distance `ReceptorLook.over` is measured over: from the threshold to full ROM
+ * (`1 - thresholdFraction`), floored at `thresholdFraction * METER_OVER_RANGE` so a near-full-ROM
+ * threshold cannot collapse it to zero.
  *
- * IT MUST NOT SATURATE INSIDE THE REACHABLE RANGE. `LaneState.value` is `clamp01`ed by the
- * calibration (src/vision/calibration.ts `normalizeFeature`), so the reachable range is exactly
- * `[0, 1]`; a band narrower than `1 - threshold` would pin the column — and with it the drain cap,
- * the chevron and the return-to-rest arc — for every value between the band's top and full ROM.
- * That is the frozen gauge this function exists to make impossible: a patient holding at end range
- * and then lowering must see the gauge move from the FIRST millimetre of the descent, because the
- * eccentric phase is a therapeutic target in its own right and a display that flatlines through it
- * reads as "broken" or "I am doing it wrong".
- *
- * So the band is `1 - thresholdFraction` (target line → full ROM), floored at
- * `thresholdFraction * METER_OVER_RANGE` so a near-full-ROM threshold still leaves a readable band.
- * Above that floor the column simply cannot reach the top of the well, which is honest: the patient
- * has not got there.
+ * THIS IS A READOUT, NOT THE RENDERER'S SCALE. `Highway.drawReceptors` positions every mark in the
+ * well with `meterPos`, one linear map from ROM to height (full ROM at the ceiling, the target line
+ * at `thresholdFraction` of it), so nothing on screen depends on this span. It used to: the well was
+ * two bands either side of a target line pinned at a fixed height, and the band above it had to be
+ * wide enough not to saturate before full ROM — which stopped the column pinning but still drew the
+ * whole of the ROM above the threshold at up to 4.5x the compression of the ROM below it, on the
+ * default 'easy' difficulty. `over` survives as what it always described: how far past their target
+ * the patient got, as a fraction of the range they had left.
  */
 export function meterOverSpan(thresholdFraction: number): number {
   const threshold = clamp(thresholdFraction, 0.05, 1);
@@ -206,16 +204,15 @@ export interface ReceptorLook {
   fill: number;
   /**
    * Overshoot 0..1: how far *past* the threshold the value is, over `meterOverSpan(threshold)` of
-   * ROM (normally target line → full ROM). 0 whenever `fill < 1`, and — deliberately — it does NOT
-   * saturate anywhere inside the reachable range, so `fill + over` together are a strictly
-   * monotone read-out of the patient's position over the whole of `[0, 1]` ROM.
+   * ROM (the threshold → full ROM). 0 whenever `fill < 1`, and it does not saturate anywhere inside
+   * the reachable range, so `fill + over` together are a strictly monotone read-out of the
+   * patient's position over the whole of `[0, 1]` ROM.
    *
-   * The renderer maps it onto the headroom above the target line IN EVERY STATE, because it is a
-   * POSITION, not a claim about scoring: a locked lane really is at 90 % of its ROM and has to be
-   * able to show itself coming down from there. What "at this height" MEANS for the next rep is
-   * carried by the state's mark set (target line + ticks vs drain cap + re-arm line + chevron +
-   * arc), never by the height alone. The one reading that belongs to the height is (b)'s: the band
-   * above the target line during the goal latch is "this rep cleared the target by this much".
+   * A READOUT FOR CONSUMERS, NOT A DRAWING INPUT — say, "cleared the target by this much", the
+   * ROM-achieved number a therapist is after. The receptor draws every height from `rom` through
+   * `Highway.meterPos`, one linear ROM axis with the target line at `thresholdFraction` of it, so a
+   * given movement covers the same distance on screen wherever in the range it is made; `fill` and
+   * `over` are the same position expressed against the threshold instead.
    */
   over: number;
   /**
@@ -332,6 +329,36 @@ export interface ReceptorLook {
   stale?: boolean;
 }
 
+/**
+ * Which of the four MARK SETS a look wears. The four states differ by the number and shape of the
+ * marks drawn, not by brightness or hue (see `Highway.drawReceptors`), so this is the one place that
+ * decides which set a look is in — and it is exported because it is the answer EVERY live meter on
+ * screen has to give at the same instant.
+ *
+ * ONE VOICE. The receptor row is not the only movement meter in the patient's field of view: the
+ * play screen's picture-in-picture lane meters sit next to the camera preview for the whole session
+ * (src/ui/Play.tsx). They used to be drawn from their own single-frame reading, which meant they had
+ * no crossing latch and could only test `willFire` — the conjunction no input source in this repo
+ * ever publishes (see the file header) — so on the frame the patient reached their target the
+ * receptor threw the full goal look and the meter 300 px away went straight to the grey "lower to
+ * reset" costume. Two meters disagreeing at the one moment that matters is worse than either being
+ * wrong on its own. Both now go through `ReceptorHistory.update` and classify with this function.
+ *
+ * The order is the precedence order and it is not arbitrary: no measurement outranks everything
+ * (nothing derived from a value may be drawn), the crossing outranks the lockout it causes (the
+ * patient is told "you got there" before "now come back down"), and a locked lane outranks its own
+ * level (a lane that cannot fire may wear no part of the "this counts" costume at any value).
+ */
+export type ReceptorMarkSet = 'lost' | 'goal' | 'locked' | 'rising';
+
+/** Classify a look into its mark set — see `ReceptorMarkSet`. */
+export function receptorMarkSet(look: ReceptorLook): ReceptorMarkSet {
+  if (!look.tracking) return 'lost';
+  if ((look.goal ?? 0) > 0) return 'goal';
+  if (look.locked) return 'locked';
+  return 'rising';
+}
+
 /** Shape of the per-lane state this reads (structurally `RenderLaneState`). */
 export interface LaneStateLike {
   value: number;
@@ -421,8 +448,8 @@ export function receptorLookInto(
   // Where the lane re-arms, in the same ROM units (`LaneTrigger.rearmLevel`).
   const rearmRom = threshold * rearm;
   out.fill = fill;
-  // The overshoot band spans the rest of the ROM (see `meterOverSpan`), so it never saturates
-  // before full ROM: `fill + over` is a strictly monotone position read-out over the whole range.
+  // Measured over the threshold → full ROM span (see `meterOverSpan`), so it never saturates before
+  // full ROM: `fill + over` is a strictly monotone position read-out over the whole range.
   out.over = clamp((value - threshold) / meterOverSpan(threshold), 0, 1);
   out.rom = value;
   out.peakRom = locked ? peak : value;
@@ -567,6 +594,26 @@ export class ReceptorHistory {
     // one already showed (`VisionInput.getLaneStates` deliberately returns the SAME frozen objects
     // until it processes a new detection). A repeat is not an observation, and the whole gap rule
     // below is about how long it has been since the input layer last observed anything.
+    //
+    // TWO DIFFERENT QUANTITIES, AND THE DIFFERENCE IS BOUNDED. `LaneTrigger` measures its own
+    // continuity on `push()` calls — one per processed camera frame, whatever the sample says —
+    // while the renderer can only measure what it can SEE in `LaneState`, which is object identity
+    // and four field values. The two agree for `VisionInput`, and by construction rather than by
+    // luck: it rebuilds a fresh frozen `LaneState` per processed frame (memoized on `frameSeq`), so
+    // `state !== h.srcRef` is true on exactly the frames it pushed and false on the extra polls of a
+    // 60 Hz renderer. `receptor.test.ts` pins that path ("a repeated value in a NEW object is still
+    // an observation") so a future memoization that reuses the object across frames cannot silently
+    // turn a still patient into a stream break.
+    //
+    // Where they can diverge is a source that returns the SAME object for many processed frames.
+    // The scripted sources do exactly that (`src/input/laneStates.ts` caches on a held/not-held
+    // bitmask), and there a patient held at one value for longer than `maxGapSec` looks silent from
+    // here. The consequence is bounded and one-directional: the arming evidence and the peak are
+    // dropped, so the renderer may WITHHOLD a goal latch (a rising rep re-seeds `seen` several
+    // frames before it crosses, so a real crossing survives) and may restart the return journey from
+    // the patient's current height, which under-reports their progress. It can never invent a
+    // crossing. That is the safe direction, and the honest fix is the same one the RESIDUAL
+    // paragraph names: publish `triggerState` (or the sample's observation time) in `LaneState`.
     const fresh =
       state !== h.srcRef ||
       !(state === undefined || (state.value === h.srcValue && state.armed === h.srcArmed && (state.tracking !== false) === h.srcTracking && state.triggerState === h.srcTrigger));

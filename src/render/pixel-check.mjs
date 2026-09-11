@@ -300,6 +300,119 @@ function pageProbe(W, H) {
     out.receptorGoalExpiresToLocked = ga.hint > 0 && ga.luma < gs.luma;
   }
 
+  // --- 4d. the RETURN journey is drawn to scale, in real pixels --------------------------------
+  // (3) CONCURRENT FEEDBACK MUST MOVE. A patient who has reached end range is then asked to lower,
+  // and the eccentric phase is a therapeutic target in its own right — so the gauge has to move
+  // with them from the FIRST millimetre of the descent, all the way down to the re-arm line.
+  //
+  // This is the check that would have caught the frozen zone. The receptor used to derive every
+  // return-to-rest mark from a fill clamped at the threshold, so a locked lane at 1.00, 0.95, 0.90,
+  // 0.85, 0.80, 0.75 and 0.70 of ROM rendered PIXEL-IDENTICALLY: on the default 'easy' difficulty
+  // (thresholdFraction 0.5, re-arm 0.6 → 0.30 of ROM) that is 1.00 → 0.50, i.e. 71 % of the return
+  // journey with nothing moving on screen. Call-count assertions could not see it and neither could
+  // 1052 unit tests, because every locked-lane assertion in them was built at or below threshold.
+  // So this walks a locked lane down the whole journey on a real canvas and requires the pixels to
+  // change, and the two marks that carry "how much further" to move monotonically, on EVERY step.
+  {
+    const lane = 3; // blue, so the violet hint colour cannot be confused with the lane's own tint
+    const THRESHOLD = 0.5; // the DEFAULT difficulty — the one the frozen span was worst on
+    const REARM = 0.6; // ...so the lane re-arms below 0.30 of ROM
+    const { canvas, hw } = fresh();
+    let clock = 30;
+    const draw = (value, armed) => {
+      clock += 0.016;
+      hw.draw(
+        base(clock, {
+          laneStates: LANES.map((l) => ({ lane: l.index, value, armed, tracking: true })),
+          thresholdFraction: THRESHOLD,
+          rearmFraction: REARM,
+        }),
+      );
+    };
+    // A real rep: rising while armed, then the crossing frame — which the input layer publishes
+    // already disarmed — then a hold at end range long enough for the goal latch to expire, which
+    // is the "holding at end range" the file calls the most common thing a rehab patient does.
+    for (let i = 0; i < 20; i++) draw(0.1 + i * 0.02, true);
+    for (let i = 0; i < 50; i++) draw(1, false);
+
+    const g = hw.geometry;
+    const cx = laneX(g, lane, 0);
+    const rr = g.receptorRadius;
+    const rry = rr * GEM_ASPECT;
+    const bx = { x0: Math.round(cx - rr * 1.3), x1: Math.round(cx + rr * 1.3), y0: Math.round(g.strikeY - rry * 1.4), y1: Math.round(g.strikeY + rry * 1.4) };
+    const isHint = (p) => p[2] > 170 && p[0] > 110 && p[2] - p[1] > 45 && p[0] - p[1] > 18;
+    // The top of the liquid column: the topmost violet drain-cap pixel in a narrow band down the
+    // receptor's centre line. Identified by COLOUR rather than by a luminance step, because the
+    // column itself is a gradient and the well below it is not uniformly dark. The band is narrow
+    // on purpose — the chevron's two arms rise above its apex, and near the end of the journey they
+    // rise above the cap itself, so a full-width search would start tracking the chevron instead.
+    // Inside the ring only, so the return-to-rest arc (same colour, drawn outside it) cannot win.
+    const capRow = (data) => {
+      const half = Math.max(1, Math.round(rr * 0.08));
+      for (let y = bx.y0; y <= bx.y1; y++) {
+        if (Math.abs(y - g.strikeY) > rry * 0.95) continue;
+        for (let x = Math.round(cx) - half; x <= Math.round(cx) + half; x++) if (isHint(px(data, x, y))) return y;
+      }
+      return -1;
+    };
+    // The return-to-rest arc alone: hint-coloured pixels OUTSIDE the ring, so the count is the
+    // arc's length and nothing else (the cap, dashes and chevron all live inside it).
+    const arcPixels = (data) => {
+      let n = 0;
+      for (let y = bx.y0; y <= bx.y1; y++) {
+        for (let x = bx.x0; x <= bx.x1; x++) {
+          const dx = (x - cx) / rr;
+          const dy = (y - g.strikeY) / rry;
+          if (dx * dx + dy * dy < 1.05 * 1.05) continue;
+          if (isHint(px(data, x, y))) n++;
+        }
+      }
+      return n;
+    };
+    const changed = (a, b) => {
+      let n = 0;
+      for (let y = bx.y0; y <= bx.y1; y++) {
+        for (let x = bx.x0; x <= bx.x1; x++) {
+          const p = px(a, x, y);
+          const q = px(b, x, y);
+          if (Math.abs(p[0] - q[0]) + Math.abs(p[1] - q[1]) + Math.abs(p[2] - q[2]) > 12) n++;
+        }
+      }
+      return n;
+    };
+
+    const values = [1, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5, 0.45, 0.4, 0.35, 0.3];
+    const rows = [];
+    const arcs = [];
+    const diffs = [];
+    let prev = grab(canvas, 'receptor-descent-top');
+    rows.push(capRow(prev));
+    arcs.push(arcPixels(prev));
+    for (let i = 1; i < values.length; i++) {
+      draw(values[i], false);
+      draw(values[i], false);
+      const now = grab(canvas, i === values.length - 1 ? 'receptor-descent-rearm' : null);
+      diffs.push(changed(prev, now));
+      rows.push(capRow(now));
+      arcs.push(arcPixels(now));
+      prev = now;
+    }
+    out.descentValues = values;
+    out.descentCapRows = rows;
+    out.descentArcPx = arcs;
+    out.descentDiffs = diffs;
+    // Every step: the pixels change, the column top travels DOWN the well, the arc grows.
+    out.descentMinDiff = Math.min(...diffs);
+    out.descentMinCapStep = Math.min(...rows.slice(1).map((y, i) => y - rows[i]));
+    out.descentMinArcStep = Math.min(...arcs.slice(1).map((a, i) => a - arcs[i]));
+    // ...and how much of that motion happens ABOVE the threshold — the span that used to be dead.
+    const aboveIdx = values.map((v, i) => (v >= THRESHOLD ? i : -1)).filter((i) => i >= 0);
+    const top = rows[aboveIdx[0]];
+    const atThreshold = rows[aboveIdx[aboveIdx.length - 1]];
+    out.descentTravelAboveThreshold = atThreshold - top;
+    out.descentTravelTotal = rows[rows.length - 1] - top;
+  }
+
   // --- 4c. the miss cue is fully inside the canvas at the latest possible verdict ---------------
   // The engine declares a miss at note.time + goodMs (180) + grace (100). Diffing against a frame
   // that has the same miss *event* (so the same puff) but no gem isolates the dying gem's pixels.
@@ -324,7 +437,13 @@ function pageProbe(W, H) {
         // Signed, like the chart-gem measurement: the gem *body* is brighter than the road it
         // covers. (Its soft drop shadow is drawn ~0.35 r further down and may be clipped by the
         // bottom edge in the last frames of the fizzle; the gem itself may not be.)
-        if (lum(px(test.data, x, y)) - lum(px(ref.data, x, y)) > 20) {
+        // The two frames differ ONLY by the gem (same miss event, so the same puff and lane
+        // flash), so the floor only has to clear rasterizer noise — and it must not be a
+        // BRIGHTNESS test: the dying gem is drawn at 75 % alpha and its rim lands a few luma
+        // above the road. A +20 floor measured 129 px of a 197 px gem and then failed the
+        // "is it all on screen" assertion for a gem that was entirely on screen, which is the
+        // harness lying about the renderer.
+        if (lum(px(test.data, x, y)) - lum(px(ref.data, x, y)) > 6) {
           if (first < 0) first = x;
           last = x;
         }
@@ -672,12 +791,26 @@ try {
     `largest row-to-row luma step down the centre line: ${out.receptorStepLocked.toFixed(0)}`,
   );
   check(
+    'the return journey is drawn to scale: every step of the descent moves the gauge',
+    out.descentMinDiff > 0 && out.descentMinCapStep >= 1 && out.descentMinArcStep > 0,
+    `walking a locked lane 1.00 → 0.30 of ROM at the default difficulty (threshold 0.5, re-arm 0.30): ` +
+      `smallest change ${out.descentMinDiff} px, smallest column-top step ${out.descentMinCapStep} px, ` +
+      `smallest arc growth ${out.descentMinArcStep} px; column-top rows ${out.descentCapRows.join(', ')}`,
+  );
+  check(
+    'most of that motion is ABOVE the threshold — the span that used to render pixel-identically',
+    out.descentTravelAboveThreshold >= out.descentTravelTotal * 0.5,
+    `column top travels ${out.descentTravelAboveThreshold} px from full ROM down to the threshold, ` +
+      `${out.descentTravelTotal} px over the whole journey ` +
+      `(${((out.descentTravelAboveThreshold / Math.max(1, out.descentTravelTotal)) * 100).toFixed(0)}% of it)`,
+  );
+  check(
     'the whole missed gem is on screen at the latest miss verdict (+280 ms)',
     out.missGemBottom > 0 &&
       out.missGemBottom <= out.canvasH - 2 &&
       out.missGemCentreRow + out.missGemExpectedHeight / 2 <= out.canvasH - 2 &&
       out.missGemHeight >= out.missGemExpectedHeight * 0.7,
-    `gem rows ${out.missGemTop}..${out.missGemBottom} of ${out.canvasH}, centre ${out.missGemCentreRow} + half-height ${(out.missGemExpectedHeight / 2).toFixed(0)} = ${(out.missGemCentreRow + out.missGemExpectedHeight / 2).toFixed(0)}; lit core ${out.missGemHeight} px of a ${out.missGemExpectedHeight.toFixed(0)} px gem (the dying gem is drawn at 75 % alpha, so its rim falls under the detection threshold)`,
+    `gem rows ${out.missGemTop}..${out.missGemBottom} of ${out.canvasH}, centre ${out.missGemCentreRow} + half-height ${(out.missGemExpectedHeight / 2).toFixed(0)} = ${(out.missGemCentreRow + out.missGemExpectedHeight / 2).toFixed(0)}; lit core ${out.missGemHeight} px of a ${out.missGemExpectedHeight.toFixed(0)} px gem (the dying gem is drawn at 75 % alpha, which is why the detection floor is low)`,
   );
   check('every chart gem is rasterized', out.noteYMeasured.every((v) => Number.isFinite(v)), `rows ${out.noteYMeasured.join(', ')}`);
   check('gems land exactly where the projection says (≤ 3 px, incl. the one on the strike line)', out.noteYMaxErr <= 3, `max err ${out.noteYMaxErr.toFixed(2)} px vs expected ${out.noteYExpected.join(', ')}`);

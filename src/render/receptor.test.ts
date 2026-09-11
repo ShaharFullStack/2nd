@@ -323,6 +323,105 @@ describe('ReceptorHistory — the crossing is an edge, and tracking is noisy', (
     expect(look.goal ?? 0).toBe(0);
   });
 
+
+  it('measures the return journey from the observed PEAK, so every millimetre of the descent counts', () => {
+    // THE FROZEN GAUGE, at the model level. `resetProgress` used to be measured in clamped-`fill`
+    // units, so every value at or above the threshold reported 0: a patient who had genuinely
+    // lowered from full ROM to the threshold — 71 % of the return journey on the default 'easy'
+    // difficulty — was told they had given back nothing, and every mark the renderer hangs off this
+    // number sat still while they did exactly what the gauge had asked.
+    //
+    // Driven against the real trigger, at the DEFAULT difficulty (thresholdFraction 0.5, re-arm 0.6
+    // → the lane re-arms below 0.30 of ROM).
+    const TH = 0.5;
+    const trig = new LaneTrigger({ thresholdFraction: TH, rearmFraction: REARM, minIntervalSec: 0.3 });
+    const h = new ReceptorHistory();
+    const look = emptyReceptorLook();
+    let t = 0;
+    const feedAt = (value: number): ReceptorLook => {
+      t += 0.033;
+      trig.push(value, t);
+      return h.update(look, 0, { value, armed: trig.armed }, TH, REARM, t);
+    };
+    for (const v of [0.05, 0.2, 0.4]) feedAt(v);
+    feedAt(1); // the crossing: the trigger fires and publishes the frame already disarmed
+    expect(look.locked).toBe(true);
+    expect(look.peakRom).toBeCloseTo(1, 6);
+    expect(look.resetProgress).toBe(0); // at the top: nothing given back yet
+    let prev = 0;
+    const REARM_ROM = TH * REARM; // 0.30 of ROM — the level `LaneTrigger` re-arms below
+    for (const v of [0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5, 0.45, 0.4, 0.35, REARM_ROM]) {
+      const l = feedAt(v);
+      // The journey is peakRom → threshold * rearmFraction, and this is the fraction of it
+      // travelled — a real number for every value, not 0 until the threshold is reached.
+      expect(l.resetProgress, `resetProgress at ${v.toFixed(2)}`).toBeCloseTo((1 - v) / (1 - REARM_ROM), 6);
+      expect(l.resetProgress, `moves at ${v.toFixed(2)}`).toBeGreaterThan(prev);
+      prev = l.resetProgress;
+      expect(l.locked, `still locked at ${v.toFixed(2)}`).toBe(true);
+    }
+    // It completes exactly at the re-arm level, which is where the trigger re-arms.
+    expect(prev).toBeCloseTo(1, 6);
+    expect(look.needsLower).toBe(true); // on the line is one notch short: `armed` is `value < line`
+    // ...and more than half of that motion happened above the threshold — the span that used to
+    // report 0. (1.00 → 0.50 of ROM is 0.5 of a 0.7-of-ROM journey.)
+    const half = (1 - TH) / (1 - TH * REARM);
+    expect(half).toBeGreaterThan(0.7);
+  });
+
+  it('only ever raises the peak, so a landmark spike under-reports instead of inventing a descent', () => {
+    // A spurious spike sets a peak the patient never reached, which makes the arc report LESS
+    // progress than they have made. Decaying the peak back toward the current value would instead
+    // make the arc creep forward while they hold perfectly still — a lie in the one state whose
+    // whole message is "you have not given anything back yet".
+    const h = new ReceptorHistory();
+    const look = emptyReceptorLook();
+    let t = 0;
+    const feedAt = (value: number, armed: boolean): ReceptorLook => {
+      t += 0.033;
+      return h.update(look, 0, { value, armed }, T, REARM, t);
+    };
+    feedAt(0.5, true);
+    feedAt(1, false); // a crossing at full ROM
+    feedAt(0.8, false);
+    const from1 = look.resetProgress;
+    feedAt(0.95, false); // the patient goes back UP: the peak holds, progress falls back
+    expect(look.peakRom).toBeCloseTo(1, 6);
+    expect(look.resetProgress).toBeLessThan(from1);
+    feedAt(1.0, false);
+    expect(look.resetProgress).toBe(0);
+    // A higher peak is taken immediately — the journey is measured from wherever they really got to.
+    feedAt(0.7, false);
+    expect(look.peakRom).toBeCloseTo(1, 6);
+    expect(look.resetProgress).toBeCloseTo((1 - 0.7) / (1 - T * REARM), 6);
+  });
+
+  it('starts the return journey again when the evidence for the peak expires', () => {
+    // The peak is evidence like the arming is, and it expires on the same two rules: a break in the
+    // stream longer than `maxGapSec` (the renderer did not watch how high they got) and a threshold
+    // retune (the finish line moved). Either way the honest thing is to measure from where the
+    // patient is now, which under-reports their progress rather than inventing a descent.
+    const h = new ReceptorHistory();
+    const look = emptyReceptorLook();
+    h.update(look, 0, { value: 0.5, armed: true }, T, REARM, 0);
+    h.update(look, 0, { value: 1, armed: false }, T, REARM, 0.033);
+    h.update(look, 0, { value: 0.8, armed: false }, T, REARM, 0.066);
+    expect(look.peakRom).toBeCloseTo(1, 6);
+    // ...a gap longer than the trigger's own continuity window, then a lane at 0.8 again.
+    h.update(look, 0, { value: 0.8, armed: false }, T, REARM, 0.066 + DEFAULT_MAX_GAP_SEC + 0.1);
+    expect(look.peakRom).toBeCloseTo(0.8, 6);
+    expect(look.resetProgress).toBe(0);
+    // A retune does the same (`LaneTrigger.setThreshold` re-checks every lane's arming).
+    const h2 = new ReceptorHistory();
+    const look2 = emptyReceptorLook();
+    h2.update(look2, 0, { value: 0.5, armed: true }, T, REARM, 0);
+    h2.update(look2, 0, { value: 1, armed: false }, T, REARM, 0.033);
+    h2.update(look2, 0, { value: 0.9, armed: false }, T, REARM, 0.066);
+    expect(look2.resetProgress).toBeGreaterThan(0);
+    h2.update(look2, 0, { value: 0.9, armed: false }, 0.8, REARM, 0.099);
+    expect(look2.peakRom).toBeCloseTo(0.9, 6);
+    expect(look2.resetProgress).toBe(0);
+  });
+
   it('holds the last tracked look through a single-frame visibility dropout', () => {
     const h = new ReceptorHistory();
     const look = emptyReceptorLook();

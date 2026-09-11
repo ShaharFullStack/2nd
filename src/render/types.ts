@@ -48,8 +48,9 @@ export interface RenderLaneState {
    * but still carrying the lane's own hue, so the lane keeps its identity at the instant its note is
    * struck — a dulled liquid column, and — uniquely to this state — a violet drain cap riding the
    * top of that column, a dashed re-arm line at the level to come back down to, a "lower to reset"
-   * chevron in the gap between the two, and an arc outside the ring that grows with the fraction of
-   * the return journey travelled and completes exactly when the lane re-arms. Just as important is
+   * chevron in the gap between the two, and an arc outside the ring — contained inside this lane's
+   * half of the board, like every other mark (`outerMarkRadius` in Highway.ts) — that grows with the
+   * fraction of the return journey travelled and completes exactly when the lane re-arms. Just as important is
    * what is *removed*: no level line, no target line or ticks, no hot fill, no halo, no additive rim
    * or corona. A lane with `armed === false` must never wear any part of the "this counts" costume:
    * the input layer will emit nothing for it however hard the patient pushes.
@@ -152,6 +153,13 @@ export interface RenderFrame {
    * Live movement meters, one per lane — matched by `RenderLaneState.lane` when present. A lane
    * with no entry has no measurement and is drawn as tracking-lost (see `RenderLaneState.tracking`),
    * never as an idle at-rest gauge.
+   *
+   * ONE VOICE. The receptor row is not the only live meter a patient can see — the play screen's
+   * picture-in-picture lane meters sit beside the camera preview for the whole session — and two
+   * meters that disagree at the moment of success are worse than either being wrong alone. Any
+   * other meter fed from the same `getLaneStates()` must go through `ReceptorHistory.update` (for
+   * the crossing latch and the tracking hold, neither of which a single frame can know) and
+   * classify with `receptorMarkSet`, which is exactly what the renderer does with this array.
    */
   laneStates: RenderLaneState[];
   combo: number;
@@ -173,15 +181,32 @@ export interface RenderFrame {
   energy?: number;
   /**
    * Fraction of ROM that counts as a hit — pass `Difficulty.thresholdFraction` for the session,
-   * every frame. It is drawn as a fixed TARGET LINE across the receptor's meter well (and as two
-   * marks on the ring's outline at the same height, where the liquid can never cover them), at 76 %
-   * of the well's height; the band above it spans the rest of the patient's calibrated ROM, so the
-   * meter answers "how much further" during the rise and can never saturate before full ROM. The
-   * column is a POSITION on one scale in all four states — including the locked one, whose whole
-   * job is to be lowered and which therefore has to be able to show itself coming down from above
-   * the line. Only during the ~0.45 s after a real threshold crossing is a height above that line
-   * ALSO a claim: "this rep cleared the target by this much", the ROM-achieved reading a therapist
-   * is looking for. In every other state the height says where the patient is and nothing more.
+   * every frame. It is drawn as a DASHED TARGET LINE across the receptor's meter well, and as two
+   * solid marks on the ring's outline at the same height, where the liquid can never cover them.
+   *
+   * Dashed because of where it lands: on the default 'easy' difficulty the threshold puts it at
+   * 0.465 of the well, a few pixels from the receptor's vertical centre — which is where the
+   * board-wide strike line crosses every ring. A solid white rule there is confounded with a
+   * decorative element at 2 m (and at 'medium' the two read as a pair of near-parallel white
+   * rules), so the one fixed reference mark in the gauge is given a form the strike line cannot
+   * have. The solid ticks outside the ring carry the same height unbroken.
+   *
+   * ONE LINEAR ROM SCALE. The well is a ROM axis: full calibrated ROM at the ceiling, 0 at the
+   * floor, and this fraction is where the target line lands on it — low on the well for an easy
+   * session, near the top for a hard one, fixed for the session either way. So the meter answers
+   * "how much further" during the rise, cannot saturate before full ROM, and a given movement is
+   * the same distance on screen wherever in the range the patient makes it. (It used to be two
+   * scales meeting at a target line pinned at 76 % of the well, which gave the whole of the ROM
+   * above the threshold the remaining 24 % — on the default 'easy' difficulty, half the patient's
+   * range drawn at 4.5x the compression of the other half, i.e. 0.4 px per 0.05 of ROM on a clinic
+   * tablet at 2 m, for exactly the span the locked state exists to draw.)
+   *
+   * The column is a POSITION on that scale in all four states — including the locked one, whose
+   * whole job is to be lowered and which therefore has to be able to show itself coming down from
+   * above the line. Only during the ~0.45 s after a real threshold crossing is a height above that
+   * line ALSO a claim: "this rep cleared the target by this much", the ROM-achieved reading a
+   * therapist is looking for. In every other state the height says where the patient is, nothing
+   * more.
    *
    * A level at or above the target line is necessary but NOT sufficient for the "you reached it"
    * look. That one (hot fill into the headroom, split white-hot cap, two solid arrowheads in place

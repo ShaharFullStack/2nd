@@ -67,6 +67,7 @@ export type { LaneColor, LanePalette } from './palette';
 export {
   receptorLook,
   receptorLookInto,
+  receptorMarkSet,
   emptyReceptorLook,
   goalStrength,
   ReceptorHistory,
@@ -77,6 +78,6 @@ export {
   LOST_HOLD_SEC,
   METER_OVER_RANGE,
 } from './receptor';
-export type { ReceptorLook, LaneStateLike } from './receptor';
+export type { ReceptorLook, LaneStateLike, ReceptorMarkSet } from './receptor';
 export { runDemo, buildDemoChart, mountDemoIfRequested, DEMO_QUERY } from './demo';
 export type { DemoOptions, DemoHandle } from './demo';

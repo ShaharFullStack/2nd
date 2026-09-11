@@ -11,7 +11,7 @@ import { SILENT_GRID, buildSessionChart, songGridOf } from '../session/chart.ts'
 import { buildSessionResult } from '../session/results.ts';
 import { runtime } from '../session/runtime.ts';
 import { useStore } from '../state/store.ts';
-import { DEFAULT_REARM_FRACTION, receptorLookInto, type ReceptorLook } from '../render/receptor.ts';
+import { DEFAULT_REARM_FRACTION, ReceptorHistory, emptyReceptorLook, receptorMarkSet, type ReceptorLook } from '../render/receptor.ts';
 import CameraFallback from './CameraFallback.tsx';
 import { CameraPreview } from './CameraPreview.tsx';
 import { Meter, Toast, laneName } from './common.tsx';
@@ -29,49 +29,77 @@ function playCredit(m: SongManifest): string {
   return `${m.artist} · ${m.license}`;
 }
 
-/** Grey column + violet cap of a locked-out lane — the receptor's lock cues, in CSS. */
+/**
+ * The picture-in-picture lane meters' marks, in CSS — the same four mark sets the receptor row
+ * draws (`receptorMarkSet`), told apart by the NUMBER and SHAPE of their marks rather than by
+ * brightness, because a 14 px bar read at 2 m has no brightness to spare:
+ *   rising → the lane column alone;
+ *   goal   → a white cap ON the column and a white ring around the whole bar (two added marks);
+ *   locked → a grey column with a violet cap (the receptor's drain cap);
+ *   lost   → no column at all and a dashed grey outline (the receptor's broken ring).
+ */
 const PIP_LOCK_FILL = 'linear-gradient(0deg, #3a3b42, #8b8d96)';
 const PIP_LOCK_CAP = '#c08cff';
+const PIP_GOAL_CAP = '#ffffff';
+const PIP_GOAL_RING = '0 0 0 2px #ffffff';
+/** The receptor's broken-ring grey, as a dashed outline (outline, so nothing reflows when it appears). */
+const PIP_LOST_OUTLINE = '2px dashed #a9b0bb';
 
 /**
  * The picture-in-picture lane meters, shown next to the camera preview for the whole session.
  *
  * ONE VOICE: these are the only other movement meters in the patient's field of view, so they must
- * say what the receptors say. They used to brighten on `value >= threshold` with no reference to
- * `armed`, under the caption "gold = hit level" — so at the exact moment a receptor correctly went
- * grey and said "lower to reset", the meter 300 px away lit up and said "hit level reached". That
- * is the same biofeedback lie the receptor contract exists to remove, and two meters disagreeing is
- * worse than either one being wrong.
+ * say what the receptors say, at the same instant. They used to brighten on `value >= threshold`
+ * with no reference to `armed`, under the caption "gold = hit level" — so at the exact moment a
+ * receptor correctly went grey and said "lower to reset", the meter 300 px away lit up and said
+ * "hit level reached". That is the same biofeedback lie the receptor contract exists to remove.
  *
- * So the state comes from the same pure model the receptor uses (`receptorLookInto`), against the
- * same threshold and the same re-arm fraction: bright only when the lane would actually fire, grey
- * with a violet cap while it is locked out, and dropped to a hint while tracking is lost.
+ * FIXING IT WITH A SINGLE-FRAME READ WAS ONLY HALF THE JOB, AND THE HALF THAT LEFT THE WORSE BUG.
+ * Reading `receptorLookInto` per frame with no `ReceptorHistory` gave this meter no crossing latch,
+ * so the only "this is scoring" test it had was `look.willFire` — the conjunction
+ * `armed && tracking && fill >= 1`, which (receptor.ts's header, and its tests) NO input source in
+ * this repo ever publishes: the trigger disarms on the sample that crosses, before `getLaneStates`
+ * reads it. Driven in the real app, the bar went straight from the rising look to the grey "lower
+ * to reset" look on the held frame, with `brightness(1.5)` unreachable dead code behind it, while
+ * the receptor 300 px away was showing the full 0.45 s goal acknowledgement. So this now keeps its
+ * own `ReceptorHistory` — the same model, the same threshold, the same re-arm fraction — and reads
+ * `receptorMarkSet`, which is the receptor's own classifier.
  */
 function LaneMeters({ source, threshold }: { source: InputSource; threshold: number }) {
   const host = useRef<HTMLDivElement>(null);
   useEffect(() => {
     let raf = 0;
-    const look: ReceptorLook = { fill: 0, over: 0, willFire: false, locked: false, resetProgress: 0, resetLevel: DEFAULT_REARM_FRACTION, glowTarget: 0, tracking: true };
+    const look: ReceptorLook = emptyReceptorLook(DEFAULT_REARM_FRACTION);
+    // The crossing latch and the anti-strobe tracking hold are per-lane history, not per-frame
+    // state. Its clock only has to be monotone and in seconds; the audio clock is not available
+    // here and does not need to be — nothing here is judged, it is drawn.
+    const history = new ReceptorHistory();
     const tick = () => {
       const el = host.current;
       if (el) {
         const states = source.getLaneStates();
         const bars = el.children;
+        const now = performance.now() / 1000;
         for (let i = 0; i < bars.length && i < states.length; i++) {
-          const fill = bars[i].firstElementChild as HTMLElement | null;
+          const bar = bars[i] as HTMLElement;
+          const fill = bar.firstElementChild as HTMLElement | null;
           if (!fill) continue;
-          const s = states[i];
-          receptorLookInto(look, s, threshold, DEFAULT_REARM_FRACTION);
+          history.update(look, i, states[i], threshold, DEFAULT_REARM_FRACTION, now);
+          const marks = receptorMarkSet(look);
           // No measurement ⇒ nothing derived from one: the bar empties rather than leaving a stale
           // column standing at 80 % while the camera cannot see the patient at all.
-          const pct = look.tracking ? Math.max(0, Math.min(1, s.value)) * 100 : 0;
-          fill.style.height = `${pct}%`;
-          fill.style.opacity = look.tracking ? '1' : '0.25';
-          // Brightness means "this is scoring" — armed AND tracked AND at threshold, never a full
-          // meter on its own.
-          fill.style.filter = look.willFire ? 'brightness(1.5)' : 'none';
-          fill.style.background = look.locked ? PIP_LOCK_FILL : '';
-          fill.style.borderTop = look.locked ? `3px solid ${PIP_LOCK_CAP}` : '';
+          const rom = marks === 'lost' ? 0 : Math.max(0, Math.min(1, look.rom ?? 0));
+          fill.style.height = `${rom * 100}%`;
+          fill.style.opacity = marks === 'lost' ? '0.25' : '1';
+          fill.style.background = marks === 'locked' ? PIP_LOCK_FILL : '';
+          // The cap is a MARK, and which mark it is says which state this is: white = the rep just
+          // reached target range (latched, so it is on screen long enough to be caught), violet =
+          // locked out, lower to reset, none = still rising.
+          fill.style.borderTop =
+            marks === 'goal' ? `3px solid ${PIP_GOAL_CAP}` : marks === 'locked' ? `3px solid ${PIP_LOCK_CAP}` : '';
+          bar.style.boxShadow = marks === 'goal' ? PIP_GOAL_RING : '';
+          bar.style.outline = marks === 'lost' ? PIP_LOST_OUTLINE : '';
+          bar.dataset.state = marks;
         }
       }
       raf = requestAnimationFrame(tick);
@@ -352,7 +380,7 @@ export default function PlayScreen() {
           <div className="pip" ref={pipRef}>
             <CameraPreview className="pip-video" />
             <LaneMeters source={input} threshold={threshold} />
-            <div className="pip-note">lane meters · bright = scoring · grey = lower to reset</div>
+            <div className="pip-note">lane meters · white cap = target reached · violet cap = lower to reset · dashed = out of frame</div>
           </div>
         )}
 

@@ -18,9 +18,15 @@ import type { CanvasLike, RenderFrame, RenderNote } from './types';
 /** Mirrors of the receptor's private drawing constants (Highway.ts). */
 const METER_WELL = '#080a12';
 const WHITE = '#ffffff';
-const METER_TARGET_POS = 0.76;
 /** Ceiling on the liquid column in EVERY state, as a fraction of the well (Highway.METER_LEVEL_CEIL). */
 const METER_LEVEL_CEIL = 0.93;
+/**
+ * ROM → height in the meter well, the renderer's ONE linear scale (Highway.meterPos): full
+ * calibrated ROM at the ceiling, everything else proportional. So the target line sits at
+ * `meterPos(thresholdFraction)` and the re-arm line at `meterPos(thresholdFraction * rearmFraction)`
+ * — and a given movement is the same number of pixels wherever in the range it is made.
+ */
+const meterPos = (rom: number): number => Math.min(Math.max(rom, 0), 1) * METER_LEVEL_CEIL;
 /** A locked receptor's ring — and with it its whole gauge — is drawn 12 % smaller (Highway pulse). */
 const LOCK_RING_SCALE = 0.88;
 /** Drain cap / re-arm line / chevron / return-to-rest arc — violet, a hue no lane palette contains. */
@@ -1382,10 +1388,38 @@ function liquidRect(canvas: MockCanvas, hw: Highway, lane: number): MeterRect | 
 function wellRect(canvas: MockCanvas, hw: Highway, lane: number): MeterRect | undefined {
   return meterRects(canvas, hw, lane).find((m) => m.style === METER_WELL);
 }
-/** The fixed threshold line across the well (`undefined` when the lane does not draw one). */
-function targetLine(canvas: MockCanvas, hw: Highway, lane: number): MeterRect | undefined {
+/**
+ * The dashes of the fixed threshold line inside the well — short white bars, all at one height,
+ * centred on the lane and well inside the ring (the two solid ticks live OUTSIDE it, at ~1.0 r).
+ *
+ * The target line is dashed because its height follows the session's threshold and on the default
+ * difficulty that puts it within a few pixels of the board-wide strike line, which is solid and
+ * continuous: a fixed reference mark has to be a different KIND of mark from the decoration it
+ * lands on. So this is a segment count, not a rect.
+ */
+function targetDashes(canvas: MockCanvas, hw: Highway, lane: number): MeterRect[] {
   const g = hw.geometry;
-  return meterRects(canvas, hw, lane).find((m) => m.style === WHITE && m.h < g.receptorRadius * 0.2);
+  const cx = laneX(g, lane, 0);
+  const out: MeterRect[] = [];
+  canvas.ctx.calls.forEach((c, i) => {
+    if (c.name !== 'fillRect') return;
+    const [x, y, w, h] = c.args as number[];
+    if (canvas.ctx.propBefore(i, 'fillStyle') !== WHITE) return;
+    if (h > g.receptorRadius * 0.2 || w > g.receptorRadius * 0.35 || w < 1) return;
+    if (Math.abs(x + w / 2 - cx) > g.receptorRadius * 0.7) return;
+    out.push({ y, h, style: WHITE, i });
+  });
+  return out;
+}
+/**
+ * The fixed threshold line across the well, as one mark (`undefined` when the lane does not draw
+ * one): its height and thickness, from the dashes it is made of — which must all sit at one height.
+ */
+function targetLine(canvas: MockCanvas, hw: Highway, lane: number): MeterRect | undefined {
+  const dashes = targetDashes(canvas, hw, lane);
+  if (dashes.length < 3) return undefined;
+  for (const d of dashes) if (Math.abs(d.y - dashes[0].y) > 0.001) return undefined;
+  return dashes[0];
 }
 /** The moving level line at the patient's current value (lane-coloured, white-hot at threshold). */
 function levelLine(canvas: MockCanvas, hw: Highway, lane: number, bright: string): MeterRect | undefined {
@@ -1476,12 +1510,15 @@ function chevrons(canvas: MockCanvas, hw: Highway, lane: number): number {
  * `scale` is the ring scale in force: 1 for a live lane, `LOCK_RING_SCALE` for a locked one, whose
  * ring — and therefore whose whole gauge — is drawn 12 % smaller.
  */
-function meterAxis(hw: Highway, scale = 1): { yBot: number; span: number; yTarget: number } {
+function meterAxis(hw: Highway, scale = 1, threshold = 0.6): { yBot: number; span: number; yTarget: number } {
   const g = hw.geometry;
   const wry = g.receptorRadius * GEM_ASPECT * 0.9 * scale;
   const yBot = g.strikeY + wry;
   const span = wry * 2;
-  return { yBot, span, yTarget: yBot - METER_TARGET_POS * span };
+  // The target line is not a fixed height any more: it is the session's threshold ON the ROM axis
+  // (0.6 in every test that uses this default), which is what makes the rise and the return move at
+  // the same speed per millimetre.
+  return { yBot, span, yTarget: yBot - meterPos(threshold) * span };
 }
 
 const serialize = (canvas: MockCanvas): string[] => canvas.ctx.calls.map((c) => `${c.name}(${JSON.stringify(c.args.map((a) => (typeof a === 'number' ? Math.round(a * 100) / 100 : typeof a === 'object' ? 'obj' : a)))})`);
@@ -1933,7 +1970,7 @@ describe('the receptor draws four distinct states', () => {
       // Monotonic, and each 20 % of the rise moves the level by a fifth of the target height —
       // ~4 % of the receptor's height per step is what "a little higher" has to look like.
       expect(steps[i].level).toBeLessThan(steps[i - 1].level);
-      expect(steps[i - 1].level - steps[i].level).toBeGreaterThan(axis.span * METER_TARGET_POS * 0.15);
+      expect(steps[i - 1].level - steps[i].level).toBeGreaterThan(axis.span * meterPos(THRESH) * 0.15);
       expect(steps[i].liquid).toBeCloseTo(steps[i].level, 0);
     }
     // The rise is measured against the target line, which never moves and is never reached early.
@@ -1942,7 +1979,7 @@ describe('the receptor draws four distinct states', () => {
     expect(target.y + target.h / 2).toBeCloseTo(axis.yTarget, 1);
     for (const st of steps) expect(st.level).toBeGreaterThan(axis.yTarget); // still below the line
     // Halfway up is halfway to the line, not 45 % of a bar with no line on it.
-    expect(at(0.5).level).toBeCloseTo(axis.yBot - 0.5 * METER_TARGET_POS * axis.span, 1);
+    expect(at(0.5).level).toBeCloseTo(axis.yBot - meterPos(THRESH * 0.5) * axis.span, 1);
   });
 
   it('draws the column on ONE scale in every state, and never saturates it inside the patient\'s range', () => {
@@ -1986,7 +2023,7 @@ describe('the receptor draws four distinct states', () => {
     // the state is to show them coming back down from wherever that is.
     const lockAxis = meterAxis(hw, LOCK_RING_SCALE);
     const lockedTop = (value: number): number =>
-      lockAxis.yBot - Math.min(METER_TARGET_POS * Math.min(value / THRESH, 1) + (METER_LEVEL_CEIL - METER_TARGET_POS) * Math.min(Math.max(value - THRESH, 0) / Math.max(1 - THRESH, THRESH * 0.5), 1), METER_LEVEL_CEIL) * lockAxis.span;
+      lockAxis.yBot - meterPos(value) * lockAxis.span;
     for (const v of [0.18, 0.3, 0.42, 0.6, 0.75, 0.9, 1]) {
       expect(topOfLiquid(v, false), `locked at ${v}`).toBeCloseTo(lockedTop(v), 0);
     }
@@ -2038,7 +2075,11 @@ describe('the receptor draws four distinct states', () => {
       canvas.ctx.calls.forEach((c, i) => {
         if (c.name !== 'ellipse' || c.args.length < 7) return;
         if (Math.abs((c.args[1] as number) - g.strikeY) > 0.5) return;
-        if (Math.abs((c.args[2] as number) - g.receptorRadius * 1.16) > 0.5) return;
+        // Outside the ring, inside this lane's half of the board: the arc's nominal 1.16 r is
+        // clamped to the room the lane actually has (`outerMarkRadius`), so this matches a range
+        // rather than a number. Containment itself is asserted in 'no receptor mark crosses into a
+        // neighbouring lane'.
+        if (!((c.args[2] as number) > g.receptorRadius && (c.args[2] as number) <= g.receptorRadius * 1.17)) return;
         if (canvas.ctx.propBefore(i, 'strokeStyle') !== LOCK_HINT) return;
         span = Math.max(span, (c.args[6] as number) - (c.args[5] as number));
       });
@@ -2085,6 +2126,190 @@ describe('the receptor draws four distinct states', () => {
     // More than half of that motion happened ABOVE the threshold — the span that used to be dead.
     // (0.36..0.6 of ROM is the old live span; 0.6..1.0 is the span this test was written for.)
     expect(descent.filter((v) => v >= THRESH)).toHaveLength(8);
+  });
+
+
+  it('draws ONE LINEAR ROM SCALE at every difficulty — equal movement, equal distance, either side of the target line', () => {
+    // (1) HONESTY + (3) THE GAUGE MUST MOVE + (6) DOCS ARE THE CONTRACT. The well used to promise
+    // "one scale, the same height always means the same millimetres" while drawing two: the target
+    // line was pinned at a fixed 0.76 of the well whatever the session's threshold was, so on the
+    // DEFAULT 'easy' difficulty (thresholdFraction 0.5) the lower half of the patient's range got
+    // 0.76 of the well and the whole upper half got the remaining 0.17 — a 4.5x compression of
+    // exactly the span state (c) exists to draw. Measured in a real browser at 1920x1080, a locked
+    // lane lowering from full ROM to the threshold moved the column top 27 px in total: 2 px per
+    // 0.05 of ROM, i.e. 0.4 px on a 10" clinic tablet read at 2 m. It moved — and a patient could
+    // not see that it moved, for 71 % of the return journey.
+    //
+    // So: walk the whole range at all three real difficulties and require every equal step of ROM
+    // to be the same distance on screen, including the steps that straddle the target line.
+    const { canvas, hw } = setup(1280, 720, { reducedMotion: true });
+    hw.resize(1280, 720, 1);
+    const axis = meterAxis(hw);
+    let t = 1;
+    const topAt = (value: number, threshold: number): number => {
+      t += 0.033;
+      canvas.ctx.reset();
+      hw.draw(
+        makeFrame({
+          lanes: LANES,
+          songTime: t,
+          laneStates: LANES.map((l) => ({ lane: l.index, value, armed: true, tracking: true })),
+          thresholdFraction: threshold,
+          rearmFraction: 0.6,
+        }),
+      );
+      return (liquidRect(canvas, hw, 0) as MeterRect).y;
+    };
+    // easy / medium / hard (src/engine/difficulty.ts). Each ladder straddles that difficulty's
+    // target line, so a two-scale well shows up as one step out of five being a different size.
+    for (const threshold of [0.5, 0.65, 0.8]) {
+      const ladder = [0.15, 0.3, 0.45, 0.6, 0.75, 0.9].map((v) => topAt(v, threshold));
+      const perStep = 0.15 * METER_LEVEL_CEIL * axis.span;
+      for (let i = 1; i < ladder.length; i++) {
+        expect(ladder[i - 1] - ladder[i], `0.15 of ROM at threshold ${threshold}, step ${i}`).toBeCloseTo(perStep, 0);
+      }
+      // ...and the fixed marks are on that same ROM axis: the target line at the threshold, the
+      // re-arm dashes at threshold * rearmFraction. Nothing in the well is at a hard-coded height.
+      const target = targetLine(canvas, hw, 0) as MeterRect;
+      expect(target, `target line at threshold ${threshold}`).toBeDefined();
+      expect(target.y + target.h / 2).toBeCloseTo(axis.yBot - meterPos(threshold) * axis.span, 0);
+    }
+  });
+
+  it('keeps a lane\'s target-height marks inside its own lane at every difficulty', () => {
+    // The target line moves with the session's threshold, and the ticks and goal arrowheads hang
+    // off the ring's outline AT that height — which is ~1.0 r at a mid-range threshold, the ring's
+    // widest point, where a fixed-length mark reaches 1.24 r. Half a lane is 1.21 r at the board's
+    // widest geometry, so two neighbouring lanes' ticks would have touched and two neighbouring
+    // arrowheads would have merged into one blob spanning the gutter: a per-lane mark turned into a
+    // shelf joining the receptors, which destroys "WHICH lane is at target".
+    for (const threshold of [0.5, 0.65, 0.8]) {
+      const { canvas, hw } = setup(1280, 720, { reducedMotion: true });
+      hw.resize(1280, 720, 1);
+      const g = hw.geometry;
+      const half = g.laneWidthNear * 0.5;
+      // (a) rising: the two ticks. Measured on an INNER lane, which has a neighbour on both sides.
+      canvas.ctx.reset();
+      hw.draw(
+        makeFrame({
+          lanes: LANES,
+          songTime: 1,
+          laneStates: LANES.map((l) => ({ lane: l.index, value: threshold * 0.5, armed: true, tracking: true })),
+          thresholdFraction: threshold,
+        }),
+      );
+      const cx = laneX(g, 1, 0);
+      const ticks = targetTicks(canvas, hw, 1);
+      expect(ticks, `ticks at threshold ${threshold}`).toHaveLength(2);
+      for (const tk of ticks) {
+        const outer = Math.max(Math.abs(tk.x - cx), Math.abs(tk.x + tk.w - cx));
+        expect(outer, `tick reach at threshold ${threshold}`).toBeLessThan(half);
+        expect(tk.w, `tick still resolvable at threshold ${threshold}`).toBeGreaterThan(Math.max(3, g.receptorRadius * 0.09));
+      }
+      // (b) the crossing: the two solid arrowheads, which are the mark this state survives a hard
+      // downscale on — so they may be SHORTER when the line is at the ring's widest point, but they
+      // must still be inside the lane and still be triangles rather than dots.
+      canvas.ctx.reset();
+      let t2 = 1;
+      const cross = (value: number, armed: boolean): void => {
+        t2 += 0.033;
+        hw.draw(
+          makeFrame({
+            lanes: LANES,
+            songTime: t2,
+            laneStates: LANES.map((l) => ({ lane: l.index, value, armed, tracking: true })),
+            thresholdFraction: threshold,
+          }),
+        );
+      };
+      cross(threshold * 0.8, true);
+      canvas.ctx.reset();
+      cross(1, false); // the crossing frame, as the input layer publishes it
+      // Every arrowhead vertex on the board, measured against the lane it belongs to — the NEAREST
+      // receptor centre, which is the only assignment that cannot be argued with: if a vertex is
+      // closer to the neighbour's centre than to its own, the mark has left its lane.
+      const yTarget = meterAxis(hw).yBot - meterPos(threshold) * meterAxis(hw).span;
+      const vertices: Array<{ lane: number; d: number }> = [];
+      canvas.ctx.calls.forEach((c, i) => {
+        if (c.name !== 'moveTo' && c.name !== 'lineTo') return;
+        if (canvas.ctx.propBefore(i, 'fillStyle') !== WHITE) return;
+        const [x, y] = c.args as number[];
+        if (Math.abs(y - yTarget) > g.receptorRadius * 0.4) return;
+        let best = 0;
+        let bestD = Infinity;
+        for (const l of LANES) {
+          const d = Math.abs(x - laneX(g, l.index, 0));
+          if (d < bestD) {
+            bestD = d;
+            best = l.index;
+          }
+        }
+        // Outside the ring and within a receptor's reach of it — the same window `goalWedges`
+        // uses, so an unrelated white path elsewhere on the board cannot be counted as a mark.
+        if (bestD < g.receptorRadius * 0.5 || bestD > g.receptorRadius * 1.6) return;
+        vertices.push({ lane: best, d: bestD });
+      });
+      // Two arrowheads per lane, three vertices each.
+      expect(vertices.length, `arrowhead vertices at threshold ${threshold}`).toBe(LANES.length * 6);
+      for (const v of vertices) expect(v.d, `arrowhead reach at threshold ${threshold}`).toBeLessThan(half);
+      // Tip to base is still a real length, not a dot: at least 11 % of the receptor radius.
+      const own = vertices.filter((v) => v.lane === 1).map((v) => v.d);
+      expect(Math.max(...own) - Math.min(...own)).toBeGreaterThan(g.receptorRadius * 0.11);
+    }
+  });
+
+  it('draws the return from full ROM at the same scale as the rise, on the DEFAULT difficulty', () => {
+    // The critic's scenario, at the difficulty the app actually ships with: easy, thresholdFraction
+    // 0.5, re-arm 0.6 → the lane re-arms below 0.30 of ROM, so a patient who has just reached end
+    // range has to travel 1.00 → 0.30 and 71 % of that journey is above the threshold. Every step
+    // of it has to move the gauge by the SAME distance as a step of the rise does — "it moves" is
+    // not enough if the part that moves 2 px per step is the part the patient spends longest in.
+    const { canvas, hw } = setup(1280, 720, { reducedMotion: true });
+    hw.resize(1280, 720, 1);
+    const THRESHOLD = 0.5;
+    const REARM = 0.6;
+    const lockAxis = meterAxis(hw, LOCK_RING_SCALE, THRESHOLD);
+    let t = 1;
+    const step = (value: number, armed: boolean): void => {
+      t += 0.033;
+      canvas.ctx.reset();
+      hw.draw(
+        makeFrame({
+          lanes: LANES,
+          songTime: t,
+          laneStates: LANES.map((l) => ({ lane: l.index, value, armed, tracking: true })),
+          thresholdFraction: THRESHOLD,
+          rearmFraction: REARM,
+        }),
+      );
+    };
+    for (const v of [0.1, 0.25, 0.4]) step(v, true);
+    step(1, false); // the crossing, published already disarmed
+    for (let i = 0; i < 25; i++) step(1, false); // hold at end range until the goal latch expires
+    const caps: number[] = [(drainCap(canvas, hw, 0) as MeterRect).y];
+    const descent = [0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5, 0.45, 0.4, 0.35, 0.3];
+    for (const v of descent) {
+      step(v, false);
+      const cap = drainCap(canvas, hw, 0);
+      expect(cap, `drain cap at ${v}`).toBeDefined();
+      caps.push((cap as MeterRect).y);
+    }
+    // One scale: every 0.05 of ROM given back is the same distance down the well, above the
+    // threshold and below it alike.
+    const perStep = 0.05 * METER_LEVEL_CEIL * lockAxis.span;
+    for (let i = 1; i < caps.length; i++) {
+      expect(caps[i] - caps[i - 1], `descent step ${i} (to ${descent[i - 1]} of ROM)`).toBeCloseTo(perStep, 0);
+    }
+    // 71 % of the journey is above the threshold, and it gets 71 % of the travel — this is the
+    // number the whole work item is about.
+    const atThreshold = caps[1 + descent.indexOf(THRESHOLD)];
+    const above = atThreshold - caps[0];
+    const total = caps[caps.length - 1] - caps[0];
+    expect(above / total).toBeCloseTo((1 - THRESHOLD) / (1 - THRESHOLD * REARM), 2);
+    // ...and it ends on the dashed re-arm line, which is itself on the same ROM axis.
+    const dash = rearmDashes(canvas, hw, 0)[0];
+    expect(dash.y + dash.h / 2).toBeCloseTo(lockAxis.yBot - meterPos(THRESHOLD * REARM) * lockAxis.span, 0);
+    expect(Math.abs(caps[caps.length - 1] - dash.y)).toBeLessThan(1.5);
   });
 
   it('keeps the four mark sets apart at desktop, tablet and portrait aspect ratios', () => {
@@ -2181,10 +2406,13 @@ describe('the receptor draws four distinct states', () => {
       return { cap: cap.y + cap.h / 2, dashes: dashes[0].y + dashes[0].h / 2 };
     };
     // The dashed line never moves: it is the fixed reference the cap is coming down to.
-    const yRearmLine = axis.yBot - METER_TARGET_POS * REARM * axis.span;
-    // A ladder from the ceiling down to the re-arm point. Every step moves the cap by a real
-    // distance, so "nearly there" is readable — this is the drain equivalent of the rise readout.
-    const ladder = [0.9, 0.8, 0.7, 0.6].map((f) => capAt(THRESH * f));
+    const yRearmLine = axis.yBot - meterPos(THRESH * REARM) * axis.span;
+    // A ladder from FULL ROM down to the re-arm point. Every step moves the cap by a real distance,
+    // so "nearly there" is readable — this is the drain equivalent of the rise readout. It starts
+    // above the threshold on purpose: every locked-lane assertion in this file used to be built at
+    // or below it, which is structurally why a column frozen for the whole span between the
+    // patient's real peak and the threshold survived a thousand passing tests.
+    const ladder = [1, 0.85, 0.7, THRESH * 0.9, THRESH * 0.8, THRESH * 0.7, THRESH * 0.6].map((v) => capAt(v));
     for (const step of ladder) expect(Math.abs(step.dashes - yRearmLine)).toBeLessThan(1.5);
     for (let i = 1; i < ladder.length; i++) {
       expect(ladder[i].cap).toBeGreaterThan(ladder[i - 1].cap); // travelling DOWN the well
@@ -2326,7 +2554,11 @@ describe('the receptor draws four distinct states', () => {
         if (c.name !== 'ellipse' || c.args.length < 7) return;
         if (Math.abs((c.args[1] as number) - g.strikeY) > 0.5) return;
         // The arc sits just outside the ring; the meter's clip ellipse is inside it.
-        if (Math.abs((c.args[2] as number) - g.receptorRadius * 1.16) > 0.5) return;
+        // Outside the ring, inside this lane's half of the board: the arc's nominal 1.16 r is
+        // clamped to the room the lane actually has (`outerMarkRadius`), so this matches a range
+        // rather than a number. Containment itself is asserted in 'no receptor mark crosses into a
+        // neighbouring lane'.
+        if (!((c.args[2] as number) > g.receptorRadius && (c.args[2] as number) <= g.receptorRadius * 1.17)) return;
         if (s.canvas.ctx.propBefore(i, 'strokeStyle') !== LOCK_HINT) return;
         span = Math.max(span, (c.args[6] as number) - (c.args[5] as number));
       });
@@ -2334,6 +2566,13 @@ describe('the receptor draws four distinct states', () => {
     };
     // The arc spans at most 1.5π, leaving the top quarter of the ring permanently open: a cue that
     // closed into a complete ring would read as a lit ring, which is what (c) may never look like.
+    // `record` gives each value its own Highway, so each of these is a lane the renderer is SEEING
+    // for the first time, at that value: the return journey is measured from the peak it has
+    // actually observed, so a lane first seen at the top of its range — at the threshold or at full
+    // ROM — has given nothing back yet and draws no arc at all. The arc growing across a real
+    // descent from full ROM is asserted frame by frame in the descent tests above; what is asserted
+    // here is the shape of the mark and where it starts and ends.
+    expect(sweep(1)).toBe(0); // first seen at full ROM: no journey has been watched
     expect(sweep(0.6)).toBe(0); // at threshold: nothing given back yet, no arc at all
     expect(sweep(0.54)).toBeGreaterThan(0);
     expect(sweep(0.48)).toBeCloseTo(Math.PI * 0.75, 2); // half way down
@@ -3109,5 +3348,269 @@ describe('lanes are matched by identity, not by array position', () => {
     } finally {
       warn.mockRestore();
     }
+  });
+});
+
+// -------------------------------------------------------------------------------------------------
+// LANE CONTAINMENT. Four receptors must read as four receptors — never as one joined shelf. Every
+// mark a receptor draws has to stay inside its own lane's half of the board, at every geometry the
+// app can be opened at and in every one of the four states.
+// -------------------------------------------------------------------------------------------------
+
+describe('receptor marks stay inside their own lane', () => {
+  /** The colours a receptor paints its marks in — solid hex, unlike the road's gradients / rgba(). */
+  const isMarkStyle = (v: unknown): boolean => typeof v === 'string' && v.startsWith('#');
+
+  /**
+   * How far, in pixels, the furthest receptor mark in this frame reaches from its lane centre.
+   *
+   * Ops are attributed to the lane they are centred on, and only those inside the receptor's own
+   * vertical band are considered (the road, the rails and the crowd are drawn with gradients and
+   * rgba() fills, so the hex-style filter drops them; the band keeps out anything else that happens
+   * to be a flat colour). A stroked ellipse counts its stroke: half the line width lands outside the
+   * radius, which is exactly how the return-to-rest arc used to overrun its lane by 2–4 px while
+   * measuring "1.16 r" on paper.
+   */
+  function maxMarkReach(canvas: MockCanvas, hw: Highway): { reach: number; half: number; what: string } {
+    const g = hw.geometry;
+    const ry = g.receptorRadius * GEM_ASPECT;
+    let reach = 0;
+    let what = 'nothing';
+    canvas.ctx.calls.forEach((c, i) => {
+      const fill = canvas.ctx.propBefore(i, 'fillStyle');
+      const stroke = canvas.ctx.propBefore(i, 'strokeStyle');
+      let y: number;
+      let spans: Array<{ x: number; half: number }>;
+      if (c.name === 'fillRect') {
+        if (!isMarkStyle(fill)) return;
+        const [x, y0, w, h] = c.args as number[];
+        y = y0 + h / 2;
+        spans = [{ x: x + w / 2, half: Math.abs(w) / 2 }];
+      } else if (c.name === 'ellipse') {
+        if (!isMarkStyle(fill) && !isMarkStyle(stroke)) return;
+        const [x, y0, rx] = c.args as number[];
+        const lw = (canvas.ctx.propBefore(i, 'lineWidth') as number) ?? 0;
+        y = y0;
+        spans = [{ x, half: rx + lw / 2 }];
+      } else if (c.name === 'moveTo' || c.name === 'lineTo') {
+        if (!isMarkStyle(fill) && !isMarkStyle(stroke)) return;
+        const [x, y0] = c.args as number[];
+        // A stroked path spreads half its line width either side of the point; a FILLED one (the
+        // goal arrowheads) does not, and counting a stale `lineWidth` against it would report a
+        // 5 px overrun that is not on the canvas. Which it is, is what the path ends with.
+        const ends = canvas.ctx.calls.slice(i + 1).find((k) => k.name === 'fill' || k.name === 'stroke');
+        const lw = ends?.name === 'stroke' ? ((canvas.ctx.propBefore(i, 'lineWidth') as number) ?? 0) : 0;
+        y = y0;
+        spans = [{ x, half: lw / 2 }];
+      } else return;
+      if (Math.abs(y - g.strikeY) > ry * 1.6) return;
+      for (const s of spans) {
+        for (let lane = 0; lane < g.laneCount; lane++) {
+          const off = Math.abs(s.x - laneX(g, lane, 0));
+          // Attributed to the lane it is ANCHORED on, which is how every receptor mark is drawn:
+          // all of them are positioned from the receptor's centre x. An op anchored outside every
+          // lane's half is board or HUD chrome (the rock gauge's white needle can land in this
+          // vertical band on a 2-lane board), not a receptor mark.
+          if (off > g.laneWidthNear / 2) continue;
+          if (off + s.half > reach) {
+            reach = off + s.half;
+            what = `${c.name} lane ${lane} (fill ${String(fill)}, stroke ${String(stroke)})`;
+          }
+        }
+      }
+    });
+    return { reach, half: g.laneWidthNear / 2, what };
+  }
+
+  /** One frame of each state, at a given geometry and lane count, with the marks measured. */
+  function worstReach(w: number, h: number, laneCount: number): Array<{ state: string; reach: number; half: number; r: number; what: string }> {
+    const lanes = LANES.slice(0, laneCount);
+    const { canvas, hw } = setup(w, h, { reducedMotion: true });
+    hw.resize(w, h, 1);
+    let t = 1;
+    const step = (value: number, armed: boolean, tracking = true): void => {
+      canvas.ctx.reset();
+      hw.draw(
+        makeFrame({
+          lanes,
+          songTime: t,
+          laneStates: lanes.map((l) => ({ lane: l.index, value, armed, tracking })),
+          thresholdFraction: 0.5,
+          rearmFraction: 0.6,
+        }),
+      );
+      t += 1 / 30;
+    };
+    const out: Array<{ state: string; reach: number; half: number; r: number; what: string }> = [];
+    const r = hw.geometry.receptorRadius;
+    // (a) rising, (b) the crossing — every lane at once, which is what a chord in the chart is,
+    // and the case where two coronas used to merge across the gutter.
+    for (const v of [0.1, 0.3, 0.45]) step(v, true);
+    out.push({ state: 'rising', r, ...maxMarkReach(canvas, hw) });
+    step(0.95, false);
+    out.push({ state: 'goal', r, ...maxMarkReach(canvas, hw) });
+    // (c) locked, walked down the whole return journey: the arc grows the whole way, so its worst
+    // case is the last step before the lane re-arms.
+    for (let i = 0; i < 25; i++) step(0.95, false);
+    for (const v of [0.9, 0.8, 0.7, 0.6, 0.5, 0.45, 0.4, 0.35, 0.3]) {
+      step(v, false);
+      out.push({ state: `locked@${v}`, r, ...maxMarkReach(canvas, hw) });
+    }
+    // (d) no signal.
+    step(0.3, true, false);
+    step(0.3, true, false);
+    out.push({ state: 'lost', r, ...maxMarkReach(canvas, hw) });
+    return out;
+  }
+
+  it('never crosses into a neighbouring lane, at any geometry, lane count or state', () => {
+    for (const [w, h] of [
+      [1280, 800],
+      [1920, 1080],
+      [900, 1400], // portrait: the widest lanes relative to the receptor
+      [1024, 768],
+      [400, 800],
+    ]) {
+      for (const laneCount of [2, 3, 4]) {
+        for (const m of worstReach(w, h, laneCount)) {
+          const tag = `${w}x${h} ${laneCount} lanes, ${m.state}: ${m.what}`;
+          // Inside the lane's own half, less the margin every receptor mark is grown inward from
+          // (`TARGET_MARK_MARGIN`), so two adjacent receptors always have an unpainted gutter
+          // between them however many of them are in the same state at the same instant.
+          const margin = Math.max(2, m.r * 0.06);
+          expect(m.reach, tag).toBeLessThanOrEqual(m.half - margin + 1e-6);
+        }
+      }
+    }
+  });
+
+  it('gives the return-to-rest arc and the goal corona the lane\'s room, not a fixed 1.16 r', () => {
+    // The two marks that are drawn OUTSIDE the ring. They want 1.16 r; what they get is whatever is
+    // left inside the lane after the same margin the target ticks use. On a wide-lane geometry the
+    // wish is granted in full; on the board's widest-receptor geometry it is trimmed — and it is the
+    // radius that gives way, never the containment.
+    const { canvas, hw } = setup(1280, 800, { reducedMotion: true });
+    hw.resize(1280, 800, 1);
+    const g = hw.geometry;
+    let t = 1;
+    const step = (value: number, armed: boolean): void => {
+      canvas.ctx.reset();
+      hw.draw(
+        makeFrame({
+          lanes: LANES,
+          songTime: t,
+          laneStates: LANES.map((l) => ({ lane: l.index, value, armed, tracking: true })),
+          thresholdFraction: 0.5,
+          rearmFraction: 0.6,
+        }),
+      );
+      t += 1 / 30;
+    };
+    /** Radii of the ellipses stroked outside the ring on lane 0 (arc in (c), corona in (b)). */
+    const outerRings = (): Array<{ rx: number; lw: number }> => {
+      const out: Array<{ rx: number; lw: number }> = [];
+      canvas.ctx.calls.forEach((c, i) => {
+        if (c.name !== 'ellipse') return;
+        if (Math.abs((c.args[0] as number) - laneX(g, 0, 0)) > 1) return;
+        if (Math.abs((c.args[1] as number) - g.strikeY) > 0.5) return;
+        const rx = c.args[2] as number;
+        if (rx <= g.receptorRadius) return;
+        out.push({ rx, lw: (canvas.ctx.propBefore(i, 'lineWidth') as number) ?? 0 });
+      });
+      return out;
+    };
+    step(0.2, true);
+    step(0.95, false); // the crossing: corona
+    const corona = outerRings();
+    expect(corona.length, 'the goal corona is drawn').toBeGreaterThan(0);
+    for (let i = 0; i < 25; i++) step(0.95, false);
+    step(0.4, false); // well into the return: the arc is long
+    const arc = outerRings();
+    expect(arc.length, 'the return-to-rest arc is drawn').toBeGreaterThan(0);
+    for (const m of [...corona, ...arc]) {
+      expect(m.rx + m.lw / 2).toBeLessThanOrEqual(g.laneWidthNear / 2 - 1);
+      expect(m.rx, 'still outside the ring it belongs to').toBeGreaterThan(g.receptorRadius);
+    }
+  });
+});
+
+// -------------------------------------------------------------------------------------------------
+// The fixed reference mark must not be confounded with the board's own decoration.
+// -------------------------------------------------------------------------------------------------
+
+describe('the target line is a different KIND of mark from the strike line', () => {
+  const THRESH_CASES: Array<[string, number]> = [
+    ['easy', 0.5],
+    ['medium', 0.65],
+    ['hard', 0.8],
+  ];
+
+  it('draws the threshold as dashes inside the well and solid ticks outside the ring', () => {
+    for (const [name, threshold] of THRESH_CASES) {
+      const { canvas, hw } = setup(1280, 720, { reducedMotion: true });
+      hw.resize(1280, 720, 1);
+      const g = hw.geometry;
+      canvas.ctx.reset();
+      hw.draw(
+        makeFrame({
+          lanes: LANES,
+          songTime: 1,
+          laneStates: LANES.map((l) => ({ lane: l.index, value: threshold * 0.5, armed: true, tracking: true })),
+          thresholdFraction: threshold,
+          rearmFraction: 0.6,
+        }),
+      );
+      const dashes = targetDashes(canvas, hw, 0);
+      // Several marks at one height, not one rule: a continuous white bar at this height is
+      // confounded with the board-wide strike line, which on the DEFAULT difficulty crosses the
+      // ring within a few pixels of it.
+      expect(dashes.length, `${name}: dash count`).toBeGreaterThanOrEqual(3);
+      const axis = meterAxis(hw, 1, threshold);
+      for (const d of dashes) {
+        expect(d.y + d.h / 2, `${name}: dash height`).toBeCloseTo(axis.yTarget, 0);
+        expect(d.h, `${name}: dash thickness`).toBeLessThan(g.receptorRadius * 0.2);
+      }
+      // No white bar at that height spans the well: the gaps are real, at every difficulty.
+      const solid = meterRects(canvas, hw, 0).filter(
+        (m) => m.style === WHITE && Math.abs(m.y + m.h / 2 - axis.yTarget) < 1.5,
+      );
+      expect(solid, `${name}: no solid full-width rule at the target height`).toHaveLength(0);
+      // ...and the same height IS carried unbroken, outside the ring where no liquid reaches: two
+      // solid ticks. So the reference never rests on the dashes alone.
+      const ticks = targetTicks(canvas, hw, 0);
+      expect(ticks, `${name}: ticks`).toHaveLength(2);
+      for (const tick of ticks) expect(Math.abs(tick.y - (axis.yTarget - 1.1)), `${name}: tick height`).toBeLessThan(2);
+    }
+  });
+
+  it('keeps the dashes clear of the solid ticks, so the two never read as one run', () => {
+    const { canvas, hw } = setup(1280, 720, { reducedMotion: true });
+    hw.resize(1280, 720, 1);
+    const g = hw.geometry;
+    canvas.ctx.reset();
+    hw.draw(
+      makeFrame({
+        lanes: LANES,
+        songTime: 1,
+        laneStates: LANES.map((l) => ({ lane: l.index, value: 0.3, armed: true, tracking: true })),
+        thresholdFraction: 0.5,
+        rearmFraction: 0.6,
+      }),
+    );
+    const cx = laneX(g, 0, 0);
+    // Measured from the recorded rects (the helper reports heights, not horizontal extents).
+    const xs: number[] = [];
+    canvas.ctx.calls.forEach((c, i) => {
+      if (c.name !== 'fillRect') return;
+      if (canvas.ctx.propBefore(i, 'fillStyle') !== WHITE) return;
+      const [x, , w, h] = c.args as number[];
+      if (h > g.receptorRadius * 0.2 || w > g.receptorRadius * 0.35) return;
+      if (Math.abs(x + w / 2 - cx) > g.receptorRadius * 0.75) return;
+      xs.push(Math.abs(x + w / 2 - cx) + w / 2);
+    });
+    const ticks = targetTicks(canvas, hw, 0);
+    const tickInner = Math.min(...ticks.map((t) => Math.abs(t.x + t.w / 2 - cx) - t.w / 2));
+    // A real gap between the last dash and the first tick — at least a dash's worth of dark.
+    expect(tickInner - Math.max(...xs)).toBeGreaterThan(g.receptorRadius * 0.1);
   });
 });

@@ -123,7 +123,7 @@ import {
   type LanePalette,
 } from './palette';
 import { PARTICLE_RING, PARTICLE_SMOKE, PARTICLE_SPARK, PARTICLE_STREAK, ParticlePool, emitHitBurst, makeRng } from './particles';
-import { DEFAULT_MAX_GAP_SEC, DEFAULT_REARM_FRACTION, ReceptorHistory, emptyReceptorLook, type ReceptorLook } from './receptor';
+import { DEFAULT_MAX_GAP_SEC, DEFAULT_REARM_FRACTION, ReceptorHistory, emptyReceptorLook, receptorMarkSet, type ReceptorLook } from './receptor';
 import { SpriteCache, blit } from './sprites';
 import { DigitRoller, TextCache, defaultCanvasFactory, fontPx, type Ctx2D, type TextStyle } from './text';
 import type { CanvasLike, HighwayOptions, RenderFrame, RenderLaneState, RenderNote, RenderStats } from './types';
@@ -240,13 +240,6 @@ const METER_LOCK_KEY = 'meterLocked';
  */
 const LOCK_HINT_COLOR = '#c08cff';
 /**
- * Where the trigger threshold sits inside the receptor's meter well, as a fraction of the well's
- * height. The remaining 24 % is overshoot headroom, so the target line is a line the level can be
- * BELOW, ON, or ABOVE — a gauge with a fixed mark, which is what makes "half way" readable as
- * something other than "not yet".
- */
-const METER_TARGET_POS = 0.76;
-/**
  * Ceiling on the liquid column, as a fraction of the well's height — the same in EVERY state,
  * because the column is a position gauge and the patient's position does not change meaning with
  * the lane's arming.
@@ -268,6 +261,30 @@ const METER_TARGET_POS = 0.76;
  */
 const METER_LEVEL_CEIL = 0.93;
 /**
+ * ROM → height, and the ONLY map from a measurement to a position in the well: a value of `rom`
+ * (fraction of calibrated ROM) sits at `rom * METER_LEVEL_CEIL` of the well's height. Full ROM is
+ * the ceiling, 0 is the floor, and everything between is proportional — so the target line lands at
+ * `thresholdFraction * METER_LEVEL_CEIL`, the re-arm line at `thresholdFraction * rearmFraction *
+ * METER_LEVEL_CEIL`, and a given number of millimetres of movement is the same number of pixels
+ * wherever in the range the patient makes it.
+ *
+ * IT USED TO BE TWO SCALES EITHER SIDE OF A FIXED TARGET LINE, and that was a second frozen zone
+ * hiding behind the same "one scale" claim this comment used to make. The line sat at a fixed 0.76
+ * of the well whatever the threshold was, which left 0.17 of the well for ALL the ROM above it: on
+ * the default 'easy' difficulty (thresholdFraction 0.5) half the patient's range was drawn at
+ * 4.5x the compression of the other half. Measured on real pixels at 1920x1080, a locked lane
+ * lowering from full ROM to the threshold moved the column top 27 px in total — 2 px per 0.05 of
+ * ROM, i.e. 0.4 px on a 10" clinic tablet read at 2 m, for the exact span (71 % of the return
+ * journey at that difficulty) whose motion is the point of state (c).
+ *
+ * The line moving with the session's threshold is not a cost, it is the prescription made visible:
+ * an easy session's target line is low on the well and a hard one's is near the top, and either way
+ * "how much further" is the same distance per millimetre for the rise and for the return.
+ */
+function meterPos(rom: number): number {
+  return clamp(rom, 0, 1) * METER_LEVEL_CEIL;
+}
+/**
  * Ring scale while the lane is locked out. The 12 % shrink is one of the marks of (c); it is
  * reached by gliding over the tail of the goal latch (`ReceptorLook.goal`) rather than by stepping,
  * so the gauge does not visibly shrink at the exact instant the patient reaches their target.
@@ -282,10 +299,40 @@ const LOCK_RING_SCALE = 0.88;
  * additive rings.
  */
 const GOAL_WEDGE_R = 0.34;
+/**
+ * How far outside the ring a mark hung at the TARGET HEIGHT may reach, in receptor radii.
+ *
+ * The threshold ticks and the goal arrowheads are anchored flush to the ring's outline at the
+ * target line, so how far out they start depends on where that line is: near the ring's vertical
+ * centre the outline is at ~1.0 r, near the top or bottom it is much narrower. Now that the target
+ * line follows the session's threshold (see `meterPos`) that anchor moves, and at a mid-range
+ * threshold it sits at the ring's widest point — where a fixed-length mark would cross into the
+ * neighbouring lane. Half a lane is 1.21 r at the board's widest geometry (`GEM_LANE_FRACTION` /
+ * `RECEPTOR_GEM_RATIO` in geometry.ts), so two adjacent lanes' ticks would have touched and two
+ * adjacent arrowheads would have merged into one blob across the gutter — turning a per-lane mark
+ * into a shelf joining the receptors, which is the opposite of "which lane is at target".
+ *
+ * So the marks grow inward from an outer limit instead of outward from a moving inner one: their
+ * LENGTH gives way, their reach does not. The limit is the room the lane actually has — half a lane
+ * less this margin — rather than a fixed number of radii, so a board whose lanes are wide relative
+ * to its receptors (a 2-lane session, or a tall narrow window where the gem's height cap binds
+ * first) keeps the full-length marks. Only the horizontal extent is ever clamped: an arrowhead's
+ * height has nothing above or below it to collide with, so it keeps its blob-at-2-m area by staying
+ * as tall as it ever was.
+ */
+const TARGET_MARK_MARGIN = 0.06;
 /** Ground of the meter well: flat and dark, so the liquid's top edge is a hard step, not a bevel. */
 const METER_WELL_COLOR = '#080a12';
 /** Threshold (target) line and the white-hot level cap at the trigger point. */
 const TARGET_LINE_COLOR = '#ffffff';
+/**
+ * The target line is drawn as `TARGET_DASH_COUNT` dashes (with equal gaps) spanning
+ * `TARGET_DASH_SPAN` of the well's half-width either side of centre — see the drawing site for why
+ * it is dashed at all. The span stops short of the well's edge so the outermost dash cannot line up
+ * with the solid tick just outside the ring at the same height and read as one continuous run.
+ */
+const TARGET_DASH_COUNT = 5;
+const TARGET_DASH_SPAN = 0.72;
 /**
  * "No signal" ring colour (tracking lost). Deliberately a *light* neutral grey: the locked-out ring
  * is the palette's dead dark grey, so at 2 m the two never read as the same thing.
@@ -298,6 +345,34 @@ const LOST_RING_COLOR = '#a9b0bb';
  */
 const RESET_ARC_START = -Math.PI / 4;
 const RESET_ARC_SWEEP = Math.PI * 1.5;
+/**
+ * Nominal radius, in receptor radii, of the two marks drawn OUTSIDE the ring: the return-to-rest arc
+ * of (c) and the goal corona of (b). Nominal because it is a wish, not a promise — `outerMarkRadius`
+ * clamps it to the room the lane actually has.
+ */
+const OUTER_MARK_R = 1.16;
+/**
+ * Largest radius a ring-shaped mark centred on a receptor may be drawn at, given its stroke width,
+ * so that its OUTER edge still lands inside this lane's half of the board.
+ *
+ * LANE CONTAINMENT IS PART OF THE CONTRACT, and it was enforced for the target ticks and the goal
+ * arrowheads (`TARGET_MARK_MARGIN`) and not for these two. At `OUTER_MARK_R` with a stroke of up to
+ * `r * 0.12` the arc reaches ~1.22 r, and half a lane is ~1.21 r at the board's widest geometry
+ * (`GEM_LANE_FRACTION` / `RECEPTOR_GEM_RATIO`): measured on real pixels the arc overran its lane by
+ * 2–4 px at every geometry, so four locked lanes descending together drew four violet arcs that
+ * crossed in the gutters and read as ONE scalloped ribbon spanning the board — the receptors joined
+ * into a shelf, which is precisely the failure the tick margin exists to prevent. Two adjacent lanes
+ * crossing threshold on the same chord did the same, briefly, with their coronas.
+ *
+ * So the radius gives way instead. `reach` is half a lane less the tick margin; the floor keeps the
+ * mark outside the ring it belongs to (it can never bind on a real board — the geometry guarantees
+ * half a lane ≥ 1.2 r — but a synthetic geometry must degrade to "touching the ring", never to
+ * "inside the neighbour").
+ */
+function outerMarkRadius(r: number, laneWidthNear: number, lineWidth: number): number {
+  const reach = laneWidthNear * 0.5 - Math.max(2, r * TARGET_MARK_MARGIN);
+  return Math.max(r, Math.min(r * OUTER_MARK_R, reach - lineWidth * 0.5));
+}
 /** Arc segments of the broken "no signal" ring, and the gap between them in radians. */
 const LOST_RING_SEGMENTS = 4;
 const LOST_RING_GAP_RAD = 0.52;
@@ -1359,17 +1434,22 @@ export class Highway {
    * a translucent dark disc across the whole ellipse; a meter drawn underneath it is a scrimmed
    * warm-up glow with no resolvable level, which is exactly what a rising meter must not be.
    *
-   * The meter is a GAUGE: a flat dark well, a liquid column with a hard-edged top, a fixed target
-   * line at `thresholdFraction` (`METER_TARGET_POS`) with the rest of the patient's calibrated ROM
-   * as headroom above it (`meterOverSpan`), and two ticks marking that same threshold outside the
-   * ring where no liquid can cover them.
+   * The meter is a GAUGE: a flat dark well, a liquid column with a hard-edged top, a target line at
+   * the session's `thresholdFraction` with the rest of the patient's calibrated ROM as headroom
+   * above it, and two ticks marking that same threshold outside the ring where no liquid can cover
+   * them. The target line is fixed for the session, and where it sits IS the prescription: low on
+   * the well for an easy session, near the top for a hard one.
    *
-   * THE COLUMN IS ONE SCALE IN ALL FOUR STATES, and it is a POSITION, not a verdict: the same
-   * height always means the same millimetres of movement. It cannot saturate anywhere inside the
-   * reachable range, so it moves with the patient throughout the concentric rise AND the eccentric
-   * return — the return is a therapeutic target in its own right, and a gauge that flatlines while
-   * the patient performs the movement it just asked for reads as broken. What that position MEANS
-   * for the next rep is carried entirely by which marks surround it, below.
+   * THE COLUMN IS ONE LINEAR SCALE IN ALL FOUR STATES, and it is a POSITION, not a verdict. Every
+   * height in the well is `meterPos` of a ROM value — full ROM at the ceiling, the target line at
+   * `thresholdFraction` of it, the re-arm line at `thresholdFraction * rearmFraction` — so the same
+   * height always means the same millimetres of movement, and the same movement covers the same
+   * distance on screen wherever in the range the patient makes it. It cannot saturate anywhere
+   * inside the reachable range, so it moves with the patient throughout the concentric rise AND the
+   * eccentric return — the return is a therapeutic target in its own right, and a gauge that
+   * flatlines (or crawls at a fifth speed) while the patient performs the movement it just asked
+   * for reads as broken. What that position MEANS for the next rep is carried entirely by which
+   * marks surround it, below.
    *
    *   (a) rising, armed        → lane-coloured ring with the beat pulse; liquid rising in the well;
    *                              a lane-coloured LEVEL LINE at the patient's current value; the
@@ -1483,11 +1563,15 @@ export class Highway {
       // getLaneStates reads it), so "you reached your target" is drawn from the crossing EDGE and
       // held ~0.45 s. `goal` is 1 for the hold and then ramps to 0. See receptor.ts.
       const goal = look.goal ?? 0;
-      const hot = goal > 0;
+      // ONE VOICE: the same classifier every other live meter on screen uses (`receptorMarkSet`),
+      // so the picture-in-picture lane meters next to the camera preview cannot be in a different
+      // state from the receptor at the same instant.
+      const marks = receptorMarkSet(look);
+      const hot = marks === 'goal';
       // The return-to-rest marks belong to (c) alone. During the latch the lane is both locked and
       // freshly scored, and the patient is told the second thing first; when the latch ends the
       // ring has already glided into the lockout look and the "lower to reset" instruction appears.
-      const showLock = look.locked && !hot;
+      const showLock = marks === 'locked';
       // ...and, inside (c), whether the patient has anywhere left to lower TO. A lane can be locked
       // while already below the re-arm line ('unconfirmed' is a statement about what has been
       // observed, not about the current value: `setThreshold`, a reset, or a stream break can leave
@@ -1583,37 +1667,37 @@ export class Highway {
 
       // ---- the meter well ------------------------------------------------------------------
       // A gauge, not a glow: flat dark ground, a liquid column whose top edge is a hard luminance
-      // step, and a FIXED target line at the trigger threshold with overshoot headroom above it.
+      // step, and a target line at the trigger threshold — fixed for the session — with the rest of
+      // the patient's ROM as headroom above it.
       // The fixed mark is what makes "half way" different from "nearly there" at 2 m — a level with
       // nothing to read it against is only comparable to itself.
       const wr = r * 0.92 * pulse;
       const wry = ry * 0.9 * pulse;
       const yBot = y + wry;
       const span = wry * 2;
-      const yTarget = yBot - METER_TARGET_POS * span;
-      // Where the top of the liquid goes. ONE SCALE, IN EVERY STATE: the threshold sits at
-      // METER_TARGET_POS of the well, and the band above it spans the rest of the patient's
-      // calibrated ROM (`ReceptorLook.over` / `meterOverSpan`), up to `METER_LEVEL_CEIL` so the cap
-      // bar riding the top of the column always has width to be drawn at.
+      // Every height in the well is `meterPos` of a ROM value and nothing else — one linear scale,
+      // in all four states, for the target line, the column, and the re-arm line. The column is
+      // therefore a POSITION: the same height means the same millimetres of movement whatever the
+      // lane's arming is doing, and the same movement means the same distance on screen whether the
+      // patient makes it below the target line or above it. What that position MEANS for the next
+      // rep is carried by the mark set around it: (a)/(b) draw the target line, its ticks and a
+      // level line; (c) draws none of those and instead draws the drain cap, the dashed re-arm
+      // line, the chevron and the return-to-rest arc.
       //
-      // The column is therefore a POSITION and nothing else — the same height means the same
-      // millimetres of movement whatever the lane's arming is doing. What that position MEANS for
-      // the next rep is carried by the mark set around it: (a)/(b) draw the target line, its ticks
-      // and a level line; (c) draws none of those and instead draws the drain cap, the dashed
-      // re-arm line, the chevron and the return-to-rest arc.
-      //
-      // IT USED TO BE TWO SCALES, and that was the defect. A locked column was clamped to
-      // `min(fill, 0.9)` of the target height, and `fill` itself saturates at the threshold, so a
+      // IT USED TO BE CLAMPED, TWICE, and both clamps were frozen zones. A locked column was capped
+      // at `min(fill, 0.9)` of the target height and `fill` saturates at the threshold, so a
       // patient holding at end range and then lowering saw the column — and the drain cap, the
       // chevron and the arc that hang off it — sit perfectly still for the whole span from their
       // real peak down to the threshold: 71 % of the return journey on the default 'easy'
-      // difficulty, one to two seconds of "you have given nothing back yet" while they were in fact
-      // doing exactly what the gauge had just asked them to do. The eccentric phase is a
-      // therapeutic target in its own right, and concurrent feedback that flatlines through it
-      // reads as "broken" or "I am doing this wrong".
-      const levelFrac = METER_TARGET_POS * look.fill + (METER_LEVEL_CEIL - METER_TARGET_POS) * look.over;
-      const yLevel = yBot - clamp(levelFrac, 0, METER_LEVEL_CEIL) * span;
-      const yRearm = yBot - METER_TARGET_POS * look.resetLevel * span;
+      // difficulty. Removing that left a second, quieter one: the target line was pinned at a fixed
+      // 0.76 of the well, so the whole of the ROM above the threshold had to share the remaining
+      // 0.17 and moved at a fifth of the speed of the rise. The eccentric phase is a therapeutic
+      // target in its own right, and concurrent feedback that crawls through it reads as broken
+      // just as surely as one that stops.
+      const yTarget = yBot - meterPos(threshold) * span;
+      const rom = clamp(look.rom ?? look.fill * threshold, 0, 1);
+      const yLevel = yBot - meterPos(rom) * span;
+      const yRearm = yBot - meterPos(threshold * look.resetLevel) * span;
       ctx.save();
       ctx.beginPath();
       ctx.ellipse(x, y, wr, wry, 0, 0, Math.PI * 2);
@@ -1678,13 +1762,32 @@ export class Highway {
           }
           ctx.globalAlpha = 1;
         }
-        // Target line: the threshold, at a fixed height, always drawn on top of the liquid. The one
-        // continuous full-width white bar in states (a) and (b) — so the split cap above cannot be
-        // confused with it even when both are white.
-        ctx.fillStyle = TARGET_LINE_COLOR;
-        ctx.globalAlpha = 0.8;
-        ctx.fillRect(x - wr, yTarget - Math.max(1, 1.1 * this.u), wr * 2, Math.max(2, 2.2 * this.u));
-        ctx.globalAlpha = 1;
+        // Target line: the threshold, at a fixed height, always drawn on top of the liquid — the
+        // fixed reference that makes "half way" different from "nearly there".
+        //
+        // DASHED, AND NOT FULL WIDTH, because of where it lands. Its height is the session's
+        // threshold on the ROM axis (see `meterPos`), and on the DEFAULT difficulty ('easy',
+        // thresholdFraction 0.5) that is 0.465 of the well — within a few pixels of the receptor's
+        // vertical centre, which is exactly where the board-wide strike line and its glow cross
+        // every ring. A solid white rule there is confounded with a decorative element at 2 m, and
+        // at 'medium' (0.65) the two read as a pair of near-parallel white rules. A dashed mark is
+        // a different KIND of mark from the continuous strike line at any size, and it cannot be
+        // confused with the split white-hot cap of (b) either (two long segments, twice as thick).
+        // The violet dashes of (c) share the dash idea but never share a frame with it, are a
+        // different colour, and there are three of them at a different height.
+        //
+        // The solid ticks flush against the ring outline (below, outside the well) carry the same
+        // height as unbroken marks, so the reference is never dashes alone.
+        {
+          const th = Math.max(2, 2.2 * this.u);
+          const unit = (wr * TARGET_DASH_SPAN * 2) / (TARGET_DASH_COUNT * 2 - 1);
+          ctx.fillStyle = TARGET_LINE_COLOR;
+          ctx.globalAlpha = 0.85;
+          for (let k = 0; k < TARGET_DASH_COUNT; k++) {
+            ctx.fillRect(x - wr * TARGET_DASH_SPAN + k * unit * 2, yTarget - th * 0.5, unit, th);
+          }
+          ctx.globalAlpha = 1;
+        }
       } else {
         // Drain cap: a hard bar in the lock hint colour riding the top of the grey column. It is not
         // a level line — it says nothing about scoring, it is the thing the patient has to bring
@@ -1734,6 +1837,19 @@ export class Highway {
         // outline at exactly the threshold height.
         const dy = clamp((yTarget - y) / (ry * pulse), -1, 1);
         const edge = r * pulse * Math.sqrt(Math.max(0, 1 - dy * dy));
+        // How far from this receptor's centre a mark may reach before it is in the next lane's
+        // half: half a lane, less a margin (see TARGET_MARK_MARGIN). `edge` is where the ring's
+        // outline is at the target height, and it is at its widest — ~1.0 r, more while the re-arm
+        // pop is scaling the ring up — exactly when the target line is near the ring's middle.
+        //
+        // A HARD CAP, NOT A PREFERENCE. It used to be `max(edge + minLength, laneLimit)`, so the
+        // minimum length a mark needs to read as a mark could push its outer end past the lane
+        // boundary: measured at 1280x800 with four lanes, the goal arrowheads of a chord ended
+        // 1.0 px short of the lane edge — two adjacent lanes' pairs separated by 2 px, which at the
+        // 220 px downscale a low-vision patient at 2 m effectively applies is one blob spanning the
+        // gutter. The mark keeps its length by moving its INNER end inward (onto the ring, which has
+        // nothing to collide with) instead of its outer end outward.
+        const markLimit = g.laneWidthNear * 0.5 - Math.max(2, r * TARGET_MARK_MARGIN);
         if (hot) {
           // GOAL REACHED. The two thin ticks become two SOLID ARROWHEADS pointing at the target
           // line from outside the ring — the same two marks, changed in shape and roughly ten times
@@ -1742,12 +1858,17 @@ export class Highway {
           // a distinction in the high-contrast palette, where the rising cap is already near-white.
           // Solid triangles at a fixed height either side of the ring are still two unmistakable
           // blobs at the target line when everything else has blurred together.
-          const wl = Math.max(5, r * GOAL_WEDGE_R);
+          // Grown inward from the lane's outer limit (see TARGET_MARK_MARGIN), never past it, and
+          // never shorter than a mark that reads as a triangle rather than as a dot — so when the
+          // ring is wide at this height (a mid-range threshold, or the re-arm pop mid-scale) it is
+          // the TIP that moves in, onto the ring outline, rather than the base that moves out.
+          const wl = clamp(markLimit - (edge + Math.max(1, this.u)), Math.max(4, r * 0.12), Math.max(5, r * GOAL_WEDGE_R));
+          const tip0 = Math.min(edge + Math.max(1, this.u), markLimit - wl);
           const wh = Math.max(4, r * GOAL_WEDGE_R * 0.9);
           ctx.fillStyle = TARGET_LINE_COLOR;
           ctx.globalAlpha = clamp(0.95 * goal, 0, 1);
           for (const dir of [1, -1]) {
-            const tip = x + dir * (edge + Math.max(1, this.u));
+            const tip = x + dir * tip0;
             ctx.beginPath();
             ctx.moveTo(tip, yTarget);
             ctx.lineTo(tip + dir * wl, yTarget - wh * 0.5);
@@ -1757,13 +1878,17 @@ export class Highway {
           }
           ctx.globalAlpha = 1;
         } else {
-          // Two ticks flush against the ring's outline at exactly the threshold height.
-          const tick = Math.max(3, r * 0.24);
+          // Two ticks flush against the ring's outline at exactly the threshold height, ending at
+          // the same outer limit the arrowheads do (see TARGET_MARK_MARGIN) so they cannot reach
+          // into the neighbouring lane when the target line sits at the ring's widest point.
+          const tick = clamp(markLimit - edge, Math.max(3, r * 0.1), Math.max(3, r * 0.24));
+          // Same rule as the arrowheads: the outer end is the lane's, the inner end gives way.
+          const tickX = Math.min(edge, markLimit - tick);
           const th = Math.max(2, 2.2 * this.u);
           ctx.fillStyle = TARGET_LINE_COLOR;
           ctx.globalAlpha = 0.92;
-          ctx.fillRect(x + edge, yTarget - th * 0.5, tick, th);
-          ctx.fillRect(x - edge - tick, yTarget - th * 0.5, tick, th);
+          ctx.fillRect(x + tickX, yTarget - th * 0.5, tick, th);
+          ctx.fillRect(x - tickX - tick, yTarget - th * 0.5, tick, th);
           ctx.globalAlpha = 1;
         }
       } else {
@@ -1800,11 +1925,17 @@ export class Highway {
         // range cannot otherwise know. It is deliberately never a closed ring — the top quarter
         // stays open — and it is drawn in a hue no lane palette contains, so it cannot be read as
         // a lit lane ring on the yellow / orange lane at 2 m.
+        //
+        // ...and it stays in its own lane. At the nominal 1.16 r with this stroke it reached past
+        // half a lane, so four locked lanes coming down together joined into one scalloped ribbon
+        // across the board (see `outerMarkRadius`). The radius, not the containment, gives way.
         if (look.resetProgress > 0.001) {
+          const lw = Math.max(2, r * 0.12);
+          const arcR = outerMarkRadius(r, g.laneWidthNear, lw);
           ctx.globalAlpha = 0.95;
-          ctx.lineWidth = Math.max(2, r * 0.12);
+          ctx.lineWidth = lw;
           ctx.beginPath();
-          ctx.ellipse(x, y, r * 1.16, ry * 1.16, 0, RESET_ARC_START, RESET_ARC_START + RESET_ARC_SWEEP * look.resetProgress);
+          ctx.ellipse(x, y, arcR, ry * (arcR / r), 0, RESET_ARC_START, RESET_ARC_START + RESET_ARC_SWEEP * look.resetProgress);
           ctx.stroke();
         }
         ctx.globalAlpha = 1;
@@ -1822,12 +1953,18 @@ export class Highway {
         ctx.stroke();
         // ...and a corona just outside the ring. The inner rim can be swallowed by the fill it sits
         // on at a bright lane colour; the corona sits on the dark road, so "this rep is scoring"
-        // survives being read across a clinic room.
-        ctx.globalAlpha = clamp((0.34 + 0.3 * (still ? 0.4 : beatPulse)) * goal, 0, 1);
-        ctx.lineWidth = Math.max(2, r * 0.1);
-        ctx.beginPath();
-        ctx.ellipse(x, y, r * 1.16 * pulse, ry * 1.16 * pulse, 0, 0, Math.PI * 2);
-        ctx.stroke();
+        // survives being read across a clinic room. Contained to its own lane like the return arc
+        // (see `outerMarkRadius`): a chord — two adjacent lanes crossing threshold on the same beat,
+        // which the chart generator writes deliberately — merged the two coronas across the gutter.
+        {
+          const lw = Math.max(2, r * 0.1);
+          const coronaR = Math.min(outerMarkRadius(r, g.laneWidthNear, lw), r * OUTER_MARK_R * pulse);
+          ctx.globalAlpha = clamp((0.34 + 0.3 * (still ? 0.4 : beatPulse)) * goal, 0, 1);
+          ctx.lineWidth = lw;
+          ctx.beginPath();
+          ctx.ellipse(x, y, coronaR, ry * (coronaR / r), 0, 0, Math.PI * 2);
+          ctx.stroke();
+        }
         ctx.globalAlpha = 1;
         ctx.globalCompositeOperation = 'source-over';
       }
