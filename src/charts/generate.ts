@@ -82,14 +82,31 @@ export function defaultCrossLaneGapSec(difficulty: DifficultyName, bpm: number):
  * who needs longer to return to rest; lower it (down to `MIN_LANE_REST_SEC`) for a fast, mild case.
  */
 export const DEFAULT_LANE_REST_SEC = 1.2;
-/** Bounds of the therapist's pacing control (seconds between two reps in the same lane). */
-export const MIN_LANE_REST_SEC = 0.35;
+/**
+ * Bounds of the therapist's pacing control (seconds between two reps in the same lane).
+ *
+ * ON THE CONTROL'S OWN GRID. The floor was 0.35 s, which is not a step of the 0.1 s stepper above
+ * it: pressing "− 0.1 s" at 0.4 s stored 0.35 while the number field rendered "0.3" and the ceiling
+ * beside it read 171 reps/min (= 60/0.35) — three different numbers for one prescription, on the
+ * screen built to state the dose honestly. The floor is a round step now, so the value displayed is
+ * always the value in force. `LANE_REST_STEP_SEC` is that grid; `clampLaneRestSec` quantises onto it.
+ */
+export const MIN_LANE_REST_SEC = 0.4;
 export const MAX_LANE_REST_SEC = 6;
+/** The step the pacing control moves in, and the grid every stored pacing sits on. */
+export const LANE_REST_STEP_SEC = 0.1;
 
-/** Clamp a therapist pacing floor; a non-finite value falls back to the default. */
+/**
+ * Clamp a therapist pacing floor onto the control's grid; a non-finite value falls back to the
+ * default. Quantising here (not only in the UI) means a pacing typed into the number field, dragged
+ * on the slider or restored from a stored session all round-trip to the same displayable value.
+ */
 export function clampLaneRestSec(sec: number): number {
   if (!Number.isFinite(sec)) return DEFAULT_LANE_REST_SEC;
-  return Math.min(MAX_LANE_REST_SEC, Math.max(MIN_LANE_REST_SEC, sec));
+  const snapped = Math.round(sec / LANE_REST_STEP_SEC) * LANE_REST_STEP_SEC;
+  const clamped = Math.min(MAX_LANE_REST_SEC, Math.max(MIN_LANE_REST_SEC, snapped));
+  // Binary floats: 0.30000000000000004 must print as "0.3" and compare equal to 0.3.
+  return Math.round(clamped * 1000) / 1000;
 }
 
 /** Reps per minute a pacing floor allows in one lane. */

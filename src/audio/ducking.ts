@@ -10,6 +10,9 @@
  * body: a patient hitting every note with the strong leg heard nothing because the weak leg missed.
  * The miss run is per DuckController, and `assignLaneStems` gives each lane its own stem (and so its
  * own controller) whenever the song has enough of them, so the weak lane dims its own instrument only.
+ * When the song has too few stems for the lane count every lane shares one controller, and that
+ * controller's floor is raised to a single step (`duckOptionsFor`): a shared instrument belongs to
+ * the working limb as much as to the weak one, so a run of misses cannot take it 9 dB down.
  * Hit → restore to 1.0 in 60 ms. Streak bonus: at `streakThreshold` (8) combo or more the restored
  * level is raised by `streakBoostDb` (+2 dB).
  *
@@ -88,6 +91,28 @@ export function duckGainForMisses(misses: number, opts: DuckOptions = DEFAULT_DU
   return Math.max(floor, opts.hitGain * dbToGain(opts.missStepDb * n));
 }
 
+/**
+ * The duck settings a given assignment mode should run with.
+ *
+ * 'per-lane': the full contract — one step per consecutive miss IN THAT LANE, down to `missGain`.
+ * The lane owns its instrument, so the depth is allowed to grow with the lane's own miss run.
+ *
+ * 'shared': the floor is raised to ONE STEP. When the song has too few stems every lane ducks the
+ * same instrument, so that instrument is also the reward for the limb that IS working, and a run of
+ * misses — which can be a chart with three notes for the weak hand in a row — must not take it down
+ * 9 dB. One step is the whole consequence, however long the run, and any hit anywhere restores it.
+ */
+export function duckOptionsFor(mode: LaneStemAssignment['mode'], opts: DuckOptions = DEFAULT_DUCK_OPTIONS): DuckOptions {
+  if (mode === 'per-lane') return opts;
+  return { ...opts, missGain: Math.min(opts.hitGain, Math.max(opts.missGain, dbToGain(opts.missStepDb))) };
+}
+
+/** Attenuation (positive dB) of one miss and of the deepest possible run, for a given mode. */
+export function duckDepthDb(mode: LaneStemAssignment['mode'], opts: DuckOptions = DEFAULT_DUCK_OPTIONS): { stepDb: number; floorDb: number } {
+  const o = duckOptionsFor(mode, opts);
+  return { stepDb: -gainToDb(duckGainForMisses(1, o)), floorDb: -gainToDb(duckGainForMisses(99, o)) };
+}
+
 /** Which stem each lane ducks, and which stems never duck at all. See `assignLaneStems`. */
 export interface LaneStemAssignment {
   /** 'per-lane': every lane has its own stem. 'shared': every lane ducks the player stem. */
@@ -96,6 +121,14 @@ export interface LaneStemAssignment {
   perLane: string[];
   /** Stems no lane ducks — the bed, which always plays at full level. Never empty. */
   bed: string[];
+  /** How many stems the song has. */
+  stemCount: number;
+  /**
+   * The most lanes this song can give an instrument of its own (`stemCount − 1`, since one stem
+   * always stays out of the assignment to carry the song). Above it the mode is 'shared' — the
+   * Setup screen needs the number to say what would have to change.
+   */
+  capacity: number;
   /** One sentence a therapist can read: the rule AND which lane has which instrument. */
   summary: string;
   /**
@@ -110,9 +143,9 @@ export interface LaneStemAssignment {
  *
  * Rehab rule: a miss must never take away the reward for the parts of the body that are working.
  * With enough stems, the weak side dims its own instrument and the strong side's keeps playing; with
- * too few, every lane shares the player stem and the depth is still only proportional to the miss run
- * (`duckGainForMisses`), so one miss is a dip and not a silence. At least one stem is always left out
- * of the assignment, so the song itself never stops.
+ * too few, every lane shares the player stem — and then the duck is capped at ONE STEP however long
+ * the run (`duckOptionsFor('shared')`), because that instrument is also the reward for the limb that
+ * is working. At least one stem is always left out of the assignment, so the song itself never stops.
  */
 export function assignLaneStems(
   stemIds: readonly string[],
@@ -130,10 +163,17 @@ export function assignLaneStems(
   const n = Math.max(0, Math.floor(lanes));
   const named = (perLane: readonly string[]): string =>
     perLane.map((stem, i) => `${laneLabels?.[i] ?? `lane ${i + 1}`} → ${stem}`).join('; ');
+  // "lead play throughout" was printed for every 3-lane session on a 4-stem song: the bed is a list,
+  // and a list of one takes a singular verb.
+  const bedPlays = (bed: readonly string[]): string =>
+    bed.length === 0 ? 'nothing else is playing' : `${bed.join(', ')} ${bed.length === 1 ? 'plays' : 'play'} throughout`;
   const ordered = stemIds.includes(playerStem) ? [playerStem, ...stemIds.filter((id) => id !== playerStem)] : [...stemIds];
   if (ordered.length === 0 || n === 0) {
     const none = 'No stems are loaded, so nothing is ducked.';
-    return { mode: 'shared', perLane: new Array<string>(n).fill(playerStem), bed: [], summary: none, rule: none };
+    return {
+      mode: 'shared', perLane: new Array<string>(n).fill(playerStem), bed: [],
+      stemCount: ordered.length, capacity: 0, summary: none, rule: none,
+    };
   }
   const capacity = ordered.length - 1; // one stem always stays out of the assignment
   if (n <= capacity) {
@@ -143,17 +183,29 @@ export function assignLaneStems(
       mode: 'per-lane',
       perLane,
       bed,
-      summary: `Each lane has its own instrument — ${named(perLane)}. ${bed.join(', ')} play throughout. A miss dips only that lane's instrument, so a weak limb's misses never take the reward away from the limb that is working.`,
-      rule: `Each lane has its own instrument; ${bed.join(', ')} play throughout. A miss dips only that lane's instrument, so a weak limb's misses never take the reward away from the limb that is working.`,
+      stemCount: ordered.length,
+      capacity,
+      summary: `Each lane has its own instrument — ${named(perLane)}. ${bedPlays(bed)}. A miss dips only that lane's instrument, so a weak limb's misses never take the reward away from the limb that is working.`,
+      rule: `Each lane has its own instrument; ${bedPlays(bed)}. A miss dips only that lane's instrument, so a weak limb's misses never take the reward away from the limb that is working.`,
     };
   }
   const perLane = new Array<string>(n).fill(ordered[0]);
+  const bed = ordered.slice(1);
+  // ONE STEP, AND NO DEEPER. A shared instrument belongs to every lane at once, so the depth of the
+  // duck is capped at a single step here (`duckOptionsFor`) — see the floor it installs. The
+  // sentence and the behaviour are written together on purpose: this is the text a therapist reads.
+  const why = `This song has ${ordered.length} stem${ordered.length === 1 ? '' : 's'} — enough for ${capacity} lane${capacity === 1 ? '' : 's'}, not ${n} — so every lane shares "${ordered[0]}", and ${bedPlays(bed)}`;
+  const consequence = `A miss in ANY lane dips it one step and no further, however long the run, because that instrument is also the reward for the limb that is working; the next hit in any lane brings it straight back.`;
   return {
     mode: 'shared',
     perLane,
-    bed: ordered.slice(1),
-    summary: `This song has ${ordered.length} stem${ordered.length === 1 ? '' : 's'} — too few for ${n} lanes — so every lane shares "${ordered[0]}" (${named(perLane)}). A miss in any lane dips it one step; the rest of the band plays on.`,
-    rule: `This song has ${ordered.length} stem${ordered.length === 1 ? '' : 's'} — too few for ${n} lanes — so every lane shares "${ordered[0]}". A miss in any lane dips it one step; the rest of the band plays on.`,
+    bed,
+    stemCount: ordered.length,
+    capacity,
+    summary: `${why} (${named(perLane)}). ${consequence}`,
+    // The screen that prints this puts the depth in dB beside it, so the rule states the MAPPING and
+    // leaves the consequence to the sentence that can quantify it.
+    rule: `${why}. A miss in ANY lane dips that one shared instrument.`,
   };
 }
 
@@ -265,7 +317,7 @@ export function rampGain(param: GainParamLike, now: number, target: number, ramp
 
 export class DuckController {
   private param: GainParamLike;
-  private readonly opts: DuckOptions;
+  private opts: DuckOptions;
   private isDucked = false;
   /** Consecutive misses on this stem — the depth of the duck, reset by any hit. */
   private missRunCount = 0;
@@ -284,6 +336,21 @@ export class DuckController {
   /** Last level this controller scheduled (the ramp destination). */
   get target(): number { return this.ramp.to; }
   get options(): DuckOptions { return this.opts; }
+  /**
+   * Change the duck settings in place (StemMixer does this when the lane→stem assignment switches
+   * between 'per-lane' and 'shared': the same controller keeps the same gain param, but a shared
+   * stem ducks by at most one step). Re-ramps to the level the current miss run implies under the
+   * new settings, so a stem already ducked deeper than the new floor comes back up instead of
+   * sitting at a level the settings say is impossible.
+   */
+  setOptions(opts: Partial<DuckOptions>, now: number): void {
+    const next = { ...this.opts, ...opts };
+    const changed = (Object.keys(next) as (keyof DuckOptions)[]).some((k) => next[k] !== this.opts[k]);
+    this.opts = next;
+    if (!changed) return;
+    const target = this.missRunCount > 0 ? duckGainForMisses(this.missRunCount, next) : this.ramp.to;
+    if (target !== this.ramp.to) this.ramp = scheduleRamp(this.param, this.valueAt(now), now, target, next.hitRampMs / 1000);
+  }
   /** The ramp currently scheduled on the param. */
   get currentRamp(): RampState { return { ...this.ramp }; }
 

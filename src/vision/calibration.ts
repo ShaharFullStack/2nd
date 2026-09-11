@@ -304,7 +304,7 @@ export function calibrationMismatch(cal: CalibrationRange | null | undefined, mo
 export const ROM_NUDGE_FRACTION = 0.05;
 
 /** Why a nudge stopped short of what was asked for. */
-export type RomNudgeLimit = 'ok' | 'patient_best' | 'minimum_range' | 'no_range';
+export type RomNudgeLimit = 'ok' | 'patient_best' | 'minimum_range' | 'no_range' | 'below_precision';
 
 /** What an Easier/Harder press would do — everything the button needs to label itself. */
 export interface RomNudgePreview {
@@ -365,31 +365,51 @@ function buildNudgePreview(opts: {
   // there is no evidence of anything above the current top, so the top is the ceiling and the button
   // says why. A target nobody has ever reached is not a harder exercise, it is an unplayable lane.
   if (fraction > 0) next = patientBest === null ? max : Math.min(wanted, Math.max(patientBest, max));
-  if (fraction < 0) next = Math.max(wanted, floorMax);
+  // EASIER NEVER RAISES THE TARGET. The floor stops a range being shrunk below what can be told from
+  // rest noise — but on a range that is ALREADY below it, `max(wanted, floorMax)` moved the top UP:
+  // the button labelled "Easier" offered to take a 0.32 top to 0.42, which is a harder exercise, on
+  // exactly the impaired lane that produced too small a range in the first place.
+  if (fraction < 0) next = Math.min(max, Math.max(wanted, floorMax));
   const eps = Math.max(1e-9, Math.abs(span) * 1e-9);
-  const disabled = Math.abs(next - max) <= eps;
+  // WHAT THE BUTTON WILL PRINT, at a precision that shows the move. If even four decimals cannot
+  // separate the two numbers the press is invisible to the therapist AND to the patient, so it is
+  // not offered: a live button that says it will turn 0.33 into 0.33 is worse than a dead one.
+  const [maxStr, nextStr] = formatFeaturePair(max, next, unit);
+  const belowPrecision = Math.abs(next - max) > eps && maxStr === nextStr;
+  const disabled = Math.abs(next - max) <= eps || belowPrecision;
   const pct = `${Math.abs(Math.round(fraction * 100))}%`;
   const verb = fraction < 0 ? 'Easier' : 'Harder';
+  /** The lane's range is already below the minimum usable one: there is nothing to give back. */
+  const belowFloor = fraction < 0 && max < floorMax - eps;
   let limit: RomNudgeLimit = 'ok';
   if (fraction > 0 && next < wanted - eps) limit = 'patient_best';
   else if (fraction < 0 && next > wanted + eps) limit = 'minimum_range';
+  if (belowPrecision && limit === 'ok') limit = 'below_precision';
   const noEvidence = fraction > 0 && patientBest === null;
   const label = disabled
     ? `${verb} — ${
         noEvidence
           ? `no rep on record above ${formatFeature(max, unit)}`
-          : limit === 'patient_best'
-            ? `already at this patient's best (${formatFeature(patientBest ?? max, unit)})`
-            : `already at the smallest usable range (${formatFeature(floorMax, unit)})`
+          : limit === 'below_precision'
+            ? `a step is smaller than this measurement can show (${maxStr})`
+            : limit === 'patient_best'
+              ? `already at this patient's best (${formatFeature(patientBest ?? max, unit)})`
+              : belowFloor
+                ? `this range is already smaller than a usable one (it needs a top of ${formatFeature(floorMax, unit)})`
+                : `already at the smallest usable range (${formatFeature(floorMax, unit)})`
       }`
-    : `${verb} — target ${formatFeature(max, unit)} → ${formatFeature(next, unit)} (${fraction < 0 ? '−' : '+'}${pct} of the measured range)`;
-  const note = noEvidence
+    : `${verb} — target ${maxStr} → ${nextStr} (${fraction < 0 ? '−' : '+'}${pct} of the measured range)`;
+  const note = limit === 'below_precision'
+    ? `A ${pct} step on a range this small is ${maxStr} either way once it is written down — there is nothing to press. Re-measure the lane if the range itself is wrong.`
+    : noEvidence
     ? `This range carries no record of the reps behind it (it was set by hand or saved by an older version), so there is nothing above ${formatFeature(max, unit)} that this patient is known to have reached. Re-measure the lane to raise the target.`
     : limit === 'patient_best'
       ? `Capped at ${formatFeature(patientBest ?? max, unit)} — the most this patient reached during calibration. A target above that has never been produced.`
-      : limit === 'minimum_range'
-        ? `Held at ${formatFeature(floorMax, unit)} — any smaller and the range cannot be told from rest noise.`
-        : null;
+      : belowFloor
+        ? `This lane's range is already below the ${formatFeature(floorMax, unit)} top the movement needs to be told from rest noise, so it cannot be made smaller — re-measure the lane, or ask for a larger movement.`
+        : limit === 'minimum_range'
+          ? `Held at ${formatFeature(floorMax, unit)} — any smaller and the range cannot be told from rest noise.`
+          : null;
   return { delta: next - max, currentMax: max, nextMax: next, patientBest, floorMax, limit, disabled, label, note };
 }
 
@@ -446,6 +466,35 @@ export function applyRomNudge(
 export function formatFeature(value: number, unit: 'deg' | 'ratio'): string {
   if (!Number.isFinite(value)) return '—';
   return unit === 'deg' ? `${Math.round(value)}°` : value.toFixed(2);
+}
+
+/** Decimal places `formatFeature` uses, and the most a label may widen to (see `formatFeaturePair`). */
+const FEATURE_DP: Readonly<Record<'deg' | 'ratio', number>> = Object.freeze({ deg: 0, ratio: 2 });
+const FEATURE_MAX_DP = 4;
+
+const atPrecision = (value: number, unit: 'deg' | 'ratio', dp: number): string =>
+  unit === 'deg' ? `${value.toFixed(dp)}°` : value.toFixed(dp);
+
+/**
+ * Print two feature values at whatever precision it takes to TELL THEM APART.
+ *
+ * A button whose label reads "target 0.33 → 0.33" teaches the therapist nothing about what pressing
+ * it does — and that is what `formatFeature`'s two decimal places produced for a real seated-march
+ * nudge (0.3125 → 0.3256, a 4 % move on a body-scaled ratio). Degrees have the same failure one step
+ * down (48.0° → 48.4° both print "48°"). The pair is widened by up to two extra places until the two
+ * strings differ; if they still do not, the change is below what the measurement can express at all
+ * and the caller disables the button rather than printing an identity.
+ */
+export function formatFeaturePair(a: number, b: number, unit: 'deg' | 'ratio'): [string, string] {
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return [formatFeature(a, unit), formatFeature(b, unit)];
+  const base = FEATURE_DP[unit];
+  for (let dp = base; dp <= FEATURE_MAX_DP; dp++) {
+    const sa = atPrecision(a, unit, dp);
+    const sb = atPrecision(b, unit, dp);
+    if (sa !== sb || dp === FEATURE_MAX_DP) return [sa, sb];
+  }
+  /* istanbul ignore next — the loop always returns */
+  return [formatFeature(a, unit), formatFeature(b, unit)];
 }
 
 /**

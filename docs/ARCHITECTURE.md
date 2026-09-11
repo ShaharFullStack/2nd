@@ -81,7 +81,12 @@ ROM calibration: patient holds rest for 2 s (min), then does 3 reps at comfortab
 
 ## Audio contract (src/audio/StemMixer.ts)
 - Load all stems of a song as AudioBuffers; start all sources at the same ctx time (sample-accurate).
-- Each stem has a GainNode. The "player stem" (song.playerStem) is ducked to `missGain` (default 0.05 with a 40 ms ramp) on miss and restored (60 ms ramp) on hit; ducking persists until next hit (so a run of misses = silence for the player's instrument). Other stems always play.
+- Each stem has a GainNode. **Ducking is per lane and proportionate** (`src/audio/ducking.ts`), which replaces the original flat 5 % player-stem duck: that rule let one missed note from a hemiparetic patient's weak side silence the instrument they were earning with every rep of the strong side, and the weak side IS the therapy.
+  - `assignLaneStems(stems, playerStem, lanes)` maps lane → stem, always leaving at least one stem out of the assignment as the bed (the song itself never stops). With `lanes <= stems - 1` the mode is `per-lane`: every lane ducks its own instrument. Otherwise the mode is `shared`: every lane ducks the player stem.
+  - A miss steps that lane's stem DOWN by `missStepDb` (−3 dB) per consecutive miss on that stem, with a 40 ms ramp, bottoming out at `missGain` (0.35, −9 dB) — audibly quieter, never silent. A hit restores 1.0 over 60 ms and resets the run; at `streakThreshold` (8) combo the restore is `streakBoostDb` (+2 dB).
+  - In `shared` mode the floor is raised to ONE step (`duckOptionsFor`): a shared instrument is the reward for every limb at once, so a run of misses cannot take it below −3 dB.
+  - Ramps are anchored on the analytic position of the ramp in flight (`RampState`/`rampValueAt`, `cancelAndHoldAtTime` where available), so a hit mid-duck does not click.
+  - The Setup screen prints the assignment in force (`LaneStemAssignment.rule` + the lane→instrument list) — every sentence there must be conditional on `mode`.
 - Optional per-lane hit SFX layer (short, quiet) for extra feedback, toggleable.
 
 ## Song manifest (public/songs/<id>/song.json)
@@ -99,7 +104,14 @@ ROM calibration: patient holds rest for 2 s (min), then does 3 reps at comfortab
 `public/songs/index.json` lists song ids. Attribution must be shown in song select and results.
 
 ## Session flow
-Home → Mode (leg/hand) → Therapist Setup (pick 2–4 movements+sides, difficulty, song) → Camera check → ROM calibration per lane → Latency calibration → Play → Results (score, accuracy per lane, reps, ROM achieved, compensation flags) → persisted to localStorage (history).
+Home → Patient → Mode (leg/hand) → Therapist Setup (pick 2–4 movements+sides, difficulty, song, **pacing**) → Camera check → ROM calibration per lane → Latency calibration → Play → Results → persisted to localStorage (history, patient-scoped).
+
+### The prescription, and what is shown when
+- **Dose before Start.** Setup measures the chart it will actually play (`generateChartDetailed` with the prescribed seed and pacing) and states reps per lane, reps/min per limb and reps/min for the whole body (`chartDose`). Nothing on that screen may claim a dose it has not measured.
+- **Pacing is physiology, not difficulty.** `SessionConfig.laneRestSec` (default 1.2 s, bounds `MIN_LANE_REST_SEC`=0.4 … `MAX_LANE_REST_SEC`=6, on a `LANE_REST_STEP_SEC`=0.1 grid) is the minimum rest between two reps of the SAME lane, set by the therapist and stored with the session. It is NOT keyed off `Difficulty`; changing the timing windows must not move it. `clampLaneRestSec` quantises onto the grid so the value displayed is always the value in force.
+- **Nothing in the patient's view may alarm about a state that has no failure.** A song can never be failed, so there is no rock meter: `RenderFrame.health` is NOTES ANSWERED (`answerRateOf` — movements made ÷ notes judged, with a `ANSWER_WARMUP_NOTES`=6 opening warm-up on the live gauge only), the gauge is labelled with what it counts, and it never pulses or turns red.
+- **Results leads with work, not with a grade.** Movements performed, range achieved, today vs THIS patient's last camera session (`patientSessions`/`isPatientDriven`), notes answered; score, stars, weighted accuracy and the per-lane clinical table are kept in full but folded away for the therapist.
+- **A ROM nudge is bounded by the patient's own evidence.** Easier/Harder step by a FRACTION of the measured range (`ROM_NUDGE_FRACTION`), never an absolute feature delta, refuse to exceed the best rep on record (`calibrationPatientBest`), refuse to shrink below the minimum usable range, and label themselves with the target they will set in the movement's units (`previewRomNudge` → `RomNudgePreview.label`).
 
 ## Dev/test affordances (mandatory)
 - `?input=keyboard` URL param bypasses camera; `?autoplay=1` bot hits every note (for screenshots); `?seed=`.

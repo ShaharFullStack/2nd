@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { DEFAULT_DUCK_OPTIONS, assignLaneStems, duckGainForMisses, gainToDb } from '../audio/ducking.ts';
+import { assignLaneStems, duckDepthDb } from '../audio/ducking.ts';
 import { attributionText } from '../audio/manifest.ts';
 import type { SongEntry } from '../audio/manifest.ts';
 import {
+  LANE_REST_STEP_SEC,
   MAX_LANE_REST_SEC,
   MIN_LANE_REST_SEC,
   chartDose,
@@ -254,13 +255,20 @@ export default function TherapistSetup() {
     if (!m) return null;
     return assignLaneStems(m.stems.map((st) => st.id), m.playerStem, lanes.length, lanes.map(laneLabel));
   }, [selected, lanes]);
-  const stepDb = Math.round(-gainToDb(duckGainForMisses(1)));
-  const floorDb = Math.round(-gainToDb(DEFAULT_DUCK_OPTIONS.missGain));
+  // The depth depends on the mode, so the numbers on this card are read off the SAME function the
+  // mixer runs (`duckOptionsFor`): a shared instrument dips one step and stops there.
+  const depth = duckDepthDb(mix?.mode ?? 'per-lane');
+  const stepDb = Math.round(depth.stepDb);
+  const floorDb = Math.round(depth.floorDb);
 
-  /** One place that clamps and quantises the pacing, whichever control moved it. */
+  /**
+   * One place that clamps and quantises the pacing, whichever control moved it — and it is the SAME
+   * clamp the generator runs (`clampLaneRestSec` snaps to the 0.1 s grid), so the number this screen
+   * prints is always the number the chart is built with.
+   */
   const setPacing = (value: number) => {
     if (!Number.isFinite(value)) return;
-    setLaneRestSec(clampLaneRestSec(Math.round(value * 10) / 10));
+    setLaneRestSec(clampLaneRestSec(value));
   };
   const stepPacing = (delta: number) => setPacing(laneRestSec + delta);
 
@@ -475,61 +483,71 @@ export default function TherapistSetup() {
         )}
 
         <div className="stack" style={{ gap: 6 }} data-testid="setup-pacing">
-          <div className="row">
+          <div className="row" style={{ gap: 12 }}>
             <h4 style={{ margin: 0 }}>Pacing — rest between two reps of the SAME limb</h4>
             <div className="grow" />
-            {/* A specific 1.5 s on a shared tablet cannot depend on landing a drag: the value is
-                typed or stepped, and the slider is the coarse control beside it. */}
-            <button
-              className="btn btn-ghost"
-              onClick={() => stepPacing(-0.1)}
-              disabled={laneRestSec <= MIN_LANE_REST_SEC + 1e-6}
-              aria-label="Less rest between reps (0.1 s faster)"
-              data-testid="pacing-down"
+            {/* ONE UNBREAKABLE GROUP. The stepper used to be five siblings of the heading's flex row,
+                so at 1024 px the "+" wrapped to a second line with "−" left behind at the far right,
+                and at 820 px the number went with it: the one control on this screen whose job is
+                prescribing a dose read as broken on both clinic-tablet widths. The −/number/+/badge
+                are one nowrap group that moves to its own line as a unit. */}
+            <div
+              style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'nowrap' }}
+              data-testid="pacing-stepper"
             >
-              − 0.1 s
-            </button>
-            <input
-              className="control mono"
-              type="number"
-              min={MIN_LANE_REST_SEC}
-              max={MAX_LANE_REST_SEC}
-              step={0.1}
-              style={{ width: 96, textAlign: 'right' }}
-              value={laneRestSec.toFixed(1)}
-              aria-label="Minimum rest between reps in one lane, seconds"
-              data-testid="pacing-number"
-              onChange={(e) => setPacing(Number(e.target.value))}
-            />
-            <span className="dim">s</span>
-            <button
-              className="btn btn-ghost"
-              onClick={() => stepPacing(0.1)}
-              disabled={laneRestSec >= MAX_LANE_REST_SEC - 1e-6}
-              aria-label="More rest between reps (0.1 s slower)"
-              data-testid="pacing-up"
-            >
-              + 0.1 s
-            </button>
-            {/* The pacing AND the ceiling it implies, in one badge — the dose itself is the card above. */}
-            <span className="badge" data-testid="pacing-value">
-              {laneRestSec.toFixed(1)} s · ≤{Math.round(repsPerMinuteAt(laneRestSec))} reps/min
-            </span>
+              {/* A specific 1.5 s on a shared tablet cannot depend on landing a drag: the value is
+                  typed or stepped, and the slider is the coarse control below. */}
+              <button
+                className="btn btn-ghost"
+                onClick={() => stepPacing(-LANE_REST_STEP_SEC)}
+                disabled={laneRestSec <= MIN_LANE_REST_SEC + 1e-6}
+                aria-label="Less rest between reps (0.1 s faster)"
+                data-testid="pacing-down"
+              >
+                − 0.1 s
+              </button>
+              <input
+                className="control mono"
+                type="number"
+                min={MIN_LANE_REST_SEC}
+                max={MAX_LANE_REST_SEC}
+                step={LANE_REST_STEP_SEC}
+                style={{ width: 88, textAlign: 'right', flex: '0 0 auto' }}
+                value={laneRestSec.toFixed(1)}
+                aria-label="Minimum rest between reps in one lane, seconds"
+                data-testid="pacing-number"
+                onChange={(e) => setPacing(Number(e.target.value))}
+              />
+              <span className="dim">s</span>
+              <button
+                className="btn btn-ghost"
+                onClick={() => stepPacing(LANE_REST_STEP_SEC)}
+                disabled={laneRestSec >= MAX_LANE_REST_SEC - 1e-6}
+                aria-label="More rest between reps (0.1 s slower)"
+                data-testid="pacing-up"
+              >
+                + 0.1 s
+              </button>
+              {/* The pacing AND the ceiling it implies, in one badge — the dose itself is the card above. */}
+              <span className="badge" style={{ whiteSpace: 'nowrap' }} data-testid="pacing-value">
+                {laneRestSec.toFixed(1)} s · ≤{Math.round(repsPerMinuteAt(laneRestSec))} reps/min
+              </span>
+            </div>
           </div>
           <input
             type="range"
-            /* A tenth-second grid starting at 0.4 s: the clamp floor (MIN_LANE_REST_SEC) is not on a
-               0.1 s step, and a range input off its own step sequence rejects values. */
-            min={Math.max(0.4, MIN_LANE_REST_SEC)}
+            /* The clamp floor IS a 0.1 s step now (charts/generate.ts), so the slider, the stepper and
+               the stored value share one grid and one floor. */
+            min={MIN_LANE_REST_SEC}
             max={MAX_LANE_REST_SEC}
-            step={0.1}
+            step={LANE_REST_STEP_SEC}
             value={laneRestSec}
             aria-label="Minimum rest between reps in one lane, seconds (slider)"
             data-testid="pacing-slider"
             onChange={(e) => setPacing(Number(e.target.value))}
           />
           <div className="row dim" style={{ justifyContent: 'space-between' }}>
-            <span>{Math.max(0.4, MIN_LANE_REST_SEC).toFixed(1)} s — fastest (little time to return to rest)</span>
+            <span>{MIN_LANE_REST_SEC.toFixed(1)} s — fastest (little time to return to rest)</span>
             <span>{(MAX_LANE_REST_SEC / 2).toFixed(1)} s</span>
             <span>{MAX_LANE_REST_SEC.toFixed(1)} s — slowest</span>
           </div>
@@ -578,12 +596,31 @@ export default function TherapistSetup() {
         )}
         {/* The weak side IS the therapy. A miss used to drop the player's instrument to 5 % and hold it
             there until the next hit, anywhere on the board — so one missed left-leg note silenced the
-            reward a patient was earning with every right-leg rep. */}
-        <span className="dim">
-          A missed note lowers that lane's instrument by about {stepDb} dB, and a run of misses by at most {floorDb} dB.
-          It is never silenced, a miss in one lane never touches another lane's instrument, and the next hit in that lane
-          brings it straight back.
-        </span>
+            reward a patient was earning with every right-leg rep.
+
+            CONDITIONAL ON THE ASSIGNMENT. "A miss in one lane never touches another lane's instrument"
+            is true only in per-lane mode. Both shipped songs have four stems, so every FOUR-lane
+            session — a bilateral hand session — shares one instrument, and printing the per-lane
+            sentence there made this card, the card added to make the mix honest, the least honest
+            thing on the screen. */}
+        {mix === null ? null : mix.mode === 'per-lane' ? (
+          <span className="dim" data-testid="mix-claim">
+            A missed note lowers <b>that lane's</b> instrument by about {stepDb} dB, and a run of misses in the same lane
+            by at most {floorDb} dB. It is never silenced, a miss in one lane never touches another lane's instrument,
+            and the next hit in that lane brings it straight back.
+          </span>
+        ) : (
+          <span className="dim" data-testid="mix-claim">
+            All {lanes.length} lanes share <b>{mix.perLane[0]}</b>, so a missed note in <b>any</b> lane lowers it — by
+            about {stepDb} dB and no further, however long the run of misses, because that instrument is the reward for
+            the limb that is working too. It is never silenced, the next hit in any lane brings it straight back, and{' '}
+            {mix.bed.length === 1 ? 'the other stem plays' : `the other ${mix.bed.length} stems play`} at full level
+            throughout.{' '}
+            {mix.capacity >= MIN_LANES
+              ? `For an instrument of its own per lane on this song, run ${mix.capacity} lane${mix.capacity === 1 ? '' : 's'} or fewer, or choose a song with more stems.`
+              : 'This song has too few stems for any lane to have an instrument of its own.'}
+          </span>
+        )}
       </div>
 
       <div className="card stack">

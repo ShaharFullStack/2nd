@@ -14,6 +14,7 @@
  * the system producing the input, not the patient producing a movement.
  */
 import { useMemo } from 'react';
+import { ANSWER_WARMUP_NOTES } from '../engine/scoring.ts';
 import { endReasonLabel, formatDuration, formatMs, formatPercent } from '../session/results.ts';
 import { isPatientDriven, patientSessions } from '../session/trends.ts';
 import type { LaneResultSummary, SessionResult } from '../session/types.ts';
@@ -96,16 +97,22 @@ export default function ResultsScreen() {
   /**
    * Counted from the lanes where the record carries them; the rate is the fallback for older ones.
    *
-   * AND NEVER MORE THAN THE NOTES OFFERED. The screen must not be able to print "a movement was made
-   * for 120 of the 189 notes" from a record whose per-lane and session totals disagree (a hand-built
-   * or half-migrated record): the impossible sentence is exactly the defect this card was rebuilt to
-   * remove, so the sum is used only when it is consistent with the session total.
+   * AND NEVER MORE THAN THE NOTES OFFERED, AND NEVER AT ODDS WITH THE PERCENTAGE ABOVE IT. The screen
+   * must not be able to print "a movement was made for 120 of the 189 notes" from a record whose
+   * per-lane and session totals disagree (a hand-built or half-migrated record) — and it must not be
+   * able to print a 74 % headline over a count that works out at 98 % either, which the ≤ judged test
+   * alone allowed. Real records derive both figures from the same Scoring totals, so the two agree and
+   * the lane sum (the exact integer) is used; when they do not, the count is derived from the rate
+   * that is being displayed, so the card says one thing.
    */
   const laneAttempted = result.lanes.every((l) => typeof l.attempted === 'number')
     ? result.lanes.reduce((n, l) => n + (l.attempted ?? 0), 0)
     : null;
+  const fromRate = Math.round((answerRate ?? 0) * judged);
   const answered =
-    laneAttempted !== null && laneAttempted <= judged ? laneAttempted : Math.round((answerRate ?? 0) * judged);
+    laneAttempted !== null && laneAttempted <= judged && (answerRate === null || Math.abs(laneAttempted - fromRate) <= 1)
+      ? laneAttempted
+      : fromRate;
   const surplus =
     typeof result.surplusMovements === 'number' && Number.isFinite(result.surplusMovements)
       ? result.surplusMovements
@@ -258,9 +265,20 @@ export default function ResultsScreen() {
           <div className="dim">
             {answerRate === null
               ? 'not recorded for this session'
-              : `a movement was made for ${answered} of the ${judged} notes offered — the gauge on the highway`}
+              : `a movement was made for ${answered} of the ${judged} notes offered — the quantity the gauge on the highway shows`}
           </div>
           {answerRate !== null && <Meter value={answerRate} label="notes answered with a movement" />}
+          {/* NOT THE SAME NUMBER AS THE GAUGE ON A SHORT SESSION. The live gauge holds its needle up
+              over the opening notes so one missed first note does not empty it; the stored record is
+              the measurement itself, from note one. On the session a therapist stops after a handful
+              of notes — exactly what a struggling patient produces — the two differ, and this card
+              used to caption the figure "the gauge on the highway" full stop. */}
+          {answerRate !== null && (
+            <div className="dim" data-testid="results-answer-basis">
+              Counted from the first note. The gauge eases its first {ANSWER_WARMUP_NOTES} notes, so a session stopped
+              after a few notes reads higher there than here.
+            </div>
+          )}
           <div className="dim" data-testid="results-surplus">
             {surplus === null
               ? ''

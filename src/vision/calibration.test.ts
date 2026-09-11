@@ -704,6 +704,60 @@ describe('the Easier / Harder nudge is proportional, bounded and self-describing
     expect(m.label).toContain('0.4');
   });
 
+  /**
+   * A BUTTON MUST NEVER SAY IT WILL TURN 0.33 INTO 0.33. formatFeature prints a ratio at two places
+   * and a degree at none, so a small-but-real step ("+5 % of the measured range" on a range of 0.03,
+   * or 0.4° on a knee) printed the same number twice and told the therapist nothing about the press
+   * they had just made.
+   */
+  it('prints the target at a precision that shows the move, in both unit families', () => {
+    const march: RomCalibration = { min: 0.30, max: 0.32, samples: 0, movement: 'seated_march', peaks: [0.5] };
+    const m = previewRomNudge(march, 'seated_march', 0.05);
+    expect(m.disabled).toBe(false);
+    expect(m.nextMax).toBeCloseTo(0.321, 9);
+    expect(m.label).toContain('0.320 → 0.321');
+    const knee: RomCalibration = { min: 52, max: 60, samples: 0, movement: 'knee_extension', peaks: [90] };
+    const k = previewRomNudge(knee, 'knee_extension', 0.05);
+    expect(k.nextMax).toBeCloseTo(60.4, 9);
+    expect(k.label).toContain('60.0° → 60.4°');
+    // The ordinary case keeps the ordinary precision.
+    const wide: RomCalibration = { min: 20, max: 60, samples: 0, movement: 'knee_extension', peaks: [90] };
+    expect(previewRomNudge(wide, 'knee_extension', 0.05).label).toContain('60° → 62°');
+  });
+
+  it('refuses the press when the step is smaller than the measurement can express', () => {
+    const tiny: RomCalibration = { min: 0.4000, max: 0.40002, samples: 0, movement: 'seated_march', peaks: [0.9] };
+    const p = previewRomNudge(tiny, 'seated_march', 0.05);
+    expect(p.disabled).toBe(true);
+    expect(p.limit).toBe('below_precision');
+    expect(p.label).toMatch(/smaller than this measurement can show/);
+    expect(p.note).toMatch(/nothing to press/);
+    // and nothing is applied through it
+    expect(applyRomNudge(tiny, 'seated_march', 0.05).calibration.max).toBe(tiny.max);
+  });
+
+  /**
+   * "EASIER" MUST NEVER MAKE IT HARDER. The minimum-usable-range floor stopped a range being shrunk
+   * past noise — but on a lane whose range is ALREADY below that floor (the impaired lane this button
+   * exists for) it moved the top UP: on a seated march measured 0.30–0.32 the button read
+   * "Easier — target 0.32 → 0.42", a third more range than the patient has ever produced.
+   */
+  it('refuses to raise the target under the word Easier', () => {
+    const tooSmall: RomCalibration = { min: 0.30, max: 0.32, samples: 0, movement: 'seated_march', peaks: [0.31, 0.32] };
+    const down = previewRomNudge(tooSmall, 'seated_march', -0.05);
+    expect(down.nextMax).toBeLessThanOrEqual(tooSmall.max);
+    expect(down.delta).toBe(0);
+    expect(down.disabled).toBe(true);
+    expect(down.label).toMatch(/already smaller than a usable one/);
+    expect(down.note).toMatch(/cannot be made smaller/);
+    expect(applyRomNudge(tooSmall, 'seated_march', -0.05).calibration.max).toBe(tooSmall.max);
+    // A range with room to give still gives it, and still stops at the floor.
+    const roomy: RomCalibration = { min: 0.1, max: 0.9, samples: 0, movement: 'seated_march', peaks: [0.9] };
+    const ok = previewRomNudge(roomy, 'seated_march', -0.05);
+    expect(ok.disabled).toBe(false);
+    expect(ok.nextMax).toBeCloseTo(0.9 - 0.05 * 0.8, 9);
+  });
+
   it('says so instead of throwing when there is no range to nudge', () => {
     const fresh = new RomCalibrator('knee_extension');
     const p = fresh.previewNudgeTop(0.05);

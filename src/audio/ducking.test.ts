@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  DEFAULT_DUCK_OPTIONS, DuckController, MIN_GAIN, assignLaneStems, dbToGain, duckGainForMisses, gainToDb, rampGain, rampValueAt,
+  DEFAULT_DUCK_OPTIONS, DuckController, MIN_GAIN, assignLaneStems, dbToGain, duckDepthDb, duckGainForMisses, duckOptionsFor, gainToDb, rampGain, rampValueAt,
   scheduleRamp, targetGainForCombo,
   type GainParamLike, type RampState,
 } from './ducking';
@@ -355,7 +355,10 @@ describe('assignLaneStems (the weak side must not mute the whole band)', () => {
     expect(a.mode).toBe('shared');
     expect(a.perLane).toEqual(['drums', 'drums', 'drums', 'drums']);
     expect(a.bed).toEqual(['bass', 'keys', 'gtr']);
-    expect(a.summary).toContain('too few');
+    expect(a.stemCount).toBe(4);
+    // What the Setup screen needs in order to say what would have to change.
+    expect(a.capacity).toBe(3);
+    expect(a.summary).toContain('enough for 3 lanes, not 4');
     const two = assignLaneStems(['drums', 'bass'], 'drums', 2);
     expect(two.mode).toBe('shared');
     expect(two.bed).toEqual(['bass']);
@@ -369,6 +372,42 @@ describe('assignLaneStems (the weak side must not mute the whole band)', () => {
   });
 });
 
+
+describe('shared stems duck one step and no deeper (duckOptionsFor)', () => {
+  it('raises the floor to one step in shared mode and leaves per-lane alone', () => {
+    const shared = duckOptionsFor('shared');
+    expect(shared.missGain).toBeCloseTo(dbToGain(DEFAULT_DUCK_OPTIONS.missStepDb), 12);
+    expect(duckGainForMisses(5, shared)).toBeCloseTo(duckGainForMisses(1), 12);
+    expect(duckOptionsFor('per-lane')).toBe(DEFAULT_DUCK_OPTIONS);
+    expect(duckGainForMisses(5, duckOptionsFor('per-lane'))).toBeCloseTo(DEFAULT_DUCK_OPTIONS.missGain, 12);
+  });
+
+  it('reports the depth in dB for each mode, so a screen never has to guess', () => {
+    expect(duckDepthDb('per-lane')).toEqual({ stepDb: expect.closeTo(3, 6), floorDb: expect.closeTo(9.1, 1) });
+    const shared = duckDepthDb('shared');
+    expect(shared.stepDb).toBeCloseTo(3, 6);
+    expect(shared.floorDb).toBeCloseTo(shared.stepDb, 6);
+  });
+
+  it('setOptions lifts a stem already ducked past the new floor, with a ramp', () => {
+    const p = new FakeAudioParam(1);
+    const c = new DuckController(p);
+    p.now = 0;
+    c.miss(0); c.miss(0.1); c.miss(0.2);
+    p.now = 0.3;
+    expect(c.valueAt(0.3)).toBeCloseTo(D3, 12);
+    c.setOptions(duckOptionsFor('shared'), 0.3);
+    expect(c.target).toBeCloseTo(D1, 12);
+    // a ramp, never a step: the from-value is where the deep duck actually was
+    const last = p.lastRamp();
+    expect(last[2]).toBeGreaterThan(0.3);
+    p.now = 0.4;
+    expect(c.valueAt(0.4)).toBeCloseTo(D1, 12);
+    // and the miss run is still the lane's own: a further miss cannot go deeper than the new floor
+    c.miss(0.5);
+    expect(c.target).toBeCloseTo(D1, 12);
+  });
+});
 
 describe('the mix summary names which limb has which instrument', () => {
   const stems = ['drums', 'bass', 'keys', 'lead'];
@@ -391,5 +430,20 @@ describe('the mix summary names which limb has which instrument', () => {
 
   it('falls back to lane numbers when no labels are supplied', () => {
     expect(assignLaneStems(stems, 'drums', 2).summary).toContain('lane 1 → drums');
+  });
+
+  // "lead play throughout" was on the Setup screen for every 3-lane session on a 4-stem song.
+  it('gives a bed of one stem a singular verb', () => {
+    expect(assignLaneStems(stems, 'drums', 3).rule).toContain('lead plays throughout');
+    expect(assignLaneStems(stems, 'drums', 2).rule).toContain('keys, lead play throughout');
+    expect(assignLaneStems(['drums', 'bass'], 'drums', 3).rule).toContain('bass plays throughout');
+  });
+
+  it('reports the lane capacity so a screen can say what would have to change', () => {
+    const four = assignLaneStems(stems, 'drums', 4);
+    expect({ mode: four.mode, capacity: four.capacity, stemCount: four.stemCount }).toEqual({
+      mode: 'shared', capacity: 3, stemCount: 4,
+    });
+    expect(assignLaneStems(stems, 'drums', 2).capacity).toBe(3);
   });
 });

@@ -4,9 +4,15 @@ A rhythm game you play with your body, built for physiotherapy. The patient perf
 therapist-prescribed exercises in time with real music; each exercise is a lane on a
 Guitar-Hero-style note highway, and a camera — not a controller — reads the movement.
 
-The music is multitrack. One stem belongs to the patient: hit your notes and your
-instrument plays in the mix, miss them and it drops out while the rest of the band keeps
-going. The body plays the music.
+The music is multitrack, and where the song has the stems for it each lane gets an
+instrument of its own: hit that lane's notes and its instrument plays at full level, miss
+one and it dips — about 3 dB, a run of misses at most 9 dB, never silence, back the moment
+the next note in that lane lands. A weak left leg dims its own instrument and never the
+one the right leg is earning. When a song has too few stems for the lane count (both demo
+songs have four stems, so a four-lane session shares), every lane ducks one shared
+instrument, and then a miss costs one step and no more, however long the run — because
+that instrument is the working limb's reward too. The Setup screen states which of the two
+is in force, per lane, before the session starts. The body plays the music.
 
 ```bash
 npm install
@@ -101,18 +107,21 @@ npm run build
 npm run critic:smoke   # boots the app in headless Chromium and plays a session end to end
 npm run critic:frames  # captures 1080p gameplay frames for visual review
 npm run critic:motion  # frame bursts across a hit and a miss, plus frame pacing and clock drift
-npm run critic:audio   # proves the player's stem really ducks on a miss and returns on a hit
+npm run critic:audio   # proves the per-lane ducking end to end: real Web Audio gains in a browser
 ```
 
 Each of these starts and stops its own dev server. `critic:smoke` drives the whole flow and
 asserts the engine scored, the clock froze on pause, and the session was saved.
 `critic:audio` is the one that checks the game's central promise: it plays a session, stops
-feeding the engine, and reads the live Web Audio gains to confirm the player's instrument
-falls out of the mix while the rest of the band keeps going.
+feeding the engine, and reads the live Web Audio gains to confirm the missing lane's
+instrument dips in proportion, that no other lane's instrument moves with it, and that the
+rest of the band keeps going.
 
 Measured on this build: 59 fps median with one dropped frame in 118, audio-to-render clock
-drift under 4 ms over 3 seconds, and the player stem ducking 1.0 → 0.05 → 1.0 across a miss
-and the next hit.
+drift under 4 ms over 3 seconds, and — on a two-lane session on a four-stem song — lane 1
+on `drums`, lane 2 on `bass`, `keys` and `lead` playing throughout, and the missing lane's
+gain going 1.0 → 0.71 on one miss, bottoming out at 0.35, and back to 1.0 on the next hit
+while the other lane's stem never leaves 1.0.
 
 ## A note on safety and scope
 

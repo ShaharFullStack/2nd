@@ -158,6 +158,39 @@ describe('a session where the patient moved and almost nothing scored', () => {
     expect(card.textContent).not.toContain('960');
   });
 
+  /**
+   * THE COUNT AND THE PERCENTAGE MUST BE THE SAME CLAIM. The ≤ judged guard alone still let a
+   * hand-built record print "74 %" directly above "a movement was made for 95 of the 97 notes
+   * offered" (98 %) — one impossible sentence swapped for two figures that contradict each other.
+   */
+  it('never prints a count that disagrees with the percentage above it', () => {
+    const broken = tremor();
+    useStore.setState({
+      // lane sum says 185 of 189 (98 %); the stored rate — the figure the headline shows — says 32 %.
+      lastResult: { ...broken, lanes: [lane({ hits: 12, misses: 177, judged: 189, reps: 280, attempted: 185, surplus: 95 })] },
+    });
+    render(<ResultsScreen />);
+    const card = screen.getByTestId('results-consistency');
+    expect(card.textContent).toContain('32%');
+    expect(card.textContent).toContain('60 of the 189 notes offered');
+    expect(card.textContent).not.toContain('185 of the 189');
+  });
+
+  /**
+   * The card used to caption this figure "the gauge on the highway" full stop. The live gauge holds
+   * its needle up over the opening notes (ANSWER_WARMUP_NOTES) and the stored record does not, so on
+   * a session stopped after a handful of notes — exactly what a struggling patient produces — the two
+   * disagree, and the claim of identity was false there.
+   */
+  it('says how the stored figure differs from the live gauge instead of claiming they are the same', () => {
+    useStore.setState({ lastResult: tremor() });
+    render(<ResultsScreen />);
+    const card = screen.getByTestId('results-consistency');
+    expect(card.textContent).toContain('the quantity the gauge on the highway shows');
+    expect(screen.getByTestId('results-answer-basis').textContent).toContain('Counted from the first note');
+    expect(screen.getByTestId('results-answer-basis').textContent).toMatch(/eases its first \d+ notes/);
+  });
+
   it('reports the movements that answered no note as their own figure, not as success', () => {
     useStore.setState({ lastResult: tremor() });
     render(<ResultsScreen />);

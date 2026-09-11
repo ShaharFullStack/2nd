@@ -596,6 +596,58 @@ describe('StemMixer', () => {
     expect(mixer.getLaneStemGain(3)).toBe(1);
   });
 
+  /**
+   * A SHARED INSTRUMENT IS THE WORKING LIMB'S REWARD TOO. Both songs that ship have four stems, so a
+   * four-lane bilateral hand session ALWAYS shares one stem and all four lanes pool their miss runs
+   * on one controller — a weak left hand missing three notes in a row would take the right hand's
+   * instrument down 9 dB. In shared mode the floor is one step, however long the run.
+   */
+  it('shared mode: a run of misses in any lane never takes the shared stem below one step', async () => {
+    const { ctx, mixer } = setup();
+    await mixer.loadSong(manifest, '/songs');
+    ctx.currentTime = 1;
+    mixer.play();
+    expect(mixer.setLaneCount(4).mode).toBe('shared');
+    ctx.currentTime = 2;
+    for (let i = 0; i < 6; i++) {
+      mixer.onLaneMiss(i % 4);
+      ctx.currentTime += 0.05; // each ramp lands before the next miss
+    }
+    expect(mixer.getLaneStemGain(0)).toBeCloseTo(D1, 12);
+    expect(mixer.getLaneStemGain(2)).toBeCloseTo(D1, 12);
+    // ...and the depth comes back when the same mixer is wired for a per-lane session.
+    mixer.onLaneHit(0, 1);
+    ctx.currentTime += 0.1;
+    expect(mixer.setLaneCount(2).mode).toBe('per-lane');
+    ctx.currentTime += 0.1;
+    mixer.onLaneMiss(0);
+    ctx.currentTime += 0.05;
+    mixer.onLaneMiss(0);
+    ctx.currentTime += 0.05;
+    expect(mixer.getLaneStemGain(0)).toBeCloseTo(duckGainForMisses(2), 12);
+  });
+
+  /**
+   * Switching INTO shared mode while a stem sits below the shared floor must lift it back to the
+   * floor, not leave it parked at a level the settings say is impossible.
+   */
+  it('re-wiring to shared mode lifts a deeply ducked stem back to the shared floor', async () => {
+    const { ctx, mixer } = setup();
+    await mixer.loadSong(manifest, '/songs');
+    ctx.currentTime = 1;
+    mixer.play();
+    mixer.setLaneCount(2);
+    ctx.currentTime = 2;
+    for (let i = 0; i < 4; i++) {
+      mixer.onLaneMiss(0);
+      ctx.currentTime += 0.05;
+    }
+    expect(mixer.getLaneStemGain(0)).toBeCloseTo(duckGainForMisses(4), 12);
+    mixer.setLaneCount(4);
+    ctx.currentTime += 0.1;
+    expect(mixer.getLaneStemGain(0)).toBeCloseTo(D1, 12);
+  });
+
   it('seek/stop/replay while ducked restore the player stem with a ramp, never a step (click-free)', async () => {
     const { ctx, mixer } = setup();
     await mixer.loadSong(manifest, '/songs');

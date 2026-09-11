@@ -1,5 +1,5 @@
 {
-  "capturedAt": "2026-09-11T11:14:06.067Z",
+  "capturedAt": "2026-09-11T14:43:20.769Z",
   "failures": [],
   "stems": {
     "stems": [
@@ -21,7 +21,7 @@
     "ducked": false,
     "hits": 3,
     "misses": 0,
-    "songTime": 3.310022675736961
+    "songTime": 3.3216326530612243
   },
   "whileMissing": {
     "gains": {
@@ -34,7 +34,7 @@
     "ducked": true,
     "hits": 3,
     "misses": 2,
-    "songTime": 5.449160997732427
+    "songTime": 5.449160997732426
   },
   "recovery": {
     "before": 0.7079457843841379,
@@ -52,6 +52,8 @@
         "keys",
         "lead"
       ],
+      "stemCount": 4,
+      "capacity": 3,
       "summary": "Each lane has its own instrument — lane 1 → drums; lane 2 → bass. keys, lead play throughout. A miss dips only that lane's instrument, so a weak limb's misses never take the reward away from the limb that is working.",
       "rule": "Each lane has its own instrument; keys, lead play throughout. A miss dips only that lane's instrument, so a weak limb's misses never take the reward away from the limb that is working."
     },

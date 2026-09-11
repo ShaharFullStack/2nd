@@ -76,7 +76,7 @@
 import type { FetchLike, SongManifest, StemSpec } from './manifest';
 import { stemUrl } from './manifest';
 import type { SongTimeSource } from '../input/types';
-import { DuckController, MIN_GAIN, SmoothGain, assignLaneStems, rampValueAt, scheduleRamp, type DuckOptions, type LaneStemAssignment, type RampState } from './ducking';
+import { DEFAULT_DUCK_OPTIONS, DuckController, MIN_GAIN, SmoothGain, assignLaneStems, duckOptionsFor, rampValueAt, scheduleRamp, type DuckOptions, type LaneStemAssignment, type RampState } from './ducking';
 import { Sfx, type SfxLevels } from './sfx';
 import { LatencyProbe, type LatencyProbeOptions } from './latencyProbe';
 
@@ -827,8 +827,10 @@ export class StemMixer implements SongTimeSource {
    * Wire `lanes` lanes to stems so a miss dims only the lane that missed, where the song has enough
    * stems for it (`assignLaneStems`). Call it once per session, after the song is loaded; the
    * returned assignment is what the Setup screen tells the therapist. Lanes beyond the stems the song
-   * has share the player stem — with the PROPORTIONATE depth (`duckGainForMisses`), so the shared
-   * case is still a dip per miss and not a mute.
+   * has share the player stem — and a shared stem ducks by ONE STEP and no deeper however long the
+   * miss run (`duckOptionsFor`), because it is the reward for every limb at once. Both demo songs
+   * have four stems, so a four-lane (bilateral hand) session is always the shared case: it has to be
+   * fair on its own terms, not merely bounded.
    */
   setLaneCount(lanes: number): LaneStemAssignment {
     const n = Math.max(0, Math.floor(lanes));
@@ -849,6 +851,13 @@ export class StemMixer implements SongTimeSource {
       byStem.set(stemId, c);
       return c;
     });
+    // The DEPTH depends on the mode, and the same controller can move between modes (2 lanes → 4
+    // lanes on the same song), so the settings are pushed on every assignment, not at construction.
+    const laneOpts = duckOptionsFor(assign.mode, { ...DEFAULT_DUCK_OPTIONS, ...this.duckOptions });
+    const baseOpts = duckOptionsFor('per-lane', { ...DEFAULT_DUCK_OPTIONS, ...this.duckOptions });
+    const inLanes = new Set(this.laneControllers);
+    for (const c of inLanes) c.setOptions(laneOpts, now);
+    if (this.duckController && !inLanes.has(this.duckController)) this.duckController.setOptions(baseOpts, now);
     this.laneAssign = assign;
     return assign;
   }
