@@ -28,6 +28,8 @@ import {
 import type { TrackingGrade } from '../session/tracking.ts';
 import { FINGERTIP_NAME, MOVEMENT_INFO, movementCalibrationInstruction } from '../vision/features.ts';
 import { CameraPreview } from './CameraPreview.tsx';
+import { DwellLegend, DwellTarget, pairedDwellTargets, useDwellTargets } from './DwellTarget.tsx';
+import type { DwellChoice } from './DwellTarget.tsx';
 import { Meter, ProgressRing, Screen, Toast, TopBar, laneName } from './common.tsx';
 import PatientBanner from './PatientBanner.tsx';
 import { ScopeNote } from './ScopeNote.tsx';
@@ -113,6 +115,10 @@ export default function RomCalibrationScreen() {
   // WHOSE BODY is being measured. It is stamped on every range captured here and checked against every
   // range offered back, because `movement:side[:fingertip]` says what was measured and not on whom.
   const patientId = useStore((s) => s.activePatientId);
+  // Which limb the hands-free target follows (a hand in hand mode, a knee in leg mode) and where it
+  // is drawn; and whether the ring is allowed to breathe while it waits.
+  const mode = useStore((s) => s.mode);
+  const reducedMotion = useStore((s) => s.settings.reducedMotion);
 
   const [laneIndex, setLaneIndex] = useState(0);
   const [live, setLive] = useState<Live | null>(null);
@@ -331,6 +337,60 @@ export default function RomCalibrationScreen() {
   };
 
   /**
+   * THE HANDS-FREE PAIR, AND WHY "REDO" IS ONE OF THEM.
+   *
+   * Every other genuine CHOICE on this screen — easier, harder, reuse last session's range — is a
+   * therapist's decision about the denominator of the whole record, and none of them is put behind a
+   * dwell target. Redo is not in that class. It is the patient's own account of their own attempt: a
+   * patient working alone who coughed, whose spasticity took the third rep, or who simply moved
+   * before the ring said to, has measured a range that is about to become the scale of every
+   * percentage in their session, and the only other hands-free thing they can do is walk forward onto
+   * it. "Do it again" is not a clinical judgement and it destroys nothing that was not just measured
+   * thirty seconds ago; being unable to say it is what strands them. So it gets a target of its own,
+   * on the other side of the frame, and only once there is something to redo.
+   *
+   * Neither target exists while the range is being measured — `laneDone` is false for the whole rest
+   * hold and all three reps — so nothing here can fire during the exercise itself.
+   */
+  /**
+   * THE ATTEMPT ENDED WITH NOTHING USABLE — the state a patient alone can most easily be trapped in.
+   *
+   * The calibrator can finish with 'insufficient_range' or 'no_reps', and the runtime can refuse the
+   * range it produced. In every one of those cases the lane has no range, the forward target is
+   * therefore (correctly) dead, and the calibrator will not measure again until somebody presses
+   * Redo. Without a hands-free Redo that is a dead end with no patient-reachable way out of it.
+   */
+  const romStuck = laneRefused || (status?.phase === 'done' && !!status.error);
+  const handsFreeReady = laneDone !== null || romStuck;
+
+  const dwellChoices: DwellChoice[] = useMemo(() => {
+    const [go, back] = pairedDwellTargets(mode);
+    return [
+      {
+        id: 'next',
+        target: go,
+        label: laneIndex + 1 < lanes.length ? 'Next movement' : 'Latency check',
+        enabled: laneDone !== null,
+        disabledNote: 'No range yet',
+        onConfirm: next,
+        tone: 'go',
+      },
+      {
+        id: 'redo',
+        target: back,
+        label: 'Do it again',
+        enabled: handsFreeReady,
+        onConfirm: retry,
+        tone: 'back',
+      },
+    ];
+    // `next` and `retry` close over this render's lane state; the hook keeps the LIVE list and calls
+    // the current one, so they are deliberately not dependencies (including them would rebuild the
+    // trackers on every poll and throw away a hold in progress).
+  }, [mode, laneIndex, lanes.length, laneDone, handsFreeReady]);
+  const dwell = useDwellTargets(dwellChoices);
+
+  /**
    * Offer last session's range ONLY when it describes what this lane measures now.
    *
    * The saved-calibration key is `movement:side[:fingertip]` — it does not carry the mirror
@@ -388,6 +448,42 @@ export default function RomCalibrationScreen() {
 
       <div className="row" style={{ alignItems: 'stretch', gap: 24 }}>
         <div className="card stack grow" style={{ gap: 20 }}>
+          {/* THE HANDS-FREE PAIR, at the size a patient two metres away can actually use. The small
+              sidebar preview is stood down while this is up: there is one <video> in the app, and the
+              screen the patient has to read from a chair is not a 340 px thumbnail. */}
+          {handsFreeReady && (
+            <div className="stack" style={{ gap: 12 }} data-testid="rom-handsfree">
+              <CameraPreview overlay>
+                {dwellChoices.map((choice) => (
+                  <DwellTarget
+                    key={choice.id}
+                    choice={choice}
+                    state={dwell.states[choice.id]}
+                    reducedMotion={reducedMotion}
+                    testId={`rom-dwell-${choice.id}`}
+                  />
+                ))}
+              </CameraPreview>
+              <DwellLegend
+                session={dwell}
+                what={
+                  laneDone === null
+                    ? 'the right circle to measure this movement again'
+                    : laneIndex + 1 < lanes.length
+                      ? 'the left circle for the next movement'
+                      : 'the left circle to go on'
+                }
+                testId="rom-dwell-legend"
+              />
+              <span className="dim">
+                The right circle measures this movement again — it is there whenever there is something to redo,
+                including when nothing usable was measured at all, so nobody working alone is left with a lane they
+                cannot re-do. Easier, harder and reusing last session&rsquo;s range stay on the buttons: those change the
+                scale every later figure is a percentage of, and that is the therapist&rsquo;s call.
+              </span>
+            </div>
+          )}
+
           <div className="row" style={{ gap: 24 }}>
             <ProgressRing value={ringValue} label={ringLabel} />
             <div className="stack grow" style={{ gap: 10 }}>
@@ -569,7 +665,11 @@ export default function RomCalibrationScreen() {
 
         <div className="card stack" style={{ width: 'min(340px, 100%)' }}>
           <h3>Camera</h3>
-          <CameraPreview overlay />
+          {handsFreeReady ? (
+            <span className="dim">Shown larger on the left while you confirm without touching the screen.</span>
+          ) : (
+            <CameraPreview overlay />
+          )}
           <h3>Lanes</h3>
           <ul className="list-reset">
             {lanes.map((l, i) => {

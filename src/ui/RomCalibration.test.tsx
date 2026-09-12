@@ -308,3 +308,57 @@ describe('Easier / Harder say what they will do, in the movement’s own units',
     expect(useStore.getState().calibrations[0]?.max).toBeCloseTo(0.52, 6);
   });
 });
+
+/**
+ * THE HANDS-FREE PAIR — and in particular the state a patient working alone can most easily be
+ * trapped in.
+ *
+ * Everything on this screen except "go on" and "do it again" is a therapist's decision about the
+ * DENOMINATOR of the whole record (easier, harder, reuse last session's range), and none of those is
+ * put behind a dwell target. Redo is not in that class: it is the patient's own account of their own
+ * attempt, it destroys nothing that was not measured thirty seconds ago — and when the attempt
+ * produced nothing usable it is the ONLY thing that can move a patient alone at all, because the
+ * forward target is correctly dead and the calibrator will not measure again until somebody asks.
+ */
+describe('the hands-free pair on the ROM screen', () => {
+  it('offers nothing to hold while the range is still being measured', () => {
+    render(<RomCalibrationScreen />);
+    expect(screen.queryByTestId('rom-handsfree')).toBeNull();
+    expect(screen.queryByTestId('rom-dwell-next')).toBeNull();
+    expect(screen.queryByTestId('rom-dwell-redo')).toBeNull();
+  });
+
+  it('offers both circles once the runtime holds a range for the lane', async () => {
+    fake.mirrored = true;
+    saveRange(pinchCal('pinky', true));
+    render(<RomCalibrationScreen />);
+    fireEvent.click(await screen.findByTestId('rom-reuse'));
+
+    await waitFor(() => expect(screen.getByTestId('rom-handsfree')).toBeTruthy());
+    expect(screen.getByTestId('rom-dwell-next').dataset.phase).not.toBe('off');
+    expect(screen.getByTestId('rom-dwell-redo').dataset.phase).not.toBe('off');
+    // …and the buttons they duplicate are still there and still work.
+    expect((screen.getByTestId('rom-next') as HTMLButtonElement).disabled).toBe(false);
+    expect(screen.getByTestId('rom-redo')).toBeTruthy();
+  });
+
+  it('a REFUSED range still leaves a redo to hold — the forward circle is dead, not the screen', async () => {
+    fake.accept = false;
+    fake.mirrored = true;
+    saveRange(pinchCal('pinky', true));
+    render(<RomCalibrationScreen />);
+    fireEvent.click(await screen.findByTestId('rom-reuse'));
+
+    // The refusal is on screen…
+    await waitFor(() => expect(screen.getByTestId('rom-rejected')).toBeTruthy());
+    expect(screen.getByTestId('rom-lane-badge-0').textContent).toBe('✕');
+    // …the way FORWARD is shut, hands-free exactly as it is on the button…
+    await waitFor(() => expect(screen.getByTestId('rom-dwell-next').dataset.phase).toBe('off'));
+    expect((screen.getByTestId('rom-next') as HTMLButtonElement).disabled).toBe(true);
+    // …and the patient can still ask for the movement to be measured again without touching anything.
+    expect(screen.getByTestId('rom-dwell-redo').dataset.phase).not.toBe('off');
+    // (What the legend beside it says about the limb it is following needs live frames; that is
+    // covered in DwellTarget.test.tsx. Here there is no camera, and it says so.)
+    expect(screen.getByTestId('rom-dwell-legend').dataset.state).toBe('offline');
+  });
+});

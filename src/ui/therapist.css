@@ -259,3 +259,64 @@
   white-space: normal;
 }
 .table tr.visit-row:hover td { background: rgba(143, 180, 255, 0.07); }
+
+/* ---------- hands-free confirm (the dwell target) ---------- */
+
+/*
+ * THE PATIENT IS NOT ABLE TO REACH THE TABLET.
+ *
+ * In hand mode the forearms are on the table and the hands ARE the input device; in leg mode the
+ * patient is seated and the tablet is out of reach. Reaching for a mouse breaks the pose, and for a
+ * hemiparetic patient it may not be possible at all. Everything below is sized so that the one screen
+ * element the patient has to find — the ring — is findable from the chair.
+ *
+ * The whole target is one SVG on a fixed viewBox (see DwellTarget.tsx), so the ring, the countdown
+ * inside it and the caption under it scale together with the preview: no part of it can end up as
+ * 13 px of type under a 150 px ring. Nothing here is positioned in px for the same reason.
+ */
+.dwell-target {
+  position: absolute;
+  pointer-events: none; /* it is a target for a limb, not for a cursor: never eat a therapist's click */
+  z-index: 3;
+  filter: drop-shadow(0 6px 18px rgba(0, 0, 0, 0.6));
+}
+.dwell-target.off { opacity: 0.55; }
+
+/* The idle breathing that says "this is waiting for you" — and the one thing reducedMotion removes.
+   The filling arc is never animated by CSS: it IS the measurement, and it moves because the hold
+   moved. */
+.dwell-target .dwell-track { transform-origin: center; animation: dwell-breathe 2.4s ease-in-out infinite; }
+.dwell-target.still .dwell-track,
+.dwell-target[data-phase='holding'] .dwell-track,
+.dwell-target[data-phase='done'] .dwell-track { animation: none; }
+@keyframes dwell-breathe {
+  0%, 100% { opacity: 0.65; }
+  50% { opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .dwell-target .dwell-track { animation: none; }
+}
+
+/*
+ * The sentence beside the preview. It carries the two facts the ring cannot: what the hold will DO,
+ * and WHICH LIMB is being followed — a patient who cannot tell "hold longer" from "it is watching the
+ * other hand" has no way to finish.
+ */
+.dwell-legend {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: flex-start;
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--accent-2);
+  border-radius: var(--radius);
+  background: rgba(53, 214, 255, 0.06);
+  padding: 14px 16px;
+}
+.dwell-legend strong { font-size: 1.15rem; line-height: 1.4; }
+.dwell-legend[data-state='offline'] { border-left-color: var(--bad); background: rgba(255, 90, 90, 0.06); }
+
+/* The one real tap of the session, on Home. It is kept because the browser will not start audio
+   without it (see runtime.ensureAudio) — so it is made unmissable rather than pretended away. */
+.only-tap { display: flex; flex-direction: column; gap: 10px; align-items: flex-start; }
+.only-tap .btn-primary { min-height: 86px; font-size: 1.5rem; padding: 0 40px; }

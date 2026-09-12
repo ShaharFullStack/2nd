@@ -19,7 +19,8 @@
     "critic:audition": "node critic/audition-cost.mjs",
     "critic:record": "node critic/honest-record.mjs",
     "critic:uneven": "node critic/measured-unevenly.mjs",
-    "critic:firstnote": "node critic/first-note.mjs"
+    "critic:firstnote": "node critic/first-note.mjs",
+    "critic:handsfree": "node critic/handsfree.mjs"
   },
   "dependencies": {
     "@mediapipe/tasks-vision": "^1.0.1",

@@ -14,12 +14,15 @@
  * Every path off this screen therefore either KEEPS the offset in force, or names the number it is
  * about to store and the number that number replaces.
  */
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { LatencyProbe, LatencyProbeResult } from '../audio/latencyProbe.ts';
 import { formatDate } from '../session/results.ts';
 import { runtime } from '../session/runtime.ts';
 import { DEFAULT_LATENCY_SEC, laneFingertip, useStore } from '../state/store.ts';
 import { movementInstructions } from '../vision/features.ts';
+import { CameraPreview } from './CameraPreview.tsx';
+import { DwellLegend, DwellTarget, singleDwellTarget, useDwellTargets } from './DwellTarget.tsx';
+import type { DwellChoice } from './DwellTarget.tsx';
 import { Screen, Toast, TopBar, laneName } from './common.tsx';
 
 /** Measured clicks. Eight beats at 60 BPM is eight seconds of movement — as much as a patient will give. */
@@ -35,6 +38,9 @@ export default function LatencyCalibrationScreen() {
   const latencyMeasured = useStore((s) => s.latencyMeasured);
   const latencyNote = useStore((s) => s.latencyNote);
   const latencySetAt = useStore((s) => s.latencySetAt);
+  // Where the hands-free target goes (a hand in hand mode, a knee in leg mode), and whether it breathes.
+  const mode = useStore((s) => s.mode);
+  const reducedMotion = useStore((s) => s.settings.reducedMotion);
 
   const probeRef = useRef<LatencyProbe | null>(null);
   const stopInput = useRef<(() => void) | null>(null);
@@ -136,6 +142,57 @@ export default function LatencyCalibrationScreen() {
         .filter(Boolean)
         .join(' ');
 
+  /**
+   * THE HANDS-FREE PATH THROUGH THE LATENCY CHECK.
+   *
+   * Both blocking presses on this screen are acknowledgements, and each gets the same target in turn:
+   * before the probe it starts the metronome, after an acceptable probe it stores the number the
+   * button names. The two GENUINE choices stay on their buttons — "measure again" and "discard the
+   * offset in force and use the generic default" are therapist decisions about what this session is
+   * judged at, and a discard in particular must never be reachable by a limb resting in the wrong
+   * place. What the patient alone gets instead, when the probe produced nothing usable, is a target
+   * that goes FORWARD on the offset already in force, naming it. Nobody is stranded, and nothing is
+   * overwritten by a hold.
+   *
+   * No target is drawn while the metronome is running: the patient is doing a rep on every click, and
+   * a target live during those eight seconds is exactly the accidental confirm this design refuses.
+   */
+  const dwellChoices: DwellChoice[] = useMemo(() => {
+    if (running) return [];
+    const target = singleDwellTarget(mode);
+    if (!result) {
+      return [{ id: 'start', target, label: 'Start', onConfirm: () => void startProbe() }];
+    }
+    if (result.accepted) {
+      return [
+        {
+          id: 'accept',
+          target,
+          label: `Use ${Math.round(result.offsetSec * 1000)} ms`,
+          onConfirm: () => accept(result.offsetSec, true, result.warning ? result.message : ''),
+        },
+      ];
+    }
+    return [
+      {
+        id: 'carry-on',
+        target,
+        label: inForce ? `Go on at ${currentMs} ms` : `Go on at ${DEFAULT_MS} ms`,
+        onConfirm: skip,
+      },
+    ];
+    // Same rule as the other screens: the hook keeps the live list and calls the current callback, so
+    // rebuilding the trackers whenever a closure changes identity would discard a hold in progress.
+  }, [running, result, mode, inForce, currentMs]);
+  const dwell = useDwellTargets(dwellChoices);
+
+  /** What the hold does right now, for the sentence beside the preview. */
+  const dwellWhat = !result
+    ? 'the circle to start the metronome'
+    : result.accepted
+      ? `the circle to use ${Math.round(result.offsetSec * 1000)} ms and start the song`
+      : `the circle to go on at ${inForce ? currentMs : DEFAULT_MS} ms`;
+
   return (
     <Screen>
       <TopBar
@@ -151,10 +208,32 @@ export default function LatencyCalibrationScreen() {
 
       <div className="row" style={{ alignItems: 'stretch', gap: 24 }}>
         <div className="card stack grow" style={{ gap: 18 }}>
-          <p style={{ fontSize: '1.2rem' }}>
-            A camera sees a movement 80–200 ms after it happens. This measures that delay so the game judges the movement,
-            not the pipeline.
-          </p>
+          {/* THE PATIENT'S OWN WAY PAST THIS SCREEN. The preview is here rather than in the sidebar
+              because it is the thing the patient has to see from the chair, and the sidebar is
+              where the therapist's numbers live. */}
+          {dwellChoices.length > 0 && (
+            <div className="stack" style={{ gap: 12, width: 'min(440px, 100%)' }} data-testid="latency-handsfree">
+              <CameraPreview overlay>
+                {dwellChoices.map((choice) => (
+                  <DwellTarget
+                    key={choice.id}
+                    choice={choice}
+                    state={dwell.states[choice.id]}
+                    reducedMotion={reducedMotion}
+                    testId={`latency-dwell-${choice.id}`}
+                  />
+                ))}
+              </CameraPreview>
+              <DwellLegend session={dwell} what={dwellWhat} testId="latency-dwell-legend" />
+            </div>
+          )}
+          {running && (
+            <span className="dim" style={{ width: 'min(440px, 100%)' }} data-testid="latency-handsfree-paused">
+              The hands-free circle is hidden while the metronome runs — you are moving on every click, and a target on
+              screen during that would be confirmed by a repetition rather than by a decision. It comes back with the
+              result.
+            </span>
+          )}
           {/* The patient is READ this while doing the reps that measure the delay. "do one finger
               opposition with the left side" does not say which digit, and on a two-pinch prescription
               the wrong finger measures a different quantity's latency. */}
@@ -192,6 +271,14 @@ export default function LatencyCalibrationScreen() {
             </button>
           )}
           {running && <p className="muted">Listening… keep moving with the clicks.</p>}
+
+          {/* WHAT THIS SCREEN IS FOR, under the controls rather than above them. It is context for
+              the therapist, and putting it first pushed both the patient's circle and the therapist's
+              own start button off the bottom of a 1024x768 tablet. */}
+          <p className="muted" style={{ fontSize: '1.05rem' }}>
+            A camera sees a movement 80–200 ms after it happens. This measures that delay so the game judges the movement,
+            not the pipeline.
+          </p>
 
           {result && (
             <div className="stack">

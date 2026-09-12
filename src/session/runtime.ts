@@ -100,12 +100,32 @@ export function laneFeatureOptions(lanes: readonly LaneSpec[]): ({ fingertip?: F
  * "Play again" from the results screen re-opens it, which is the right trade: a second song starts
  * with a song load and a 3-2-1 count-in anyway, and the alternative is the light staying on through
  * every gap between patients.
+ *
+ * THE ONE EXCEPTION is a patient who has been working the session hands-free — see
+ * `CameraHoldContext.handsFree` below. Pressing "Play again" is exactly what they cannot do.
  */
 const CAMERA_SCREENS: ReadonlySet<Screen> = new Set<Screen>(['camera', 'rom', 'latency', 'play']);
 
+export interface CameraHoldContext {
+  /**
+   * The patient has been confirming with the hands-free dwell target (`AppState.handsFree`), which is
+   * the evidence that there may be nobody else in the room.
+   *
+   * THE ONE EXCEPTION TO RELEASING ON RESULTS, and it is narrow on purpose. Results ends with "Play
+   * again" and "New session"; a patient who has driven the whole session from the chair, whose
+   * forearms are on the table or who cannot reach the tablet at all, has no way to press either. So
+   * the device is held for that screen and ONLY for that screen, and only after the patient has
+   * actually used the hands-free path — a session a therapist clicked through releases the camera the
+   * moment play ends, exactly as before. The results screen says out loud that the camera is still on
+   * and offers a control that turns it off.
+   */
+  handsFree?: boolean;
+}
+
 /** True when `screen` consumes camera frames within seconds of being shown. */
-export function screenNeedsCamera(screen: Screen): boolean {
-  return CAMERA_SCREENS.has(screen);
+export function screenNeedsCamera(screen: Screen, ctx: CameraHoldContext = {}): boolean {
+  if (CAMERA_SCREENS.has(screen)) return true;
+  return screen === 'results' && ctx.handsFree === true;
 }
 
 /**
@@ -506,7 +526,7 @@ class SessionRuntime {
    * and every test — is arguing with the same statement of it.
    */
   releaseVisionUnless(screen: Screen): boolean {
-    if (screenNeedsCamera(screen)) return false;
+    if (screenNeedsCamera(screen, { handsFree: useStore.getState().handsFree })) return false;
     if (!this.vision) return false;
     this.disposeVision();
     return true;

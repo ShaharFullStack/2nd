@@ -1,4 +1,5 @@
 import { useEffect, useRef } from 'react';
+import type { ReactNode } from 'react';
 import { runtime } from '../session/runtime.ts';
 import { drawDetection } from './overlay.ts';
 import type { DetectionResult } from '../vision/mediapipe.ts';
@@ -10,7 +11,16 @@ import type { DetectionResult } from '../vision/mediapipe.ts';
  * so this MOVES it into place and puts it back when the screen unmounts. Cloning it would mean a
  * second decode of the same stream for no benefit.
  */
-export function CameraPreview({ overlay = false, className = 'camera-frame mirror' }: { overlay?: boolean; className?: string }) {
+export function CameraPreview({
+  overlay = false,
+  className = 'camera-frame mirror',
+  children,
+}: {
+  overlay?: boolean;
+  className?: string;
+  /** Drawn INSIDE the frame, over the video and the landmark overlay (the hands-free dwell targets). */
+  children?: ReactNode;
+}) {
   const host = useRef<HTMLDivElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
   const latest = useRef<DetectionResult | null>(null);
@@ -57,6 +67,7 @@ export function CameraPreview({ overlay = false, className = 'camera-frame mirro
   return (
     <div className={className} ref={host}>
       {overlay && <canvas ref={canvas} />}
+      {children}
     </div>
   );
 }

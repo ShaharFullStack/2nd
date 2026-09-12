@@ -33,6 +33,23 @@ describe('screenNeedsCamera', () => {
     // The exact case the reviewer saw in the running app. "Play again" re-opens it, which costs a
     // second at the start of a song that has a count-in anyway.
     expect(screenNeedsCamera('results')).toBe(false);
+    expect(screenNeedsCamera('results', {})).toBe(false);
+    expect(screenNeedsCamera('results', { handsFree: false })).toBe(false);
+  });
+
+  /**
+   * …UNLESS THE PATIENT HAS BEEN DRIVING THE SESSION THEMSELVES.
+   *
+   * Results ends with "Play again" and "New session". A patient whose forearms are on the table, or
+   * who is seated out of reach of the tablet, can press neither — and for a hemiparetic patient
+   * reaching for it may not be possible at all. `handsFree` is not a preference: it is set by the
+   * first dwell confirm, so it is evidence that this session was actually worked from the chair.
+   */
+  it('keeps it on results — and ONLY on results — for a session the patient confirmed hands-free', () => {
+    expect(screenNeedsCamera('results', { handsFree: true })).toBe(true);
+    for (const screen of ['home', 'patients', 'mode', 'setup', 'history'] as Screen[]) {
+      expect(screenNeedsCamera(screen, { handsFree: true }), screen).toBe(false);
+    }
   });
 });
 
@@ -49,6 +66,6 @@ describe('the release rule is armed for the whole visit, not just for the play s
     goto('setup'); // nothing listening any more
     expect(seen).toEqual(['play', 'results', 'home']);
     // …and the rule applied to that sequence keeps the camera for exactly one of them.
-    expect(seen.map(screenNeedsCamera)).toEqual([true, false, false]);
+    expect(seen.map((s) => screenNeedsCamera(s))).toEqual([true, false, false]);
   });
 });

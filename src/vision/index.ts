@@ -12,4 +12,5 @@ export * from './filters.ts';
 export * from './calibration.ts';
 export * from './pipeline.ts';
 export * from './trigger.ts';
+export * from './dwell.ts';
 export * from './mediapipe.ts';

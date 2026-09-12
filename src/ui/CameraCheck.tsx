@@ -12,6 +12,8 @@ import type { InvalidCalibration } from '../input/VisionInput.ts';
 import type { DetectionResult } from '../vision/mediapipe.ts';
 import { drawDetection } from './overlay.ts';
 import CameraFallback from './CameraFallback.tsx';
+import { DwellLegend, DwellTarget, singleDwellTarget, useDwellTargets } from './DwellTarget.tsx';
+import type { DwellChoice } from './DwellTarget.tsx';
 import { Screen, Toast, TopBar, laneName } from './common.tsx';
 
 export default function CameraCheck() {
@@ -184,6 +186,29 @@ export default function CameraCheck() {
     [starting, observed, windows],
   );
 
+  /**
+   * THE HANDS-FREE PATH PAST THIS SCREEN.
+   *
+   * `camera-continue` is an acknowledgement, not a choice — its gate is already computed from what
+   * vision is reporting (`readiness.gate`) — so the patient holding a limb over the target confirms
+   * exactly what the button confirms, under exactly the same gate. The button stays: a therapist in
+   * the room is faster with it, and it is the only path while the readiness gate is closed.
+   */
+  const dwellChoices: DwellChoice[] = useMemo(
+    () => [
+      {
+        id: 'continue',
+        target: singleDwellTarget(mode),
+        label: 'Continue',
+        enabled: !readiness.gate && !starting,
+        disabledNote: 'Not yet',
+        onConfirm: () => goto('rom'),
+      },
+    ],
+    [mode, readiness.gate, starting, goto],
+  );
+  const dwell = useDwellTargets(dwellChoices);
+
   // A camera that never started is not a corner of the camera-check screen — it is the screen.
   if (error !== null) return <CameraFallback error={error} onRetry={retry} retries={attempt} />;
 
@@ -211,10 +236,21 @@ export default function CameraCheck() {
       />
 
       <div className="row" style={{ alignItems: 'flex-start', gap: 24 }}>
+        <div className="stack grow" style={{ gap: 14, maxWidth: 760 }}>
         {/* The preview (and the overlay with it) is always CSS-mirrored: the patient expects a mirror,
             and flipping both together keeps the landmarks on top of the limbs they came from. */}
-        <div className="camera-frame mirror grow" ref={holder} style={{ maxWidth: 760 }}>
+        <div className="camera-frame mirror" ref={holder}>
           <canvas ref={canvas} />
+          {!starting &&
+            dwellChoices.map((choice) => (
+              <DwellTarget
+                key={choice.id}
+                choice={choice}
+                state={dwell.states[choice.id]}
+                reducedMotion={settings.reducedMotion}
+                testId={`camera-dwell-${choice.id}`}
+              />
+            ))}
           {starting && (
             <div className="overlay" data-testid="camera-starting">
               <div className="card stack" style={{ maxWidth: 420 }}>
@@ -258,6 +294,11 @@ export default function CameraCheck() {
               </div>
             </div>
           )}
+        </div>
+
+        {/* THE SENTENCE THE RING CANNOT CARRY: what the hold does, and which limb it is following.
+            It sits under the preview because that is where the patient is already looking. */}
+        {!starting && <DwellLegend session={dwell} what="to go on to the range check" testId="camera-dwell-legend" />}
         </div>
 
         <div className="stack" style={{ width: 'min(380px, 100%)' }}>

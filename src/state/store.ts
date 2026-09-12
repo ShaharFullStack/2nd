@@ -507,8 +507,22 @@ export interface AppState {
   lastSave: SaveOutcome | null;
   persistenceFailed: boolean;
 
+  /**
+   * THE PATIENT HAS BEEN DRIVING THIS SESSION THEMSELVES.
+   *
+   * Set the first time a dwell target is confirmed (src/ui/DwellTarget.tsx) and cleared when a new
+   * session is started from Home. It is not a preference and it is never persisted: it is the
+   * evidence, gathered from what actually happened, that there may be nobody in the room but the
+   * patient — and the only thing that decides whether the camera is kept alive on the results screen,
+   * where the therapist's two buttons would otherwise be the only way off the last screen of the
+   * session (see `screenNeedsCamera`). A session a therapist clicked through releases the device the
+   * moment play ends, exactly as before.
+   */
+  handsFree: boolean;
+
   goto: (screen: Screen) => void;
   setInputMode: (m: InputMode) => void;
+  setHandsFree: (on: boolean) => void;
   /** Create a patient and make them the one the next session is recorded against. Returns the id. */
   addPatient: (name: string) => string;
   /** Switch patients: swaps in their stored ranges and clears the lane ranges measured for the last. */
@@ -829,6 +843,7 @@ export const useStore = create<AppState>((set, get) => {
     lastResult: null,
     lastSave: null,
     persistenceFailed: false,
+    handsFree: false,
 
     acknowledgeActivePatient: () =>
       set((s) => {
@@ -844,6 +859,7 @@ export const useStore = create<AppState>((set, get) => {
 
     goto: (screen) => set((s) => (s.screen === screen ? s : { screen, previousScreen: s.screen })),
     setInputMode: (inputMode) => set({ inputMode }),
+    setHandsFree: (handsFree) => set((s) => (s.handsFree === handsFree ? s : { handsFree })),
 
     addPatient: (name) => {
       const patient = makePatient(name);

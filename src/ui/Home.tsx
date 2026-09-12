@@ -18,6 +18,7 @@ export default function Home() {
   const patients = useStore((s) => s.patients);
   const activePatientId = useStore((s) => s.activePatientId);
   const selectDeviceTestPatient = useStore((s) => s.selectDeviceTestPatient);
+  const setHandsFree = useStore((s) => s.setHandsFree);
   const patient = patients.find((p) => p.id === activePatientId) ?? null;
   // THE LAST SESSION FOR THE PATIENT ON SCREEN, never the tablet's last session — on a shared device
   // those are different people, and the second one belongs to nobody in particular.
@@ -51,6 +52,9 @@ export default function Home() {
   const start = () => {
     // First user gesture: this is the only place an AudioContext may be created.
     void runtime.ensureAudio().catch((err) => console.warn('[home] audio unavailable', err));
+    // A new session has not been driven hands-free until it has been: the flag that keeps the camera
+    // alive on the results screen is evidence, and last session's evidence is not this one's.
+    setHandsFree(false);
     if (inputMode !== 'camera') {
       if (!activePatientId) selectDeviceTestPatient();
       goto('mode');
@@ -78,13 +82,36 @@ export default function Home() {
         </p>
       </div>
 
-      <div className="row" style={{ gap: 18 }}>
-        <button className="btn btn-primary btn-lg" onClick={start} data-testid="start-session">
-          {activePatientId && !(inputMode === 'camera' && patient?.deviceTest) ? 'Start session' : 'Choose patient & start'}
-        </button>
-        <button className="btn btn-lg" onClick={() => goto('history')} data-testid="open-history">
-          History {patientSessions > 0 && <span className="badge">{patientSessions}</span>}
-        </button>
+      {/*
+        THE ONE TAP THE SESSION NEEDS, AND IT IS NOT NEGOTIABLE.
+
+        Every browser refuses to start audio without a genuine user gesture — `ctx.resume()` never
+        even settles without one (see runtime.ts) — and this app's whole clock is that AudioContext.
+        So exactly one real press has to happen, and it has to happen HERE: before the patient is in
+        position, while somebody can still reach the tablet. Everything after it — framing the camera,
+        every range, the latency check, the song, and the way off the results screen — is done by
+        holding a limb over a circle on the preview.
+
+        It is not hidden and it is not apologised for: it is the biggest thing on the screen, and the
+        sentence under it says it is the last one.
+      */}
+      <div className="row only-tap" style={{ gap: 18 }}>
+        <div className="row" style={{ gap: 18 }}>
+          <button className="btn btn-primary btn-lg" onClick={start} data-testid="start-session">
+            {activePatientId && !(inputMode === 'camera' && patient?.deviceTest) ? 'Start session' : 'Choose patient & start'}
+          </button>
+          <button className="btn btn-lg" onClick={() => goto('history')} data-testid="open-history">
+            History {patientSessions > 0 && <span className="badge">{patientSessions}</span>}
+          </button>
+        </div>
+        {inputMode === 'camera' && (
+          <p className="muted" style={{ margin: 0, maxWidth: 620, fontSize: '1.05rem' }} data-testid="only-tap-note">
+            <b>This is the only time the screen has to be touched.</b> Press it before the patient gets into position:
+            the browser will not start the sound without one real press, and the song clock is that sound. From the
+            camera check onwards the patient confirms every step themselves, by holding a hand or a knee inside a circle
+            on the camera preview until the ring fills. The buttons all keep working for whoever is in the room.
+          </p>
+        )}
       </div>
 
       <PatientBanner />

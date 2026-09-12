@@ -35,6 +35,10 @@ import { isPatientDriven, patientSessions } from '../session/trends.ts';
 import type { LaneResultSummary, SessionResult } from '../session/types.ts';
 import { MAX_HISTORY, useStore } from '../state/store.ts';
 import { FEATURE_UNIT_SHORT, formatFeature } from '../vision/calibration.ts';
+import { runtime } from '../session/runtime.ts';
+import { CameraPreview } from './CameraPreview.tsx';
+import { DwellLegend, DwellTarget, pairedDwellTargets, useDwellTargets } from './DwellTarget.tsx';
+import type { DwellChoice } from './DwellTarget.tsx';
 import { Meter, Screen, shortDate, Stars, Toast, TopBar } from './common.tsx';
 import { MeasurementNote } from './ScopeNote.tsx';
 import LatencyHandover from './LatencyHandover.tsx';
@@ -444,6 +448,37 @@ export default function ResultsScreen() {
   const lastSave = useStore((s) => s.lastSave);
   const retrySave = useStore((s) => s.retrySaveLastResult);
   const [saveNote, setSaveNote] = useState<string | null>(null);
+  /**
+   * THE LAST SCREEN IS THE EASIEST ONE TO BE STRANDED ON.
+   *
+   * It ends with "Play again" and "New session", and a patient who has driven the whole session from
+   * the chair can press neither. So when the patient has been confirming hands-free (`handsFree`, set
+   * by the first dwell confirm), the camera is NOT released on arriving here — see
+   * `screenNeedsCamera` — and the same two actions are offered as targets. Every other session
+   * releases the device the moment play ends, exactly as before, and this screen says out loud that
+   * the camera is still on and offers the control that turns it off.
+   */
+  const mode = useStore((s) => s.mode);
+  const handsFree = useStore((s) => s.handsFree);
+  const setHandsFree = useStore((s) => s.setHandsFree);
+  const reducedMotion = useStore((s) => s.settings.reducedMotion);
+  const dwellChoices: DwellChoice[] = useMemo(() => {
+    if (!handsFree) return [];
+    const [go, back] = pairedDwellTargets(mode);
+    return [
+      {
+        id: 'again',
+        target: go,
+        label: 'Play again',
+        onConfirm: () => {
+          setSeed(seed + 1);
+          goto('play');
+        },
+      },
+      { id: 'new', target: back, label: 'New session', onConfirm: () => goto('mode') },
+    ];
+  }, [handsFree, mode, seed, setSeed, goto]);
+  const dwell = useDwellTargets(dwellChoices);
 
   /**
    * WHICH SESSION "LAST TIME" IS — AND WHETHER IT IS A WHOLE SESSION.
@@ -648,6 +683,52 @@ export default function ResultsScreen() {
           </>
         }
       />
+
+      {/* THE PATIENT'S OWN WAY OFF THE LAST SCREEN — shown only when they have actually been working
+          hands-free, and honest that the camera is still running to provide it. */}
+      {handsFree && dwell.live && dwellChoices.length > 0 && (
+        <div className="card stack" data-testid="results-handsfree" style={{ gap: 12 }}>
+          <div className="row">
+            <h3 style={{ margin: 0 }}>Carry on without touching the screen</h3>
+            <div className="grow" />
+            <span className="badge badge-warn" data-testid="results-camera-on">
+              camera still on
+            </span>
+          </div>
+          {/* Capped, so the legend and the therapist's way out of this stay on screen with it at
+              1024x768 — a full-card-width preview pushed both below the fold. */}
+          <div style={{ width: 'min(560px, 100%)' }}>
+            <CameraPreview overlay>
+              {dwellChoices.map((choice) => (
+                <DwellTarget
+                  key={choice.id}
+                  choice={choice}
+                  state={dwell.states[choice.id]}
+                  reducedMotion={reducedMotion}
+                  testId={`results-dwell-${choice.id}`}
+                />
+              ))}
+            </CameraPreview>
+          </div>
+          <DwellLegend session={dwell} what="the left circle to play again, the right one to start a new session" testId="results-dwell-legend" />
+          <div className="row">
+            <button
+              className="btn"
+              data-testid="results-camera-off"
+              onClick={() => {
+                setHandsFree(false);
+                runtime.disposeVision();
+              }}
+            >
+              Turn the camera off
+            </button>
+            <span className="dim">
+              The camera was kept on after the song only because this session was driven from the chair. Turning it off
+              leaves the buttons above, which is every other session&rsquo;s behaviour.
+            </span>
+          </div>
+        </div>
+      )}
 
       {/*
         A SESSION THE PATIENT DID NOT DRIVE IS NOT A CLINICAL RESULT, and it says so before any figure
