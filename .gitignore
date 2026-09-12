@@ -16,6 +16,7 @@ playwright-report
 critic/screenshots/*.png
 critic/screenshots/**/*.png
 critic/handsfree/
+critic/handsfree-thigh/
 critic/frames/
 critic/motion/
 critic/_tmp_*

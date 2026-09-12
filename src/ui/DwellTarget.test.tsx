@@ -51,6 +51,7 @@ import {
   dwellAxisFor,
   dwellDistance,
   dwellLimbs,
+  dwellOrigin,
   dwellPlaceable,
   dwellReferences,
   dwellTargetClear,
@@ -276,6 +277,7 @@ function drive(opts: {
     const detection = frame(t, layout.circles());
     const limbs = dwellLimbs(detection, mode, mirrored, aspect);
     const references = dwellReferences(detection, mode, { lanes: opts.lanes, mirrored, xScale: aspect });
+    const origin = dwellOrigin(detection);
     let busy = false;
     for (const tracker of trackers.values()) {
       const st = tracker.state;
@@ -285,11 +287,17 @@ function drive(opts: {
     // reach must not teach it that the limb lives on the ring), bounded in time by `DwellEngagement`
     // because a limb still there three seconds later is not answering. The COUPLING record takes every
     // frame: leaving out the engaged ones starved it of the rise that carries the hand into the ring.
-    for (const l of limbs) coupling.noteOne(l.key, l.point, references, t, aspect);
+    for (const l of limbs) coupling.noteOne(l.key, l.point, references, t, aspect, origin);
     if (busy) engagement.noteAnswering(t);
-    if (!busy) {
+    const carried = opts.withoutCouplingGate ? new Set<string>() : coupling.coupledKeys(t);
+    {
+      // Per limb, exactly as the hook does it: a blanket "somebody is answering, record nothing"
+      // silences the record for the limbs the gate most needs to know about.
       const engagedCounts = dwellAxisFor(mode) === 'radial';
       for (const l of limbs) {
+        // A limb the exercise is carrying is not living anywhere: its travel belongs to the exercise,
+        // and recording it made every ring unplaceable for twenty seconds (see the note in the hook).
+        if (carried.has(l.key)) continue;
         if (engagedCounts && engagement.gesture(l.key, l.point, layout.circles(), t, aspect, DWELL_DEFAULTS.exitRatio)) continue;
         habitat.noteOne(l.key, l.point, t, l.scale ?? null);
       }
@@ -307,7 +315,6 @@ function drive(opts: {
       }
     }
     for (const [id, tracker] of trackers) tracker.setOccupied(occupied.get(id) === true);
-    const carried = opts.withoutCouplingGate ? new Set<string>() : coupling.coupledKeys(t);
     if (carried.size > 0) {
       out.refusedFrames += 1;
       for (const key of carried) {
@@ -761,19 +768,25 @@ describe('THE PRESCRIBED EXERCISE MAY NOT ANSWER FOR THE PATIENT', () => {
     // rests there, leaves (which opens the entry gate), and comes back to exactly the same place —
     // the worst version of this, and the one that shipped once — cannot fill the ring: the band clock
     // stops the hold within `bandGraceSec`, and a hold may only ever COMPLETE inside the drawn circle.
+    /**
+     * A hand that rests IN THE BAND — outside the drawn circle, inside the hysteresis — leaves (which
+     * opens the entry gate) and comes back to exactly the same place. The worst version of the escape,
+     * and the one that shipped once. It cannot fill the ring: the band clock stops the hold within
+     * `bandGraceSec`, a hold may only ever COMPLETE inside the drawn circle, and the habitat learns
+     * that a limb lives there and moves the ring off it.
+     */
+    const band = (c: DwellCircle) => {
+      // 0.19 from the centre: past the radius (0.15), inside the band (0.15 x 1.25 + 0.03 = 0.2175).
+      const d = 0.19;
+      return { x: c.x - (d * 0.6) / PREVIEW_ASPECT, y: c.y + d * 0.8 };
+    };
     const legs = drive({
       mode: 'leg',
       aspect: PREVIEW_ASPECT,
       authored: pairedDwellTargets('leg'),
       seconds: 30,
       frame: (t) => {
-        // 4 s at rest INSIDE THE RING AS AUTHORED, 1.5 s away, repeatedly: the patient reaching for
-        // something and putting their hand back exactly where it was. A hand that lives where the
-        // circle is drawn is the worst version of this case, and the hand does NOT chase the ring when
-        // the layout moves it — that would be a patient following a circle around the preview, which is
-        // not a body. The hand is otherwise supported (a chair arm), so what is under test here is the
-        // placement and the band, not the coupling.
-        const home = { x: singleDwellTarget('leg').x - 0.02, y: singleDwellTarget('leg').y + 0.01 };
+        const home = band(singleDwellTarget('leg'));
         const away = t % 5.5 >= 4;
         const left = away ? { x: 0.55, y: 0.72 } : home;
         return legFrame({
@@ -787,9 +800,14 @@ describe('THE PRESCRIBED EXERCISE MAY NOT ANSWER FOR THE PATIENT', () => {
         });
       },
     });
+    expect(dwellDistance(band(singleDwellTarget('leg')), singleDwellTarget('leg'), PREVIEW_ASPECT)).toBeGreaterThan(
+      singleDwellTarget('leg').radius,
+    );
+    expect(dwellDistance(band(singleDwellTarget('leg')), singleDwellTarget('leg'), PREVIEW_ASPECT)).toBeLessThan(
+      singleDwellTarget('leg').radius * DWELL_DEFAULTS.exitRatio + DWELL_CLEAR_MARGIN,
+    );
     expect(legs.confirms).toBe(0);
-    // The other hand rests just OUTSIDE the smaller ring's band, which is exactly the case the measured
-    // gate is for: it is stood down, and then moved somewhere clear rather than left dead.
+    // …and the ring does not sit there dead either: it is stood down and then moved somewhere clear.
     expect(legs.standDowns).toBeGreaterThan(0);
     expect(legs.moves).toBeGreaterThan(0);
 
@@ -809,6 +827,61 @@ describe('THE PRESCRIBED EXERCISE MAY NOT ANSWER FOR THE PATIENT', () => {
     });
     expect(hands.confirms).toBe(0);
     expect(hands.standDowns).toBeGreaterThan(0);
+  });
+
+  it('THE RESIDUAL, STATED: a hand INSIDE the drawn circle can still answer by leaving and returning', () => {
+    /**
+     * WHAT THIS GESTURE CANNOT DEFEND AGAINST, measured rather than left as a hope.
+     *
+     * A patient whose hand rests inside a ring — up beside the shoulder, on a table at that height —
+     * takes it out and puts it back, and the ring fills. The habitat cannot save them: every frame of
+     * a limb that lives inside a drawn circle is either part of a hold that is accumulating or part of
+     * the reach into it, and excluding those frames is what stops the reach itself from teaching the
+     * record that the limb lives on the ring (the circularity in `DwellHabitat`'s own header). So the
+     * protections for this body are, in order: the AUTHORED POSITIONS, which clear every rest position
+     * the app instructs by more than the whole hysteresis band (see the reach test below); the ENTRY
+     * GATE, which makes the limb leave the drawn circle and come back, so a confirm needs a real
+     * excursion and not a tremor; the BAND CLOCK, which covers the much larger set of positions just
+     * outside the circle; and the 1.8 s hold itself.
+     *
+     * It is asserted here so that it is a known quantity and not a surprise: one confirm per
+     * out-and-back, not a ring filling on its own. If a future change makes this body confirm WITHOUT
+     * leaving the circle first, this test is the one that will say so.
+     */
+    const target = singleDwellTarget('leg');
+    const inRing = { x: target.x - 0.02, y: target.y + 0.01 };
+    expect(dwellDistance(inRing, target, PREVIEW_ASPECT)).toBeLessThan(target.radius);
+    const parked = drive({
+      mode: 'leg',
+      aspect: PREVIEW_ASPECT,
+      authored: [target],
+      seconds: 20,
+      // It never leaves: the entry gate alone holds the ring at zero for the whole run.
+      frame: () =>
+        legFrame({ movement: 'seated_march', side: 'left', amount: 0, compensation: 'none', rest: 'chair_arms', hand: { side: 'left', ...inRing }, aspect: PREVIEW_ASPECT }),
+    });
+    expect(parked.confirms).toBe(0);
+    expect(parked.maxProgress).toBe(0);
+
+    // …and when it DOES leave and come back, that is the gesture, and it is one confirm per excursion.
+    const cycling = drive({
+      mode: 'leg',
+      aspect: PREVIEW_ASPECT,
+      authored: [target],
+      seconds: 30,
+      frame: (t) =>
+        legFrame({
+          movement: 'seated_march',
+          side: 'left',
+          amount: 0,
+          compensation: 'none',
+          rest: 'chair_arms',
+          hand: { side: 'left', ...(t % 5.5 >= 4 ? { x: 0.55, y: 0.72 } : inRing) },
+          aspect: PREVIEW_ASPECT,
+        }),
+    });
+    expect(cycling.confirms).toBeGreaterThan(0);
+    expect(cycling.confirms).toBeLessThanOrEqual(6);
   });
 
   it('…and the same pipeline DOES confirm a deliberate hold, so none of the above is vacuous', () => {
@@ -1332,6 +1405,21 @@ describe('the layouts the screens ask for', () => {
       const [go, back] = pairedDwellTargets(mode);
       expect(back.radius).toBeLessThan(go.radius * 0.85);
     }
+    /**
+     * AND THE TWO SETS OF SIZES MAY NOT OVERLAP ACROSS MODES. `toneOf` reads the tone off the radius
+     * for screens that do not say which ring is which (Results asks for two and names neither), and
+     * the modes have different primary sizes because their clearance rules do. If a secondary ever
+     * grew past a primary, the forward ring of one mode would draw itself as the one that goes back —
+     * with the back-pointing mark, on the screen where one of the two ends the session.
+     */
+    const primaries = (['hand', 'leg'] as const).map((m) => singleDwellTarget(m).radius);
+    const secondaries = (['hand', 'leg'] as const).map((m) => pairedDwellTargets(m)[1].radius);
+    expect(Math.max(...secondaries)).toBeLessThan(Math.min(...primaries));
+    for (const mode of ['hand', 'leg'] as const) {
+      const [go, back] = pairedDwellTargets(mode);
+      expect(toneOf({ ...CHOICE, target: go })).toBe('go');
+      expect(toneOf({ ...CHOICE, target: back })).toBe('back');
+    }
   });
 });
 
@@ -1622,7 +1710,7 @@ describe('dwellCadence', () => {
 function session(over: Partial<DwellSession> = {}): DwellSession {
   // A session with a tracker in it: the legend distinguishes "no frames", "nothing to confirm yet"
   // (no live trackers) and "here is what to hold", and the first two have their own tests below.
-  return { states: { go: state() }, limb: null, coupled: null, live: true, xScale: PREVIEW_ASPECT, frameIntervalSec: 1 / 30, ...over };
+  return { states: { go: state() }, limb: null, coupled: null, rooms: {}, live: true, xScale: PREVIEW_ASPECT, frameIntervalSec: 1 / 30, ...over };
 }
 
 describe('DwellLegend', () => {
@@ -1636,7 +1724,7 @@ describe('DwellLegend', () => {
     );
     expect(screen.getByTestId('dwell-legend-limb').textContent).toBe('Following your right hand');
     // The point of accepting either side: the affected limb cannot be asked to hold still for 2 s.
-    expect(screen.getByTestId('dwell-legend').textContent).toMatch(/Either side may do this, including the unaffected one/);
+    expect(screen.getByTestId('dwell-legend').textContent).toMatch(/Either side will do, the unaffected one included/);
   });
 
   it('says a hand is unidentified rather than guessing which one it is', () => {
@@ -1665,9 +1753,9 @@ describe('DwellLegend', () => {
     const leg = screen.getByTestId('dwell-legend');
     expect(leg.textContent).toMatch(/Move a hand into the circle/);
     expect(leg.textContent).not.toMatch(/a hand or a knee/);
-    expect(screen.getByTestId('dwell-legend-limbs').textContent).toMatch(/a knee held in the circle cannot be told apart from a repetition/);
+    expect(screen.getByTestId('dwell-legend-limbs').textContent).toMatch(/a knee in the circle cannot be told from a repetition/);
     // …and it names the support the hand has to be on, and rules out the one the leg carries.
-    expect(screen.getByTestId('dwell-legend-limbs').textContent).toMatch(/not on your thigh/);
+    expect(screen.getByTestId('dwell-legend-limbs').textContent).toMatch(/not your thigh, which your leg carries/);
     useStore.getState().setMode('hand');
     cleanup();
     render(<DwellLegend session={session()} what="x" />);
@@ -1708,7 +1796,7 @@ describe('DwellLegend', () => {
     // …and the small print does not repeat the explanation the first line now carries (which is what
     // pushed the block off the bottom of a 768 px screen), but still says the buttons are there.
     const small = screen.getByTestId('dwell-legend-limbs').textContent ?? '';
-    expect(small).toMatch(/Either side may do this/);
+    expect(small).toMatch(/Either side will do/);
     /**
      * AND IT NO LONGER POINTS AT A CONTROL THAT MAY BE SWITCHED OFF.
      *
@@ -1852,6 +1940,7 @@ describe('DwellLegend', () => {
             coupled: true,
             explained: 0.19,
             r2: 0.99,
+            fraction: 0.7,
             reference: 'lane:0:seated_march:left/y',
             samples: 40,
             settled: true,

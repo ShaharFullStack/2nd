@@ -21,7 +21,8 @@
     "critic:uneven": "node critic/measured-unevenly.mjs",
     "critic:firstnote": "node critic/first-note.mjs",
     "critic:handsfree": "node critic/handsfree.mjs",
-    "critic:deadends": "node critic/handsfree-dead-ends.mjs"
+    "critic:deadends": "node critic/handsfree-dead-ends.mjs",
+    "critic:thigh": "node critic/handsfree-thigh.mjs"
   },
   "dependencies": {
     "@mediapipe/tasks-vision": "^1.0.1",

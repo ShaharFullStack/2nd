@@ -231,7 +231,22 @@ async function hold(page, id, settled, budgetMs = 40000) {
       }
     }
   }
-  throw new Error(`${id} never confirmed; ring reached ${(best * 100).toFixed(0)}%`);
+  // WHY it did not fill, in the app's own words: a ring standing on a limb, a limb the exercise is
+  // carrying and a limb nobody is holding are three different faults with three different remedies,
+  // and "reached 0 %" tells them apart from none of them.
+  const why = await page.evaluate((target) => {
+    const el = document.querySelector(`[data-testid="${target}"]`);
+    const legend = document.querySelector('[data-coupled]:not([data-coupled=""])');
+    return {
+      phase: el?.getAttribute('data-phase') ?? null,
+      block: el?.getAttribute('data-dwell-block') ?? null,
+      coupled: legend?.getAttribute('data-coupled') ?? null,
+    };
+  }, id);
+  throw new Error(
+    `${id} never confirmed; ring reached ${(best * 100).toFixed(0)}% (phase ${why.phase ?? '?'}` +
+      `${why.block ? `, blocked: ${why.block}` : ''}${why.coupled ? `; measured ${why.coupled}` : ''})`,
+  );
 }
 
 const screenOf = (page) => page.evaluate(() => window.__beatRehab.getState().screen);

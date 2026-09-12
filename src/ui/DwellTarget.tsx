@@ -11,6 +11,13 @@
  * prescribed leg movement, so a circle a knee can hold is a circle the exercise fills. It did, three
  * times, in the running app.
  *
+ * AND A HAND IS ONLY A POINTER WHILE SOMETHING THE EXERCISE CANNOT MOVE IS HOLDING IT UP. A hand
+ * resting on the thigh is carried by the thigh; driven through these classes it filled the primary
+ * circle in 3.23 s on the first repetition of a seated march. So this file asks the vision module
+ * whether the limb it is following is independent of the prescription (`dwellReferences`,
+ * `DwellCoupling`), follows the other hand when it is not, and stands the rings down and says so when
+ * there is no other hand — see the `coupled` phase and `DwellLegend`'s carried sentence.
+ *
  * WHAT THE DRAWING HAS TO SURVIVE
  * -------------------------------
  *  - A CLINIC TABLET AT 2 m. Everything is one SVG on a fixed viewBox sized as a fraction of the
@@ -20,8 +27,14 @@
  *    unknown room.
  *  - LOW VISION, AND COLOUR VISION THAT IS NOT THE DESIGNER'S. No state is signalled by hue alone.
  *    Each one has its own GLYPH (✕ nothing tracked, ◎ come in, ↻ move out and back, ⊘ a limb lives
- *    here, a COUNTDOWN while holding, ✓ confirmed) and its own ring pattern (dashed when nothing is
- *    tracked, solid when the limb is there, a filling arc while holding). Colour is the fourth cue.
+ *    here, ⊗ the exercise is carrying this limb, a COUNTDOWN while holding, ✓ confirmed) and its own
+ *    ring pattern (dashed when nothing is tracked, solid when the limb is there, a filling arc while
+ *    holding). Colour is the fourth cue.
+ *  - BEING BIG ENOUGH TO AIM AT. The ring used to be 58 px across on the 1024x768 tablet this is built
+ *    for — about 0.6 degrees of visual angle at a metre, against assistive-technology guidance of 1.5
+ *    degrees for a dwell-activated control. It is now as large as the clearance gate can place (see
+ *    the radius note below), and the thing that says WHICH of two rings is which survives being
+ *    rastered at a fifth of the size, because that is what a patient across a room sees.
  *  - TWO TARGETS THAT MEAN OPPOSITE THINGS, at 1/5 scale. "Next movement" and "Do it again" — or
  *    "Play again" and "New session" — used to render identically: same size, same white ring, same
  *    glyph, same caption size, distinguishable only by reading two words from two metres. The
@@ -61,11 +74,13 @@ import {
   DwellTracker,
   dwellAxisFor,
   dwellLimbs,
+  dwellOrigin,
   dwellReferences,
+  dwellTargetClear,
   pickDwellLimb,
   retargetForPreview,
 } from '../vision/dwell.ts';
-import type { DwellCircle, DwellCouplingVerdict, DwellLimb, DwellPoint, DwellState } from '../vision/dwell.ts';
+import type { DwellCircle, DwellClearance, DwellCouplingVerdict, DwellLimb, DwellPoint, DwellState } from '../vision/dwell.ts';
 import type { VisionInput } from '../input/VisionInput.ts';
 
 /**
@@ -236,6 +251,14 @@ export interface DwellSession {
    * independent witness, or when there is not enough of a window to say either way.
    */
   coupled: DwellCouplingVerdict | null;
+  /**
+   * HOW MUCH ROOM EACH RING HAS, per choice id — the measurement the `occupied` gate actually decided
+   * on (`dwellTargetClear`). It is published for the same reason `blocked` is drawn: a ring that is not
+   * filling looks identical whether it is standing on a limb, following a limb the exercise is
+   * carrying, or waiting for one that is not there, and those have three different remedies. The
+   * critic harnesses read it off the legend (`data-rooms`); nothing in the UI depends on it.
+   */
+  rooms: Record<string, DwellClearance>;
   /** Frames are arriving from the camera. False = there is nothing hands-free to offer. */
   live: boolean;
   /** The frame aspect (width/height) the camera is actually delivering, as the trackers measured in. */
@@ -248,6 +271,7 @@ const IDLE: DwellSession = Object.freeze({
   states: {},
   limb: null,
   coupled: null,
+  rooms: {},
   live: false,
   xScale: PREVIEW_ASPECT,
   frameIntervalSec: 0,
@@ -435,13 +459,18 @@ export function useDwellTargets(choices: readonly DwellChoice[]): DwellSession {
      * what let a hand resting inside the (now bigger) drawn circle be recorded as living elsewhere.
      */
     const engagement = new DwellEngagement();
+    // The clearance rule, in one place: the gate, the placement solver and the published `rooms` have
+    // to be measuring the same thing or the screen would be explaining a decision nobody made.
+    const clearanceOpts = {
+      xScale,
+      axis: dwellAxisFor(mode),
+      exitRatio: DWELL_DEFAULTS.exitRatio,
+      extra: DWELL_CLEAR_EXTRA,
+    };
     const layout = new DwellLayout(
       offered.map((c) => ({ id: c.id, authored: c.target, enabled: c.enabled !== false })),
       {
-        xScale,
-        axis: dwellAxisFor(mode),
-        exitRatio: DWELL_DEFAULTS.exitRatio,
-        extra: DWELL_CLEAR_EXTRA,
+        ...clearanceOpts,
         crowdedGraceSec: CROWDED_GRACE_SEC,
         moveIntervalSec: MOVE_INTERVAL_SEC,
         // The layout re-expresses its circles in the delivered frame; `xScale` here follows it.
@@ -464,6 +493,7 @@ export function useDwellTargets(choices: readonly DwellChoice[]): DwellSession {
     let coupledVerdict: DwellCouplingVerdict | null = null;
     let previous: DwellPoint | null = null;
     let previousKey: string | null = null;
+    let rooms: Record<string, DwellClearance> = {};
     let published: Record<string, DwellState> = {};
     let publishedLimb: string | null = null;
     let publishedCoupled: string | null = null;
@@ -533,12 +563,18 @@ export function useDwellTargets(choices: readonly DwellChoice[]): DwellSession {
 
     /** Re-measure the layout against where the limbs live, and act on the verdict. */
     const survey = (t: number) => {
-      const { occupied, moved } = layout.survey(habitat.all(t, xScale), t, busy());
+      const summaries = habitat.all(t, xScale);
+      const { occupied, moved } = layout.survey(summaries, t, busy());
       if (moved) {
         circles = layout.circles();
         for (const [id, tracker] of trackers) tracker.setTarget(layout.circleFor(id) as DwellCircle, xScale);
       }
       for (const [id, tracker] of trackers) tracker.setOccupied(occupied.get(id) === true);
+      const next: Record<string, DwellClearance> = {};
+      for (const [id] of trackers) {
+        next[id] = dwellTargetClear(layout.circleFor(id) as DwellCircle, summaries, clearanceOpts);
+      }
+      rooms = next;
     };
 
     /** The camera finally said what shape its frames are (or changed it mid-stream). */
@@ -575,6 +611,9 @@ export function useDwellTargets(choices: readonly DwellChoice[]): DwellSession {
         noteFrame(t);
         const limbs = dwellLimbs(result, mode, mirrored, xScale);
         const references = dwellReferences(result, mode, { lanes, mirrored, xScale });
+        // The patient's own frame of reference, so that a chair scoot or a nudged camera is not read
+        // as a limb travelling with the exercise (`dwellOrigin`).
+        const origin = dwellOrigin(result);
         /**
          * THE COUPLING RECORD TAKES EVERY FRAME, and that is a deliberate difference from the habitat.
          *
@@ -591,18 +630,41 @@ export function useDwellTargets(choices: readonly DwellChoice[]): DwellSession {
          * the ring filled. Measured in the running classes: the window stalled at 9 samples and the
          * primary confirmed at 2.90 s.
          */
-        for (const l of limbs) coupling.noteOne(l.key, l.point, references, t, xScale);
+        for (const l of limbs) coupling.noteOne(l.key, l.point, references, t, xScale, origin);
         // An answer in flight (or just finished) is what the habitat has to be kept away from; see
         // `DwellEngagement`. Everything else about a limb inside a ring is evidence.
         if (busy()) engagement.noteAnswering(t);
-        if (!busy()) {
+        const carried = coupling.coupledKeys(t);
+        {
+          /**
+           * WHICH LIMB IS ANSWERING IS A PER-LIMB QUESTION. This block used to be skipped entirely
+           * whenever ANY hold was accumulating (`if (!busy())`), which silenced the record for every
+           * limb in the frame — including the hand resting in the patient's lap, which is exactly the
+           * limb the gate needs to know about. Worse, on a body whose hand rests INSIDE a drawn circle
+           * the hold starts the instant the hand returns, so the blanket guard threw away every frame
+           * that could ever have taught the habitat where that hand lives: it filled the ring five
+           * times in thirty seconds, measured. `DwellEngagement` answers the same question properly —
+           * per limb, from where it is and what the rings are doing — so the blanket guard is gone.
+           */
           const engagedCounts = dwellAxisFor(mode) === 'radial';
           for (const l of limbs) {
+            /**
+             * A LIMB THE EXERCISE IS CARRYING IS NOT LIVING ANYWHERE, so its travel is not evidence
+             * about where it lives. Recording it is what turned a hand on the thigh into a limb that
+             * "wanders" over a third of the frame — and `dwellClearance` demands the band PLUS the
+             * measured wander, so every ring on the screen became unplaceable for the whole
+             * twenty-second window, including for the patient's OTHER hand. Measured in the running
+             * app: required clearance 0.634 against a frame that is 1.0 high. The remedy the screen
+             * offers ("rest it on the arm of the chair") then could not be acted on, which is the
+             * worst version of this: an instruction the app itself has made impossible to follow.
+             * Its RESTING position still counts — the frames before the movement starts, and every
+             * frame after the verdict lapses — which is what the gate actually needs.
+             */
+            if (carried.has(l.key)) continue;
             if (engagedCounts && engagement.gesture(l.key, l.point, circles, t, xScale, DWELL_DEFAULTS.exitRatio)) continue;
             habitat.noteOne(l.key, l.point, t, l.scale ?? null);
           }
         }
-        const carried = coupling.coupledKeys(t);
         limb = pickDwellLimb(limbs, circles, {
           xScale,
           previous,
@@ -652,7 +714,7 @@ export function useDwellTargets(choices: readonly DwellChoice[]): DwellSession {
       publishedLimb = limbLabel;
       publishedLive = live;
       publishedCoupled = carriedKey;
-      setSession({ states: next, limb, coupled: coupledVerdict, live, xScale, frameIntervalSec: interval });
+      setSession({ states: next, limb, coupled: coupledVerdict, rooms, live, xScale, frameIntervalSec: interval });
     };
     raf = requestAnimationFrame(publish);
 
@@ -882,11 +944,15 @@ export function DwellTarget({ choice, state, mirrored = true, reducedMotion = fa
             y={cy - plate}
             width={plate * 2}
             height={plate * 2}
-            rx={14}
+            rx={12}
             fill="rgba(5, 7, 13, 0.72)"
             stroke={style.colour}
-            strokeOpacity={0.5}
-            strokeWidth={3}
+            /* A BRIGHT SQUARE, not a faint one. At a fifth of the raster the mark inside the ring is a
+               few pixels and the caption is gone, so what tells the two rings apart there is size,
+               which side of the preview they are on, and the SILHOUETTE — a square against a disc. A
+               50 %-opacity 3-unit outline did not survive the downscale; this does. */
+            strokeOpacity={0.85}
+            strokeWidth={4}
           />
         )}
         <circle cx={CX} cy={cy} r={R} fill="none" stroke="rgba(5, 7, 13, 0.85)" strokeWidth={16} />
@@ -1022,9 +1088,14 @@ function describe(phase: Phase, state: DwellState | undefined): string {
       // holding there would be indistinguishable from sitting still. It moves itself off in a moment.
       return 'a limb rests here';
     case 'coupled':
-      // Measured, not guessed (`DwellCoupling`): this hand is travelling with the exercise, so a hold
-      // made with it could not be told from a repetition. Three words that name the remedy.
-      return 'that hand moves with your exercise';
+      /**
+       * Measured, not guessed (`DwellCoupling`): this hand is travelling with the exercise, so a hold
+       * made with it could not be told from a repetition. It is kept to the length of the other
+       * sub-captions on purpose — "that hand moves with your exercise" was 33 characters and the
+       * preview clipped the end of it off the left edge of the frame (seen at 1024x768). The whole
+       * explanation, and the remedy, are in the legend beside the preview, which has room for them.
+       */
+      return 'your leg moves it';
     default:
       return 'not available yet';
   }
@@ -1154,9 +1225,13 @@ export function DwellLegend({
       /* The measured verdict, for a harness and a bug report: WHICH limb was refused, what it was
          moving with, and by how much. A ring that will not fill is otherwise indistinguishable from
          a patient not holding still enough, which is the confusion this whole round is about. */
+      /* And how much room each ring has, from the same measurement the gate decided on. */
+      data-rooms={Object.entries(session.rooms)
+        .map(([id, r]) => `${id} ${r.actual.toFixed(3)}${r.clear ? '>=' : '<'}${r.required.toFixed(3)} ${r.key ?? 'nothing'}`)
+        .join(' | ')}
       data-coupled={
         session.coupled
-          ? `${session.coupled.key} follows ${session.coupled.reference} r2=${session.coupled.r2.toFixed(2)} explained=${session.coupled.explained.toFixed(3)}`
+          ? `${session.coupled.key} follows ${session.coupled.reference} r2=${session.coupled.r2.toFixed(2)} f=${session.coupled.fraction.toFixed(2)} explained=${session.coupled.explained.toFixed(3)}`
           : ''
       }
       data-state={
@@ -1225,11 +1300,11 @@ export function DwellLegend({
           768 px tablet by somebody who cannot scroll it. So it is trimmed to those four facts and no
           explanation: `critic:deadends` measures the whole block against the fold. */}
       <span className="dim" data-testid={`${testId}-limbs`}>
-        Either side may do this, including the unaffected one.{' '}
+        Either side will do, the unaffected one included.{' '}
         {unseen
           ? `If no hand can come into the picture, this step has to be done on the screen. ${touchNote}`
           : mode === 'leg'
-            ? `Rest it on the arm of the chair, an armrest or a table — not on your thigh, which your leg carries, and not a knee: a knee held in the circle cannot be told apart from a repetition. ${touchNote}`
+            ? `The hand goes on the arm of the chair, an armrest or a table — not your thigh, which your leg carries, and not a knee: a knee in the circle cannot be told from a repetition. ${touchNote}`
             : touchNote}
       </span>
     </div>

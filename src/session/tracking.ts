@@ -711,12 +711,22 @@ function withPointerVerdict(base: DeviceReadiness, p: PointerObservation | null)
           : `Rest that hand on the arm of the chair, an armrest or a table instead — anything the leg does not move — or use the other hand. It clears as soon as the hand stops travelling with the exercise.`,
       };
     }
+    /**
+     * AND WHAT IS CLAIMED DEPENDS ON WHAT THE CALLER MEASURED. With `carriedFraction` in hand this can
+     * say the hand is free of the exercise; without it, it may not — a hand in the picture that the
+     * prescription is carrying is refused by the rings (`DwellCoupling`), so "the patient can answer
+     * every step" would be a promise about a measurement the app itself will decline. A caller that
+     * did not look gets the narrower sentence, which is true either way.
+     */
+    const free = carried !== null;
     return {
       ...base,
       will: [
         ...base.will,
         p.mode === 'leg'
-          ? 'A hand is in the picture and is not being moved by the exercise, so the patient can answer every step by holding a circle — no one has to press anything for them.'
+          ? free
+            ? 'A hand is in the picture and the exercise is not moving it, so the patient can answer every step by holding a circle — no one has to press anything for them.'
+            : 'A hand is in the picture for the circles to follow, so the patient has something to answer with — provided it is resting on something their leg does not move (the circles refuse a hand the exercise is carrying).'
           : 'The hand is in the picture, so the patient can answer every step by holding a circle — no one has to press anything for them.',
       ],
     };

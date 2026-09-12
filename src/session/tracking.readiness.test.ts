@@ -202,12 +202,20 @@ describe('cameraReadiness: whether anything can answer the screen', () => {
   });
 
   it('a hand in the picture is stated as something this device WILL support', () => {
+    // With the coupling share measured, it may say the exercise is not moving that hand…
+    const measured = cameraReadiness(q(), MEDIUM, { pointer: { fraction: 1, mode: 'leg', carriedFraction: 0 } });
+    expect(measured.kind).toBe('ready');
+    expect(measured.gate).toBe(false);
+    expect(measured.will.join(' ')).toMatch(/A hand is in the picture and the exercise is not moving it/);
+    expect(measured.will.join(' ')).toMatch(/no one has to press anything/);
+    expect(measured.wont).toEqual([]);
+    // …and without it, it may NOT: a hand the prescription carries is refused by the rings, so "the
+    // patient can answer every step" would promise a measurement the app itself declines.
     const r = cameraReadiness(q(), MEDIUM, pointer(1));
     expect(r.kind).toBe('ready');
-    expect(r.gate).toBe(false);
-    expect(r.will.join(' ')).toMatch(/A hand is in the picture/);
-    expect(r.will.join(' ')).toMatch(/no one has to press anything/);
-    expect(r.wont).toEqual([]);
+    expect(r.will.join(' ')).toMatch(/A hand is in the picture for the circles to follow/);
+    expect(r.will.join(' ')).toMatch(/resting on something their leg does not move/);
+    expect(r.will.join(' ')).not.toMatch(/answer every step/);
   });
 
   it('NO hand in the picture costs the ready badge, names the knee rule, and says what to do', () => {
@@ -290,7 +298,7 @@ describe('cameraReadiness: whether anything can answer the screen', () => {
     // And a caller that cannot say claims nothing either way — the old behaviour, unchanged.
     const silent = cameraReadiness(q(), MEDIUM, pointer(1));
     expect(silent.kind).toBe('ready');
-    expect(silent.will.join(' ')).toMatch(/A hand is in the picture/);
+    expect(silent.will.join(' ')).toMatch(/A hand is in the picture for the circles to follow/);
   });
 
   it('claims nothing while it is still measuring the device', () => {

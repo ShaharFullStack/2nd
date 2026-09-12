@@ -42,6 +42,7 @@ import {
   dwellEngaged,
   dwellLimbs,
   dwellReferences,
+  dwellOrigin,
   dwellPlaceable,
   dwellTargetClear,
   dwellTargetsOverlap,
@@ -1226,79 +1227,205 @@ describe('placeDwellCircle', () => {
  * DwellTarget.test.tsx ("A HAND ON THE THIGH CANNOT ANSWER").
  */
 describe('DwellCoupling', () => {
-  const REF = 'knee:y';
-  /** A pointer whose y is `-carry` x the reference, sampled at 12.5 Hz — the app's survey cadence. */
+  /**
+   * A seated patient's leg, in the patient's own frame of reference (hip at the origin, frame heights,
+   * x already scaled): the knee hangs level with the hip and rises 0.28 as it lifts, and swings 0.15
+   * out with circumduction. `carry` is the fraction of the thigh the hand is resting at — 1 at the
+   * knee, 0.7 mid-thigh, 0 on a chair arm — and `drift` moves the whole patient relative to the frame,
+   * which is what a chair scoot or a nudged tripod does.
+   */
   function feed(
     coupling: DwellCoupling,
-    opts: { carry: number; seconds: number; from?: number; ref?: (t: number) => number; key?: string },
+    opts: {
+      carry: number;
+      seconds: number;
+      from?: number;
+      /** 0..1 of the movement at time t. */
+      amount?: (t: number) => number;
+      circumduction?: number;
+      /** Where the hand rests, in the patient's frame, when it is not being carried. */
+      rest?: DwellPoint;
+      drift?: (t: number) => DwellPoint;
+      key?: string;
+      /** A world-fixed hand does NOT move with the patient; a carried one does. */
+      worldFixed?: boolean;
+    },
   ): number {
-    const ref = opts.ref ?? ((t: number) => Math.min(1, Math.max(0, t / 2)));
+    const amount = opts.amount ?? ((t: number) => Math.min(1, Math.max(0, t / 2)));
+    const rest = opts.rest ?? { x: 0.04, y: 0.02 };
+    const drift = opts.drift ?? (() => ({ x: 0, y: 0 }));
+    const xScale = 4 / 3;
     let t = opts.from ?? 0;
     const end = t + opts.seconds;
     for (; t <= end + 1e-9; t += 0.08) {
-      coupling.noteOne(opts.key ?? 'hand:left', { x: 0.64, y: 0.62 - opts.carry * 0.28 * ref(t) }, [{ key: REF, value: ref(t) }], t);
+      const a = amount(t);
+      const d = drift(t);
+      const hip = { x: 0.5 + d.x, y: 0.6 + d.y };
+      const knee = { x: hip.x + (opts.circumduction ?? 0) * 0.15 * a, y: hip.y - 0.28 * a };
+      // The hand: carried along the hip->knee segment, or world-fixed at its resting place.
+      const carried = { x: hip.x + rest.x + opts.carry * (knee.x - hip.x), y: hip.y + rest.y + opts.carry * (knee.y - hip.y) };
+      const fixed = { x: 0.5 + rest.x, y: 0.6 + rest.y };
+      const wrist = opts.worldFixed ? fixed : carried;
+      coupling.noteOne(
+        opts.key ?? 'hand:left',
+        wrist,
+        [{ key: REF, x: (knee.x - hip.x) * xScale, y: knee.y - hip.y }],
+        t,
+        xScale,
+        hip,
+      );
     }
     return t;
   }
+  const REF = 'lane:0:seated_march:left';
 
-  it('a hand CARRIED by the movement is refused, and says how much of its travel the exercise owns', () => {
+  it('a hand CARRIED by the movement is refused, and says how much of it the exercise owns', () => {
     const coupling = new DwellCoupling();
     const t = feed(coupling, { carry: 1, seconds: 3 });
     const v = coupling.verdict('hand:left', t);
     expect(v?.coupled).toBe(true);
     expect(v?.settled).toBe(true);
     expect(v?.r2).toBeGreaterThan(0.99);
-    // f = 1 on a 0.28 knee rise: the exercise accounts for 0.28 of a frame height, nearly two radii.
+    // At the knee the hand inherits the whole of the segment's movement…
+    expect(v?.fraction).toBeCloseTo(1, 2);
+    // …which on a 0.28 knee rise is 0.28 of a frame height: nearly two dwell radii.
     expect(v?.explained).toBeCloseTo(0.28, 2);
-    expect(v?.reference).toBe(`${REF}/y`);
+    expect(v?.reference).toBe(REF);
   });
 
   it('…at every fraction along the thigh that moves the hand further than a quarter of a radius', () => {
     // Non-monotonic in f is exactly what the critic found in the app, so every fraction is checked
-    // rather than the worst one: a hand at mid-thigh is refused as surely as a hand at the knee.
+    // rather than the worst one: a hand at mid-thigh is refused as surely as a hand at the knee, and
+    // the fitted fraction says which one it is.
     for (const f of [0.35, 0.5, 0.7, 0.85, 1]) {
       const coupling = new DwellCoupling();
-      const t = feed(coupling, { carry: f, seconds: 3 });
-      expect(coupling.verdict('hand:left', t)?.coupled, `f=${f}`).toBe(true);
+      const t = feed(coupling, { carry: f, seconds: 3, circumduction: 1 });
+      const v = coupling.verdict('hand:left', t);
+      expect(v?.coupled, `f=${f}`).toBe(true);
+      expect(v?.fraction, `f=${f}`).toBeCloseTo(f, 1);
     }
     // A hand at the HIP end of the thigh barely moves, and is not refused on the strength of a
     // perfect correlation with nothing: `explained` is what decides, not r2 alone.
     const still = new DwellCoupling();
     const t = feed(still, { carry: 0.05, seconds: 3 });
     const v = still.verdict('hand:left', t);
-    expect(v?.r2 === 0 || (v?.explained ?? 0) < DWELL_COUPLING_MIN_TRAVEL).toBe(true);
+    expect((v?.explained ?? 0) < DWELL_COUPLING_MIN_TRAVEL || v?.r2 === 0).toBe(true);
     expect(v?.coupled).toBe(false);
   });
 
   it('a hand on FURNITURE is not refused, however hard the leg is working', () => {
     const coupling = new DwellCoupling();
-    const t = feed(coupling, { carry: 0, seconds: 6, ref: (x) => 0.5 * (1 - Math.cos(x)) });
+    const t = feed(coupling, { carry: 0, seconds: 6, worldFixed: true, amount: (x) => 0.5 * (1 - Math.cos(x)) });
     const v = coupling.verdict('hand:left', t);
     expect(v?.settled).toBe(true);
     expect(v?.coupled).toBe(false);
   });
 
+  it('A CHAIR SCOOT IS NOT COUPLING, even when it runs alongside a repetition', () => {
+    /**
+     * The false positive that decided the SHAPE of this measurement. Anything that moves the patient as
+     * a whole — sliding down in the seat, a nudged tripod, a harness aiming a limb by translating the
+     * scene — moves a world-fixed hand in the patient's own frame by exactly minus the drift. If the
+     * drift runs alongside a repetition, its y is proportional to the knee's, and a per-axis
+     * correlation calls that coupling: in the running app a hand resting on a CHAIR ARM was refused for
+     * thirty seconds on the latency screen. Fitting ONE coefficient across BOTH axes is what tells the
+     * two apart — a carried hand moves the WAY the segment moves, and a drifting one does not.
+     */
+    const coupling = new DwellCoupling();
+    const t = feed(coupling, {
+      carry: 0,
+      seconds: 4,
+      worldFixed: true,
+      drift: (x) => ({ x: -0.04 * Math.min(1, x / 2), y: -0.06 * Math.min(1, x / 2) }),
+    });
+    const v = coupling.verdict('hand:left', t);
+    expect(v?.settled).toBe(true);
+    expect(v?.coupled, `r2 ${v?.r2.toFixed(2)}, f ${v?.fraction.toFixed(2)}, ${v?.explained.toFixed(3)} explained`).toBe(false);
+
+    // …and the carried hand is STILL caught while the patient drifts, because both sides of the
+    // measurement are taken from the hips: (wrist - hip) = f x (knee - hip) whatever the camera does.
+    const carried = new DwellCoupling();
+    const u = feed(carried, {
+      carry: 1,
+      seconds: 4,
+      drift: (x) => ({ x: -0.04 * Math.min(1, x / 2), y: -0.06 * Math.min(1, x / 2) }),
+    });
+    expect(carried.verdict('hand:left', u)?.coupled).toBe(true);
+  });
+
   it('A DELIBERATE REACH IS NOT COUPLING — the false positive that would end the feature', () => {
     /**
-     * The patient's hand is still on the chair arm while the leg works, and then they raise it to the
-     * ring. Levels would correlate (both went up); INCREMENTS do not, because for most of the window
-     * the hand is not moving while the exercise is — which is why the regression is on increments.
+     * The patient's hand is on the chair arm while the leg works, and then they raise it to the ring.
+     * Levels would correlate (both went up); INCREMENTS do not, because for most of the window the hand
+     * is not moving while the exercise is — and the reach has a sideways component the thigh does not.
      */
     const coupling = new DwellCoupling();
     const march = (t: number) => 0.5 * (1 - Math.cos((2 * Math.PI * t) / 9.3));
+    const hip = { x: 0.5, y: 0.6 };
+    const ref = (a: number) => [{ key: REF, x: 0, y: -0.28 * a }];
     let t = 0;
-    for (; t <= 4; t += 0.08) {
-      coupling.noteOne('hand:left', { x: 0.7, y: 0.45 }, [{ key: REF, value: march(t) }], t);
-    }
-    // …then a one-second reach up to the ring, still inside the same window.
+    for (; t <= 4; t += 0.08) coupling.noteOne('hand:left', { x: 0.7, y: 0.45 }, ref(march(t)), t, 4 / 3, hip);
     const from = t;
     for (; t <= from + 1; t += 0.08) {
       const k = (t - from) / 1;
-      coupling.noteOne('hand:left', { x: 0.7 + 0.02 * k, y: 0.45 - 0.13 * k }, [{ key: REF, value: march(t) }], t);
+      coupling.noteOne('hand:left', { x: 0.7 + 0.02 * k, y: 0.45 - 0.13 * k }, ref(march(t)), t, 4 / 3, hip);
     }
     const v = coupling.verdict('hand:left', t);
     expect(v?.settled).toBe(true);
-    expect(v?.coupled).toBe(false);
+    expect(v?.coupled, `r2 ${v?.r2.toFixed(2)}, f ${v?.fraction.toFixed(2)}`).toBe(false);
+  });
+
+  it('A HAND RAISED TO THE RING MID-REPETITION IS NOT COUPLING — found in the running app', () => {
+    /**
+     * The ROM screen asks for repetitions and THEN a confirm, so the hand goes up while the leg is
+     * still coming down: for about a second the two move together, and at an r2 threshold of 0.5 the
+     * app refused the hand that was answering it. A carried hand measures r2 = 1.00 with a carry
+     * fraction in the body's range; an overlap like this one does not.
+     */
+    const coupling = new DwellCoupling();
+    const hip = { x: 0.5, y: 0.6 };
+    const rep = (t: number) => {
+      const cycle = t % 4;
+      return cycle < 1.5 ? cycle / 1.5 : cycle < 2 ? 1 : Math.max(0, 1 - (cycle - 2) / 1.5);
+    };
+    const ref = (a: number) => [{ key: REF, x: 0, y: -0.28 * a }];
+    let t = 0;
+    for (; t <= 3.2; t += 0.08) coupling.noteOne('hand:left', { x: 0.7, y: 0.45 }, ref(rep(t)), t, 4 / 3, hip);
+    const from = t;
+    for (; t <= from + 1; t += 0.08) {
+      const k = (t - from) / 1;
+      coupling.noteOne('hand:left', { x: 0.7 + 0.08 * k, y: 0.45 - 0.22 * k }, ref(rep(t)), t, 4 / 3, hip);
+    }
+    const v = coupling.verdict('hand:left', t);
+    expect(v?.settled).toBe(true);
+    expect(v?.coupled, `r2 ${v?.r2.toFixed(2)}, f ${v?.fraction.toFixed(2)}`).toBe(false);
+  });
+
+  it('ONE COINCIDENT JUMP IS NOT COUPLING — the other false positive found in the running app', () => {
+    /**
+     * A correlation over increments is PERFECT whenever exactly one pair of frames moved, and that
+     * instant is common and innocent: a detection glitch, the patient shifting, the therapist changing
+     * which lane is being measured (which moves every reference at once) while the scene also moves.
+     * A carried limb moves with the segment on every frame of the movement.
+     */
+    const coupling = new DwellCoupling();
+    const hip = { x: 0.5, y: 0.6 };
+    let t = 0;
+    for (; t <= 2; t += 0.08) coupling.noteOne('hand:left', { x: 0.7, y: 0.45 }, [{ key: REF, x: 0, y: 0 }], t, 4 / 3, hip);
+    coupling.noteOne('hand:left', { x: 0.7, y: 0.2 }, [{ key: REF, x: 0, y: -0.28 }], t, 4 / 3, hip);
+    t += 0.08;
+    for (; t <= 4; t += 0.08) coupling.noteOne('hand:left', { x: 0.7, y: 0.2 }, [{ key: REF, x: 0, y: -0.28 }], t, 4 / 3, hip);
+    const v = coupling.verdict('hand:left', t);
+    expect(v?.settled).toBe(true);
+    expect(v?.coupled, `r2 ${v?.r2.toFixed(2)}, ${v?.explained.toFixed(3)} explained`).toBe(false);
+  });
+
+  it('a limb moving the OTHER way from the segment is not being carried by it', () => {
+    // A hand that goes down as the knee comes up is doing something of its own — and a fit that
+    // ignored the sign would call a perfect anti-correlation coupling.
+    const coupling = new DwellCoupling();
+    const t = feed(coupling, { carry: -1, seconds: 3 });
+    expect(coupling.verdict('hand:left', t)?.coupled).toBe(false);
   });
 
   it('claims nothing until it has a window: UNSETTLED IS NOT A CLEAN BILL OF HEALTH', () => {
@@ -1318,15 +1445,25 @@ describe('DwellCoupling', () => {
     const t = feed(coupling, { carry: 1, seconds: 3 });
     expect(coupling.verdict('hand:left', t)?.coupled).toBe(true);
     // A still hand on a still leg, long enough for the window to be all new evidence.
-    let u = t;
-    for (; u <= t + 3; u += 0.08) coupling.noteOne('hand:left', { x: 0.7, y: 0.45 }, [{ key: REF, value: 0 }], u);
+    const u = feed(coupling, { carry: 0, seconds: 3, from: t, worldFixed: true, amount: () => 0 });
     expect(coupling.verdict('hand:left', u)?.coupled).toBe(false);
+  });
+
+  it('a HELD refusal reports the evidence it was held on, not the window that went quiet', () => {
+    const coupling = new DwellCoupling({ holdSec: 2 });
+    const t = feed(coupling, { carry: 1, seconds: 3 });
+    const found = coupling.verdict('hand:left', t);
+    expect(found?.coupled).toBe(true);
+    const held = coupling.verdict('hand:left', t + 0.5);
+    expect(held?.coupled).toBe(true);
+    expect(held?.reference).toBe(found?.reference);
+    expect(held?.r2).toBeGreaterThan(0.99);
   });
 
   it('keeps limbs apart, and forgets one that has left the picture', () => {
     const coupling = new DwellCoupling();
     const t = feed(coupling, { carry: 1, seconds: 3 });
-    feed(coupling, { carry: 0, seconds: 3, key: 'hand:right' });
+    feed(coupling, { carry: 0, seconds: 3, key: 'hand:right', worldFixed: true });
     expect(coupling.coupledKeys(t)).toEqual(new Set(['hand:left']));
     expect(coupling.verdict('hand:right', t)?.coupled).toBe(false);
     expect(coupling.verdict('hand:left', t + DWELL_COUPLING_FORGET_SEC + 1)).toBeNull();
@@ -1340,23 +1477,36 @@ describe('DwellCoupling', () => {
 describe('dwellReferences', () => {
   const frame = (params: Parameters<typeof seatedPose>[0]): DetectionResult => ({ tMs: 0, pose: seatedPose(params), hands: [] });
 
-  it('reports the PRESCRIBED lane feature, and the raw segments as well', () => {
+  it('names the segment the PRESCRIBED lane is measured from, and keeps the others too', () => {
     const refs = dwellReferences(frame({ kneeLift: 0.5, side: 'left' }), 'leg', {
       lanes: [{ index: 0, movement: 'seated_march', side: 'left' }],
       xScale: 4 / 3,
     });
     const keys = refs.map((r) => r.key);
+    // seated_march is measured from the knee, so the knee carries the lane's name…
     expect(keys).toContain('lane:0:seated_march:left');
-    // The segments are there whatever was prescribed, because a hand can be carried by a segment the
-    // prescription does not measure (a hand on the shin during ankle work, a thigh that flexes as a
-    // compensation for the lane that IS prescribed).
-    expect(keys.some((k) => k.startsWith('knee'))).toBe(true);
-    expect(keys.some((k) => k.startsWith('ankle'))).toBe(true);
-    expect(keys.some((k) => k.startsWith('foot'))).toBe(true);
-    expect(refs.every((r) => Number.isFinite(r.value))).toBe(true);
+    // …and every other segment is still watched, because a hand can be carried by a segment nobody
+    // prescribed (a hand on the shin during ankle work, a thigh that flexes as a compensation).
+    expect(keys).toContain('ankle:left');
+    expect(keys).toContain('foot:left');
+    expect(keys).toContain('knee:right');
+    expect(refs.every((r) => Number.isFinite(r.x) && Number.isFinite(r.y))).toBe(true);
   });
 
-  it('every reference is HIP-RELATIVE, so a chair scoot is not mistaken for an exercise', () => {
+  it('follows the mirror convention when naming the prescribed segment', () => {
+    // On a mirrored stream the patient's left leg arrives in the RIGHT_* slots, so the lane's name has
+    // to land on the landmark the feature is actually read from.
+    const mirrored = dwellReferences(frame({ kneeLift: 1, side: 'left' }), 'leg', {
+      lanes: [{ index: 0, movement: 'knee_extension', side: 'left' }],
+      mirrored: true,
+      xScale: 4 / 3,
+    });
+    expect(mirrored.map((r) => r.key)).toContain('lane:0:knee_extension:left');
+    // The ankle on the OTHER side keeps its plain name, so the two are never confused.
+    expect(mirrored.map((r) => r.key)).toContain('ankle:left');
+  });
+
+  it('is HIP-RELATIVE, so a chair scoot moves nothing', () => {
     const still = dwellReferences(frame({ kneeLift: 0.4, side: 'left' }), 'leg', { xScale: 4 / 3 });
     const scooted = dwellReferences(
       { tMs: 0, pose: translateLandmarks(seatedPose({ kneeLift: 0.4, side: 'left' }), 0.07, -0.05), hands: [] },
@@ -1365,8 +1515,13 @@ describe('dwellReferences', () => {
     );
     for (let i = 0; i < still.length; i++) {
       expect(scooted[i].key).toBe(still[i].key);
-      expect(scooted[i].value, still[i].key).toBeCloseTo(still[i].value, 10);
+      expect(scooted[i].x, still[i].key).toBeCloseTo(still[i].x, 10);
+      expect(scooted[i].y, still[i].key).toBeCloseTo(still[i].y, 10);
     }
+    // And the origin the pointer is measured from moves with the patient, as it must.
+    const origin = dwellOrigin({ tMs: 0, pose: translateLandmarks(seatedPose(), 0.07, -0.05), hands: [] });
+    expect(origin?.x).toBeCloseTo(0.57, 10);
+    expect(origin?.y).toBeCloseTo(0.55, 10);
   });
 
   it('HAND MODE HAS NONE, and that is not an oversight', () => {
@@ -1377,9 +1532,11 @@ describe('dwellReferences', () => {
     expect(dwellReferences(frame({ kneeLift: 1 }), 'hand', {})).toEqual([]);
   });
 
-  it('no pose is no references, not a fabricated zero', () => {
+  it('no pose is no references and no origin, not a fabricated zero', () => {
     expect(dwellReferences({ tMs: 0, pose: null, hands: [] }, 'leg', {})).toEqual([]);
     expect(dwellReferences(null, 'leg', {})).toEqual([]);
+    expect(dwellOrigin(null)).toBeNull();
+    expect(dwellOrigin({ tMs: 0, pose: null, hands: [] })).toBeNull();
   });
 });
 
@@ -1412,51 +1569,60 @@ describe('pickDwellLimb: a limb the exercise is carrying', () => {
 describe('DwellEngagement', () => {
   const target: DwellCircle = { x: 0.78, y: 0.23, radius: 0.15 };
   const inside = { x: 0.78, y: 0.23 };
+  /** In the hysteresis band: outside the drawn circle, inside the exit radius. */
+  const band = { x: 0.78, y: 0.23 + 0.17 };
   const outside = { x: 0.5, y: 0.72 };
+  const gesture = (e: DwellEngagement, p: DwellPoint, t: number) =>
+    e.gesture('hand:left', p, [target], t, 4 / 3, DWELL_DEFAULTS.exitRatio);
 
-  it('keeps an ANSWER IN FLIGHT out of the record, and the moment after it', () => {
-    const e = new DwellEngagement();
-    // A hold is accumulating: the reach and the hold must not teach the habitat that the limb lives
-    // on the ring, or the requirement would grow by exactly the gesture and nobody could ever fill it.
-    e.noteAnswering(10);
-    expect(e.gesture('hand:left', inside, [target], 10, 4 / 3)).toBe(true);
-    // …and the moment after, while the limb is still sitting on the target it has just answered.
-    expect(e.gesture('hand:left', inside, [target], 10 + DWELL_GESTURE_SEC - 0.1, 4 / 3)).toBe(true);
-    expect(e.gesture('hand:left', inside, [target], 10 + DWELL_GESTURE_SEC + 0.1, 4 / 3)).toBe(false);
-  });
-
-  it('A LIMB IN A RING THAT IS ANSWERING NOTHING IS EVIDENCE, from the first frame', () => {
+  it('INSIDE THE DRAWN CIRCLE is never evidence: the ENTRY GATE owns that limb', () => {
     /**
-     * The hole this closes, twice over. With the rule keyed on POSITION alone, every sample of a hand
-     * resting inside the drawn circle was thrown away, the habitat learned it lived somewhere else, the
-     * gate called the ring clear and the parked hand filled it five times in thirty seconds. Keyed on
-     * position AND A TIMER, the hand was still excluded for the first 2.6 s of the screen — long enough
-     * to leave once, come back and confirm. Keyed on whether an ANSWER IS IN FLIGHT, a limb sitting in
-     * a ring that is accumulating nothing is recorded immediately, which is the only way the gate can
-     * find out and move the ring off it.
+     * A limb in there cannot start a hold until it has been seen outside the drawn circle and come
+     * back, so there is nothing for the habitat to add and — measured twice in the running app —
+     * everything for it to break: recording those frames slid the ring away from a patient who had
+     * just confirmed with that hand and was still holding it there (the latency screen, every ring
+     * stood down), and did the same on the pause dialog's second hold, where the same hand answers the
+     * same ring twice.
      */
     const e = new DwellEngagement();
-    expect(e.gesture('hand:left', inside, [target], 0, 4 / 3)).toBe(false);
-    for (let t = 0; t <= 8; t += 0.1) expect(e.gesture('hand:left', inside, [target], t, 4 / 3)).toBe(false);
+    for (let t = 0; t <= 30; t += 0.5) expect(gesture(e, inside, t), `t=${t}`).toBe(true);
+    expect(dwellDistance(inside, target, 4 / 3)).toBeLessThanOrEqual(target.radius);
   });
 
-  it('a limb outside every ring is never a gesture, whatever else is happening', () => {
+  it('IN THE BAND it depends on whether an answer is in flight — the reach, and nothing else', () => {
+    // The approach and the moment after a hold: recording those is the circularity in
+    // `DwellHabitat`'s header — the reach teaches the record that the limb lives on the ring.
+    const answering = new DwellEngagement();
+    answering.noteAnswering(10);
+    expect(gesture(answering, band, 10)).toBe(true);
+    expect(gesture(answering, band, 10 + DWELL_GESTURE_SEC - 0.1)).toBe(true);
+    expect(gesture(answering, band, 10 + DWELL_GESTURE_SEC + 0.1)).toBe(false);
+    // …and with nobody answering, a limb resting in the band is EVIDENCE, from the first frame. That
+    // is the escape that shipped once: a hand just outside the drawn circle has its entry gate open
+    // simply by being there, and can then hold without moving.
+    const quiet = new DwellEngagement();
+    for (let t = 0; t <= 10; t += 0.5) expect(gesture(quiet, band, t), `t=${t}`).toBe(false);
+    expect(dwellDistance(band, target, 4 / 3)).toBeGreaterThan(target.radius);
+    expect(dwellDistance(band, target, 4 / 3)).toBeLessThan(target.radius * DWELL_DEFAULTS.exitRatio);
+  });
+
+  it('anywhere else is always evidence, whatever is happening on screen', () => {
     const e = new DwellEngagement();
     e.noteAnswering(5);
-    expect(e.gesture('hand:right', outside, [target], 5, 4 / 3)).toBe(false);
+    expect(gesture(e, outside, 5)).toBe(false);
   });
 
   it('forgets the answer when the screen does', () => {
     const e = new DwellEngagement();
     e.noteAnswering(5);
-    expect(e.gesture('hand:left', inside, [target], 5, 4 / 3)).toBe(true);
+    expect(gesture(e, band, 5)).toBe(true);
     e.clear();
-    expect(e.gesture('hand:left', inside, [target], 5, 4 / 3)).toBe(false);
+    expect(gesture(e, band, 5)).toBe(false);
   });
 
   it('`dwellEngaged` on its own still answers only the question it is asked', () => {
-    // It is about position and nothing else, and that is exactly why it is not enough by itself: a
-    // hand on a high chair arm is inside a ring big enough to see.
+    // It is about position and nothing else — which is why the rule above is three clauses and not
+    // one: a hand on a high chair arm is inside a ring big enough to see.
     expect(dwellEngaged({ x: 0.76, y: 0.25 }, [target], 4 / 3)).toBe(true);
     expect(dwellEngaged(outside, [target], 4 / 3)).toBe(false);
   });

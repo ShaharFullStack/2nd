@@ -257,7 +257,9 @@ export function seatedPose(params: SeatedPoseParams = {}): Landmark[] {
   const thighF = params.handThighFraction ?? support.fraction;
   for (const side of ['left', 'right'] as Side[]) {
     const raised = params.handAt && params.handAt.side === side ? params.handAt : null;
-    const gone = hidden || (params.hideHand === side && !raised);
+    // A hand RAISED to a point is in the picture whatever the framing says: that is the gesture, and a
+    // patient who brings one hand back into frame has one pointer and not none.
+    const gone = !raised && (hidden || params.hideHand === side);
     const sign = side === 'left' ? 1 : -1;
     const shoulder = side === 'left' ? p[POSE.LEFT_SHOULDER] : p[POSE.RIGHT_SHOULDER];
     const hip = side === 'left' ? p[POSE.LEFT_HIP] : p[POSE.RIGHT_HIP];

@@ -622,10 +622,15 @@ table.table tr:hover td { background: rgba(255, 255, 255, 0.03); }
   .screen-inner:has(.dwell-legend) h2 { font-size: 1.35rem; }
   .screen-inner:has(.dwell-legend) [data-testid="patient-banner"] { padding: 10px 14px; }
   .screen-inner:has(.dwell-legend) [data-testid="patient-banner"] .eyebrow { font-size: 0.66rem; }
-  /* The legend itself: tighter, never shorter. Every sentence in it survives — see DwellLegend. */
-  .screen-inner:has(.dwell-legend) .dwell-legend { padding: 10px 12px; gap: 6px; }
-  .screen-inner:has(.dwell-legend) .dwell-legend strong { font-size: 1.02rem; line-height: 1.32; }
-  .screen-inner:has(.dwell-legend) .dwell-legend .dim { font-size: 0.86rem; }
+  /* The legend itself: tighter, never shorter. Every sentence in it survives — see DwellLegend.
+     The small print carries four facts the patient can get nowhere else (either side will do, the
+     hand goes on furniture and not the thigh, a knee cannot answer, and what a tap is worth on this
+     screen), and naming the support cost it a line. What gives is the leading, not a sentence:
+     measured in the running app at 1024x768, where `critic:deadends` holds the whole block — badge
+     included — above the fold. */
+  .screen-inner:has(.dwell-legend) .dwell-legend { padding: 9px 12px; gap: 5px; }
+  .screen-inner:has(.dwell-legend) .dwell-legend strong { font-size: 1.02rem; line-height: 1.3; }
+  .screen-inner:has(.dwell-legend) .dwell-legend .dim { font-size: 0.82rem; line-height: 1.3; }
 }
 
 /*

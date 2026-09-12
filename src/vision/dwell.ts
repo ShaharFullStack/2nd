@@ -28,14 +28,37 @@
  *
  * The cost is stated rather than hidden, and it is now also PAID. Leg mode needs a HAND in the picture
  * for the hands-free path, so the framing the app ASKS for is a framing that path survives:
- * `POSTURE_INFO.seated_leg` asks for a hand resting where the camera can see it (thigh, chair arm) and
- * not only for hips, knees and feet. An instruction is not evidence that it was followed, so the camera
- * check MEASURES whether a pointer is there — off the same session the rings are driven from — and says
- * so before the patient is left alone (`cameraReadiness`, `PointerObservation`). It warns rather than
- * gates, because the hands-free ways forward and back that a blocked verdict is required to leave ARE
- * these circles, and because the patient fixes it by raising a hand. When no hand is in frame the
- * legend's FIRST line says what to do about it and the buttons remain. A confirm nobody made is worse
- * than a confirm nobody can make.
+ * `POSTURE_INFO.seated_leg` asks for a hand resting where the camera can see it and not only for hips,
+ * knees and feet. An instruction is not evidence that it was followed, so the camera check MEASURES
+ * whether a pointer is there — off the same session the rings are driven from — and says so before the
+ * patient is left alone (`cameraReadiness`, `PointerObservation`). It warns rather than gates, because
+ * the hands-free ways forward and back that a blocked verdict is required to leave ARE these circles,
+ * and because the patient fixes it by raising a hand. When no hand is in frame the legend's FIRST line
+ * says what to do about it. A confirm nobody made is worse than a confirm nobody can make.
+ *
+ * AND THEN THE SAME MISTAKE, IN THE HAND. "The leg prescription does not move the hands" was the
+ * premise the knees were removed on, and it is false for the support the text used to offer first: A
+ * HAND RESTING ON THE THIGH IS CARRIED BY THE THIGH. Hip flexion rotates the thigh about the hip, so a
+ * hand at fraction f along the hip->knee segment rises by f x the knee's travel, and hip circumduction
+ * carries it laterally at the same time. Driven through these classes with the wrist interpolated along
+ * the real hip->knee segment, a left seated march with circumduction and a hand at f = 1.0 CONFIRMED
+ * THE PRIMARY CIRCLE AT t = 3.23 s, and a right march the SECONDARY (which on the pause dialog ends the
+ * session and writes a truncated record) at 3.30 s — on the first repetition, at 12, 15, 24 and 30 fps,
+ * in 4:3 and 16:9, mirrored and not. The 324-case sweep that was supposed to prove otherwise had
+ * hard-coded the wrist at the one point on the thigh a hip flexion does not move.
+ *
+ * So the instruction changed AND the premise became a measurement, because this is the third round lost
+ * to trusting one:
+ *   - `POSTURE_INFO.seated_leg` now asks for a support the leg cannot move — a chair arm, an armrest, a
+ *     table — and says, in the patient's own words, why the thigh is not one;
+ *   - `DwellCoupling` FITS each candidate pointer's travel against the travel of the segments the
+ *     prescription moves (`dwellReferences`: knee, ankle and foot, hip-relative, each named after the
+ *     lane whose feature is measured from it) over a rolling readiness window. A limb the exercise is
+ *     carrying is passed over while any other limb is in the picture, and when it is the only limb
+ *     there is, the rings stand down (`blocked: 'coupled'`) and the screen says what to do. A patient
+ *     who rests a hand on their thigh anyway cannot end their session with it.
+ * The fixtures carry a thigh-resting hand with the thigh now (`SEATED_HAND_SUPPORTS`), so the sweep
+ * that proves this can fail — and it is run with the gate removed to show that it does.
  *
  * In HAND mode the prescribed limb is the only limb there is, so the separation cannot be by identity
  * and is geometric instead — but along the ONE AXIS the prescription cannot move the palm. The four
@@ -71,12 +94,28 @@
  *   - the limb that confirms is never a limb the prescription moves into the target: in leg mode the
  *     knees cannot point at all, and in hand mode the target clears the palm along the one axis the
  *     prescription does not use;
+ *   - and in leg mode that is MEASURED as well as instructed: a hand the prescribed movement is
+ *     carrying is refused as a pointer (`DwellCoupling`), which is what makes the separation a property
+ *     of this patient's body rather than of the sentence they were shown;
  *   - a hold may only accumulate while the target clears every limb's MEASURED habitat, so neither
- *     sitting still, nor relaxing back to rest, nor a limb that simply lives where the circle was
- *     drawn can fill a ring — whatever the framing, the patient's size or the frame aspect;
+ *     sitting still, nor relaxing back to rest, nor a limb that lives just outside the ring (in the
+ *     hysteresis band, where the entry gate is open simply because the limb is there) can fill one —
+ *     whatever the framing, the patient's size or the frame aspect;
+ *   - AND THE ONE CASE THAT IS NOT CLAIMED, because it is not true: a limb that lives INSIDE the drawn
+ *     circle can still answer by leaving it and coming back. Every frame of such a limb is part of a
+ *     hold or of the reach into one, and excluding those is what stops the reach from teaching the
+ *     record that the limb lives on the ring — so the habitat cannot help, and what protects that
+ *     patient is the ENTRY GATE (the limb must leave the drawn circle and return: a real excursion,
+ *     not a tremor), the 1.8 s hold, and the authored positions, which clear every rest position the
+ *     app instructs by more than the whole band. It is measured and stated in DwellTarget.test.tsx,
+ *     "THE RESIDUAL, STATED", so that it is a known quantity rather than a surprise;
  *   - a rep cannot fill a target: driven as a REAL rep profile (a 4 s rise, 1.5 s at the top and a 3 s
- *     descent — a hemiparetic pace, slower than anything this app paces), every lane, both sides, with
- *     and without the documented compensations, against every live target;
+ *     descent — a hemiparetic pace, slower than anything this app paces, and the critic's own
+ *     2 / 2.5 / 2 / 10 s duty cycle), every lane, both sides, with and without the documented
+ *     compensations, with a hand on the thigh at every fraction along it, at 12 / 15 / 24 / 30 fps, in
+ *     every frame aspect, mirrored and not, with and without a second hand to fall back on — 576 cases
+ *     in the test suite and the same 576 through the shipping build in the browser
+ *     (`critic/handsfree-thigh.mjs`), with the gate switched off in both to show that they can fail;
  *   - a limb that merely stops being detected cannot arm or complete anything;
  *   - and the hold can only COMPLETE while the pointer is inside the circle the patient can see.
  *
@@ -130,7 +169,7 @@
  * DwellTarget.tsx, which waits for a frame before believing it.
  */
 import type { LaneSpec, Mode, Side } from '../engine/types.ts';
-import { extractFeature } from './features.ts';
+import { poseSideIndices } from './features.ts';
 import { HAND, MIN_VISIBILITY, POSE } from './landmarks.ts';
 import type { Landmark } from './landmarks.ts';
 import { labelToPatientSide } from './mediapipe.ts';
@@ -1207,30 +1246,55 @@ export class DwellHabitat {
  *   THE POINTER'S INDEPENDENCE IS MEASURED FROM THE LANDMARKS, over a rolling readiness window, and a
  *   limb that is moving WITH the prescribed movement may not point at anything.
  *
- * The measurement is a regression of the pointer's FRAME-TO-FRAME TRAVEL on the reference signal's
- * (`dwellReferences`: the prescribed lane features, plus the raw hip-relative travel of knee, ankle
- * and foot so that a hand carried by a segment nobody prescribed is caught too). Increments rather
- * than levels, deliberately: a hand that is carried tracks the exercise on every frame, up AND down,
- * so its increments are proportional to the reference's; a hand that the patient DELIBERATELY RAISES
- * makes one excursion of its own while the exercise goes on around it, and over the window its
- * increments are mostly zero where the reference's are not. That is the difference between
- * `explained` ~ the whole reach and `explained` ~ nothing, and it is what keeps this gate from
- * refusing the very gesture it exists to protect.
+ * The measurement is a least-squares fit of the pointer's FRAME-TO-FRAME TRAVEL onto the travel of one
+ * prescribed segment (`dwellReferences`), both taken in the patient's own frame of reference
+ * (`dwellOrigin`: hip-relative), with ONE coefficient across BOTH AXES. That shape is not a detail —
+ * every part of it is a false positive that was found in the running app and had to be closed:
+ *   - INCREMENTS RATHER THAN LEVELS. A hand that is carried tracks the segment on every frame, up AND
+ *     down; a hand the patient DELIBERATELY RAISES makes one excursion of its own while the exercise
+ *     goes on around it, so over the window its increments are mostly zero where the segment's are
+ *     not. Levels would correlate those two equally well, and refusing the second is refusing the
+ *     gesture this whole path exists for.
+ *   - BOTH SIDES HIP-RELATIVE. Anything that moves the patient as a whole — sliding down in the chair,
+ *     a nudged tripod — moves an absolute pointer while the segments stand still.
+ *   - ONE COEFFICIENT ACROSS BOTH AXES. This is what makes it a statement about DIRECTION: a hand at
+ *     fraction f along the hip->knee segment satisfies (wrist - hip) = f x (knee - hip) in x and y at
+ *     once, with the same f. A world-fixed hand under a drift that happens to run alongside a
+ *     repetition satisfies it in one axis only, and the pooled fit leaves the rest in the residual.
+ *   - AND THE FIT HAS TO REST ON MANY FRAMES (`DWELL_COUPLING_MIN_MOVING`), because a single instant
+ *     in which the pointer jumped and the segment jumped correlates perfectly and means nothing.
  *
- * Two numbers decide, and both have to be met:
- *   - R2, how much of the pointer's travel the exercise ACCOUNTS FOR (a carried hand: ~1);
+ * Three numbers decide, and all of them have to be met:
+ *   - R2, how much of the pointer's travel the segment ACCOUNTS FOR (a carried hand: 1.00);
+ *   - `fraction`, the fitted carry coefficient, which has to be forward and no more than a little past
+ *     the end of the segment — a hand rests somewhere between the hip and the knee;
  *   - `explained`, how far the pointer travels BECAUSE of the exercise, in frame heights — so a hand
  *     resting at the hip end of the thigh, which moves a millimetre, is not called coupled on the
  *     strength of a perfect correlation with nothing.
- * Units cancel in `explained` (frame heights per feature unit, times the feature's own range), so a
- * reference in degrees and one in torso lengths are compared on the same footing.
  */
 
-/** One reference signal for one frame: what the prescribed exercise is doing, as a scalar. */
+/**
+ * One reference for one frame: WHERE A PRESCRIBED SEGMENT IS, in the patient's own frame of reference
+ * (hip-relative, frame heights, x already multiplied by `xScale`).
+ *
+ * It is a POINT and not a scalar, and that is the whole of why this measurement works. A scalar
+ * feature ("knee height over torso") tells you the pointer moved in proportion to the exercise; it
+ * cannot tell you the pointer moved WITH it. A hand resting on a chair arm while the patient slides
+ * down in the seat moves, in the patient's frame, by exactly minus the drift — and if the drift runs
+ * alongside a repetition, its y is proportional to the knee's. Refusing that hand is refusing the
+ * support the app asks for (seen in the running app: `hand:right follows knee1:x r2=1.00`, and all of
+ * that hand's travel was the room moving under it).
+ *
+ * Fitting a SINGLE coefficient across BOTH axes asks the question the body actually answers: a hand at
+ * fraction f along the hip->knee segment satisfies (wrist - hip) = f x (knee - hip) in x and y at once,
+ * with the same f and f > 0. A drifting world-fixed hand cannot: its motion has a component the segment
+ * does not have, and the pooled fit leaves it in the residual.
+ */
 export interface DwellReference {
-  /** Stable name, so a verdict can say WHICH movement the limb was following. */
+  /** Stable name, so a verdict can say WHICH prescribed movement the limb was following. */
   key: string;
-  value: number;
+  x: number;
+  y: number;
 }
 
 /** How long the pointer and the exercise are compared over — the readiness window. */
@@ -1240,8 +1304,19 @@ export const DWELL_COUPLING_INTERVAL_SEC = 0.08;
 /** Below this many samples, or this much time, nothing is claimed either way. */
 export const DWELL_COUPLING_MIN_SAMPLES = 12;
 export const DWELL_COUPLING_MIN_SPAN_SEC = 1;
-/** Share of the pointer's travel the exercise must account for before they are "moving together". */
-export const DWELL_COUPLING_MIN_R2 = 0.5;
+/**
+ * Share of the pointer's travel the exercise must account for before they are "moving together".
+ *
+ * 0.8, not 0.5, and the difference is a false positive found in the running app rather than a taste:
+ * a patient who RAISES a hand to the ring while their leg is mid-repetition — which is exactly what
+ * the ROM screen asks for, reps and then a confirm — produced an overlap of a second or so in which
+ * the hand's increments and the knee's were correlated enough to clear 0.5, and the app refused the
+ * hand that was answering it. A limb that is genuinely being CARRIED is an affine function of the
+ * segment holding it: measured in these classes, at every fraction along the thigh, in every framing
+ * and at every frame rate, it comes out at r2 = 1.00. There is a wide gap between the two, and the
+ * threshold belongs in the gap.
+ */
+export const DWELL_COUPLING_MIN_R2 = 0.8;
 /**
  * Travel (frame heights) the exercise must explain before it matters. A quarter of a dwell radius: a
  * hand carried this far by a repetition can be carried into a circle by one, and a hand carried less
@@ -1250,6 +1325,30 @@ export const DWELL_COUPLING_MIN_R2 = 0.5;
 export const DWELL_COUPLING_MIN_TRAVEL = 0.025;
 /** Once coupled, a limb stays refused this long without new evidence — a verdict, not a flicker. */
 export const DWELL_COUPLING_HOLD_SEC = 1.5;
+/**
+ * HOW MANY FRAMES HAVE TO AGREE, and why one is never enough.
+ *
+ * A correlation over increments is perfect whenever exactly ONE pair of frames moved: a single instant
+ * in which the pointer jumped and the prescribed feature jumped gives r2 = 1 and an `explained` as
+ * large as the jump. That instant is common and innocent — a detection glitch, the patient shifting in
+ * the chair, the therapist changing which lane is being measured — and in the running app it refused a
+ * hand resting on a chair arm for thirty seconds (found by critic/handsfree.mjs on the latency screen,
+ * where the harness moves the whole scene and the active leg in the same frame). A limb that is
+ * genuinely being carried moves with the segment on EVERY frame of the movement, so:
+ *   - at least `MIN_MOVING` frame pairs must have both the pointer and the reference moving, and
+ *   - no single pair may carry more than `MAX_PAIR_SHARE` of the fit.
+ * At 12 fps — the slowest rate the sweeps cover — a two-second rise still supplies about 12 of them.
+ */
+export const DWELL_COUPLING_MIN_MOVING = 6;
+export const DWELL_COUPLING_MAX_PAIR_SHARE = 0.6;
+/**
+ * The band of carry fractions that means "this segment is holding this limb": forward (a limb dragged
+ * the other way is doing something of its own) and no more than a little past the far end of the
+ * segment. A hand rests between the hip and the knee, so 0 < f <= 1 covers the body; the headroom
+ * above 1 is for a hand further down the shin and for landmark noise on a small segment.
+ */
+export const DWELL_COUPLING_MIN_FRACTION = 0.05;
+export const DWELL_COUPLING_MAX_FRACTION = 1.6;
 /** A limb not seen for this long is forgotten entirely. */
 export const DWELL_COUPLING_FORGET_SEC = 5;
 
@@ -1262,6 +1361,12 @@ export interface DwellCouplingVerdict {
   explained: number;
   /** 0..1 — the share of its travel that is accounted for. */
   r2: number;
+  /**
+   * How much of the segment's movement this limb inherits: about 1 for a hand at the knee, 0.7 for one
+   * mid-thigh, 0 for one on furniture. It is the fitted coefficient, so it is also the thing that says
+   * the limb moved WITH the segment rather than merely in proportion to it.
+   */
+  fraction: number;
   /** Which reference signal it was following (null when none was implicated). */
   reference: string | null;
   samples: number;
@@ -1274,25 +1379,26 @@ interface CouplingTrack {
   /** Pointer position in frame-height units (x already multiplied by xScale). */
   xs: number[];
   ys: number[];
-  /** Reference values, per reference key, aligned with the arrays above. */
-  refs: Map<string, number[]>;
+  /** Reference positions, per reference key, aligned with the arrays above. */
+  refs: Map<string, Array<{ x: number; y: number }>>;
   last: number;
   coupledUntil: number;
   verdict: DwellCouplingVerdict | null;
+  /** The last verdict that actually found coupling, so a HELD refusal can say what it was held on. */
+  lastCoupled: DwellCouplingVerdict | null;
   dirty: boolean;
 }
 
 /**
  * THE REFERENCE SIGNALS a pointer's travel is correlated against — what the exercise is doing.
  *
- * LEG MODE: the prescribed lane features themselves (`lanes`, through the same `extractFeature` the
- * game is scored from, in the same mirror convention), plus the hip-relative travel of the knee, the
- * ankle and the foot on both sides. The prescribed features are the literal claim ("this limb does not
- * move with the prescription"); the raw segments are there because a patient's hand can be carried by
- * a segment the prescription does not measure — a hand on the shin during ankle work, a hand on a
- * thigh that flexes as a compensation for the lane that IS prescribed. Everything is measured relative
- * to the HIP, so a chair scoot or a camera bump — which moves the pointer and the whole body together
- * — is not mistaken for the patient's exercise carrying their hand.
+ * LEG MODE: the knee, the ankle and the foot on both sides, hip-relative, each named after the
+ * prescribed lane whose feature is measured FROM it (seated_march and hip_abduction from the knee,
+ * knee_extension from the ankle, ankle_dorsiflexion from the foot, through the same
+ * `poseSideIndices` mirror convention the features use). The segments no lane names are kept too,
+ * because a patient's hand can be carried by a segment the prescription does not measure — a hand on
+ * the shin during ankle work, a hand on a thigh that flexes as a compensation for the lane that IS
+ * prescribed — and the question is whether this limb is independent of the patient's LEG.
  *
  * HAND MODE: none, and that is not an oversight. There the prescribed hand IS the pointer and always
  * moves with the prescription; what makes a confirm deliberate there is geometric, along the one axis
@@ -1306,41 +1412,67 @@ export function dwellReferences(
 ): DwellReference[] {
   if (mode !== 'leg') return [];
   const pose = result?.pose;
-  if (!pose) return [];
+  const origin = dwellOrigin(result);
+  if (!pose || !origin) return [];
   const xScale = opts.xScale ?? 1;
   const mirrored = opts.mirrored ?? false;
-  const out: DwellReference[] = [];
+  /**
+   * WHICH SEGMENTS THE PRESCRIPTION MOVES, and what to call them. Every leg lane's feature is computed
+   * from these three landmarks (seated_march and hip_abduction from the knee, knee_extension from the
+   * ankle, ankle_dorsiflexion from the foot), so a prescribed lane names the segment it is measured
+   * from and the verdict can say which movement the limb was following. The segments the prescription
+   * does NOT name are kept as well, because a hand can be carried by a segment nobody prescribed — a
+   * hand on the shin during ankle work, a thigh that flexes as a compensation for the lane that IS
+   * prescribed — and the question here is whether this limb is independent of the patient's LEG, not
+   * whether it is independent of the paperwork.
+   */
+  const named = new Map<string, string>();
   for (const lane of opts.lanes ?? []) {
-    const value = extractFeature(lane.movement, pose, lane.side, {
-      mirrored,
-      xScale,
-      worldLandmarks: result?.poseWorld ?? null,
-    });
-    if (value !== null && Number.isFinite(value)) out.push({ key: `lane:${lane.index}:${lane.movement}:${lane.side}`, value });
+    const idx = poseSideIndices(lane.side, mirrored);
+    const landmark =
+      lane.movement === 'knee_extension' ? idx.ankle : lane.movement === 'ankle_dorsiflexion' ? idx.foot : idx.knee;
+    if (!named.has(String(landmark))) named.set(String(landmark), `lane:${lane.index}:${lane.movement}:${lane.side}`);
   }
-  // The segments themselves, hip-relative and in frame heights. `side` here is the IMAGE side; the
-  // verdict is about a limb's travel, not about which of the patient's legs it was, so no mirror
-  // correction is needed (and the labels are only ever shown as a movement name, never as a side).
-  const hips = [pose[POSE.LEFT_HIP], pose[POSE.RIGHT_HIP]].filter(visible);
-  if (hips.length === 0) return out;
-  const hip = { x: hips.reduce((a, h) => a + h.x, 0) / hips.length, y: hips.reduce((a, h) => a + h.y, 0) / hips.length };
+  const out: DwellReference[] = [];
   const segments: Array<[string, number]> = [
-    ['knee', POSE.LEFT_KNEE],
-    ['knee', POSE.RIGHT_KNEE],
-    ['ankle', POSE.LEFT_ANKLE],
-    ['ankle', POSE.RIGHT_ANKLE],
-    ['foot', POSE.LEFT_FOOT_INDEX],
-    ['foot', POSE.RIGHT_FOOT_INDEX],
+    ['knee:left', POSE.LEFT_KNEE],
+    ['knee:right', POSE.RIGHT_KNEE],
+    ['ankle:left', POSE.LEFT_ANKLE],
+    ['ankle:right', POSE.RIGHT_ANKLE],
+    ['foot:left', POSE.LEFT_FOOT_INDEX],
+    ['foot:right', POSE.RIGHT_FOOT_INDEX],
   ];
-  let i = 0;
   for (const [name, idx] of segments) {
-    i += 1;
     const p = pose[idx];
     if (!visible(p)) continue;
-    out.push({ key: `${name}${i}:y`, value: p.y - hip.y });
-    out.push({ key: `${name}${i}:x`, value: (p.x - hip.x) * xScale });
+    out.push({ key: named.get(String(idx)) ?? name, x: (p.x - origin.x) * xScale, y: p.y - origin.y });
   }
   return out;
+}
+
+/**
+ * THE POINT THE WHOLE MEASUREMENT IS TAKEN FROM: the midpoint of the hips, or null when they are not
+ * visible.
+ *
+ * Every reference signal is already hip-relative, and the POINTER has to be too. Otherwise anything
+ * that moves the patient as a whole relative to the frame — sliding down in the chair, a nudged
+ * tripod, a harness that aims a limb by translating the scene — moves the pointer while the
+ * references stand still, and if that drift happens to run alongside a repetition the two correlate
+ * and an innocent hand is refused. Found in the running app: a hand resting on a chair arm was
+ * refused for thirty seconds on the latency screen (`hand:right follows knee1:x r2=1.00`), and the
+ * whole of its apparent travel was the scene moving under it.
+ *
+ * Taking both sides from the hips makes the question the only one worth asking: does this limb move
+ * WITH THE SEGMENT, in the patient's own frame of reference? A carried hand still answers yes — a hand
+ * at fraction f along the thigh satisfies (wrist - hip) = f x (knee - hip) exactly — and a hand on
+ * furniture answers no, however the camera and the chair are moving.
+ */
+export function dwellOrigin(result: DetectionResult | null | undefined): DwellPoint | null {
+  const pose = result?.pose;
+  if (!pose) return null;
+  const hips = [pose[POSE.LEFT_HIP], pose[POSE.RIGHT_HIP]].filter(visible);
+  if (hips.length === 0) return null;
+  return { x: hips.reduce((a, h) => a + h.x, 0) / hips.length, y: hips.reduce((a, h) => a + h.y, 0) / hips.length };
 }
 
 /**
@@ -1387,32 +1519,42 @@ export class DwellCoupling {
    * the habitat does: the deliberate hold is the gesture, not evidence about it. What is left is the
    * patient sitting, resting and exercising, which is exactly the window this question is about.
    */
-  noteOne(key: string, point: DwellPoint, refs: readonly DwellReference[], tSec: number, xScale = 1): void {
+  noteOne(
+    key: string,
+    point: DwellPoint,
+    refs: readonly DwellReference[],
+    tSec: number,
+    xScale = 1,
+    /** The patient's own frame of reference (`dwellOrigin`). Null = take the pointer as it comes. */
+    origin: DwellPoint | null = null,
+  ): void {
     if (!key || !finitePoint(point) || !Number.isFinite(tSec)) return;
     let track = this.tracks.get(key);
     if (!track) {
-      track = { ts: [], xs: [], ys: [], refs: new Map(), last: -Infinity, coupledUntil: -Infinity, verdict: null, dirty: true };
+      track = { ts: [], xs: [], ys: [], refs: new Map(), last: -Infinity, coupledUntil: -Infinity, verdict: null, lastCoupled: null, dirty: true };
       this.tracks.set(key, track);
     }
     track.last = tSec;
     const n = track.ts.length;
     if (n > 0 && tSec - track.ts[n - 1] < this.intervalSec) return;
     track.ts.push(tSec);
-    track.xs.push(point.x * xScale);
-    track.ys.push(point.y);
+    // Hip-relative, like every reference signal: see `dwellOrigin`.
+    const base = finitePoint(origin) ? origin : { x: 0, y: 0 };
+    track.xs.push((point.x - base.x) * xScale);
+    track.ys.push(point.y - base.y);
     // A reference that was not reported this frame is held at its last value rather than dropped, so
     // every series stays aligned with the pointer's; a NaN placeholder would poison the regression.
     for (const [refKey, series] of track.refs) {
       const found = refs.find((r) => r.key === refKey);
-      const last = series.length > 0 ? series[series.length - 1] : 0;
-      series.push(found && Number.isFinite(found.value) ? found.value : last);
+      const last = series.length > 0 ? series[series.length - 1] : { x: 0, y: 0 };
+      series.push(found && Number.isFinite(found.x) && Number.isFinite(found.y) ? { x: found.x, y: found.y } : last);
     }
     for (const r of refs) {
-      if (track.refs.has(r.key) || !Number.isFinite(r.value)) continue;
+      if (track.refs.has(r.key) || !Number.isFinite(r.x) || !Number.isFinite(r.y)) continue;
       // A reference seen for the first time starts here: back-filling it with a constant would invent
       // a stretch of "the exercise was not moving" that nobody observed.
-      const series = new Array<number>(track.ts.length - 1).fill(r.value);
-      series.push(r.value);
+      const series = new Array<{ x: number; y: number }>(track.ts.length - 1).fill({ x: r.x, y: r.y });
+      series.push({ x: r.x, y: r.y });
       track.refs.set(r.key, series);
     }
     const cutoff = tSec - this.windowSec;
@@ -1428,8 +1570,14 @@ export class DwellCoupling {
   }
 
   /** Record every limb in a frame. */
-  note(limbs: readonly DwellLimb[], refs: readonly DwellReference[], tSec: number, xScale = 1): void {
-    for (const limb of limbs) this.noteOne(limb.key, limb.point, refs, tSec, xScale);
+  note(
+    limbs: readonly DwellLimb[],
+    refs: readonly DwellReference[],
+    tSec: number,
+    xScale = 1,
+    origin: DwellPoint | null = null,
+  ): void {
+    for (const limb of limbs) this.noteOne(limb.key, limb.point, refs, tSec, xScale, origin);
   }
 
   /** Throw the record away (a new screen, a new camera, a new framing). */
@@ -1448,10 +1596,16 @@ export class DwellCoupling {
     if (track.dirty || track.verdict === null) {
       track.verdict = this.measure(key, track);
       track.dirty = false;
-      if (track.verdict.coupled) track.coupledUntil = track.last + this.holdSec;
+      if (track.verdict.coupled) {
+        track.coupledUntil = track.last + this.holdSec;
+        track.lastCoupled = track.verdict;
+      }
     }
     const held = tSec < track.coupledUntil;
-    if (held && !track.verdict.coupled) return { ...track.verdict, coupled: true };
+    // A HELD refusal reports the evidence it was held on, not the window that has since gone quiet:
+    // "r2=0.00, explained=0.000" over a refused limb is unreadable, and a screen (or a harness) that
+    // has to explain a refusal needs the number that caused it.
+    if (held && !track.verdict.coupled) return { ...(track.lastCoupled ?? track.verdict), coupled: true };
     return track.verdict;
   }
 
@@ -1468,7 +1622,7 @@ export class DwellCoupling {
     const n = track.ts.length;
     const span = n > 1 ? track.ts[n - 1] - track.ts[0] : 0;
     const settled = n >= DWELL_COUPLING_MIN_SAMPLES && span >= DWELL_COUPLING_MIN_SPAN_SEC;
-    let best: { explained: number; r2: number; reference: string } | null = null;
+    let best: { explained: number; r2: number; reference: string; fraction: number } | null = null;
     if (settled) {
       // Only consecutive samples close enough in time to be one motion contribute an increment; a gap
       // (a lost limb, a stalled camera) is a join between two motions nobody observed.
@@ -1478,33 +1632,59 @@ export class DwellCoupling {
         if (track.ts[i] - track.ts[i - 1] <= maxGap) pairs.push(i);
       }
       if (pairs.length >= DWELL_COUPLING_MIN_SAMPLES - 1) {
-        for (const [axis, series] of [
-          ['x', track.xs],
-          ['y', track.ys],
-        ] as Array<[string, number[]]>) {
-          const travel = Math.max(...series) - Math.min(...series);
-          if (!(travel >= this.minTravel)) continue;
+        const travel = Math.hypot(
+          Math.max(...track.xs) - Math.min(...track.xs),
+          Math.max(...track.ys) - Math.min(...track.ys),
+        );
+        if (travel >= this.minTravel) {
           for (const [refKey, refSeries] of track.refs) {
+            /**
+             * ONE COEFFICIENT, BOTH AXES — the rigid-carry fit. `f` is how much of the segment's
+             * movement this limb inherits: 1 at the knee, 0.7 mid-thigh, 0 on furniture. Fitting x and
+             * y together is what makes it a statement about direction and not merely about
+             * proportion, which is what keeps a drifting world-fixed hand out of it.
+             */
             let sxx = 0;
             let sxy = 0;
             let syy = 0;
+            let moving = 0;
+            let biggest = 0;
+            let total = 0;
             for (const i of pairs) {
-              const dr = refSeries[i] - refSeries[i - 1];
-              const da = series[i] - series[i - 1];
-              sxx += dr * dr;
-              sxy += da * dr;
-              syy += da * da;
+              const drx = refSeries[i].x - refSeries[i - 1].x;
+              const dry = refSeries[i].y - refSeries[i - 1].y;
+              const dax = track.xs[i] - track.xs[i - 1];
+              const day = track.ys[i] - track.ys[i - 1];
+              sxx += drx * drx + dry * dry;
+              sxy += dax * drx + day * dry;
+              syy += dax * dax + day * day;
+              const together = Math.abs(dax * drx + day * dry);
+              if (together > 0) {
+                moving += 1;
+                total += together;
+                if (together > biggest) biggest = together;
+              }
             }
             if (!(sxx > 0) || !(syy > 0)) continue;
+            // …and how many frames the fit rests on: one coincident jump correlates perfectly (see
+            // DWELL_COUPLING_MIN_MOVING), and a limb being carried does not move in one jump.
+            if (moving < DWELL_COUPLING_MIN_MOVING) continue;
+            if (total > 0 && biggest / total > DWELL_COUPLING_MAX_PAIR_SHARE) continue;
+            const fraction = sxy / sxx;
+            // A CARRY IS FORWARD AND BOUNDED. A limb the thigh is holding moves the same way the thigh
+            // does (f > 0) and by no more than the segment itself (a hand cannot be further out than
+            // the knee by much); a limb moving the OTHER way is doing something of its own, and one
+            // moving several times as far is not attached to this segment at all.
+            if (fraction < DWELL_COUPLING_MIN_FRACTION || fraction > DWELL_COUPLING_MAX_FRACTION) continue;
             const r2 = (sxy * sxy) / (sxx * syy);
-            const slope = sxy / sxx;
-            const refRange = Math.max(...refSeries) - Math.min(...refSeries);
-            // Never credit the exercise with more of the pointer's travel than the pointer HAS: the
-            // regression is over increments, and an oscillating reference could otherwise imply a
-            // reach the limb never made.
-            const explained = Math.min(Math.abs(slope) * refRange, travel);
+            const refTravel = Math.hypot(
+              Math.max(...refSeries.map((r) => r.x)) - Math.min(...refSeries.map((r) => r.x)),
+              Math.max(...refSeries.map((r) => r.y)) - Math.min(...refSeries.map((r) => r.y)),
+            );
+            // Never credit the exercise with more of the pointer's travel than the pointer HAS.
+            const explained = Math.min(fraction * refTravel, travel);
             if (r2 < this.minR2 || explained < this.minTravel) continue;
-            if (!best || explained > best.explained) best = { explained, r2, reference: `${refKey}/${axis}` };
+            if (!best || explained > best.explained) best = { explained, r2, reference: refKey, fraction };
           }
         }
       }
@@ -1514,6 +1694,7 @@ export class DwellCoupling {
       coupled: best !== null,
       explained: best?.explained ?? 0,
       r2: best?.r2 ?? 0,
+      fraction: best?.fraction ?? 0,
       reference: best?.reference ?? null,
       samples: n,
       settled,
@@ -1594,7 +1775,30 @@ export class DwellEngagement {
     if (Number.isFinite(tSec)) this.answeredAt = tSec;
   }
 
-  /** True = this frame is part of an answer, and the habitat must not learn from it. */
+  /**
+   * True = this frame is part of an answer, and the habitat must not learn from it.
+   *
+   * WHICH FRAMES, AND WHY EACH CLAUSE. It took three wrong answers in the running app to get here.
+   *
+   *  1. INSIDE A DRAWN CIRCLE: never evidence about where a limb lives, because THE ENTRY GATE already
+   *     owns that limb. A limb in there cannot start a hold until it has been seen outside the drawn
+   *     circle and come back — a movement the patient makes on purpose — so there is nothing for the
+   *     habitat to add, and everything for it to break. Two ways of trying to make it add something
+   *     both failed in the app: recording those frames after a flat 2.6 s window slid the ring away
+   *     from a patient who had just confirmed with that hand and was still holding it there (the
+   *     latency screen, with every ring stood down and `placeable` false); and a per-limb budget did
+   *     the same thing one confirm later on the pause dialog's second hold, where the same hand
+   *     answers the same ring twice. A limb that genuinely lives in the circle is the residual this
+   *     gesture cannot close, and it is stated where it is measured, not hidden here.
+   *  2. IN THE HYSTERESIS BAND, WHILE AN ANSWER IS IN FLIGHT: the approach and the moment after a
+   *     hold. Recording those is the circularity `DwellHabitat`'s header is about — the reach teaches
+   *     the record that the limb lives on the ring, and the requirement grows by exactly the gesture.
+   *  3. ANYWHERE ELSE — including the BAND when nobody is answering: evidence, always. That is the
+   *     region the measured gate exists for (a hand resting just outside the drawn circle opens the
+   *     entry gate by simply being there and can then hold without moving: the escape that shipped
+   *     once), and the region where standing the ring down and moving it off costs the patient
+   *     nothing.
+   */
   gesture(
     _key: string,
     point: DwellPoint,
@@ -1603,7 +1807,11 @@ export class DwellEngagement {
     xScale = 1,
     exitRatio = DWELL_DEFAULTS.exitRatio,
   ): boolean {
+    // 1. Inside the ring the patient can see: the entry gate's business, not the habitat's.
+    if (dwellEngaged(point, circles, xScale, 1)) return true;
+    // 3. Outside the band altogether: evidence.
     if (!dwellEngaged(point, circles, xScale, exitRatio)) return false;
+    // 2. In the band: only while an answer is in flight.
     return tSec - this.answeredAt <= this.graceSec;
   }
 
