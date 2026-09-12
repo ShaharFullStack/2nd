@@ -315,6 +315,19 @@
 }
 .dwell-legend strong { font-size: 1.15rem; line-height: 1.4; }
 .dwell-legend[data-state='offline'] { border-left-color: var(--bad); background: rgba(255, 90, 90, 0.06); }
+/* The rings are asking for a move OUT before they will take one in, and the legend has to be saying
+   the same thing in the same breath — so it changes colour with them (the amber of the ↻ phase). */
+.dwell-legend[data-state='reenter'] { border-left-color: #ffb020; background: rgba(255, 176, 32, 0.07); }
+
+/* The secondary target's inner ring breathes with the outer one, so the double ring reads as ONE
+   object at 1/5 scale rather than two rings that disagree about the time. */
+.dwell-target .dwell-inner { transform-origin: center; animation: dwell-breathe 2.4s ease-in-out infinite; }
+.dwell-target.still .dwell-inner,
+.dwell-target[data-phase='holding'] .dwell-inner,
+.dwell-target[data-phase='done'] .dwell-inner { animation: none; }
+@media (prefers-reduced-motion: reduce) {
+  .dwell-target .dwell-inner { animation: none; }
+}
 
 /* The one real tap of the session, on Home. It is kept because the browser will not start audio
    without it (see runtime.ensureAudio) — so it is made unmissable rather than pretended away. */

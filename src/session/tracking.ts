@@ -60,9 +60,80 @@ function percentile(values: number[], p: number): number {
 }
 
 /**
+ * One health report, kept so a verdict can be taken over a WINDOW of them rather than over
+ * everything since the screen opened. `anyTracked` is null when the caller did not say how many
+ * lanes are prescribed, because "at least one limb is in frame" cannot be derived without it.
+ */
+interface TrackingSample {
+  fps: number;
+  inferenceMs: number;
+  tracked: boolean;
+  anyTracked: boolean | null;
+  lowFps: boolean;
+  delegate: 'GPU' | 'CPU' | null;
+  reason: string;
+  ok: boolean;
+}
+
+/**
+ * How many of the MOST RECENT health reports a forward-looking verdict (the camera check) is taken
+ * over: 20 samples, six seconds at `TRACKING_SAMPLE_MS`.
+ *
+ * WHY A WINDOW AT ALL. A cumulative median cannot come back. A clinic tablet that spent its first
+ * minute on the camera-check screen downloading the model, or behind another app's compositing, is
+ * a device whose median frame rate is pinned below the gate's floor FOR THE REST OF THE VISIT even
+ * after it frees up — the patient holds still, the stream recovers, and the screen goes on saying
+ * the device cannot be used because of a minute that is over. The session's own tracking block is
+ * the opposite case and keeps the cumulative figure (`summary`): a record of a three-minute song
+ * describes the whole song, not its last six seconds.
+ */
+export const READINESS_WINDOW_SAMPLES = 20;
+
+function summarize(entries: readonly TrackingSample[]): TrackingQuality | null {
+  if (entries.length === 0) return null;
+  const fps: number[] = [];
+  const inference: number[] = [];
+  let tracked = 0;
+  let lowFps = 0;
+  let delegate: 'GPU' | 'CPU' | null = null;
+  const reasons = new Map<string, number>();
+  for (const e of entries) {
+    if (e.fps > 0) fps.push(e.fps);
+    if (e.inferenceMs > 0) inference.push(e.inferenceMs);
+    if (e.tracked) tracked++;
+    if (e.lowFps) lowFps++;
+    if (e.delegate) delegate = e.delegate;
+    if (!e.ok) reasons.set(e.reason, (reasons.get(e.reason) ?? 0) + 1);
+  }
+  let worst: string | null = null;
+  let worstN = 0;
+  for (const [reason, n] of reasons) {
+    if (n > worstN) {
+      worst = reason;
+      worstN = n;
+    }
+  }
+  return {
+    samples: entries.length,
+    fpsMedian: round1(median(fps)),
+    fpsLow: round1(percentile(fps, 0.1)),
+    inferenceMsMedian: round1(median(inference)),
+    trackedFraction: tracked / entries.length,
+    lowFpsFraction: lowFps / entries.length,
+    delegate,
+    worstReason: worst,
+  };
+}
+
+/**
  * Accumulates the input layer's health report over a run. Deliberately a plain class with no timer
  * of its own: the play screen already polls `getStatus()` for the live warnings, and one poll is
  * cheaper and always consistent with what the therapist was shown while it happened.
+ *
+ * TWO VIEWS OF THE SAME STREAM, because two questions are being asked of it. `summary()` is the
+ * RECORD — everything sampled, which is what a session's tracking block has to describe. `recent()`
+ * is the VERDICT — the last `READINESS_WINDOW_SAMPLES` reports, which is what a screen deciding
+ * whether this device can be used right now has to be allowed to change its mind on.
  */
 export class TrackingRecorder {
   private fps: number[] = [];
@@ -72,22 +143,48 @@ export class TrackingRecorder {
   private total = 0;
   private delegate: 'GPU' | 'CPU' | null = null;
   private reasons = new Map<string, number>();
+  /** The trailing window, bounded. Nothing else in here is allowed to grow without limit either. */
+  private window: TrackingSample[] = [];
 
   /**
    * Record one observation. `status.fps` of 0 with `tracking` false is a dead stream — counted as a
    * sample that was NOT tracked (which is the truth) but kept out of the frame-rate statistics,
    * where a run of zeros would report a median frame rate no camera ever produced.
+   *
+   * `laneCount` is how many lanes the prescription has. With it, a sample can say whether SOME limb
+   * was in frame as opposed to all of them (`VisionStatus.tracking` is "every lane", so one hand of
+   * a bilateral prescription drifting out makes it false); without it that distinction is not
+   * derivable and is reported as unknown rather than guessed.
    */
-  sample(status: VisionStatus): void {
+  sample(status: VisionStatus, laneCount?: number): void {
     this.total++;
     if (status.fps > 0) this.fps.push(status.fps);
     if (status.inferenceMs > 0) this.inference.push(status.inferenceMs);
     if (status.tracking) this.tracked++;
-    if (status.fps > 0 && status.fps < MIN_USABLE_DETECT_FPS) this.lowFps++;
+    const low = status.fps > 0 && status.fps < MIN_USABLE_DETECT_FPS;
+    if (low) this.lowFps++;
     if (status.delegate) this.delegate = status.delegate;
-    if (!status.tracking || status.reason !== 'ok') {
+    const ok = status.tracking && status.reason === 'ok';
+    if (!ok) {
       this.reasons.set(status.reason, (this.reasons.get(status.reason) ?? 0) + 1);
     }
+    const anyTracked =
+      status.tracking === true
+        ? true
+        : laneCount !== undefined && laneCount > 0
+          ? (status.untrackedLanes?.length ?? laneCount) < laneCount
+          : null;
+    this.window.push({
+      fps: status.fps,
+      inferenceMs: status.inferenceMs,
+      tracked: status.tracking === true,
+      anyTracked,
+      lowFps: low,
+      delegate: status.delegate,
+      reason: status.reason,
+      ok,
+    });
+    if (this.window.length > READINESS_WINDOW_SAMPLES) this.window.shift();
   }
 
   get samples(): number {
@@ -118,6 +215,26 @@ export class TrackingRecorder {
       delegate: this.delegate,
       worstReason: worst,
     };
+  }
+
+  /**
+   * The same block over the TRAILING WINDOW only — what a screen deciding about this device NOW is
+   * entitled to judge it on. Null before the first sample.
+   */
+  recent(): TrackingQuality | null {
+    return summarize(this.window);
+  }
+
+  /**
+   * Share of the windowed samples in which at least one prescribed lane had usable landmarks, or
+   * null when no sample could say (no lane count was supplied). It is the difference between
+   * "nothing is being tracked" and "one of two hands has drifted out of frame", and those two have
+   * different remedies and different truths.
+   */
+  anyLandmarksFraction(): number | null {
+    const known = this.window.filter((e) => e.anyTracked !== null);
+    if (known.length === 0) return null;
+    return known.filter((e) => e.anyTracked === true).length / known.length;
   }
 }
 
@@ -469,7 +586,24 @@ function frameIntervalMs(q: TrackingQuality): number | null {
  * `q` is the camera check's own rolling observation (the same TrackingRecorder the session uses), or
  * null before any health report has arrived.
  */
-export function cameraReadiness(q: TrackingQuality | null, w: ReadinessWindows): DeviceReadiness {
+export interface ReadinessObservation {
+  /**
+   * Share of the same samples in which AT LEAST ONE prescribed lane had usable landmarks, or null
+   * when it could not be derived (see `TrackingRecorder.anyLandmarksFraction`).
+   *
+   * `TrackingQuality.trackedFraction` is EVERY lane at once (`VisionStatus.tracking`), so on a
+   * bilateral prescription it goes to zero the moment one of the two hands drifts out of frame — and
+   * "Nothing is being tracked on this camera yet" was then printed over a preview visibly drawing a
+   * skeleton. This is what tells those two states apart.
+   */
+  anyLandmarksFraction?: number | null;
+}
+
+export function cameraReadiness(
+  q: TrackingQuality | null,
+  w: ReadinessWindows,
+  obs: ReadinessObservation = {},
+): DeviceReadiness {
   if (!q || q.samples === 0) {
     return {
       kind: 'measuring',
@@ -484,21 +618,36 @@ export function cameraReadiness(q: TrackingQuality | null, w: ReadinessWindows):
   const seenPct = Math.round(q.trackedFraction * 100);
   const cpu = q.delegate === 'CPU';
 
-  // NOTHING HAS BEEN SEEN. Not "the patient is not moving" — the model found no landmarks at all, so
-  // there is no range to calibrate and no lane that can ever trigger. It clears the moment they are
-  // in frame, which is exactly what this screen is for.
+  // NOTHING FOR ANY LANE. Not "the patient is not moving" — no lane has landmarks, so there is no
+  // range to calibrate and no lane that can ever trigger. It clears the moment they are in frame,
+  // which is exactly what this screen is for.
+  //
+  // SOME lanes, though, is a DIFFERENT SENTENCE, and printing this one over a preview drawing a
+  // tracked hand was the screen calling its own picture a liar: `trackedFraction` is every lane at
+  // once, so one hand of a bilateral prescription leaving the frame zeroes it. `anyLandmarks` is
+  // what separates them; when nothing can say (no lane count was supplied) the wording falls back to
+  // the part that is true either way — this prescription is not fully in frame.
+  const anyLandmarks = obs.anyLandmarksFraction ?? null;
   if (q.trackedFraction === 0 && q.samples >= READINESS_SAMPLES) {
+    const partial = anyLandmarks !== null && anyLandmarks > 0;
     return {
       kind: 'blocked',
       gate: true,
-      headline: 'Nothing is being tracked on this camera yet.',
+      headline: partial
+        ? 'Part of this prescription is out of frame.'
+        : anyLandmarks === null
+          ? 'Not every prescribed limb is being tracked yet.'
+          : 'Nothing is being tracked on this camera yet.',
       will: [],
       wont: [
-        'Range of motion cannot be calibrated: the next screen measures a rest position and three repetitions, and neither exists without landmarks.',
-        'No lane can trigger, so the session would score nothing whatever the patient does.',
+        partial
+          ? `Some landmarks are arriving (${Math.round(anyLandmarks * 100)} % of these readings had at least one limb in frame), but never all of the prescribed lanes at once — and a lane with no landmarks has no rest position and no repetitions to measure.`
+          : 'Range of motion cannot be calibrated: the next screen measures a rest position and three repetitions, and neither exists without landmarks.',
+        'A lane with no landmarks cannot trigger, so it would score nothing whatever the patient does.',
       ],
-      action:
-        'Get the whole limb into frame, lit from the front, and check the preview shows the skeleton before going on. This clears by itself as soon as the model sees the patient.',
+      action: partial
+        ? 'Step back, or move the camera, until every prescribed limb is inside the preview at once. This clears by itself as soon as they all are.'
+        : 'Get the whole limb into frame, lit from the front, and check the preview shows the skeleton before going on. This clears by itself as soon as the model sees the patient.',
     };
   }
 
@@ -510,6 +659,32 @@ export function cameraReadiness(q: TrackingQuality | null, w: ReadinessWindows):
       will: [],
       wont: [],
       action: null,
+    };
+  }
+
+  /**
+   * NO FRAME RATE AT ALL. A stream that is being sampled but is processing zero frames a second is
+   * not a device "with limits", it is a device with no measurement on it.
+   *
+   * This used to fall through: `frameIntervalMs` returns null when the median is 0, the timing
+   * branch was therefore skipped, and the screen printed "This device will run the session, with
+   * limits: 0 fps, landmarks usable for 84 % of the session" — a dead frame rate reported as a
+   * condition the session would run with. Nothing downstream can be measured from frames that are
+   * not arriving, so it is blocked, and (like every gate here) it clears by itself the moment one
+   * frame is processed.
+   */
+  if (interval === null) {
+    return {
+      kind: 'blocked',
+      gate: true,
+      headline: 'No frames are being processed on this camera.',
+      will: [],
+      wont: [
+        'Nothing can be measured: a repetition is only ever seen in a frame, and no frame has been processed in these readings.',
+        `Neither hit window in this prescription can be reached (perfect ±${w.perfectMs} ms, good ±${w.goodMs} ms on ${w.difficulty}), because nothing is being timed.`,
+      ],
+      action:
+        'Restart the camera. If it comes back at the same rate, close other applications and browser tabs, or run this session on another device. This clears by itself as soon as frames start arriving.',
     };
   }
 
@@ -527,8 +702,8 @@ export function cameraReadiness(q: TrackingQuality | null, w: ReadinessWindows):
         `Range of motion would be measured from ${q.fpsMedian.toFixed(0)} peaks a second, so every range would come out lower than the patient's real one.`,
       ],
       action: cpu
-        ? `Inference is running on the CPU at ${q.inferenceMsMedian.toFixed(0)} ms a frame. Close other applications and browser tabs, or run this session on a device with graphics acceleration. The keyboard session below measures no range of motion but plays the song.`
-        : `Close other applications and browser tabs, or run this session on a faster device. The keyboard session below measures no range of motion but plays the song.`,
+        ? `Inference is running on the CPU at ${q.inferenceMsMedian.toFixed(0)} ms a frame. Close other applications and browser tabs, or run this session on a device with graphics acceleration. Restarting the camera re-measures this device. Going on anyway still plays the song and still records the movements, with the timing and the ranges qualified by these conditions; the keyboard session measures no range of motion at all but plays the song.`
+        : `Close other applications and browser tabs, or run this session on a faster device. Restarting the camera re-measures this device. Going on anyway still plays the song and still records the movements, with the timing and the ranges qualified by these conditions; the keyboard session measures no range of motion at all but plays the song.`,
     };
   }
 

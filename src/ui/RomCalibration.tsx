@@ -355,16 +355,50 @@ export default function RomCalibrationScreen() {
   /**
    * THE ATTEMPT ENDED WITH NOTHING USABLE — the state a patient alone can most easily be trapped in.
    *
-   * The calibrator can finish with 'insufficient_range' or 'no_reps', and the runtime can refuse the
-   * range it produced. In every one of those cases the lane has no range, the forward target is
-   * therefore (correctly) dead, and the calibrator will not measure again until somebody presses
-   * Redo. Without a hands-free Redo that is a dead end with no patient-reachable way out of it.
+   * The calibrator can finish with 'insufficient_range', 'no_reps' or 'not_tracked', and the runtime
+   * can refuse the range it produced. In every one of those cases the lane has no range, the forward
+   * target is therefore (correctly) dead, and the calibrator will not measure again until somebody
+   * presses Redo. Without a hands-free Redo that is a dead end with no patient-reachable way out.
    */
   const romStuck = laneRefused || (status?.phase === 'done' && !!status.error);
-  const handsFreeReady = laneDone !== null || romStuck;
+  /** True when there is a measured (or failed) attempt on this lane to do over. */
+  const somethingToRedo = laneDone !== null || romStuck;
 
+  /** Go back one lane, re-arming its calibrator so the range there can be measured again. */
+  const back = useCallback(() => {
+    setLaneIndex((i) => Math.max(0, i - 1));
+    setGeneration((g) => g + 1);
+  }, []);
+
+  /**
+   * THE HANDS-FREE PAIR — AND WHY THERE IS NOW ONE IN EVERY STATE THIS SCREEN CAN BE IN.
+   *
+   * WHAT WAS WRONG. The pair only existed once `laneDone !== null || romStuck`, i.e. only after an
+   * attempt had finished. That is not the state a confirm LANDS in: holding "Next movement" on lane 1
+   * arrives on lane 2 in the rest hold, where neither of those is true, so there were no targets at
+   * all and the only controls were buttons. An accidental advance — and false activation is assumed
+   * in a dwell interface — therefore locked lane 1's range in as the denominator of every percentage
+   * in the session with no patient-reachable way back to it. Reversal must be at least as reachable
+   * as activation; here it did not exist.
+   *
+   * WHAT IT IS NOW. Two targets, always drawn:
+   *  - FORWARD stays exactly as it was: enabled only when the runtime holds a range for this lane.
+   *    Nothing about measuring has been loosened.
+   *  - BACK is always enabled, and is whatever "back" means in the state the screen is actually in:
+   *      · something measured (or an attempt that failed) → "Do it again", which is the patient's own
+   *        account of their own attempt and destroys nothing that was not measured seconds ago;
+   *      · nothing measured yet on a later lane → "Back a movement", the undo of the confirm that
+   *        landed here;
+   *      · nothing measured yet on the first lane → "Camera check", which is the screen before this
+   *        one and has its own hands-free way forward.
+   *    The three chain: on a lane with a range, one hold does it over and the next hold goes back a
+   *    lane, so no state on this screen is more than two holds from the one before it.
+   *
+   * Easier, harder and reusing last session's range stay on the buttons: those change the scale every
+   * later figure is a percentage of, and that is the therapist's call, not a thing to be held into.
+   */
   const dwellChoices: DwellChoice[] = useMemo(() => {
-    const [go, back] = pairedDwellTargets(mode);
+    const [go, away] = pairedDwellTargets(mode);
     return [
       {
         id: 'next',
@@ -377,18 +411,24 @@ export default function RomCalibrationScreen() {
       },
       {
         id: 'redo',
-        target: back,
-        label: 'Do it again',
-        enabled: handsFreeReady,
-        onConfirm: retry,
+        target: away,
+        label: somethingToRedo ? 'Do it again' : laneIndex > 0 ? 'Back a movement' : 'Camera check',
+        onConfirm: somethingToRedo ? retry : laneIndex > 0 ? back : () => goto('camera'),
         tone: 'back',
       },
     ];
     // `next` and `retry` close over this render's lane state; the hook keeps the LIVE list and calls
     // the current one, so they are deliberately not dependencies (including them would rebuild the
     // trackers on every poll and throw away a hold in progress).
-  }, [mode, laneIndex, lanes.length, laneDone, handsFreeReady]);
+  }, [mode, laneIndex, lanes.length, laneDone, somethingToRedo, back, goto]);
   const dwell = useDwellTargets(dwellChoices);
+
+  /** What the back circle does right now, in the patient's words — for the legend and the caption. */
+  const backNote = somethingToRedo
+    ? 'the right circle to measure this movement again'
+    : laneIndex > 0
+      ? 'the right circle to go back to the movement before this one'
+      : 'the right circle to go back to the camera check';
 
   /**
    * Offer last session's range ONLY when it describes what this lane measures now.
@@ -448,42 +488,10 @@ export default function RomCalibrationScreen() {
 
       <div className="row" style={{ alignItems: 'stretch', gap: 24 }}>
         <div className="card stack grow" style={{ gap: 20 }}>
-          {/* THE HANDS-FREE PAIR, at the size a patient two metres away can actually use. The small
-              sidebar preview is stood down while this is up: there is one <video> in the app, and the
-              screen the patient has to read from a chair is not a 340 px thumbnail. */}
-          {handsFreeReady && (
-            <div className="stack" style={{ gap: 12 }} data-testid="rom-handsfree">
-              <CameraPreview overlay>
-                {dwellChoices.map((choice) => (
-                  <DwellTarget
-                    key={choice.id}
-                    choice={choice}
-                    state={dwell.states[choice.id]}
-                    reducedMotion={reducedMotion}
-                    testId={`rom-dwell-${choice.id}`}
-                  />
-                ))}
-              </CameraPreview>
-              <DwellLegend
-                session={dwell}
-                what={
-                  laneDone === null
-                    ? 'the right circle to measure this movement again'
-                    : laneIndex + 1 < lanes.length
-                      ? 'the left circle for the next movement'
-                      : 'the left circle to go on'
-                }
-                testId="rom-dwell-legend"
-              />
-              <span className="dim">
-                The right circle measures this movement again — it is there whenever there is something to redo,
-                including when nothing usable was measured at all, so nobody working alone is left with a lane they
-                cannot re-do. Easier, harder and reusing last session&rsquo;s range stay on the buttons: those change the
-                scale every later figure is a percentage of, and that is the therapist&rsquo;s call.
-              </span>
-            </div>
-          )}
-
+          {/* WHAT THE PATIENT IS BEING ASKED TO DO, FIRST. The hands-free pair below it is the escape,
+              not the task: at 1024x768 a full-width preview above this pushed "Hold still" / "Now move"
+              and the live meter off the bottom of the screen, which is the one sentence the person
+              being measured has to be able to read. */}
           <div className="row" style={{ gap: 24 }}>
             <ProgressRing value={ringValue} label={ringLabel} />
             <div className="stack grow" style={{ gap: 10 }}>
@@ -501,6 +509,46 @@ export default function RomCalibrationScreen() {
                 <p className="muted">{status.message}</p>
               )}
             </div>
+          </div>
+
+          {/* THE HANDS-FREE PAIR, at the size a patient two metres away can actually use — and capped,
+              so it and the instruction above it are both on the screen at 1024x768. The small sidebar
+              preview is stood down: there is one <video> in the app, and the screen the patient has to
+              read from a chair is not a 340 px thumbnail. */}
+          <div className="stack" style={{ gap: 12 }} data-testid="rom-handsfree">
+            <div style={{ width: 'min(440px, 100%)' }}>
+              <CameraPreview overlay>
+                {dwellChoices.map((choice) => (
+                  <DwellTarget
+                    key={choice.id}
+                    choice={choice}
+                    state={dwell.states[choice.id]}
+                    reducedMotion={reducedMotion}
+                    xScale={dwell.xScale}
+                    testId={`rom-dwell-${choice.id}`}
+                  />
+                ))}
+              </CameraPreview>
+            </div>
+            <DwellLegend
+              session={dwell}
+              what={
+                laneDone === null
+                  ? backNote
+                  : laneIndex + 1 < lanes.length
+                    ? 'the left circle for the next movement'
+                    : 'the left circle to go on'
+              }
+              testId="rom-dwell-legend"
+            />
+            <span className="dim" data-testid="rom-handsfree-note">
+              The right circle is the way BACK, and it is there in every state this screen can be in: it measures this
+              movement again once there is something to re-do (including when nothing usable was measured at all), and
+              until then it goes back to {laneIndex > 0 ? 'the movement before this one' : 'the camera check'} — so a
+              confirm made by accident can always be undone without touching the screen. Easier, harder and reusing last
+              session&rsquo;s range stay on the buttons: those change the scale every later figure is a percentage of, and
+              that is the therapist&rsquo;s call.
+            </span>
           </div>
 
           <div className="stack" style={{ gap: 8 }}>
@@ -534,6 +582,16 @@ export default function RomCalibrationScreen() {
           )}
           {status?.error === 'no_reps' && (
             <Toast kind="bad">No complete repetitions were detected. Three clear reps, returning to rest between each.</Toast>
+          )}
+          {/* THE CAMERA IS WORKING AND THIS LANE IS NOT. Frames arrived and none of them carried a
+              reading for the limb this lane measures — an ankle lane whose foot is below the frame
+              while the knee is perfectly visible. It is the failure that used to have no ending: the
+              screen sat in the rest hold for the whole appointment with a preview that looked fine. */}
+          {status?.error === 'not_tracked' && (
+            <Toast kind="bad">
+              <strong data-testid="rom-not-tracked">This movement could not be read from the camera.</strong>{' '}
+              {status.message}
+            </Toast>
           )}
           {status?.warnings?.map((w, i) => (
             <Toast key={i}>{w}</Toast>
@@ -665,11 +723,7 @@ export default function RomCalibrationScreen() {
 
         <div className="card stack" style={{ width: 'min(340px, 100%)' }}>
           <h3>Camera</h3>
-          {handsFreeReady ? (
-            <span className="dim">Shown larger on the left while you confirm without touching the screen.</span>
-          ) : (
-            <CameraPreview overlay />
-          )}
+          <span className="dim">Shown larger on the left, with the two circles that drive this screen hands-free.</span>
           <h3>Lanes</h3>
           <ul className="list-reset">
             {lanes.map((l, i) => {

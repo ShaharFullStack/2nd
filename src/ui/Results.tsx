@@ -452,11 +452,17 @@ export default function ResultsScreen() {
    * THE LAST SCREEN IS THE EASIEST ONE TO BE STRANDED ON.
    *
    * It ends with "Play again" and "New session", and a patient who has driven the whole session from
-   * the chair can press neither. So when the patient has been confirming hands-free (`handsFree`, set
-   * by the first dwell confirm), the camera is NOT released on arriving here — see
-   * `screenNeedsCamera` — and the same two actions are offered as targets. Every other session
-   * releases the device the moment play ends, exactly as before, and this screen says out loud that
-   * the camera is still on and offers the control that turns it off.
+   * the chair can press neither. So for a CAMERA session the camera is NOT released on arriving here
+   * (`handsFree` → `screenNeedsCamera`) and the same two actions are offered as targets. A keyboard
+   * or autoplay run releases the device the moment play ends, exactly as before, and this screen says
+   * out loud that the camera is still on and carries the control that turns it off.
+   *
+   * WHY THE FLAG IS NOT "HAS CONFIRMED HANDS-FREE ONCE" ANY MORE. It used to be set only by the first
+   * dwell confirm, which meant precisely the patient whose therapist had to tap them past a blocked
+   * camera check — the one least able to reach the tablet — arrived here with no camera and no
+   * targets. Two dead ends that compounded into one. It is now set when a camera session starts
+   * playing (src/ui/Play.tsx), because that is the fact that matters here: the patient's limb is the
+   * controller, and there may be nobody else in the room.
    */
   const mode = useStore((s) => s.mode);
   const handsFree = useStore((s) => s.handsFree);
@@ -686,30 +692,35 @@ export default function ResultsScreen() {
 
       {/* THE PATIENT'S OWN WAY OFF THE LAST SCREEN — shown only when they have actually been working
           hands-free, and honest that the camera is still running to provide it. */}
-      {handsFree && dwell.live && dwellChoices.length > 0 && (
+      {handsFree && dwellChoices.length > 0 && (
         <div className="card stack" data-testid="results-handsfree" style={{ gap: 12 }}>
           <div className="row">
             <h3 style={{ margin: 0 }}>Carry on without touching the screen</h3>
             <div className="grow" />
-            <span className="badge badge-warn" data-testid="results-camera-on">
-              camera still on
+            <span className={dwell.live ? 'badge badge-warn' : 'badge badge-bad'} data-testid="results-camera-on">
+              {dwell.live ? 'camera still on' : 'camera not running'}
             </span>
           </div>
           {/* Capped, so the legend and the therapist's way out of this stay on screen with it at
               1024x768 — a full-card-width preview pushed both below the fold. */}
-          <div style={{ width: 'min(560px, 100%)' }}>
-            <CameraPreview overlay>
-              {dwellChoices.map((choice) => (
-                <DwellTarget
-                  key={choice.id}
-                  choice={choice}
-                  state={dwell.states[choice.id]}
-                  reducedMotion={reducedMotion}
-                  testId={`results-dwell-${choice.id}`}
-                />
-              ))}
-            </CameraPreview>
-          </div>
+          {/* The preview only when there are frames to show: a black rectangle is not a picture of a
+              camera, and the legend below says what is actually going on either way. */}
+          {dwell.live && (
+            <div style={{ width: 'min(560px, 100%)' }}>
+              <CameraPreview overlay>
+                {dwellChoices.map((choice) => (
+                  <DwellTarget
+                    key={choice.id}
+                    choice={choice}
+                    state={dwell.states[choice.id]}
+                    reducedMotion={reducedMotion}
+                    xScale={dwell.xScale}
+                    testId={`results-dwell-${choice.id}`}
+                  />
+                ))}
+              </CameraPreview>
+            </div>
+          )}
           <DwellLegend session={dwell} what="the left circle to play again, the right one to start a new session" testId="results-dwell-legend" />
           <div className="row">
             <button
@@ -723,8 +734,8 @@ export default function ResultsScreen() {
               Turn the camera off
             </button>
             <span className="dim">
-              The camera was kept on after the song only because this session was driven from the chair. Turning it off
-              leaves the buttons above, which is every other session&rsquo;s behaviour.
+              The camera is kept on after the song because this session was driven by it — the patient&rsquo;s own way off
+              the last screen. Turning it off leaves the buttons above, which is what a keyboard session does anyway.
             </span>
           </div>
         </div>

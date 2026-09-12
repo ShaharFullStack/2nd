@@ -2,17 +2,29 @@
  * DWELL: how a patient who cannot touch the tablet says "yes".
  *
  * The product decision is a HOLD, not an auto-advance and not the exercise movement itself: a target
- * appears on the camera preview, the patient parks a hand (hand mode) or a knee (leg mode) inside it,
- * a ring fills while they hold, and it confirms when the ring is full. Auto-advance would take the
- * choice away from the patient; dwelling on the prescribed movement would fire by accident on every
- * rep. A deliberate park somewhere the limb does not otherwise go is the one gesture that is both
- * possible for a hemiparetic patient and impossible to make by accident.
+ * appears on the camera preview, the patient parks a hand (hand mode) or a hand or a knee (leg mode)
+ * inside it, a ring fills while they hold, and it confirms when the ring is full. Auto-advance would
+ * take the choice away from the patient; dwelling on the prescribed movement would fire by accident on
+ * every rep.
+ *
+ * WHAT THIS GESTURE IS ALLOWED TO CLAIM. Not "impossible by accident" — that sentence used to be here
+ * and it was not earned: with the targets placed where they were, a knee RELAXING BACK TO REST landed
+ * inside the hysteresis band, the ring kept filling over a limb that was doing nothing, and the app
+ * advanced the session by itself. A confirm caused by a limb returning to rest is the worst class of
+ * false activation, because the patient did nothing at all. What is claimed now is what is proved,
+ * case by case, in dwell.test.ts and DwellTarget.test.tsx:
+ *   - the activation region (the drawn circle AND its hysteresis band) is disjoint from where every
+ *     limb `dwellLimbs` can report RESTS, in both modes, at every frame aspect the app opens a camera
+ *     at — so sitting still cannot fill a ring, and relaxing out of one cannot finish it;
+ *   - a rep passing through the target cannot fill it (the hold is longer than any rep this app paces);
+ *   - a limb that merely stops being detected cannot arm or complete anything;
+ *   - and the hold can only COMPLETE while the pointer is inside the circle the patient can see.
  *
  * THIS FILE IS PURE. No DOM, no React, no timers — it is fed a pointer in normalized video
  * coordinates and a wall-clock time, and it answers with a state a UI can render honestly. Everything
  * here is decided frame by frame in a test (dwell.test.ts).
  *
- * The four properties that make it clinical rather than a mouse-over:
+ * The properties that make it clinical rather than a mouse-over:
  *
  *  1. TREMOR TOLERANCE. The pointer is averaged over a short window (`smoothingSec`) BEFORE
  *     containment is tested. A resting tremor of a few centimetres at 6 Hz moves the raw landmark in
@@ -20,9 +32,13 @@
  *     not. Smoothing the pointer is not the same as smoothing the PROGRESS — progress must still
  *     react immediately when the limb genuinely leaves, or the ring would keep filling over a hand
  *     that has gone.
- *  2. HYSTERESIS. Leaving takes a bigger circle than entering (`exitRatio`). Without it, a hand
- *     parked exactly on the boundary — which is where a patient with poor proprioception parks it —
- *     flickers in and out and the hold never completes.
+ *  2. HYSTERESIS, WITH A CLOCK ON IT. Leaving takes a bigger circle than entering (`exitRatio`):
+ *     without it a hand parked exactly on the boundary — which is where a patient with poor
+ *     proprioception parks it — flickers in and out and the hold never completes. But a band that
+ *     forgives a WOBBLE must not accommodate a PARK: a pointer that stays outside the drawn circle
+ *     for longer than `bandGraceSec` has left, whatever the band says, and the hold stops
+ *     accumulating. And the completing frame is tested against the drawn circle itself, never the
+ *     band, so a ring can never fill up over a limb sitting outside the ring it is drawn as.
  *  3. FORGIVENESS. A lost landmark does not reset the hold. Progress DECAYS, and decays more slowly
  *     than it fills (`decayRatio` < 1), so a patient whose hand flickers in and out of detection —
  *     the normal case on a clinic webcam at 12 fps — still gets there. Resetting to zero on a dropped
@@ -31,6 +47,12 @@
  *     start a new hold until it has seen the limb leave the target (the same gate that stops a limb
  *     which happens to be resting inside the target when the screen opens from confirming
  *     immediately — see `requireEntry`). One hold answers one question.
+ *  5. ONE LIMB AT A TIME. The smoothing buffer belongs to the limb it was filled from (`limbKey` on
+ *     `update`). Two limbs averaged into one pointer produce a point where NEITHER limb is — for a
+ *     symmetrically seated patient that mean is the midline, which is exactly where a centred target
+ *     would be — so a change of limb throws the buffer away and takes the hysteresis with it: the new
+ *     limb has to be inside the DRAWN circle on its own account, not inside a band the other limb
+ *     earned. (What a hand-over does NOT do is re-arm the entry gate; see the note in `update`.)
  *
  * THE CLOCK. `update` is given a WALL-CLOCK time in seconds, not song time. A dwell hold is not
  * related to the song's timebase (the AudioContext clock that ARCHITECTURE.md makes canonical for
@@ -42,11 +64,13 @@
  * MediaPipe reports landmarks. Because MediaPipe normalizes x by the frame WIDTH and y by the HEIGHT,
  * one x unit is not one y unit on a non-square frame (see the anisotropy note in landmarks.ts): every
  * distance here multiplies x by `xScale` = frameWidth / frameHeight, so `radius` is in units of frame
- * HEIGHT and the containment region is the circle the patient can actually see drawn.
+ * HEIGHT and the containment region is the circle the patient can actually see drawn. THE CALLER MUST
+ * PASS THE REAL ASPECT of the frames the landmarks came from (`VisionInput.getXScale()`): 640x480 is
+ * only an `ideal` constraint and most laptop sensors hand back 16:9 whatever was asked for.
  */
 import type { Mode, Side } from '../engine/types.ts';
 import { poseSideIndices } from './features.ts';
-import { HAND, MIN_VISIBILITY } from './landmarks.ts';
+import { HAND, MIN_VISIBILITY, POSE } from './landmarks.ts';
 import type { Landmark } from './landmarks.ts';
 import { labelToPatientSide } from './mediapipe.ts';
 import type { DetectionResult } from './mediapipe.ts';
@@ -70,6 +94,11 @@ export interface DwellOptions {
   holdSec?: number;
   /** Exit radius as a multiple of the entry radius (> 1). The hysteresis band. */
   exitRatio?: number;
+  /**
+   * How long the pointer may sit in the hysteresis band — outside the DRAWN circle — and still be
+   * counted as holding. A wobble, not a park: see property 2 in the header.
+   */
+  bandGraceSec?: number;
   /** Length of the moving-average window applied to the pointer before containment is tested. */
   smoothingSec?: number;
   /** How long the limb may be missing before the UI stops claiming it is being tracked. */
@@ -88,6 +117,9 @@ export interface DwellOptions {
    * A knee at rest, or a hand on the table, can already be sitting where the target is drawn the
    * moment the screen opens. Filling from there is not a choice the patient made, it is where their
    * limb happened to be. With this on, the ring only starts to fill once they have moved the limb in.
+   * It is a gate on DELIBERATENESS and nothing more: it is not what keeps a resting limb from
+   * confirming (placement is — see the header), because a limb resting in the hysteresis band opens
+   * this gate and then closes it again by relaxing back.
    */
   requireEntry?: boolean;
 }
@@ -100,13 +132,20 @@ export const DWELL_DEFAULTS: Required<DwellOptions> = Object.freeze({
    */
   holdSec: 1.8,
   /**
-   * 1.45. The exit circle is roughly twice the area of the entry circle: a wobble of half a radius
-   * does not end the hold, a genuine withdrawal does.
+   * 1.25. Down from 1.45, which put the exit circle nearly TWICE the drawn area and swallowed a
+   * resting knee whole (see the header). A quarter of a radius is a real wobble tolerance — several
+   * centimetres at the patient — and `bandGraceSec` stops it from being anything more than that.
    */
-  exitRatio: 1.45,
+  exitRatio: 1.25,
+  /** 0.35 s in the band. Longer than any wobble, shorter than a decision. */
+  bandGraceSec: 0.35,
   /** 0.25 s — six frames at 24 fps. Averages out tremor without making the ring lag the limb visibly. */
   smoothingSec: 0.25,
-  /** 0.4 s. Below this the UI keeps saying "tracked": one or two dropped detections is not a lost limb. */
+  /**
+   * 0.4 s. Below this the UI keeps saying "tracked": one or two dropped detections is not a lost limb.
+   * A SLOW camera is not a lost limb either — callers driving this from a real device must raise this
+   * to the device's own frame interval (`setCadence`), or a working 4 fps stream reads as a dead one.
+   */
   graceSec: 0.4,
   /**
    * 0.45 — progress is given back at 45 % of the rate it is earned. A patient whose landmark is
@@ -135,6 +174,11 @@ export interface DwellState {
   /** The smoothed pointer is inside the target (entry radius to get in, exit radius to get out). */
   inside: boolean;
   /**
+   * The smoothed pointer is inside the DRAWN circle — the entry radius, not the band. This is the
+   * test the hold has to pass to complete, and the one a renderer may describe to the patient.
+   */
+  withinEntry: boolean;
+  /**
    * A limb has been seen within `graceSec`. FALSE IS A REAL STATE and the UI must show it as one: a
    * ring that simply stops filling looks identical to a patient holding still in the wrong place.
    */
@@ -153,20 +197,14 @@ export interface DwellState {
   lostSec: number;
   /** Seconds of holding still needed, at the full fill rate. */
   remainingSec: number;
+  /**
+   * THE CIRCLE THIS STATE WAS MEASURED AGAINST, and the frame aspect it was measured in — so a
+   * renderer draws the circle that was tested instead of the one a screen asked for before the camera
+   * said what shape its frames are. See `retargetForAspect`.
+   */
+  target: DwellCircle;
+  xScale: number;
 }
-
-const EMPTY_STATE: DwellState = Object.freeze({
-  progress: 0,
-  inside: false,
-  tracked: false,
-  holding: false,
-  confirmed: false,
-  confirmations: 0,
-  blocked: 'entry' as DwellBlock | null,
-  pointer: null,
-  lostSec: Infinity,
-  remainingSec: DWELL_DEFAULTS.holdSec,
-});
 
 interface Sample {
   t: number;
@@ -181,6 +219,25 @@ function finitePoint(p: DwellPoint | null | undefined): p is DwellPoint {
 /** Distance from `p` to the centre of `c`, in units of frame height (see the coordinates note). */
 export function dwellDistance(p: DwellPoint, c: DwellCircle, xScale = 1): number {
   return Math.hypot((p.x - c.x) * xScale, p.y - c.y);
+}
+
+/** The frame aspect targets are AUTHORED in: the preview box is 4:3 and so is the camera request. */
+export const DWELL_AUTHORED_ASPECT = 4 / 3;
+
+/**
+ * The same physical target, expressed in the frame the camera actually delivered.
+ *
+ * A target is written down as a fraction of the frame — `x: 0.72` — but x is normalized by the frame
+ * WIDTH, so the same number is a different PLACE on a 16:9 sensor than on the 4:3 frame the layout was
+ * drawn for: further out, and further from the limb that has to reach it. The offset from the centre
+ * is therefore re-expressed in units of frame HEIGHT, which is the unit `radius` is already in and the
+ * unit the preview box is cropped to. On the glass the circle lands in the same place on every sensor
+ * (`previewPlacement` in DwellTarget.tsx does the matching crop), and the reach asked of the patient
+ * is the same physical distance.
+ */
+export function retargetForAspect(c: DwellCircle, xScale: number, authored = DWELL_AUTHORED_ASPECT): DwellCircle {
+  if (!Number.isFinite(xScale) || xScale <= 0 || xScale === authored) return c;
+  return { x: 0.5 + (c.x - 0.5) * (authored / xScale), y: c.y, radius: c.radius };
 }
 
 /**
@@ -211,16 +268,39 @@ export class DwellTracker {
   private lastSeen = -Infinity;
   private progress = 0;
   private insideFlag = false;
+  private withinEntry = false;
+  /** When the pointer left the drawn circle while still counting as inside (NaN = it has not). */
+  private bandSince = NaN;
   /** The entry gate: has the limb been seen outside the target since this hold was armed? */
   private seenOutside = false;
+  /** Which limb the samples in the buffer came from (null = the caller does not distinguish). */
+  private limbKey: string | null = null;
   private blockedUntil = -Infinity;
   private count = 0;
-  private current: DwellState = EMPTY_STATE;
+  private current: DwellState;
 
   constructor(target: DwellCircle, opts: DwellOptions = {}) {
     this.target = target;
     this.opts = { ...DWELL_DEFAULTS, ...opts };
-    this.current = { ...EMPTY_STATE, remainingSec: this.opts.holdSec, blocked: this.opts.requireEntry ? 'entry' : null };
+    this.current = this.empty();
+  }
+
+  private empty(): DwellState {
+    return Object.freeze({
+      progress: 0,
+      inside: false,
+      withinEntry: false,
+      tracked: false,
+      holding: false,
+      confirmed: false,
+      confirmations: this.count,
+      blocked: (this.opts.requireEntry ? 'entry' : null) as DwellBlock | null,
+      pointer: null,
+      lostSec: Infinity,
+      remainingSec: this.opts.holdSec,
+      target: this.target,
+      xScale: this.opts.xScale,
+    });
   }
 
   /** The last state produced. Frozen; a renderer may hold it between updates. */
@@ -232,11 +312,37 @@ export class DwellTracker {
     return this.target;
   }
 
-  /** Move the target (a screen that changes what it is asking). Clears the hold in progress. */
-  setTarget(target: DwellCircle): void {
-    if (target.x === this.target.x && target.y === this.target.y && target.radius === this.target.radius) return;
+  /**
+   * Move the target, and/or correct the frame aspect it is measured in (a screen that changes what it
+   * is asking, or a camera that finally said what shape its frames are). Clears the hold in progress —
+   * the geometry a half-filled ring was earned against no longer exists.
+   */
+  setTarget(target: DwellCircle, xScale: number = this.opts.xScale): void {
+    if (
+      target.x === this.target.x &&
+      target.y === this.target.y &&
+      target.radius === this.target.radius &&
+      xScale === this.opts.xScale
+    ) {
+      return;
+    }
     this.target = target;
+    this.opts = { ...this.opts, xScale };
     this.reset();
+  }
+
+  /**
+   * Follow the device's real cadence instead of a hard-coded one.
+   *
+   * At 4 fps a 0.4 s dropout tolerance is ONE frame interval, so a camera that is working — slowly —
+   * reads as a camera that has gone, and the step cap meant for a backgrounded tab throttles the fill.
+   * Neither is a statement about the patient. Changing these does not disturb a hold in progress.
+   */
+  setCadence(graceSec: number, maxStepSec: number): void {
+    const g = Number.isFinite(graceSec) && graceSec > 0 ? graceSec : this.opts.graceSec;
+    const m = Number.isFinite(maxStepSec) && maxStepSec > 0 ? maxStepSec : this.opts.maxStepSec;
+    if (g === this.opts.graceSec && m === this.opts.maxStepSec) return;
+    this.opts = { ...this.opts, graceSec: g, maxStepSec: m };
   }
 
   /** Forget everything: no hold, no pointer history, entry gate re-armed. */
@@ -246,18 +352,18 @@ export class DwellTracker {
     this.lastSeen = -Infinity;
     this.progress = 0;
     this.insideFlag = false;
+    this.withinEntry = false;
+    this.bandSince = NaN;
     this.seenOutside = false;
+    this.limbKey = null;
     this.blockedUntil = -Infinity;
-    this.current = {
-      ...EMPTY_STATE,
-      confirmations: this.count,
-      remainingSec: this.opts.holdSec,
-      blocked: this.opts.requireEntry ? 'entry' : null,
-    };
+    this.current = this.empty();
   }
 
   /**
-   * Advance to `tSec` with the pointer observed at that instant (null = the limb was not found).
+   * Advance to `tSec` with the pointer observed at that instant (null = the limb was not found), and
+   * optionally WHICH limb it is (`limbKey`): see property 5 in the header. A caller that does not
+   * distinguish limbs passes nothing and gets the old single-buffer behaviour.
    *
    * CALL IT ONCE PER OBSERVATION, not once per repaint: `null` means "this observation found no
    * limb", and re-feeding a pointer that arrived two repaints ago would count a hold nobody saw.
@@ -267,9 +373,19 @@ export class DwellTracker {
    * Returns the new state. `confirmed` is an EDGE: it is true on this one call and false on the next,
    * so a caller may act on it directly without tracking its own previous value.
    */
-  update(pointer: DwellPoint | null, tSec: number): DwellState {
-    const { holdSec, exitRatio, smoothingSec, graceSec, decayRatio, refractorySec, maxStepSec, xScale, requireEntry } =
-      this.opts;
+  update(pointer: DwellPoint | null, tSec: number, limbKey?: string | null): DwellState {
+    const {
+      holdSec,
+      exitRatio,
+      bandGraceSec,
+      smoothingSec,
+      graceSec,
+      decayRatio,
+      refractorySec,
+      maxStepSec,
+      xScale,
+      requireEntry,
+    } = this.opts;
 
     const t = Number.isFinite(tSec) ? tSec : this.lastT;
     // A non-monotonic or absent clock advances nothing rather than stepping backwards through a hold.
@@ -277,6 +393,26 @@ export class DwellTracker {
     this.lastT = t;
 
     if (finitePoint(pointer)) {
+      const key = limbKey ?? null;
+      // A DIFFERENT limb: everything in the buffer describes the other one, and the mean of two limbs
+      // is a place neither of them is. Throw it away, and drop the hysteresis with it — the new limb
+      // has to satisfy the ENTRY radius on its own rather than inherit a boundary it never crossed.
+      //
+      // The entry gate is deliberately NOT re-armed here. It records that the pointer has been outside
+      // this circle since the tracker was armed, and `pickDwellLimb` only ever hands over to a limb
+      // that is INSIDE a target (a limb outside every target cannot take the pick from one inside one),
+      // so the gate can only have opened at a moment when no limb was in the circle at all — which is
+      // the thing it exists to establish. Re-arming it here instead made the gesture impossible: the
+      // hand-over happens exactly as the new limb crosses into the circle, so the gate would be closed
+      // by the very movement that was supposed to open it, and the ring sat at "move out, then back"
+      // for ever. Seen in the running app before it was fixed.
+      if (key !== null && this.limbKey !== null && key !== this.limbKey) {
+        this.samples = [];
+        this.insideFlag = false;
+        this.withinEntry = false;
+        this.bandSince = NaN;
+      }
+      if (key !== null) this.limbKey = key;
       this.samples.push({ t, x: pointer.x, y: pointer.y });
       this.lastSeen = t;
     }
@@ -312,13 +448,34 @@ export class DwellTracker {
 
     if (smoothed === null) {
       this.insideFlag = false;
+      this.withinEntry = false;
+      this.bandSince = NaN;
     } else {
       const d = dwellDistance(smoothed, this.target, xScale);
-      // Hysteresis: getting in needs the entry radius, getting out needs the bigger exit radius.
-      this.insideFlag = this.insideFlag ? d <= this.target.radius * exitRatio : d <= this.target.radius;
-      // The entry gate only opens on a limb genuinely observed OUTSIDE — never on a limb that merely
-      // stopped being detected, which is the state a patient cannot tell apart from "it is working".
-      if (!this.insideFlag) this.seenOutside = true;
+      this.withinEntry = d <= this.target.radius;
+      if (this.withinEntry) {
+        // Inside the circle the patient can see: that is the hold, and any earlier excursion is over.
+        this.insideFlag = true;
+        this.bandSince = NaN;
+      } else if (this.insideFlag) {
+        if (d > this.target.radius * exitRatio) {
+          // Past the band: gone, immediately.
+          this.insideFlag = false;
+          this.bandSince = NaN;
+        } else {
+          // In the band. A wobble is forgiven; LIVING here is not — a limb that has come to rest just
+          // outside the ring is not holding, whatever the hysteresis would like to say.
+          if (!Number.isFinite(this.bandSince)) this.bandSince = t;
+          if (t - this.bandSince > bandGraceSec) {
+            this.insideFlag = false;
+            this.bandSince = NaN;
+          }
+        }
+      }
+      // The entry gate opens on a limb genuinely observed outside THE DRAWN CIRCLE — the boundary the
+      // patient is looking at — and never on a limb that merely stopped being detected, which is the
+      // state a patient cannot tell apart from "it is working".
+      if (!this.withinEntry) this.seenOutside = true;
     }
 
     const refractory = t < this.blockedUntil;
@@ -331,7 +488,10 @@ export class DwellTracker {
       this.progress = 0;
     } else if (holding) {
       this.progress = Math.min(1, this.progress + dt / holdSec);
-      if (this.progress >= 1) {
+      // THE COMPLETING FRAME IS TESTED AGAINST THE DRAWN CIRCLE. A ring that filled while the pointer
+      // wobbled into the band may not ALSO finish out there: the last thing a confirm asserts is that
+      // the limb was inside the ring the patient was looking at.
+      if (this.progress >= 1 && this.withinEntry) {
         confirmed = true;
         this.count += 1;
         this.progress = 0;
@@ -346,6 +506,7 @@ export class DwellTracker {
     this.current = Object.freeze({
       progress: this.progress,
       inside: this.insideFlag,
+      withinEntry: this.withinEntry,
       tracked,
       holding,
       confirmed,
@@ -354,6 +515,8 @@ export class DwellTracker {
       pointer: smoothed,
       lostSec,
       remainingSec: (1 - this.progress) * holdSec,
+      target: this.target,
+      xScale,
     });
     return this.current;
   }
@@ -376,6 +539,12 @@ export interface DwellLimb {
   side: Side | null;
   /** What to call it in a sentence: "your left hand", "a hand", "your right knee". */
   label: string;
+  /**
+   * WHICH limb this is, stably between frames: 'knee:left', 'hand:right', 'hand:#1' for a hand whose
+   * handedness the model will not commit to. The dwell tracker keys its smoothing buffer on this so
+   * two limbs are never averaged into one pointer (property 5 in the header).
+   */
+  key: string;
 }
 
 /** Below this handedness score the MediaPipe label does not identify the hand (see mediapipe.ts). */
@@ -386,6 +555,17 @@ const PALM = [HAND.WRIST, HAND.INDEX_MCP, HAND.MIDDLE_MCP, HAND.RING_MCP, HAND.P
 
 function visible(l: Landmark | undefined): l is Landmark {
   return !!l && Number.isFinite(l.x) && Number.isFinite(l.y) && (l.visibility === undefined || l.visibility >= MIN_VISIBILITY);
+}
+
+/**
+ * Is this point in the frame at all?
+ *
+ * Pose extrapolates landmarks it cannot see off the edge of the image and still labels them visible,
+ * and a limb the patient cannot see in the preview must not be able to drive a target they can. The
+ * bound is the frame, because the frame is what the coordinates are normalized to.
+ */
+function inFrame(p: DwellPoint): boolean {
+  return p.x >= 0 && p.x <= 1 && p.y >= 0 && p.y <= 1;
 }
 
 function centre(points: readonly Landmark[]): DwellPoint | null {
@@ -402,26 +582,50 @@ function centre(points: readonly Landmark[]): DwellPoint | null {
 }
 
 /**
+ * The Pose slot holding the PATIENT's `side` wrist, under the mirror convention in force.
+ *
+ * `poseSideIndices` (features.ts) is the canonical mapping and the knee goes through it below; it does
+ * not carry the wrist, so this repeats the one rule it encodes: on a MIRRORED stream the model labels
+ * the apparent anatomy, so the patient's left limb arrives in the RIGHT_* slots.
+ */
+function poseWrist(side: Side, mirrored: boolean): number {
+  const underLeftLabels = mirrored ? side === 'right' : side === 'left';
+  return underLeftLabels ? POSE.LEFT_WRIST : POSE.RIGHT_WRIST;
+}
+
+/**
  * Every limb in this frame that could park itself on a target.
  *
  * HAND mode: the palm centre of each detected hand. The palm rather than a fingertip because the
  * prescribed hand movements (open/close, opposition, spread) move the fingertips by design — a
  * fingertip pointer would drift across the target while the patient does nothing but their exercise.
- * LEG mode: each knee that Pose reports as visible, mapped through `poseSideIndices` so the side named
- * on screen is the patient's side under the mirror convention in force, not the image's.
+ *
+ * LEG mode: each knee AND each hand that Pose reports, mapped through the mirror convention so the
+ * side named on screen is the patient's side, not the image's. The HANDS ARE FREE IN LEG MODE — the
+ * patient is exercising their legs — and raising a hand is a gesture an affected, fatigued patient can
+ * still make when holding a knee up for two seconds is itself a therapy exercise. The knee stays,
+ * because a patient may be framed knees-up with no hand in the picture; whichever is nearest the
+ * target is the one followed, and the legend says which.
  */
 export function dwellLimbs(result: DetectionResult | null | undefined, mode: Mode, mirrored = false): DwellLimb[] {
   if (!result) return [];
   const out: DwellLimb[] = [];
   if (mode === 'hand') {
+    let unlabelled = 0;
     for (const hand of result.hands) {
       const point = centre(PALM.map((i) => hand.landmarks[i]));
-      if (!point) continue;
+      if (!point || !inFrame(point)) continue;
       // An unconfident label is reported as unknown rather than guessed: the caption is read by the
       // patient and "your left hand" pointing at their right one is a small lie in the same family as
       // every other one this app refuses to tell.
       const side = hand.score >= DWELL_MIN_LABEL_SCORE ? labelToPatientSide(hand.label, mirrored) : null;
-      out.push({ point, side, label: side ? `your ${side} hand` : 'a hand' });
+      unlabelled += side ? 0 : 1;
+      out.push({
+        point,
+        side,
+        label: side ? `your ${side} hand` : 'a hand',
+        key: side ? `hand:${side}` : `hand:#${unlabelled}`,
+      });
     }
     return out;
   }
@@ -429,8 +633,11 @@ export function dwellLimbs(result: DetectionResult | null | undefined, mode: Mod
   if (!pose) return out;
   for (const side of ['left', 'right'] as Side[]) {
     const knee = pose[poseSideIndices(side, mirrored).knee];
-    if (!visible(knee)) continue;
-    out.push({ point: { x: knee.x, y: knee.y }, side, label: `your ${side} knee` });
+    if (visible(knee) && inFrame(knee)) out.push({ point: { x: knee.x, y: knee.y }, side, label: `your ${side} knee`, key: `knee:${side}` });
+  }
+  for (const side of ['left', 'right'] as Side[]) {
+    const wrist = pose[poseWrist(side, mirrored)];
+    if (visible(wrist) && inFrame(wrist)) out.push({ point: { x: wrist.x, y: wrist.y }, side, label: `your ${side} hand`, key: `hand:${side}` });
   }
   return out;
 }
@@ -438,6 +645,8 @@ export function dwellLimbs(result: DetectionResult | null | undefined, mode: Mod
 export interface PickDwellLimbOptions {
   /** Where the limb picked last frame was, so the choice does not flicker between two candidates. */
   previous?: DwellPoint | null;
+  /** WHICH limb was picked last frame (`DwellLimb.key`) — identity beats proximity. */
+  previousKey?: string | null;
   xScale?: number;
   /** How far the previously-picked limb may have moved and still be recognised as the same one. */
   continuityRadius?: number;
@@ -452,6 +661,12 @@ export const DWELL_CONTINUITY_RADIUS = 0.2;
  * "Whichever enters first" in practice means: a limb inside a target always beats a limb outside every
  * target, and the choice sticks to the limb it was already following while that limb is still there —
  * otherwise two hands equidistant from a target would swap the caption (and the hold) every frame.
+ *
+ * STICKINESS IS BY IDENTITY FIRST. Matching on position alone cannot tell "the limb I was following"
+ * from "the other limb, which happens to be about as far away" — and for a symmetrically seated
+ * patient the two knees are further apart than any continuity radius that is also tolerant of a fast
+ * move, so position-matching let the pick alternate between them. `previousKey` decides it outright
+ * while that limb is still a candidate.
  */
 export function pickDwellLimb(
   limbs: readonly DwellLimb[],
@@ -463,6 +678,7 @@ export function pickDwellLimb(
   const xScale = opts.xScale ?? 1;
   const continuity = opts.continuityRadius ?? DWELL_CONTINUITY_RADIUS;
   const previous = finitePoint(opts.previous ?? null) ? (opts.previous as DwellPoint) : null;
+  const previousKey = opts.previousKey ?? null;
 
   const scored = limbs.map((limb) => {
     let nearest = Infinity;
@@ -478,8 +694,10 @@ export function pickDwellLimb(
 
   const insiders = scored.filter((s) => s.inside);
   const pool = insiders.length > 0 ? insiders : scored;
-  // Stickiness first, and only among the limbs that are in the running: the limb we were following
-  // keeps the caption while it is still the kind of candidate that would win anyway.
+  // Identity first: the limb we were following keeps the pick while it is still in the running.
+  const same = previousKey ? pool.find((s) => s.limb.key === previousKey) : undefined;
+  if (same) return same.limb;
+  // Then position, for callers that cannot name their limbs (and for the first frame after a switch).
   const carried = pool.filter((s) => s.carried <= continuity).sort((a, b) => a.carried - b.carried);
   if (carried.length > 0) return carried[0].limb;
   return pool.slice().sort((a, b) => a.nearest - b.nearest)[0].limb;

@@ -508,15 +508,22 @@ export interface AppState {
   persistenceFailed: boolean;
 
   /**
-   * THE PATIENT HAS BEEN DRIVING THIS SESSION THEMSELVES.
+   * THIS SESSION CANNOT BE LEFT WITHOUT TOUCHING THE SCREEN.
    *
-   * Set the first time a dwell target is confirmed (src/ui/DwellTarget.tsx) and cleared when a new
-   * session is started from Home. It is not a preference and it is never persisted: it is the
-   * evidence, gathered from what actually happened, that there may be nobody in the room but the
-   * patient — and the only thing that decides whether the camera is kept alive on the results screen,
-   * where the therapist's two buttons would otherwise be the only way off the last screen of the
-   * session (see `screenNeedsCamera`). A session a therapist clicked through releases the device the
-   * moment play ends, exactly as before.
+   * It is not a preference and it is never persisted: it is the evidence, gathered from what actually
+   * happened, that there may be nobody in the room but the patient — and the only thing that decides
+   * whether the camera is kept alive on the results screen, where the therapist's two buttons would
+   * otherwise be the only way off the last screen of the session (see `screenNeedsCamera`). Cleared
+   * when a new session is started from Home, and by the patient's own "turn the camera off".
+   *
+   * WHAT COUNTS AS THAT EVIDENCE, AND WHY IT WIDENED. It used to be set ONLY by the first dwell
+   * confirm (src/ui/DwellTarget.tsx), which sounds right and was the wrong test: a patient whose
+   * therapist had to tap them past a blocked camera check never confirmed anything, so the one person
+   * least able to reach the tablet was guaranteed to arrive at the results screen with no camera and
+   * no targets. Two dead ends that compounded into one. A CAMERA SESSION REACHING THE PLAY SCREEN now
+   * sets it too (src/ui/Play.tsx): in a camera session the patient's limb IS the controller, which is
+   * the fact that matters here. A keyboard or autoplay run releases the device the moment play ends,
+   * exactly as before, and the results screen says out loud that the camera is still on.
    */
   handsFree: boolean;
 

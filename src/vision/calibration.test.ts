@@ -768,3 +768,58 @@ describe('the Easier / Harder nudge is proportional, bounded and self-describing
     expect(fresh.previewNudgeTop(0).disabled).toBe(true);
   });
 });
+
+/**
+ * A LANE THAT IS NOT BEING TRACKED MUST STILL END.
+ *
+ * `push` ignores a null feature, which is right for the statistics and was wrong for the clock: the
+ * rest and move timeouts only ran on frames that CARRIED a feature, so a lane whose limb is outside
+ * the frame — an ankle_dorsiflexion lane whose foot is below the shot while the knee is perfectly
+ * visible — sat in 'rest' or 'move' for the whole appointment. No error, no result, and (on the
+ * screen above) no hands-free target at all, on a camera that is plainly working.
+ */
+describe('RomCalibrator deadlines run on frames that carried no feature', () => {
+  it('ends the rest hold as not_tracked when no frame ever carries a feature', () => {
+    const cal = new RomCalibrator('ankle_dorsiflexion', { trackingTimeoutSec: 5 });
+    for (let t = 0; t < 4.9; t += 0.05) cal.push(null, t);
+    expect(cal.getPhase()).toBe('rest');
+    expect(cal.getError()).toBeNull();
+    cal.push(null, 5.1);
+    expect(cal.getPhase()).toBe('done');
+    expect(cal.getError()).toBe('not_tracked');
+    // …and it says the camera was delivering frames, which is the fact the therapist needs.
+    expect(cal.getStatus().message).toMatch(/frames arrived/);
+    expect(cal.getStatus().message).toMatch(/0% of them carried a reading/);
+  });
+
+  it('a lane that loses its landmark mid-rest still ends instead of waiting for ever', () => {
+    const cal = new RomCalibrator('knee_extension', { trackingTimeoutSec: 6, minRestSamples: 30 });
+    // Four usable frames, then the limb leaves the picture. Never enough to define a zero.
+    for (let i = 0; i < 4; i++) cal.push(30, i * 0.05);
+    for (let t = 0.2; t < 6.2; t += 0.05) cal.push(null, t);
+    expect(cal.getPhase()).toBe('done');
+    expect(cal.getError()).toBe('not_tracked');
+  });
+
+  it('a limb lost AFTER the rest hold still times the move phase out', () => {
+    const cal = new RomCalibrator('knee_extension', { moveTimeoutSec: 4, minRestSamples: 5, restDurationSec: 0.5 });
+    // Usable frames ONLY until the rest hold hands over — the limb leaves the picture at that moment.
+    let t = 0;
+    while (cal.getPhase() === 'rest' && t < 3) {
+      cal.push(30, t);
+      t += 0.05;
+    }
+    expect(cal.getPhase()).toBe('move');
+    for (; t < 8; t += 0.05) cal.push(null, t);
+    expect(cal.getPhase()).toBe('done');
+    // Nothing was ever seen moving because nothing was ever seen — that is not "no repetitions".
+    expect(cal.getError()).toBe('not_tracked');
+  });
+
+  it('a tracked stream is unaffected: the rest hold still advances on stillness, not on a deadline', () => {
+    const cal = new RomCalibrator('knee_extension', { minRestSamples: 5, restDurationSec: 0.5, trackingTimeoutSec: 1 });
+    for (let i = 0; i <= 20; i++) cal.push(30, i * 0.05);
+    expect(cal.getPhase()).toBe('move');
+    expect(cal.getError()).toBeNull();
+  });
+});

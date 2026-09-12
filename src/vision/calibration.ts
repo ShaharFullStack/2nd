@@ -624,7 +624,15 @@ export function requiredRom(movement: Movement, rest?: RestQuality | null): numb
 }
 
 export type CalibrationPhase = 'rest' | 'move' | 'done';
-export type CalibrationError = 'insufficient_range' | 'no_reps';
+/**
+ * `not_tracked` is the third way a calibration can end, and the one that used to have no ending at
+ * all: the frames arrived, the camera was plainly working, and the FEATURE was null on every one of
+ * them (an ankle_dorsiflexion lane whose foot is below the frame while the knee is perfectly
+ * visible). `push` ignores a null feature — right for the statistics, wrong for the clock — so the
+ * rest and move timeouts only ever advanced on frames that CARRIED a feature, and a lane like that
+ * sat in 'rest' for ever with no error, no result and, on the screen above, no hands-free target.
+ */
+export type CalibrationError = 'insufficient_range' | 'no_reps' | 'not_tracked';
 
 export interface CalibrationStatus {
   phase: CalibrationPhase;
@@ -679,6 +687,13 @@ export interface CalibratorOptions {
   restDriftFraction?: number;
   /** Give up waiting for stillness and advance after this many seconds of rest (default 10). */
   restTimeoutSec?: number;
+  /**
+   * Give up after this many seconds in which frames ARRIVED but none of them carried a usable
+   * feature (default 20). It is deliberately longer than `restTimeoutSec`: that one is about a
+   * patient who will not settle, this one is about a limb that is not in the picture at all, and the
+   * remedy (move the chair, tilt the camera) takes longer than settling does.
+   */
+  trackingTimeoutSec?: number;
   /** Reps to collect (default 3). */
   reps?: number;
   /** Override the per-movement minimum ROM (feature units). */
@@ -882,6 +897,7 @@ export class RomCalibrator {
   readonly mirrored: boolean | undefined;
   /** The patient this range is being measured on (undefined = the caller did not say). */
   readonly patient: string | undefined;
+  private readonly trackingTimeoutSec: number;
   private readonly nowMs: () => number;
 
   private phase: CalibrationPhase = 'rest';
@@ -914,6 +930,8 @@ export class RomCalibrator {
   /** The rest window that actually produced `min`, captured when the rest phase ended. */
   private restAtAdvance: RestQuality | null = null;
   private moveStart = NaN;
+  /** When the move phase was ENTERED, so its timeout runs even if no usable sample ever arrives. */
+  private moveEnteredAt = NaN;
   private moveSamples = 0;
   private min: number | null = null;
   private max: number | null = null;
@@ -944,6 +962,7 @@ export class RomCalibrator {
     this.peakPercentile = opts.peakPercentile ?? 0.9;
     this.autoAdvance = opts.autoAdvance ?? true;
     this.moveTimeoutSec = opts.moveTimeoutSec ?? 30;
+    this.trackingTimeoutSec = opts.trackingTimeoutSec ?? 20;
     this.nowMs = opts.now ?? (() => Date.now());
     this.sessionId = opts.sessionId;
     this.fingertip = movement === 'finger_opposition' ? opts.fingertip ?? DEFAULT_FINGERTIP : undefined;
@@ -990,7 +1009,15 @@ export class RomCalibrator {
     // Frames that arrive after the range is settled describe nothing about how it was measured.
     if (this.phase === 'done') return this.phase;
     this.countFrame(feature, tSec);
-    if (feature === null || !Number.isFinite(feature)) return this.phase;
+    if (feature === null || !Number.isFinite(feature)) {
+      // A FRAME WITH NO FEATURE IS STILL A FRAME, AND THE CLOCK IS STILL RUNNING. This used to
+      // `return this.phase` and nothing else, which is what let a lane whose limb is outside the
+      // frame sit in 'rest' or 'move' for the whole appointment: the timeouts below only ran on the
+      // samples that carried a feature, so a lane that never carried one never timed out. The
+      // statistics still ignore it (that is what `countFrame` is for); the deadlines do not.
+      this.checkDeadlines(tSec);
+      return this.phase;
+    }
     if (this.phase === 'rest') {
       if (Number.isNaN(this.restStart)) this.restStart = tSec;
       this.restEnd = tSec;
@@ -1035,6 +1062,50 @@ export class RomCalibrator {
       }
     }
     return this.phase;
+  }
+
+  /**
+   * THE DEADLINES THAT MUST RUN ON EVERY FRAME, not only on the ones that carried a feature.
+   *
+   * Three of them, and each one ends a state a patient working alone could otherwise not leave:
+   *  - the MOVE timeout, which used to be unreachable for a lane that lost its landmark after the
+   *    rest hold: it would finish with whatever peaks it had, or say so, and now it does either way;
+   *  - the REST timeout for a lane that collected SOME rest samples but stopped: without enough of
+   *    them there is no median to be the session's zero, so it ends as 'not_tracked' rather than
+   *    inventing one out of four frames;
+   *  - the TRACKING timeout: frames arriving, nothing usable in any of them.
+   *
+   * Every one of them ends in phase 'done' with an error, which is the state the screen above draws
+   * its "do it again" target in — so "the camera is working and this lane is going nowhere" becomes
+   * a thing a patient can answer instead of a thing they sit in.
+   */
+  private checkDeadlines(tSec: number): void {
+    if (this.phase === 'done' || !Number.isFinite(tSec)) return;
+    if (this.phase === 'move') {
+      const since = Number.isNaN(this.moveStart) ? this.moveEnteredAt : this.moveStart;
+      if (!Number.isNaN(since) && tSec - since > this.moveTimeoutSec) {
+        if (this.peaks.length > 0) this.finish();
+        else {
+          // Nothing was ever seen moving because nothing was ever seen: say THAT, not "no reps".
+          this.error = this.moveSamples === 0 ? 'not_tracked' : 'no_reps';
+          this.phase = 'done';
+        }
+      }
+      return;
+    }
+    // Rest: the window either has enough to define a zero (in which case the ordinary rest timeout
+    // advances it) or it does not, and then waiting longer is not going to produce one.
+    if (!Number.isNaN(this.restStart) && tSec - this.restStart >= this.restTimeoutSec) {
+      if (this.autoAdvance && this.restSamples.length >= this.minRestSamples) {
+        this.beginMove();
+        return;
+      }
+    }
+    if (!Number.isNaN(this.frameFirst) && tSec - this.frameFirst >= this.trackingTimeoutSec) {
+      if (this.restSamples.length >= this.minRestSamples) return; // a zero exists; not this failure
+      this.error = 'not_tracked';
+      this.phase = 'done';
+    }
   }
 
   /** One frame's worth of provenance: was it usable, and how long since the last one. */
@@ -1151,6 +1222,7 @@ export class RomCalibrator {
     this.baseline = baselineFromSamples(this.restComp);
     this.phase = 'move';
     this.moveStart = NaN;
+    this.moveEnteredAt = this.frameLast;
     this.moveSamples = 0;
     this.moveMax = -Infinity;
     this.peaks = [];
@@ -1239,6 +1311,7 @@ export class RomCalibrator {
     this.frameLast = NaN;
     this.frameGaps = [];
     this.moveStart = NaN;
+    this.moveEnteredAt = NaN;
     this.moveSamples = 0;
     this.moveMax = -Infinity;
     this.min = null;
@@ -1468,6 +1541,13 @@ export class RomCalibrator {
         : `Not enough movement was detected (${this.formatRom()}). Try a bigger movement, move closer to the camera, or let the therapist adjust the range manually.`;
     } else if (this.error === 'no_reps') {
       message = this.noRepsMessage();
+    } else if (this.error === 'not_tracked') {
+      // The camera is working; this LANE's landmarks are not arriving. Naming the difference is the
+      // whole point — "make a bigger movement" is useless advice to a foot that is out of shot.
+      const seen = this.frames > 0 ? Math.round((this.trackedFrames / this.frames) * 100) : 0;
+      message =
+        `This movement could not be read from the camera: ${this.frames} frames arrived and ${seen}% of them carried a reading for this lane. ` +
+        `The limb this lane measures (not necessarily the one you can see) has to be fully in frame — move the chair or the camera back until it is, then measure again.`;
     } else message = this.manualAdjusted ? 'Range set manually by the therapist.' : 'Calibration complete.';
     const min = this.phase === 'rest' ? (this.restSamples.length > 0 ? median(this.restSamples) : null) : this.min;
     const rest = this.getRestQuality();

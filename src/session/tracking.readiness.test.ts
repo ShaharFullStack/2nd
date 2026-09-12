@@ -121,3 +121,62 @@ describe('cameraReadiness', () => {
     expect(r.wont.join(' ')).toContain('dips to 9 fps');
   });
 });
+
+/**
+ * TWO THINGS THIS SCREEN USED TO SAY THAT WERE NOT TRUE.
+ *
+ * Both were found by driving the real app rather than by reading the code, and both are the same
+ * class of bug: a number that cannot be produced being reported as a condition of a working session.
+ */
+describe('cameraReadiness tells the truth about what it measured', () => {
+  it('a DEAD frame rate is blocked, not "the session will run, with limits: 0 fps"', () => {
+    // `frameIntervalMs` returns null at a median of 0, so the timing branch used to be SKIPPED and
+    // the verdict fell through to `degraded` — printing "This device will run the session, with
+    // limits: 0 fps, landmarks usable for 84 % of the session" next to a badge reading "0 fps".
+    const r = cameraReadiness(q({ fpsMedian: 0, fpsLow: 0, trackedFraction: 0.84, inferenceMsMedian: 5806 }), MEDIUM);
+    expect(r.kind).toBe('blocked');
+    expect(r.gate).toBe(true);
+    expect(r.headline).toMatch(/No frames are being processed/);
+    expect(r.headline).not.toMatch(/will run the session/);
+    expect(r.wont.join(' ')).toMatch(/nothing is being timed/);
+    // It is a gate that clears by itself, like every other one here.
+    expect(r.action).toMatch(/clears by itself/);
+  });
+
+  it('"nothing is being tracked" is not said over a preview that is tracking something', () => {
+    // `trackedFraction` is EVERY prescribed lane at once (VisionStatus.tracking), so one hand of a
+    // bilateral prescription drifting out of frame takes it to zero while the other is drawn, live,
+    // on the preview the patient is looking at.
+    const partial = cameraReadiness(
+      q({ trackedFraction: 0, samples: READINESS_SAMPLES }),
+      MEDIUM,
+      { anyLandmarksFraction: 0.9 },
+    );
+    expect(partial.gate).toBe(true);
+    expect(partial.headline).toBe('Part of this prescription is out of frame.');
+    expect(partial.headline).not.toMatch(/Nothing is being tracked/);
+    expect(partial.wont.join(' ')).toMatch(/90 % of these readings/);
+    expect(partial.action).toMatch(/every prescribed limb/);
+
+    // And when there genuinely is nothing, the old sentence is still the right one.
+    const nothing = cameraReadiness(
+      q({ trackedFraction: 0, samples: READINESS_SAMPLES }),
+      MEDIUM,
+      { anyLandmarksFraction: 0 },
+    );
+    expect(nothing.headline).toBe('Nothing is being tracked on this camera yet.');
+  });
+
+  it('claims neither when nothing could say which it is', () => {
+    const r = cameraReadiness(q({ trackedFraction: 0, samples: READINESS_SAMPLES }), MEDIUM);
+    expect(r.headline).toBe('Not every prescribed limb is being tracked yet.');
+  });
+
+  it('a blocked device is told it can be restarted AND gone on from — the two hands-free choices', () => {
+    const r = cameraReadiness(q({ fpsMedian: 5, fpsLow: 4, inferenceMsMedian: 190 }), MEDIUM);
+    expect(r.kind).toBe('blocked');
+    expect(r.action).toMatch(/Restarting the camera/);
+    expect(r.action).toMatch(/going on anyway/i);
+    expect(r.action).toMatch(/keyboard/i);
+  });
+});

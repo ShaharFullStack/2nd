@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
 import type { SongManifest } from '../audio/manifest.ts';
 import { DIFFICULTIES, windowsForLanes } from '../engine/difficulty.ts';
@@ -25,7 +25,10 @@ import type { OverlayPanelBox } from '../render/geometry.ts';
 import { getPalette, laneColor, laneLabel, withAlpha } from '../render/palette.ts';
 import type { LaneSpec } from '../engine/types.ts';
 import CameraFallback from './CameraFallback.tsx';
+import { reconcileDelegateHint } from './CameraCheck.tsx';
 import { CameraPreview } from './CameraPreview.tsx';
+import { DwellLegend, DwellTarget, pairedDwellTargets, useDwellTargets } from './DwellTarget.tsx';
+import type { DwellChoice } from './DwellTarget.tsx';
 import { Meter, Toast, laneName } from './common.tsx';
 
 /**
@@ -476,6 +479,10 @@ export default function PlayScreen() {
   const inputMode = useStore((s) => s.inputMode);
   /** The prescription, for naming a lane in the messages a therapist has to act on. */
   const lanes = useStore((s) => s.lanes);
+  /** Where the hands-free targets go and which limb they follow (a hand, or a knee). */
+  const mode = useStore((s) => s.mode);
+  const setHandsFree = useStore((s) => s.setHandsFree);
+  const reducedMotion = useStore((s) => s.settings.reducedMotion);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const pipRef = useRef<HTMLDivElement>(null);
@@ -589,6 +596,13 @@ export default function PlayScreen() {
    * so this is a key comparison at 2 Hz, and the watchdogs it reports on are measured in seconds.
    */
   const [liveWarnings, setLiveWarnings] = useState<string[]>([]);
+  /**
+   * The inference backend the live warnings are describing. Sampled with them, because one of those
+   * sentences ends "or use a machine with graphics acceleration" and neither this screen nor the
+   * pause dialog may print that over a session already running on the GPU — see
+   * `reconcileDelegateHint`.
+   */
+  const [visionDelegate, setVisionDelegate] = useState<'GPU' | 'CPU' | null>(null);
   useEffect(() => {
     const src = selfReporting(input);
     if (!src) {
@@ -605,13 +619,14 @@ export default function PlayScreen() {
       // The conditions the session's own figures are measured in, sampled from the same report the
       // therapist is being shown. Only while the song is running: the seconds spent on the count-in
       // (or paused, with the patient resting) are not the session's tracking quality.
-      if (phaseRef.current === 'playing') trackingRef.current.sample(status);
+      if (phaseRef.current === 'playing') trackingRef.current.sample(status, lanes.length);
       const faults = faultedLanes(status);
       runnerRef.current?.highway.setLaneFaults(faults);
       const words = status.warnings ?? [];
-      const key = `${faults.join(',')}${words.join(' ')}`;
+      const key = `${faults.join(',')}${words.join(' ')}${status.delegate ?? ''}`;
       if (key === lastKey) return;
       lastKey = key;
+      setVisionDelegate(status.delegate ?? null);
       setLiveWarnings(words.slice());
     };
     poll();
@@ -869,6 +884,69 @@ export default function PlayScreen() {
     await visionAttempt.current?.catch(() => undefined);
   }, []);
 
+  /**
+   * THE CAMERA STAYS UP FOR A CAMERA SESSION, WHICHEVER WAY THE PATIENT GOT HERE.
+   *
+   * `handsFree` decides whether the device is released when play ends (`screenNeedsCamera` in
+   * session/runtime.ts), and it used to be set ONLY by the first dwell confirm. That made the two
+   * failures on this path compound: a patient whose therapist had to tap them past a blocked camera
+   * check had never confirmed anything, so the results screen — which ends in "Play again" and "New
+   * session" — offered them no targets and no camera to hold one with. The person least able to
+   * reach the tablet was the one guaranteed to be handed two buttons.
+   *
+   * So the evidence is widened to what it always meant: this session is DRIVEN BY THE CAMERA, the
+   * patient's limb is the controller, and there may be nobody else in the room. A keyboard or
+   * autoplay run releases the device exactly as before. The results screen says out loud that the
+   * camera is still on and carries the control that turns it off, which is the honest half of this.
+   */
+  useEffect(() => {
+    if (inputMode === 'camera') setHandsFree(true);
+  }, [inputMode, setHandsFree]);
+
+  /**
+   * THE SONG STOPS ITSELF, AND SOMEBODY HAS TO BE ABLE TO START IT AGAIN.
+   *
+   * `GameRunner` pauses the run the moment the page is hidden — a tablet that locks, an OS
+   * notification, a switch to another app — because a backgrounded page gets no animation frames
+   * while the audio clock keeps running, and the song would otherwise return as a wall of misses
+   * nobody had a chance at. That protection is right and it stays. What was wrong is that the dialog
+   * it raises had two BUTTONS on it and nothing else: a patient alone, whose hands are the input
+   * device, was left with a stopped song and no way to restart it or to end the session.
+   *
+   * PREVENTION VERSUS CURE, since the cheaper-looking fix is to stop auto-pausing a hands-free
+   * session: not pausing means the song plays on to a room nobody can see the screen from and comes
+   * back as misses the patient never had a chance to answer — a new lie to replace an old dead end,
+   * on the one screen where a miss is a statement about a limb. So the pause stays and gets an exit:
+   * two targets, forward (resume) and back (end and see the results), drawn large on the preview.
+   *
+   * AND IT REALLY WORKS, unlike the audio-clock case below: `AudioContext.resume()` needs a user
+   * gesture only to LEAVE the autoplay-policy suspension it starts in. This context was unlocked by
+   * the therapist's tap before the session began; a pause/resume pair on an already-running context
+   * needs no gesture at all, which is why this dialog can be answered with a limb and the stalled-
+   * clock dialog underneath cannot.
+   */
+  const pauseChoices: DwellChoice[] = useMemo(() => {
+    if (inputMode !== 'camera' || !paused) return [];
+    const [go, back] = pairedDwellTargets(mode);
+    return [
+      {
+        id: 'resume',
+        target: go,
+        label: 'Carry on',
+        onConfirm: () => void runnerRef.current?.resume(),
+        tone: 'go',
+      },
+      {
+        id: 'end',
+        target: back,
+        label: 'Stop here',
+        onConfirm: () => runnerRef.current?.quit(),
+        tone: 'back',
+      },
+    ];
+  }, [inputMode, paused, mode]);
+  const pauseDwell = useDwellTargets(pauseChoices);
+
   if (phase === 'camera') return <CameraFallback error={cameraError} onRetry={retryCamera} retries={attempt} />;
 
   const countdown = hud?.countdown ?? 0;
@@ -942,12 +1020,15 @@ export default function PlayScreen() {
                 )}
                 {liveWarnings.map((w, i) => (
                   <p key={w} data-testid={`play-alert-${i}`}>
-                    {w}
+                    {reconcileDelegateHint(w, visionDelegate)}
                   </p>
                 ))}
               </div>
             )}
-            <CameraPreview className="pip-video" />
+            {/* THE APP HAS EXACTLY ONE <video> (see CameraPreview) and the pause dialog borrows it for
+                its hands-free targets, so the thumbnail stands down while that dialog is up rather
+                than the two fighting over the element. */}
+            {!paused && <CameraPreview className="pip-video" />}
             <LaneMeters
               source={input}
               threshold={threshold}
@@ -1074,22 +1155,58 @@ export default function PlayScreen() {
                   </Toast>
                 </div>
               )}
-              <p className="muted">The song and the chart restart together — the patient will not lose their place.</p>
+              {/* THE PATIENT'S OWN WAY OUT OF A PAUSE THEY DID NOT ASK FOR — FIRST ON THE DIALOG.
+                  It is first because it is the ESCAPE. Below the prose and the live diagnostics it was
+                  measured at 1024x768 with its rings starting 680 px down a 768 px screen: a way out
+                  that has to be scrolled to is no way out for somebody who cannot touch the tablet.
+                  Everything that EXPLAINS the pause now sits under the two circles. */}
+              {pauseChoices.length > 0 && (
+                <div className="stack" data-testid="pause-handsfree" style={{ gap: 8, alignItems: 'center' }}>
+                  <div style={{ width: 'min(320px, 100%)' }}>
+                    <CameraPreview overlay>
+                      {pauseChoices.map((choice) => (
+                        <DwellTarget
+                          key={choice.id}
+                          choice={choice}
+                          state={pauseDwell.states[choice.id]}
+                          reducedMotion={reducedMotion}
+                          xScale={pauseDwell.xScale}
+                          testId={`pause-dwell-${choice.id}`}
+                        />
+                      ))}
+                    </CameraPreview>
+                  </div>
+                  <DwellLegend
+                    session={pauseDwell}
+                    what="the left circle to carry on with the song, the right one to stop and see the results"
+                    testId="pause-dwell-legend"
+                  />
+                </div>
+              )}
+              <div className="row">
+                <button className="btn btn-primary btn-lg grow" onClick={() => void runnerRef.current?.resume()}>
+                  Resume
+                </button>
+                <button className="btn btn-lg" onClick={() => runnerRef.current?.quit()} data-testid="end-session">
+                  End &amp; see results
+                </button>
+              </div>
               {/* THE WORDS FOR THE MARK THE PAUSE PUTS ON EVERY METER. While the session is stopped the
                   camera keeps running and the patient keeps moving, but the engine discards every input
-                  — so both live meters blank to "no reading" (a broken ring with ❚❚ in it, and a dashed
-                  bar outline) rather than gauge a rep that cannot count. A therapist between patients
-                  must be able to read that off this screen instead of being taught it. */}
+                  — so both live meters blank to "no reading" (a broken ring with the pause bars in it,
+                  and a dashed bar outline) rather than gauge a rep that cannot count. A therapist
+                  between patients must be able to read that off this screen instead of being taught it. */}
               <p className="muted">
-                Movement is not being scored while paused, so every receptor and every bar shows{' '}
-                <strong>no reading</strong> (❚❚) — including any rep the patient makes now. Resume first.
+                The song and the chart restart together — the patient will not lose their place. Movement is not
+                being scored while paused, so every receptor and every bar shows <strong>no reading</strong> (❚❚),
+                including any rep the patient makes now.
               </p>
-              {/* The live input-layer warnings, at full width: a therapist who pauses to work out why
-                  a lane is not scoring should not have to read them out of a 200 px panel. These are
-                  about the patient IN FRONT OF THEM right now, so they stay in the open. */}
+              {/* The live input-layer warnings, at full width: they are about the patient IN FRONT OF
+                  the therapist right now, so they stay in the open — but under the way out, because a
+                  warning is not an escape. */}
               {liveWarnings.map((w) => (
                 <Toast kind="bad" key={w}>
-                  {w}
+                  {reconcileDelegateHint(w, visionDelegate)}
                 </Toast>
               ))}
               {/* THE CHART NOTES ARE FOLDED AWAY, and that is a decision about what this dialog is for.
@@ -1111,14 +1228,6 @@ export default function PlayScreen() {
                   </div>
                 </details>
               )}
-              <div className="row">
-                <button className="btn btn-primary btn-lg grow" onClick={() => void runnerRef.current?.resume()}>
-                  Resume
-                </button>
-                <button className="btn btn-lg" onClick={() => runnerRef.current?.quit()} data-testid="end-session">
-                  End &amp; see results
-                </button>
-              </div>
               {hud && (
                 <div className="row dim mono">
                   <span>{hud.score.toLocaleString()} pts</span>
@@ -1131,18 +1240,51 @@ export default function PlayScreen() {
           </div>
         )}
 
+        {/*
+          THE ONE THING ON THIS SCREEN THAT CANNOT BE DONE HANDS-FREE, said in those words.
+          -------------------------------------------------------------------------------
+          When the browser itself suspends the AudioContext, only a TRUSTED user gesture can start it
+          again: that is a rule of the browser, not a decision of this app, and no camera gesture, no
+          dwell hold and no amount of movement can substitute for it. Everything else a patient alone
+          can reach in this app has a hands-free way forward and a hands-free way back; this does not,
+          and pretending otherwise — a "Tap to resume" button with no explanation next to a patient
+          whose hands are the input device — leaves them holding a limb at a frozen screen working out
+          why nothing is happening.
+
+          So it says so, and it makes the gesture as easy as a gesture can be: the WHOLE overlay is
+          the control, so any touch anywhere on the screen (an elbow, a knuckle, a helper's finger)
+          restarts the clock, and the session picks up where it stopped.
+        */}
         {hud?.clockStalled && (
-          <div className="overlay">
+          <button
+            className="overlay"
+            data-testid="clock-stalled"
+            /* A full-bleed control rather than a small button in the middle of one: any touch
+               anywhere on the screen is the gesture. Inline because this is the only place in the
+               app where an `.overlay` is itself the control. */
+            style={{ border: 0, padding: 0, font: 'inherit', color: 'inherit', textAlign: 'inherit', cursor: 'pointer' }}
+            onClick={() => {
+              void runtime.ensureAudio().then(() => {
+                if (runnerRef.current?.getPhase() === 'paused') void runnerRef.current.resume();
+              });
+            }}
+          >
             <div className="card stack">
-              <h2>Audio clock stopped</h2>
+              <h2>The sound has stopped, and only a touch can start it again</h2>
               <p className="muted">
-                The browser suspended the audio context, which is the clock this game runs on. Tap to resume.
+                The browser suspended the audio, which is the clock this game keeps time by. Browsers only allow sound to
+                be started again by a touch or a key press — a movement in front of the camera cannot do it, so this is
+                the one step of the session that needs a hand on the screen or somebody to help.
               </p>
-              <button className="btn btn-primary btn-lg" onClick={() => void runtime.ensureAudio()}>
-                Resume audio
-              </button>
+              <p className="muted">
+                <strong>Touch anywhere on this screen</strong> — anywhere at all — and the song carries on from where it
+                stopped. Nothing has been lost and nothing was counted as missed while it was quiet.
+              </p>
+              <span className="btn btn-primary btn-lg" data-testid="clock-stalled-resume">
+                Touch anywhere to carry on
+              </span>
             </div>
-          </div>
+          </button>
         )}
       </div>
     </div>

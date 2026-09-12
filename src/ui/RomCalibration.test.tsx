@@ -313,19 +313,44 @@ describe('Easier / Harder say what they will do, in the movement’s own units',
  * THE HANDS-FREE PAIR — and in particular the state a patient working alone can most easily be
  * trapped in.
  *
- * Everything on this screen except "go on" and "do it again" is a therapist's decision about the
+ * Everything on this screen except "go on" and "back" is a therapist's decision about the
  * DENOMINATOR of the whole record (easier, harder, reuse last session's range), and none of those is
  * put behind a dwell target. Redo is not in that class: it is the patient's own account of their own
  * attempt, it destroys nothing that was not measured thirty seconds ago — and when the attempt
  * produced nothing usable it is the ONLY thing that can move a patient alone at all, because the
  * forward target is correctly dead and the calibrator will not measure again until somebody asks.
+ *
+ * THE BACK CIRCLE EXISTS IN EVERY STATE, which is what these tests are really about. A confirm LANDS
+ * on a lane in its rest hold, where nothing has been measured — and that used to be the one state
+ * with no dwell targets at all, so an accidental advance locked the previous lane's range in as the
+ * denominator of the session with no patient-reachable way back to it.
  */
 describe('the hands-free pair on the ROM screen', () => {
-  it('offers nothing to hold while the range is still being measured', () => {
+  it('still offers a way BACK while the range is being measured — the forward circle alone is dead', () => {
     render(<RomCalibrationScreen />);
-    expect(screen.queryByTestId('rom-handsfree')).toBeNull();
-    expect(screen.queryByTestId('rom-dwell-next')).toBeNull();
-    expect(screen.queryByTestId('rom-dwell-redo')).toBeNull();
+    // Nothing measured yet, so going on is (correctly) impossible…
+    expect(screen.getByTestId('rom-dwell-next').dataset.phase).toBe('off');
+    // …but the patient is not stranded in the state a confirm lands in.
+    expect(screen.getByTestId('rom-handsfree')).toBeTruthy();
+    expect(screen.getByTestId('rom-dwell-redo').dataset.phase).not.toBe('off');
+    // On the FIRST lane, back means the screen before this one.
+    expect(screen.getByTestId('rom-dwell-redo').textContent).toContain('Camera check');
+  });
+
+  it('on a later lane the back circle goes back a MOVEMENT — the undo of the confirm that landed there', async () => {
+    fake.mirrored = true;
+    saveRange(pinchCal('pinky', true));
+    render(<RomCalibrationScreen />);
+    // Lane 1 gets a range and hands over to lane 2, exactly as the forward circle would.
+    fireEvent.click(await screen.findByTestId('rom-reuse'));
+    await waitFor(() => expect((screen.getByTestId('rom-next') as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(screen.getByTestId('rom-next'));
+    await waitFor(() => expect(screen.getByTestId('rom-lane-badge-1').textContent).toBe('●'));
+
+    // Lane 2 is in its rest hold with nothing measured: the back circle is the way back to lane 1.
+    expect(screen.getByTestId('rom-dwell-next').dataset.phase).toBe('off');
+    expect(screen.getByTestId('rom-dwell-redo').textContent).toContain('Back a movement');
+    expect(screen.getByTestId('rom-handsfree-note').textContent).toContain('the movement before this one');
   });
 
   it('offers both circles once the runtime holds a range for the lane', async () => {

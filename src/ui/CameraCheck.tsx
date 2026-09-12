@@ -12,9 +12,29 @@ import type { InvalidCalibration } from '../input/VisionInput.ts';
 import type { DetectionResult } from '../vision/mediapipe.ts';
 import { drawDetection } from './overlay.ts';
 import CameraFallback from './CameraFallback.tsx';
-import { DwellLegend, DwellTarget, singleDwellTarget, useDwellTargets } from './DwellTarget.tsx';
+import { DwellLegend, DwellTarget, pairedDwellTargets, useDwellTargets } from './DwellTarget.tsx';
 import type { DwellChoice } from './DwellTarget.tsx';
 import { Screen, Toast, TopBar, laneName } from './common.tsx';
+
+/**
+ * A REMEDY MAY NOT CONTRADICT THE BADGE NEXT TO IT.
+ *
+ * The input layer's duty-cycling warning ends "Lower the difficulty or use a machine with graphics
+ * acceleration" (src/input/VisionInput.ts). On a machine ALREADY on the GPU delegate that sentence
+ * sits three lines under a badge reading "GPU", telling the therapist to go and get the thing they
+ * have. The warning is right about everything else and is written where the measurement is taken, so
+ * it is not suppressed — only the one clause that is false on this device is replaced, and anything
+ * that does not match is passed through untouched.
+ *
+ * (The source sentence should say this itself; that file is not this screen's to edit.)
+ */
+export function reconcileDelegateHint(warning: string, delegate: 'GPU' | 'CPU' | null): string {
+  if (delegate !== 'GPU') return warning;
+  return warning.replace(
+    /Lower the difficulty or use a machine with graphics acceleration\./,
+    'This machine is already using the GPU, so graphics acceleration is not the remedy: lower the difficulty, close other tabs, or use a machine that can run this model faster.',
+  );
+}
 
 export default function CameraCheck() {
   const goto = useStore((s) => s.goto);
@@ -42,6 +62,12 @@ export default function CameraCheck() {
    */
   const recorder = useRef(new TrackingRecorder());
   const [observed, setObserved] = useState<TrackingQuality | null>(null);
+  /**
+   * Share of the same readings in which AT LEAST ONE prescribed lane had landmarks — the difference
+   * between "nothing is being tracked" and "one hand of a bilateral prescription has drifted out",
+   * which this screen used to print the first sentence for over a preview drawing the second.
+   */
+  const [anyLandmarks, setAnyLandmarks] = useState<number | null>(null);
   /** Lanes the runtime is refusing to score, with the reason (see the refusal block in the panel). */
   const [refusals, setRefusals] = useState<InvalidCalibration[]>([]);
   /** The thrown value, not a string: CameraFallback classifies a DOMException by its `name`. */
@@ -104,8 +130,14 @@ export default function CameraCheck() {
       if (!vision) return;
       const s = vision.getStatus();
       setStatus(s);
-      recorder.current.sample(s);
-      setObserved(recorder.current.summary());
+      // The lane count is what lets the recorder tell "no limb at all" from "one of two limbs has
+      // drifted out of frame" — `VisionStatus.tracking` is every lane at once and cannot.
+      recorder.current.sample(s, lanes.length);
+      // THE VERDICT IS TAKEN OVER THE LAST FEW SECONDS, NOT OVER THE WHOLE VISIT. See
+      // `TrackingRecorder.recent`: a cumulative median cannot come back, so a tablet that was busy
+      // when this screen opened could never clear the gate again however well it ran afterwards.
+      setObserved(recorder.current.recent());
+      setAnyLandmarks(recorder.current.anyLandmarksFraction());
       const bad = vision.getInvalidCalibrations();
       setRefusals((prev) =>
         prev.length === bad.length && prev.every((r, i) => r.lane === bad[i].lane && r.reason === bad[i].reason)
@@ -125,6 +157,7 @@ export default function CameraCheck() {
       setRefusals([]);
       recorder.current = new TrackingRecorder();
       setObserved(null);
+      setAnyLandmarks(null);
     };
   }, [mode, lanes, calibrations, difficulty, settings.mirrored, attempt]);
 
@@ -141,6 +174,7 @@ export default function CameraCheck() {
     setRefusals([]);
     recorder.current = new TrackingRecorder();
     setObserved(null);
+    setAnyLandmarks(null);
     setStarting(true);
     setStartedAt(Date.now());
     setAttempt((n) => n + 1);
@@ -163,6 +197,27 @@ export default function CameraCheck() {
   }, [starting, startedAt]);
 
   const tracking = status?.tracking === true;
+  /**
+   * `VisionStatus.tracking` IS "EVERY LANE AT ONCE" (src/input/types.ts) — so on a bilateral
+   * prescription one hand leaving the frame turns this badge off while the preview goes on drawing a
+   * perfectly tracked skeleton of the other. The badge now says which of the two states it is in and
+   * names the lane, because "not detected" over a visibly tracked limb is the screen contradicting
+   * its own picture.
+   */
+  const partlyTracked =
+    status !== null && !tracking && (status.untrackedLanes?.length ?? lanes.length) < lanes.length;
+  const trackingBadge = (() => {
+    if (tracking) return mode === 'leg' ? 'Person detected' : 'Hand detected';
+    if (partlyTracked) {
+      const missing = status?.untrackedLanes ?? [];
+      const names = missing.map((i) => {
+        const spec = lanes[i];
+        return spec ? `lane ${i + 1} (${laneName(spec)})` : `lane ${i + 1}`;
+      });
+      return `Partly in frame — no landmarks for ${names.join(', ')}`;
+    }
+    return status?.message ?? 'Looking…';
+  })();
   const postures = requiredPostures(lanes);
 
   /**
@@ -182,32 +237,71 @@ export default function CameraCheck() {
   }, [lanes, difficulty, windowScale]);
 
   const readiness: DeviceReadiness = useMemo(
-    () => cameraReadiness(starting ? null : observed, windows),
-    [starting, observed, windows],
+    () => cameraReadiness(starting ? null : observed, windows, { anyLandmarksFraction: anyLandmarks }),
+    [starting, observed, windows, anyLandmarks],
   );
 
   /**
-   * THE HANDS-FREE PATH PAST THIS SCREEN.
+   * THE HANDS-FREE PATH PAST THIS SCREEN — AND BACK.
    *
-   * `camera-continue` is an acknowledgement, not a choice — its gate is already computed from what
-   * vision is reporting (`readiness.gate`) — so the patient holding a limb over the target confirms
-   * exactly what the button confirms, under exactly the same gate. The button stays: a therapist in
-   * the room is faster with it, and it is the only path while the readiness gate is closed.
+   * WHAT THIS USED TO BE, AND WHY IT WAS THE WORST BUG IN THE FEATURE. There was one target, and it
+   * was `enabled: !readiness.gate`. A disabled choice gets no tracker at all, so its phase is 'off'
+   * and its progress is pinned at 0: the ring is STRUCTURALLY INCAPABLE of filling, and no amount of
+   * holding does anything. The gate closes whenever one frame interval exceeds the widest hit window
+   * in force — on `hard` that is anything under 9 fps, which MediaPipe Pose on a CPU-delegate clinic
+   * tablet sits at routinely — and every escape from it was a button roughly 400 px below the fold
+   * at 1024x768. A patient alone on a blocked camera check had no way forward and no way back: the
+   * hands-free claim failed on its first screen.
+   *
+   * WHAT IT IS NOW. Two targets, ALWAYS enabled once the camera is up, drawn on the preview, which
+   * is the top of the screen:
+   *
+   *  - FORWARD. When the device passes, it says "Continue" and means it. When the device is BLOCKED
+   *    it says "Go on anyway" — because a device too slow to place a repetition inside a hit window
+   *    is still perfectly able to track a limb parked on a circle, so the gate is a statement about
+   *    the MEASUREMENT and not about the patient's ability to answer. What it costs is said in the
+   *    patient's own words beside the preview (`blockedNote`) rather than left in a card they would
+   *    have to scroll to: the session still plays and the movements are still recorded, the timing
+   *    and the ranges are qualified, and nothing here pretends otherwise.
+   *  - BACK. "Restart the camera" — the same `retry` the button performs, which is the only thing
+   *    that fixes a camera that came up wrong, and which a patient alone could previously only reach
+   *    by touching the tablet. Reversal has to be at least as reachable as activation, and on this
+   *    screen the thing to reverse is a device verdict.
+   *
+   * The gate still gates the THERAPIST's primary button — that is what stops an appointment being
+   * spent on a stream that cannot be measured — and the "Go on anyway" it now names is deliberately
+   * a second, differently worded control rather than the green one.
    */
-  const dwellChoices: DwellChoice[] = useMemo(
-    () => [
+  const dwellChoices: DwellChoice[] = useMemo(() => {
+    if (starting) return [];
+    const [go, back] = pairedDwellTargets(mode);
+    return [
       {
         id: 'continue',
-        target: singleDwellTarget(mode),
-        label: 'Continue',
-        enabled: !readiness.gate && !starting,
-        disabledNote: 'Not yet',
+        target: go,
+        label: readiness.gate ? 'Go on anyway' : 'Continue',
         onConfirm: () => goto('rom'),
+        tone: 'go',
       },
-    ],
-    [mode, readiness.gate, starting, goto],
-  );
+      {
+        id: 'restart',
+        target: back,
+        label: 'Restart camera',
+        onConfirm: () => void retry(),
+        tone: 'back',
+      },
+    ];
+  }, [mode, readiness.gate, starting, goto, retry]);
   const dwell = useDwellTargets(dwellChoices);
+
+  /**
+   * WHAT GOING ON ANYWAY COSTS, said where the patient is already looking.
+   *
+   * The readiness card states this in full, on the right, below the fold at clinic-tablet heights.
+   * A hands-free choice whose consequences are only legible to somebody who can scroll is not a
+   * choice the patient made. This is the same verdict, in one sentence, under the preview.
+   */
+  const blockedNote = readiness.gate && readiness.kind === 'blocked' ? readiness.headline : null;
 
   // A camera that never started is not a corner of the camera-check screen — it is the screen.
   if (error !== null) return <CameraFallback error={error} onRetry={retry} retries={attempt} />;
@@ -236,21 +330,24 @@ export default function CameraCheck() {
       />
 
       <div className="row" style={{ alignItems: 'flex-start', gap: 24 }}>
-        <div className="stack grow" style={{ gap: 14, maxWidth: 760 }}>
+        {/* 520 px, not 760: at 1024x768 a 4:3 preview as wide as the column put the sentence that says
+            which circle does what — and the limb the app is following — off the bottom of the screen.
+            The targets are a fraction of the frame, so they scale with it and stay reachable. */}
+        <div className="stack grow" style={{ gap: 14, maxWidth: 520 }}>
         {/* The preview (and the overlay with it) is always CSS-mirrored: the patient expects a mirror,
             and flipping both together keeps the landmarks on top of the limbs they came from. */}
         <div className="camera-frame mirror" ref={holder}>
           <canvas ref={canvas} />
-          {!starting &&
-            dwellChoices.map((choice) => (
-              <DwellTarget
-                key={choice.id}
-                choice={choice}
-                state={dwell.states[choice.id]}
-                reducedMotion={settings.reducedMotion}
-                testId={`camera-dwell-${choice.id}`}
-              />
-            ))}
+          {dwellChoices.map((choice) => (
+            <DwellTarget
+              key={choice.id}
+              choice={choice}
+              state={dwell.states[choice.id]}
+              reducedMotion={settings.reducedMotion}
+              xScale={dwell.xScale}
+              testId={`camera-dwell-${choice.id}`}
+            />
+          ))}
           {starting && (
             <div className="overlay" data-testid="camera-starting">
               <div className="card stack" style={{ maxWidth: 420 }}>
@@ -296,17 +393,38 @@ export default function CameraCheck() {
           )}
         </div>
 
+        {/* THE VERDICT, ABOVE THE FOLD. Whatever this screen refuses to promise, the patient reads it
+            here — beside the preview they are already looking at and beside the circle that acts on
+            it — and not only in the card on the right, which at 1024x768 is below the fold. */}
+        {blockedNote && (
+          <Toast kind="bad">
+            <strong data-testid="camera-blocked-note">{blockedNote}</strong> Left circle: go on anyway — the song plays
+            and every movement is still counted, but today&rsquo;s timing and ranges carry that. Right circle: restart the
+            camera.
+          </Toast>
+        )}
+
         {/* THE SENTENCE THE RING CANNOT CARRY: what the hold does, and which limb it is following.
             It sits under the preview because that is where the patient is already looking. */}
-        {!starting && <DwellLegend session={dwell} what="to go on to the range check" testId="camera-dwell-legend" />}
+        {!starting && (
+          <DwellLegend
+            session={dwell}
+            what={
+              readiness.gate
+                ? 'the left circle to go on anyway, the right one to restart the camera'
+                : 'the left circle to go on to the range check, the right one to restart the camera'
+            }
+            testId="camera-dwell-legend"
+          />
+        )}
         </div>
 
         <div className="stack" style={{ width: 'min(380px, 100%)' }}>
           <div className="card stack">
             <h3>Tracking</h3>
             <div className="row">
-              <span className={tracking ? 'badge badge-ok' : 'badge badge-warn'}>
-                {tracking ? (mode === 'leg' ? 'Person detected' : 'Hand detected') : (status?.message ?? 'Looking…')}
+              <span className={tracking ? 'badge badge-ok' : 'badge badge-warn'} data-testid="camera-tracking-badge">
+                {trackingBadge}
               </span>
             </div>
             <div className="row">
@@ -338,7 +456,7 @@ export default function CameraCheck() {
               ?.filter((w) => !/calibrat|compensation/i.test(w))
               .slice(0, 3)
               .map((w, i) => (
-                <Toast key={i}>{w}</Toast>
+                <Toast key={i}>{reconcileDelegateHint(w, status?.delegate ?? null)}</Toast>
               ))}
           </div>
 
@@ -401,6 +519,18 @@ export default function CameraCheck() {
               <div className="row">
                 <button className="btn" onClick={() => void retry()} data-testid="camera-readiness-retry">
                   Restart the camera
+                </button>
+                {/* THE SAME CHOICE THE PATIENT HAS. The hands-free target above can go on from a
+                    blocked device, so the therapist must be able to as well — differently worded and
+                    not the primary green button, because the gate's job is to stop somebody walking
+                    forward UNAWARE, not to make the decision for them. */}
+                <button
+                  className="btn"
+                  onClick={() => goto('rom')}
+                  title={readiness.wont.join(' ')}
+                  data-testid="camera-readiness-continue-anyway"
+                >
+                  Go on anyway (nothing above is measured any better)
                 </button>
                 <button
                   className="btn btn-ghost"

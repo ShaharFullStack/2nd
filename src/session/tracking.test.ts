@@ -187,3 +187,54 @@ describe('the mix stated under a set of plotted sessions', () => {
     expect(trackingMixOfGrades([])).toEqual({ total: 0, degraded: 0, unrecorded: 0 });
   });
 });
+
+/**
+ * THE VERDICT MUST BE ABLE TO CHANGE ITS MIND; THE RECORD MUST NOT.
+ *
+ * The camera check's readiness gate was taken off a CUMULATIVE median over an unbounded array that
+ * was never windowed and never reset while the screen was up. A clinic tablet that ran at 4 fps for
+ * its first minute — downloading the model, or behind another app's compositing — could not clear
+ * the gate for the rest of the visit however well it ran afterwards; the only thing that reset it
+ * was the "Restart the camera" BUTTON, which is exactly what a patient working alone cannot press.
+ */
+describe('TrackingRecorder: the window and the record', () => {
+  const slow = () => status({ fps: 4, inferenceMs: 240, tracking: false, reason: 'no_person', untrackedLanes: [0, 1] });
+  const fast = () => status({ fps: 30, inferenceMs: 12 });
+
+  it('recovers: a device that was slow and is now fast reports a fast WINDOW', () => {
+    const r = new TrackingRecorder();
+    for (let i = 0; i < 120; i++) r.sample(slow(), 2);
+    expect(r.recent()?.fpsMedian).toBe(4);
+    // Six seconds of a healthy stream is enough to say so — without touching anything.
+    for (let i = 0; i < 20; i++) r.sample(fast(), 2);
+    expect(r.recent()?.fpsMedian).toBe(30);
+    expect(r.recent()?.trackedFraction).toBe(1);
+  });
+
+  it('…while the SESSION block still describes the whole session, slow minute included', () => {
+    const r = new TrackingRecorder();
+    for (let i = 0; i < 120; i++) r.sample(slow(), 2);
+    for (let i = 0; i < 20; i++) r.sample(fast(), 2);
+    const whole = r.summary();
+    expect(whole?.samples).toBe(140);
+    expect(whole?.fpsMedian).toBe(4);
+    expect(whole?.trackedFraction).toBeCloseTo(20 / 140, 6);
+  });
+
+  it('tells "no limb at all" from "one limb of two out of frame"', () => {
+    const none = new TrackingRecorder();
+    for (let i = 0; i < 10; i++) none.sample(status({ tracking: false, reason: 'no_person', untrackedLanes: [0, 1] }), 2);
+    expect(none.anyLandmarksFraction()).toBe(0);
+
+    const half = new TrackingRecorder();
+    for (let i = 0; i < 10; i++) half.sample(status({ tracking: false, reason: 'low_visibility', untrackedLanes: [1] }), 2);
+    expect(half.anyLandmarksFraction()).toBe(1);
+    expect(half.recent()?.trackedFraction).toBe(0);
+  });
+
+  it('says "unknown" rather than guessing when the lane count was never supplied', () => {
+    const r = new TrackingRecorder();
+    for (let i = 0; i < 10; i++) r.sample(status({ tracking: false, reason: 'no_person', untrackedLanes: [0] }));
+    expect(r.anyLandmarksFraction()).toBeNull();
+  });
+});
