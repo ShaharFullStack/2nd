@@ -766,14 +766,16 @@ describe('THE PRESCRIBED EXERCISE MAY NOT ANSWER FOR THE PATIENT', () => {
       aspect: PREVIEW_ASPECT,
       authored: pairedDwellTargets('leg'),
       seconds: 30,
-      frame: (t, circles) => {
-        // 4 s at rest INSIDE THE RING, 1.5 s away, repeatedly: the patient reaching for something and
-        // putting their hand back exactly where it was. It is aimed at wherever the ring is, because
-        // the worst version of this case is a hand that lives exactly where the circle is drawn — and
-        // the ring may have moved. The hand is otherwise supported (a chair arm), so the point of the
-        // case is the placement and the band, not the coupling.
+      frame: (t) => {
+        // 4 s at rest INSIDE THE RING AS AUTHORED, 1.5 s away, repeatedly: the patient reaching for
+        // something and putting their hand back exactly where it was. A hand that lives where the
+        // circle is drawn is the worst version of this case, and the hand does NOT chase the ring when
+        // the layout moves it — that would be a patient following a circle around the preview, which is
+        // not a body. The hand is otherwise supported (a chair arm), so what is under test here is the
+        // placement and the band, not the coupling.
+        const home = { x: singleDwellTarget('leg').x - 0.02, y: singleDwellTarget('leg').y + 0.01 };
         const away = t % 5.5 >= 4;
-        const left = away ? { x: 0.55, y: 0.72 } : { x: circles[0].x - 0.02, y: circles[0].y + 0.01 };
+        const left = away ? { x: 0.55, y: 0.72 } : home;
         return legFrame({
           movement: 'seated_march',
           side: 'left',

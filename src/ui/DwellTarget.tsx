@@ -1084,10 +1084,10 @@ export function DwellLegend({
    */
   const touchNote =
     touch === 'off'
-      ? 'The button for this step is switched off at the moment, so the circles are the only way on from here.'
+      ? 'The button for this step is switched off at the moment, so the circles are the only way on.'
       : touch === 'on'
         ? 'A button on this screen does the same thing, for anyone who can reach the glass.'
-        : 'Anything other than the circles needs a hand on the glass — and a screen can have its own button switched off, so nothing here promises one.';
+        : 'Anything else needs a hand on the glass, and a screen can have its own button switched off.';
   if (!session.live) {
     return (
       <div className="dwell-legend" data-testid={testId} data-state="offline">
@@ -1167,15 +1167,15 @@ export function DwellLegend({
         {unseen ? (
           <span data-testid={`${testId}-bring-hand`}>
             {mode === 'leg'
-              ? `Bring a hand into the picture — nothing can be held while the camera cannot see one. Rest it on the arm of the chair or a table, NOT on your thigh (your leg carries your thigh, and the app cannot tell a carried hand from a repetition), then hold ${what}. Your knees cannot do this: they are doing the exercise.`
+              ? `Bring a hand into the picture — nothing can be held while the camera cannot see one. Rest it on the arm of the chair or a table, NOT on your thigh (your leg carries your thigh, so a hand there cannot be told apart from a repetition), then hold ${what}. Your knees cannot do this either: they are doing the exercise.`
               : `Bring your hand back into the picture — nothing can be held while the camera cannot see it. Then hold ${what}, without touching the screen.`}
           </span>
         ) : carried ? (
           <span data-testid={`${testId}-carried`}>
             {limb ? `${limb.label[0].toUpperCase()}${limb.label.slice(1)} is` : 'The hand below is'} moving with your
-            exercise — resting on your thigh, it is carried by your leg, so a hold made with it cannot be told apart from
-            a repetition. Rest it on the arm of the chair, an armrest or a table instead — something your leg does not
-            move — and then hold {what}. Your other hand will do just as well.
+            exercise — on your thigh it is carried by your leg, so a hold with it cannot be told apart from a repetition.
+            Rest it on the arm of the chair, an armrest or a table instead, then hold {what}. Your other hand will do
+            just as well.
           </span>
         ) : crowded ? (
           <>
@@ -1219,12 +1219,17 @@ export function DwellLegend({
           already carries the whole explanation, and repeating it here pushed the block 46 px past the
           bottom of a 768 px tablet — so the one thing that is not said above (either limb will do, and
           the buttons are still there) is all that is left here. Measured in the running app. */}
+      {/* THE SMALL PRINT, AND IT HAS TO FIT. Every sentence here is a fact the patient cannot get
+          anywhere else — either side will do, the support has to be furniture rather than the thigh,
+          the knees cannot answer, and what touch is worth on this screen — and the block is read on a
+          768 px tablet by somebody who cannot scroll it. So it is trimmed to those four facts and no
+          explanation: `critic:deadends` measures the whole block against the fold. */}
       <span className="dim" data-testid={`${testId}-limbs`}>
         Either side may do this, including the unaffected one.{' '}
         {unseen
           ? `If no hand can come into the picture, this step has to be done on the screen. ${touchNote}`
           : mode === 'leg'
-            ? `It has to be a hand, resting on something your leg does not move — the arm of the chair, an armrest, a table — and not on your thigh, which your leg carries. Your knees cannot do it at all: a knee held in the circle cannot be told apart from a repetition, so the circles do not follow them. ${touchNote}`
+            ? `Rest it on the arm of the chair, an armrest or a table — not on your thigh, which your leg carries, and not a knee: a knee held in the circle cannot be told apart from a repetition. ${touchNote}`
             : touchNote}
       </span>
     </div>
