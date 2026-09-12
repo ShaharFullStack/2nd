@@ -20,7 +20,8 @@
     "critic:record": "node critic/honest-record.mjs",
     "critic:uneven": "node critic/measured-unevenly.mjs",
     "critic:firstnote": "node critic/first-note.mjs",
-    "critic:handsfree": "node critic/handsfree.mjs"
+    "critic:handsfree": "node critic/handsfree.mjs",
+    "critic:deadends": "node critic/handsfree-dead-ends.mjs"
   },
   "dependencies": {
     "@mediapipe/tasks-vision": "^1.0.1",

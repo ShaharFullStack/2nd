@@ -90,7 +90,7 @@ function mergeQualifiers(parts: readonly (CompareQualifier | null)[]): CompareQu
   return { tag: kept.map((q) => q.tag).join(' \u00b7 '), note: kept.map((q) => q.note).join(' ') };
 }
 
-/** "9 Sep (stopped by therapist, 0:24, 19 movements)" — what a run that ended early actually was. */
+/** "9 Sep (stopped on purpose, 0:24, 19 movements)" — what a run that ended early actually was. */
 function abortedPhrase(s: SessionResult): string {
   return `${shortDate(s.startedAt)} (${endReasonLabel(s.endReason ?? null)}, ${formatDuration(s.durationSec)}, ${s.reps} movement${
     s.reps === 1 ? '' : 's'

@@ -376,7 +376,7 @@ describe('runs that were cut short', () => {
     const [trend] = movementTrends([legacy], PATIENT);
     expect(trend.points[0].endReason).toBeNull();
     expect(endReasonLabel(trend.points[0].endReason)).toBe('ended early');
-    expect(endReasonLabel('quit')).toBe('stopped by therapist');
+    expect(endReasonLabel('quit')).toBe('stopped on purpose');
     expect(endReasonLabel('abandoned')).toBe('interrupted');
   });
 });

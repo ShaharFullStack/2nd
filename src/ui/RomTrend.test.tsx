@@ -437,7 +437,7 @@ describe('the session-by-session list is reachable and ordered like the other sc
     render(<RomTrend history={mixed} patientId={PATIENT} />);
     const rows = [...screen.getByTestId('trend-knee_extension:left').querySelectorAll('.trend-points tbody tr')];
     expect(rows.length).toBe(4);
-    expect(rows.some((r) => (r.textContent ?? '').includes('stopped by therapist'))).toBe(true);
+    expect(rows.some((r) => (r.textContent ?? '').includes('stopped on purpose'))).toBe(true);
   });
 });
 

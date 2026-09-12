@@ -410,9 +410,15 @@ export function mostImprovedRange(summaries: readonly LaneRangeSummary[]): LaneR
  * fact: one is "the patient had had enough at 40 s", the other is "the equipment dropped the
  * session" — and the runner has always known which. A record stored before the reason was persisted
  * says exactly the old thing rather than picking one of the two.
+ *
+ * `quit` used to read "stopped on purpose", which was true while ending a run meant pressing a
+ * button. It does not any more: a patient alone can end their own session by holding a limb on the
+ * "Stop here" target in the pause dialog, and the record cannot tell the two apart. Naming the
+ * therapist would put a person who was not in the room into the clinical record, so it names the
+ * only thing the runner actually knows — that somebody chose to stop.
  */
 export function endReasonLabel(reason: SessionEndReason | null | undefined): string {
-  if (reason === 'quit') return 'stopped by therapist';
+  if (reason === 'quit') return 'stopped on purpose';
   if (reason === 'abandoned') return 'interrupted';
   return 'ended early';
 }

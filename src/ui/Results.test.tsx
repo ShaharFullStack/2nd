@@ -549,7 +549,7 @@ describe('a gain is not a gain when the two sessions were not measured alike', (
  * movement and "Biggest gain since last session: Left Seated march", and a regex over the whole
  * rendered page for /ended early|stopped by|incomplete|did not finish/ matched NOTHING. One screen
  * later the ROM trend sets exactly those runs aside from every figure, and History labels the row
- * "stopped by therapist". Two screens, two rules, and the one a therapist reads first flattered.
+ * "stopped on purpose". Two screens, two rules, and the one a therapist reads first flattered.
  */
 describe('today is compared against a whole session, and the screen says which one', () => {
   /** The walk-out: 24 seconds, 19 movements, stopped by the therapist. */
@@ -575,7 +575,7 @@ describe('today is compared against a whole session, and the screen says which o
 
     const basis = screen.getByTestId('results-comparison-basis');
     expect(basis.textContent).toContain('the last session this patient completed');
-    expect(basis.textContent).toContain('stopped by therapist');
+    expect(basis.textContent).toContain('stopped on purpose');
     expect(basis.textContent).toContain('19 movements');
     // and the card the rows sit in says it too, beside the deltas themselves
     expect(screen.getByTestId('results-today').textContent).toContain('COMPLETED camera session');
