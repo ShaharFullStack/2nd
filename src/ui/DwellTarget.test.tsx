@@ -39,24 +39,41 @@ import {
 import type { DwellChoice, DwellSession } from './DwellTarget.tsx';
 import {
   DWELL_CLEAR_EXTRA,
+  DWELL_CLEAR_MARGIN,
   DWELL_DEFAULTS,
+  DWELL_LIMB_REACH,
+  DWELL_MAX_REACH,
+  DwellCoupling,
+  DwellEngagement,
   DwellHabitat,
   DwellLayout,
   DwellTracker,
   dwellAxisFor,
   dwellDistance,
-  dwellEngaged,
   dwellLimbs,
+  dwellPlaceable,
+  dwellReferences,
   dwellTargetClear,
   dwellTargetsOverlap,
+  dwellWithinLimbReach,
   pickDwellLimb,
+  placeDwellCircle,
   retargetForAspect,
 } from '../vision/dwell.ts';
-import type { DwellCircle, DwellPoint, DwellState } from '../vision/dwell.ts';
-import { SEATED_HAND_RESTS, handPose, reNormalizeAspect, seatedHandsOutOfView, seatedPose, translateLandmarks } from '../vision/fixtures.ts';
-import { POSE } from '../vision/landmarks.ts';
+import type { DwellCircle, DwellHabitatSummary, DwellPoint, DwellState } from '../vision/dwell.ts';
+import {
+  SEATED_HAND_RESTS,
+  SEATED_HAND_SUPPORTS,
+  handPose,
+  mirrorPoseLandmarks,
+  reNormalizeAspect,
+  seatedHandsOutOfView,
+  seatedPose,
+  translateLandmarks,
+} from '../vision/fixtures.ts';
+import type { SeatedHandRest } from '../vision/fixtures.ts';
 import type { DetectionResult } from '../vision/mediapipe.ts';
-import type { Mode, Side } from '../engine/types.ts';
+import type { LaneSpec, Mode, Side } from '../engine/types.ts';
 import { useStore } from '../state/store.ts';
 
 function state(over: Partial<DwellState> = {}): DwellState {
@@ -109,6 +126,8 @@ function placements(mode: Mode): DwellCircle[] {
 /** The aspects the app can actually be handed: a square sensor, the 4:3 it asks for, the 16:9 it gets. */
 const ASPECTS = [1, 4 / 3, 16 / 9];
 const FPS = 30;
+/** The hook's watchdog interval (DwellTarget.tsx `WATCHDOG_MS`), in seconds: the survey cadence. */
+const WATCHDOG_SEC = 0.08;
 
 /**
  * A REPETITION AS A PATIENT PERFORMS ONE. The critic's profile: a 4 s rise, 1.5 s held at the top and a
@@ -118,10 +137,18 @@ const FPS = 30;
  */
 const SLOW_REP = { riseSec: 4, holdSec: 1.5, fallSec: 3 };
 const BRISK_REP = { riseSec: 0.5, holdSec: 0.2, fallSec: 0.5 };
+/**
+ * THE CRITIC'S OWN DUTY CYCLE: 2 s up, 2.5 s at the top, 2 s down, 10 s of rest. It is the profile that
+ * confirmed the primary circle at t = 3.23 s with a hand on the thigh — the long hold at the top is
+ * what fills a ring, and the long rest is what makes the excursion a small enough minority of the
+ * habitat window to leave the order statistics where they were.
+ */
+const CRITIC_REP = { riseSec: 2, holdSec: 2.5, fallSec: 2, restSec: 10 };
 
-function repAmount(t: number, profile: { riseSec: number; holdSec: number; fallSec: number }): number {
+function repAmount(t: number, profile: { riseSec: number; holdSec: number; fallSec: number; restSec?: number }): number {
+  const rest = profile.restSec ?? 0.8;
   const span = profile.riseSec + profile.holdSec + profile.fallSec;
-  const cycle = ((t % (span + 0.8)) + span + 0.8) % (span + 0.8);
+  const cycle = ((t % (span + rest)) + span + rest) % (span + rest);
   if (cycle <= 0) return 0;
   if (cycle < profile.riseSec) return 0.5 * (1 - Math.cos(Math.PI * (cycle / profile.riseSec)));
   if (cycle < profile.riseSec + profile.holdSec) return 1;
@@ -149,6 +176,24 @@ interface DriveOutcome {
    * ring: an honest dead end for that circle, which the legend has to own rather than a ring that
    * looks holdable. */
   unplaceable: boolean;
+  /**
+   * Frames on which a ring was STOOD DOWN because the limb it follows is moving with the exercise —
+   * which only happens when there is no other limb to follow.
+   */
+  coupledFrames: number;
+  /**
+   * Frames on which the coupling gate refused SOME limb, whether or not that cost the screen its
+   * pointer. With two hands in the picture the gate usually shows up as the pick moving to the other
+   * hand rather than as a stood-down ring, and a sweep that only counted stand-downs would read a
+   * working gate as an absent one.
+   */
+  refusedFrames: number;
+  /** Whichever limb the coupling gate refused, and the movement it was following. */
+  coupledBy: string | null;
+  /** Every circle the layout ever put a ring at, so a test can bound where one may be relocated to. */
+  visited: DwellCircle[];
+  /** When the first confirm happened, in seconds — Infinity when nothing ever confirmed. */
+  firstConfirmSec: number;
 }
 
 /**
@@ -163,14 +208,32 @@ function drive(opts: {
   aspect: number;
   authored: DwellCircle[];
   seconds: number;
-  frame: (t: number) => DetectionResult;
+  /**
+   * One frame of the patient. `circles` is where the rings ARE at that instant, because the layout
+   * moves them: a test that aimed a hand at the AUTHORED position would be aiming at a ring that is no
+   * longer there, and would "prove" that a deliberate hold does not work. The harnesses read the same
+   * thing off `data-dwell-x/y` for the same reason.
+   */
+  frame: (t: number, circles: DwellCircle[]) => DetectionResult;
   fps?: number;
   mirrored?: boolean;
+  /** The prescription in force, so the coupling gate correlates against the lane features it would. */
+  lanes?: LaneSpec[];
+  /**
+   * TAKE THE COUPLING GATE OUT — the app as it was before this round. Only one test passes it, and it
+   * is the one that proves the sweep below can actually fail: a proof whose negative control is not
+   * run is a proof that the variable under test was pinned, which is how this feature was lost three
+   * times.
+   */
+  withoutCouplingGate?: boolean;
 }): DriveOutcome {
   const { mode, aspect, authored, seconds, frame } = opts;
   const fps = opts.fps ?? FPS;
+  const mirrored = opts.mirrored ?? false;
   const ids = authored.map((_, i) => `t${i}`);
   const habitat = new DwellHabitat();
+  const coupling = new DwellCoupling();
+  const engagement = new DwellEngagement();
   const clearOpts = {
     xScale: aspect,
     axis: dwellAxisFor(mode),
@@ -185,43 +248,88 @@ function drive(opts: {
   const trackers = new Map(ids.map((id) => [id, new DwellTracker(layout.circleFor(id) as DwellCircle, { xScale: aspect })]));
   let previous: DwellPoint | null = null;
   let previousKey: string | null = null;
-  const out: DriveOutcome = { confirms: 0, standDowns: 0, moves: 0, maxProgress: 0, tracked: 0, frames: 0, finalClear: [], unplaceable: false };
+  const out: DriveOutcome = {
+    confirms: 0,
+    standDowns: 0,
+    moves: 0,
+    maxProgress: 0,
+    tracked: 0,
+    frames: 0,
+    finalClear: [],
+    unplaceable: false,
+    coupledFrames: 0,
+    coupledBy: null,
+    refusedFrames: 0,
+    visited: layout.circles(),
+    firstConfirmSec: Infinity,
+  };
   let summaries = habitat.all(0, aspect);
+  let occupied = new Map<string, boolean>();
+  // THE HOOK SURVEYS ON ITS WATCHDOG, NOT ON EVERY FRAME (`WATCHDOG_MS` = 80 ms), so a fast camera
+  // does not re-measure the layout four times between two decisions and a slow one is not surveyed
+  // less often than the patient moves. Driving the survey once per frame here would be a different
+  // program from the one that ships — and the frame rate is one of the variables under test.
+  let lastSurvey = -Infinity;
 
   for (let i = 0; i <= Math.round(seconds * fps); i++) {
     const t = i / fps;
-    const limbs = dwellLimbs(frame(t), mode, opts.mirrored ?? false, aspect);
+    const detection = frame(t, layout.circles());
+    const limbs = dwellLimbs(detection, mode, mirrored, aspect);
+    const references = dwellReferences(detection, mode, { lanes: opts.lanes, mirrored, xScale: aspect });
     let busy = false;
     for (const tracker of trackers.values()) {
       const st = tracker.state;
       if (st.progress > 0 || st.blocked === 'refractory') busy = true;
     }
+    // The same two rules the hook applies. The HABITAT leaves out a hold and the frames around it (a
+    // reach must not teach it that the limb lives on the ring), bounded in time by `DwellEngagement`
+    // because a limb still there three seconds later is not answering. The COUPLING record takes every
+    // frame: leaving out the engaged ones starved it of the rise that carries the hand into the ring.
+    for (const l of limbs) coupling.noteOne(l.key, l.point, references, t, aspect);
+    if (busy) engagement.noteAnswering(t);
     if (!busy) {
-      // The same rule the hook applies: a hold is never evidence about where a limb lives, and in leg
-      // mode neither is a hand sitting inside one of these circles (`dwellEngaged`).
       const engagedCounts = dwellAxisFor(mode) === 'radial';
       for (const l of limbs) {
-        if (engagedCounts && dwellEngaged(l.point, layout.circles(), aspect, DWELL_DEFAULTS.exitRatio)) continue;
+        if (engagedCounts && engagement.gesture(l.key, l.point, layout.circles(), t, aspect, DWELL_DEFAULTS.exitRatio)) continue;
         habitat.noteOne(l.key, l.point, t, l.scale ?? null);
       }
     }
     summaries = habitat.all(t, aspect);
-    const survey = layout.survey(summaries, t, busy);
-    out.unplaceable = [...survey.placeable.values()].some((ok) => !ok);
-    if (survey.moved) {
-      out.moves += 1;
-      for (const [id, tracker] of trackers) tracker.setTarget(layout.circleFor(id) as DwellCircle, aspect);
+    if (t - lastSurvey >= WATCHDOG_SEC - 1e-9) {
+      lastSurvey = t;
+      const survey = layout.survey(summaries, t, busy);
+      occupied = survey.occupied;
+      out.unplaceable = [...survey.placeable.values()].some((ok) => !ok);
+      if (survey.moved) {
+        out.moves += 1;
+        for (const [id, tracker] of trackers) tracker.setTarget(layout.circleFor(id) as DwellCircle, aspect);
+        out.visited = [...out.visited, ...layout.circles()];
+      }
     }
-    for (const [id, tracker] of trackers) tracker.setOccupied(survey.occupied.get(id) === true);
-    const limb = pickDwellLimb(limbs, layout.circles(), { xScale: aspect, previous, previousKey });
+    for (const [id, tracker] of trackers) tracker.setOccupied(occupied.get(id) === true);
+    const carried = opts.withoutCouplingGate ? new Set<string>() : coupling.coupledKeys(t);
+    if (carried.size > 0) {
+      out.refusedFrames += 1;
+      for (const key of carried) {
+        const v = coupling.verdict(key, t);
+        if (v) out.coupledBy = `${key} follows ${v.reference} (r2 ${v.r2.toFixed(2)}, ${v.explained.toFixed(3)} explained)`;
+      }
+    }
+    const limb = pickDwellLimb(limbs, layout.circles(), { xScale: aspect, previous, previousKey, avoid: carried });
+    const verdict = limb && carried.has(limb.key) ? coupling.verdict(limb.key, t) : null;
+    for (const tracker of trackers.values()) tracker.setCoupled(verdict !== null);
     out.frames += 1;
     if (limb) out.tracked += 1;
     previous = limb?.point ?? null;
     previousKey = limb?.key ?? null;
     for (const tracker of trackers.values()) {
       const state = tracker.update(limb?.point ?? null, t, limb?.key ?? null);
-      if (state.confirmed) out.confirms += 1;
+      if (state.confirmed) {
+        out.confirms += 1;
+        out.firstConfirmSec = Math.min(out.firstConfirmSec, t);
+      }
       if (state.blocked === 'occupied') out.standDowns += 1;
+      if (state.blocked === 'coupled') out.coupledFrames += 1;
       out.maxProgress = Math.max(out.maxProgress, state.progress);
     }
   }
@@ -234,45 +342,83 @@ function drive(opts: {
 const LEG_MOVEMENTS = ['seated_march', 'knee_extension', 'ankle_dorsiflexion', 'hip_abduction'] as const;
 const HAND_MOVEMENTS = ['hand_open_close', 'wrist_extension', 'finger_opposition', 'finger_spread'] as const;
 
-/** Where a seated patient's hands are while their LEGS are working. */
-const HAND_RESTS: Array<{ what: string; left: DwellPoint; right: DwellPoint }> = [
-  { what: 'in the lap', left: { x: 0.58, y: 0.72 }, right: { x: 0.42, y: 0.72 } },
-  { what: 'on the thighs', left: { x: 0.64, y: 0.62 }, right: { x: 0.36, y: 0.62 } },
-  { what: 'on chair arms, high', left: { x: 0.7, y: 0.45 }, right: { x: 0.3, y: 0.45 } },
-  { what: 'folded, near the midline', left: { x: 0.54, y: 0.55 }, right: { x: 0.46, y: 0.55 } },
+/**
+ * Where a seated patient's hands are while their LEGS are working — AND WHAT IS HOLDING THEM UP.
+ *
+ * THIS ARRAY USED TO BE THE BUG IN THIS FILE. It listed four world-fixed points and `legFrame` wrote
+ * them straight into the wrist landmarks, with a y that did not depend on `amount` at all: the sweep
+ * varied movement, side, pace, compensation, aspect and rest position and HARD-CODED THE ONE QUANTITY
+ * UNDER TEST. Worse, the "thigh" hand was listed at y 0.62 against hips at y 0.60 — a hand at the HIP,
+ * the single point on the thigh that a hip flexion does not move.
+ *
+ * So the positions and the supports now come from the shipping rig (`SEATED_HAND_RESTS`,
+ * `SEATED_HAND_SUPPORTS`), which carries a thigh-resting hand with the thigh, and `legFrame` no longer
+ * writes wrists at all.
+ */
+const HAND_RESTS: Array<{ what: string; rest: SeatedHandRest; left: DwellPoint; right: DwellPoint }> = [
+  { what: 'in the lap (on the proximal thighs)', rest: 'lap', ...SEATED_HAND_RESTS.lap },
+  { what: 'on the thighs', rest: 'thighs', ...SEATED_HAND_RESTS.thighs },
+  { what: 'on chair arms, high', rest: 'chair_arms', ...SEATED_HAND_RESTS.chair_arms },
+  { what: 'folded, near the midline', rest: 'folded', ...SEATED_HAND_RESTS.folded },
 ];
+
+/** Where along the hip->knee segment a thigh-resting hand is put, when the sweep varies it. */
+const THIGH_FRACTIONS = [0.7, 0.85, 1];
 
 /**
  * One frame of a seated patient performing `movement` at `amount`, with the documented compensations,
- * and with their hands where a seated patient's hands are.
+ * and with their hands where a seated patient's hands are — CARRIED BY WHATEVER IS HOLDING THEM.
+ *
+ * `hand` puts ONE hand at an explicit point (the reach that IS the gesture); everything else is the
+ * rig's own arms, so a hand on the thigh rises with the knee and a hand on the chair arm does not.
  */
 function legFrame(opts: {
   movement: (typeof LEG_MOVEMENTS)[number];
   side: Side;
   amount: number;
   compensation: 'none' | 'circumduction' | 'trunk lean' | 'heel lift';
-  hands: { left: DwellPoint; right: DwellPoint };
+  /** Which support the resting hands are on (default: the thighs, the worst case and the common one). */
+  rest?: SeatedHandRest | 'out_of_view';
+  /** One hand out of the picture: a patient with only ONE hand the camera can see. */
+  hideHand?: Side;
+  /** How far along the thigh a thigh-supported hand sits (default: the rest position's own fraction). */
+  thighFraction?: number;
+  /** One hand raised to a point, and which one. */
+  hand?: { side: Side; x: number; y: number } | null;
+  /**
+   * Hip circumduction as an explicit amount, so a sweep can vary HOW MUCH of it there is rather than
+   * only whether it is there (`compensation: 'circumduction'` ties it to the rep amount). It swings the
+   * knee out — and, through the thigh, any hand resting on it.
+   */
+  circumduction?: number;
   aspect: number;
   dx?: number;
   dy?: number;
+  /**
+   * The frames were flipped BEFORE detection (`mirrored: true`), which is what the app's own mirror
+   * toggle does. It swaps the LABELS as well as the coordinates, so the patient's left limb arrives in
+   * the RIGHT_* slots — the half of mirroring that a sign flip alone cannot catch.
+   */
+  mirror?: boolean;
 }): DetectionResult {
-  const { movement, side, amount, compensation, hands, aspect } = opts;
-  const params: Record<string, number | Side> = { side };
+  const { movement, side, amount, compensation, aspect } = opts;
+  const params: Record<string, unknown> = { side, hands: opts.rest ?? 'thighs' };
+  if (opts.thighFraction !== undefined) params.handThighFraction = opts.thighFraction;
+  if (opts.hideHand) params.hideHand = opts.hideHand;
+  if (opts.hand) params.handAt = opts.hand;
   if (movement === 'seated_march') params.kneeLift = amount;
   if (movement === 'knee_extension') params.kneeExtension = amount;
   if (movement === 'ankle_dorsiflexion') params.toeLift = amount;
   if (movement === 'hip_abduction') params.abduction = amount;
   // The compensations this app exists to OBSERVE and promises never to penalise. Hip circumduction
   // carries the knee sideways as it rises, which is what put it inside a dwell circle in the first
-  // place; the trunk lean takes the whole upper body (and therefore the arms) with it.
+  // place — and, through the thigh, carries a hand resting on it too.
   if (compensation === 'circumduction') params.abduction = ((params.abduction as number) ?? 0) + amount;
+  if (opts.circumduction !== undefined) params.abduction = ((params.abduction as number) ?? 0) + opts.circumduction;
   if (compensation === 'trunk lean') params.trunkLean = amount;
   if (compensation === 'heel lift') params.heelLift = amount;
-  const pose = translateLandmarks(seatedPose(params as Parameters<typeof seatedPose>[0]), opts.dx ?? 0, opts.dy ?? 0);
-  // A trunk lean moves the arms with the trunk; everything else leaves the hands where they were.
-  const sway = compensation === 'trunk lean' ? amount * 0.17 : 0;
-  pose[POSE.LEFT_WRIST] = { x: hands.left.x + sway + (opts.dx ?? 0), y: hands.left.y + (opts.dy ?? 0), z: 0, visibility: 0.95 };
-  pose[POSE.RIGHT_WRIST] = { x: hands.right.x + sway + (opts.dx ?? 0), y: hands.right.y + (opts.dy ?? 0), z: 0, visibility: 0.95 };
+  const built = translateLandmarks(seatedPose(params as Parameters<typeof seatedPose>[0]), opts.dx ?? 0, opts.dy ?? 0);
+  const pose = opts.mirror ? mirrorPoseLandmarks(built) : built;
   return { tMs: 0, pose: reNormalizeAspect(pose, PREVIEW_ASPECT, aspect), hands: [] };
 }
 
@@ -322,32 +468,40 @@ describe('THE PRESCRIBED EXERCISE MAY NOT ANSWER FOR THE PATIENT', () => {
           for (const profile of [SLOW_REP, BRISK_REP]) {
             for (const compensation of ['none', 'circumduction', 'trunk lean', 'heel lift'] as const) {
               for (const rest of HAND_RESTS) {
-                runs += 1;
-                const seconds = profile === SLOW_REP ? 12 : 8;
-                const outcome = drive({
-                  mode: 'leg',
-                  aspect,
-                  authored: pairedDwellTargets('leg'),
-                  seconds,
-                  frame: (t) =>
-                    legFrame({
-                      movement,
-                      side,
-                      amount: repAmount(t, profile),
-                      compensation,
-                      hands: rest,
-                      aspect,
-                    }),
-                });
-                if (outcome.tracked < outcome.frames * 0.9) {
-                  failures.push(`${movement}/${side} @${aspect.toFixed(2)}: nothing was being tracked — the case proves nothing`);
-                }
-                if (outcome.confirms > 0) {
-                  failures.push(
-                    `${movement}/${side} @${aspect.toFixed(2)}, ${compensation}, hands ${rest.what}, ` +
-                      `${profile === SLOW_REP ? 'slow' : 'brisk'}: ${outcome.confirms} confirm(s), ` +
-                      `ring reached ${(outcome.maxProgress * 100).toFixed(0)}%`,
-                  );
+                // WHERE ALONG THE THIGH the hand sits, for the rests a thigh is holding up. The
+                // critic found this non-monotonic in f (a hand mid-thigh escaping where a hand at the
+                // knee did not), so it is swept rather than spot-checked.
+                const fractions = SEATED_HAND_SUPPORTS[rest.rest].support === 'thigh' ? THIGH_FRACTIONS : [undefined];
+                for (const thighFraction of fractions) {
+                  runs += 1;
+                  const seconds = profile === SLOW_REP ? 12 : 8;
+                  const outcome = drive({
+                    mode: 'leg',
+                    aspect,
+                    authored: pairedDwellTargets('leg'),
+                    seconds,
+                    frame: (t) =>
+                      legFrame({
+                        movement,
+                        side,
+                        amount: repAmount(t, profile),
+                        compensation,
+                        rest: rest.rest,
+                        thighFraction,
+                        aspect,
+                      }),
+                  });
+                  if (outcome.tracked < outcome.frames * 0.9) {
+                    failures.push(`${movement}/${side} @${aspect.toFixed(2)}: nothing was being tracked — the case proves nothing`);
+                  }
+                  if (outcome.confirms > 0) {
+                    failures.push(
+                      `${movement}/${side} @${aspect.toFixed(2)}, ${compensation}, hands ${rest.what}` +
+                        `${thighFraction === undefined ? '' : ` f=${thighFraction}`}, ` +
+                        `${profile === SLOW_REP ? 'slow' : 'brisk'}: ${outcome.confirms} confirm(s), ` +
+                        `ring reached ${(outcome.maxProgress * 100).toFixed(0)}%`,
+                    );
+                  }
                 }
               }
             }
@@ -358,6 +512,137 @@ describe('THE PRESCRIBED EXERCISE MAY NOT ANSWER FOR THE PATIENT', () => {
     expect(runs).toBeGreaterThan(300);
     expect(failures.join('\n')).toBe('');
   }, 120_000);
+
+  /**
+   * THE THIRD ROUND'S DEFECT, DRIVEN AS THE CRITIC DROVE IT, AND WITH ITS NEGATIVE CONTROL.
+   *
+   * Rounds one and two removed the knee as a pointer on the premise that "the leg prescription does not
+   * move the hands". A hand resting on the THIGH is carried by the thigh: hip flexion rotates the thigh
+   * about the hip, so a hand at fraction f along the hip->knee segment rises by f x the knee's travel,
+   * and circumduction swings it sideways at the same time. Driven through these same shipping classes,
+   * the primary circle confirmed at t = 3.23 s (left march, circumduction, f = 1.0) and the SECONDARY —
+   * which on the pause dialog is `id: 'end'` -> quit -> a truncated record in the patient's history —
+   * at t = 3.30 s. 90 of a 324-case duty-cycle sweep confirmed, at every frame rate, in both aspects,
+   * mirrored and not, on the first repetition every time.
+   *
+   * The failure was NON-MONOTONIC in f and in the frame rate (the right side at f = 0.85 confirmed at
+   * 12 fps where f = 1.0 did not), so this sweeps rather than spot-checks: f, side, the amount of
+   * circumduction, four frame rates, three aspects, and both mirror conventions — with the critic's own
+   * 2 / 2.5 / 2 / 10 s duty cycle and the app's own 80 ms survey cadence.
+   */
+  it('A HAND ON THE THIGH CANNOT ANSWER: the critic’s attack, swept, confirms nothing', () => {
+    const failures: string[] = [];
+    let runs = 0;
+    let caught = 0;
+    let stoodDown = 0;
+    let oneHanded = 0;
+    for (const aspect of ASPECTS) {
+      for (const side of ['left', 'right'] as Side[]) {
+        for (const f of THIGH_FRACTIONS) {
+          for (const circumduction of [0.5, 1]) {
+            for (const fps of [12, 15, 24, 30]) {
+              for (const mirror of [false, true]) {
+                // …and WITH OR WITHOUT A SECOND HAND TO FALL BACK ON. Two hands and the gate shows up
+                // as the pick moving to the one the exercise is not carrying; ONE hand (the other out
+                // of the picture, which is a framing the camera check has to warn about and cannot
+                // prevent) and there is nothing to fall back on, so the rings must stand down instead.
+                for (const only of [false, true]) {
+                  runs += 1;
+                  const outcome = drive({
+                    mode: 'leg',
+                    aspect,
+                    fps,
+                    mirrored: mirror,
+                    authored: pairedDwellTargets('leg'),
+                    seconds: 20,
+                    lanes: [{ index: 0, movement: 'seated_march', side }],
+                    frame: (t) => {
+                      const amount = repAmount(t, CRITIC_REP);
+                      return legFrame({
+                        movement: 'seated_march',
+                        side,
+                        amount,
+                        compensation: 'none',
+                        // The circumduction is applied directly so its AMOUNT can be swept: the knee
+                        // swings out by `circumduction` x the lift, carrying the hand with it.
+                        rest: 'thighs',
+                        thighFraction: f,
+                        hideHand: only ? (side === 'left' ? 'right' : 'left') : undefined,
+                        aspect,
+                        mirror,
+                        circumduction: circumduction * amount,
+                      });
+                    },
+                  });
+                  const where = `${side} march, circ ${circumduction}, f=${f}, ${fps} fps, @${aspect.toFixed(2)}${mirror ? ', mirrored' : ''}${only ? ', that hand only' : ''}`;
+                  if (outcome.tracked < outcome.frames * 0.9) failures.push(`${where}: nothing was being tracked — the case proves nothing`);
+                  if (outcome.confirms > 0) failures.push(`${where}: ${outcome.confirms} confirm(s), ring reached ${(outcome.maxProgress * 100).toFixed(0)}%`);
+                  // …and it is the COUPLING MEASUREMENT that stops it, not luck about where the rings
+                  // ended up: the hand is measured travelling with the prescribed movement, and
+                  // refused as a pointer.
+                  if (outcome.refusedFrames > 0) caught += 1;
+                  if (only) {
+                    oneHanded += 1;
+                    // With no other limb to follow, the ring stands down and says why (phase
+                    // 'coupled'), rather than quietly following a limb it will not count.
+                    if (outcome.coupledFrames > 0) stoodDown += 1;
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    expect(runs).toBeGreaterThan(560);
+    expect(failures.join('\n')).toBe('');
+    // Every single case is caught by the measurement, in every framing and at every frame rate.
+    expect(caught).toBe(runs);
+    // And in every one-handed case the patient is TOLD, instead of being left with a dead ring.
+    expect(stoodDown).toBe(oneHanded);
+  }, 600_000);
+
+  it('…and WITHOUT the coupling gate the same attack confirms, so the sweep above can fail', () => {
+    /**
+     * THE NEGATIVE CONTROL, which is the whole reason this round exists: three times running, the test
+     * that was supposed to prove this feature safe had pinned the variable under test, and passed. So
+     * the gate is switched off here and the same body is driven through the same classes. If this ever
+     * stops confirming, the sweep above has stopped being evidence and something else is holding it up.
+     */
+    const attack = (withoutCouplingGate: boolean, f = 1, fps = 30) =>
+      drive({
+        mode: 'leg',
+        aspect: PREVIEW_ASPECT,
+        fps,
+        authored: pairedDwellTargets('leg'),
+        seconds: 20,
+        lanes: [{ index: 0, movement: 'seated_march', side: 'left' }],
+        withoutCouplingGate,
+        frame: (t) => {
+          const amount = repAmount(t, CRITIC_REP);
+          return legFrame({
+            movement: 'seated_march',
+            side: 'left',
+            amount,
+            compensation: 'none',
+            rest: 'thighs',
+            thighFraction: f,
+            aspect: PREVIEW_ASPECT,
+            circumduction: amount,
+          });
+        },
+      });
+    const unguarded = attack(true);
+    expect(unguarded.confirms).toBeGreaterThanOrEqual(1);
+    // …ON THE FIRST REPETITION, which is what made it a shipping defect rather than a curiosity: the
+    // rise is 2 s and the top is held for 2.5 s, so the ring is full before the leg comes back down.
+    expect(unguarded.firstConfirmSec).toBeLessThan(CRITIC_REP.riseSec + CRITIC_REP.holdSec + CRITIC_REP.fallSec);
+    const guarded = attack(false);
+    expect(guarded.confirms).toBe(0);
+    expect(guarded.refusedFrames).toBeGreaterThan(0);
+    // And the verdict names what the hand was following, so the screen can say something true.
+    expect(guarded.coupledBy).toMatch(/hand:left follows/);
+  });
 
   it('hand mode: no prescribed movement, at any size, framing or pace, confirms anything', () => {
     const failures: string[] = [];
@@ -417,7 +702,7 @@ describe('THE PRESCRIBED EXERCISE MAY NOT ANSWER FOR THE PATIENT', () => {
               authored: pairedDwellTargets('leg'),
               seconds: 8,
               frame: () =>
-                legFrame({ movement: 'seated_march', side: 'left', amount: 0, compensation: 'none', hands: rest, aspect, dx, dy }),
+                legFrame({ movement: 'seated_march', side: 'left', amount: 0, compensation: 'none', rest: rest.rest, aspect, dx, dy }),
             });
             const where = `leg @${aspect.toFixed(2)} hands ${rest.what} (${dx}, ${dy})`;
             cases += 1;
@@ -459,11 +744,19 @@ describe('THE PRESCRIBED EXERCISE MAY NOT ANSWER FOR THE PATIENT', () => {
   }, 120_000);
 
   it('the escapes the critic found by hand are inside the sweep, and are caught', () => {
-    // 1. A leg-mode hand resting at (0.70, 0.45): 0.1327 from the primary centre, exit radius 0.1438 —
-    //    inside the hysteresis band, which no amount of "the fixture rests it lower" makes untrue.
-    const near = dwellDistance({ x: 0.7, y: 0.45 }, singleDwellTarget('leg'), PREVIEW_ASPECT);
-    expect(near).toBeCloseTo(0.1327, 3);
-    expect(near).toBeLessThan(singleDwellTarget('leg').radius * DWELL_DEFAULTS.exitRatio);
+    /**
+     * 1. A leg-mode hand resting at (0.70, 0.45) — a high chair arm — used to sit 0.1327 from the
+     *    primary centre against an exit radius of 0.1438: inside the hysteresis band, so the layout had
+     *    to move the ring on every leg-mode screen for the support the app itself asks for. That is now
+     *    fixed at the source: the authored position (0.78, 0.23) CLEARS that hand, band and margin
+     *    included, which is what let the ring grow to a size a patient can see.
+     */
+    const legTarget = singleDwellTarget('leg');
+    const oldPlacement = { x: 0.72, y: 0.32, radius: 0.115 };
+    expect(dwellDistance({ x: 0.7, y: 0.45 }, oldPlacement, PREVIEW_ASPECT)).toBeCloseTo(0.1327, 3);
+    expect(dwellDistance({ x: 0.7, y: 0.45 }, oldPlacement, PREVIEW_ASPECT)).toBeLessThan(oldPlacement.radius * DWELL_DEFAULTS.exitRatio);
+    const now = dwellDistance({ x: 0.7, y: 0.45 }, legTarget, PREVIEW_ASPECT);
+    expect(now).toBeGreaterThan(legTarget.radius * DWELL_DEFAULTS.exitRatio + DWELL_CLEAR_MARGIN);
     // What the band is and is not: a limb may WOBBLE through it, and may not LIVE in it. A hand that
     // rests there, leaves (which opens the entry gate), and comes back to exactly the same place —
     // the worst version of this, and the one that shipped once — cannot fill the ring: the band clock
@@ -473,17 +766,21 @@ describe('THE PRESCRIBED EXERCISE MAY NOT ANSWER FOR THE PATIENT', () => {
       aspect: PREVIEW_ASPECT,
       authored: pairedDwellTargets('leg'),
       seconds: 30,
-      frame: (t) => {
-        // 4 s at rest in the band, 1.5 s away, repeatedly: the patient reaching for something and
-        // putting their hand back exactly where it was.
+      frame: (t, circles) => {
+        // 4 s at rest INSIDE THE RING, 1.5 s away, repeatedly: the patient reaching for something and
+        // putting their hand back exactly where it was. It is aimed at wherever the ring is, because
+        // the worst version of this case is a hand that lives exactly where the circle is drawn — and
+        // the ring may have moved. The hand is otherwise supported (a chair arm), so the point of the
+        // case is the placement and the band, not the coupling.
         const away = t % 5.5 >= 4;
-        const left = away ? { x: 0.55, y: 0.72 } : { x: 0.7, y: 0.45 };
+        const left = away ? { x: 0.55, y: 0.72 } : { x: circles[0].x - 0.02, y: circles[0].y + 0.01 };
         return legFrame({
           movement: 'seated_march',
           side: 'left',
           amount: 0,
           compensation: 'none',
-          hands: { left, right: { x: 0.3, y: 0.45 } },
+          rest: 'chair_arms',
+          hand: { side: 'left', ...left },
           aspect: PREVIEW_ASPECT,
         });
       },
@@ -520,23 +817,32 @@ describe('THE PRESCRIBED EXERCISE MAY NOT ANSWER FOR THE PATIENT', () => {
       mode: 'leg',
       aspect: PREVIEW_ASPECT,
       authored: [target],
-      seconds: 14,
-      frame: (t) => {
-        // 6 s of marching with the hands down, then a 1 s reach and a long hold.
+      seconds: 16,
+      lanes: [{ index: 0, movement: 'seated_march', side: 'left' }],
+      frame: (t, circles) => {
+        // 6 s of marching with the hands on the CHAIR ARMS — the support the app now asks for, and the
+        // one a hold can be made from — then a 1 s reach and a long hold. The reach aims at WHERE THE
+        // RING IS, because the layout may have moved it off the resting hand; aiming at the authored
+        // spot would be aiming at a circle that is not there.
+        const ring = circles[0];
         const reach = Math.max(0, Math.min(1, (t - 6) / 1));
-        const from = { x: 0.58, y: 0.72 };
-        const hand = { x: from.x + (target.x - from.x) * reach, y: from.y + (target.y - from.y) * reach };
+        const from = SEATED_HAND_RESTS.chair_arms.left;
+        const hand = { x: from.x + (ring.x - from.x) * reach, y: from.y + (ring.y - from.y) * reach };
         return legFrame({
           movement: 'seated_march',
           side: 'left',
           amount: repAmount(t, SLOW_REP),
           compensation: 'circumduction',
-          hands: { left: hand, right: { x: 0.42, y: 0.72 } },
+          rest: 'chair_arms',
+          hand: { side: 'left', ...hand },
           aspect: PREVIEW_ASPECT,
         });
       },
     });
     expect(raised.confirms).toBeGreaterThanOrEqual(1);
+    // And the hand that made it was never refused as a pointer: a hand on furniture is independent of
+    // the leg, which is the whole reason the app asks for that support.
+    expect(raised.coupledFrames).toBe(0);
 
     // Hand mode: the prescribed hand slides along the table into the circle and stays.
     const handTarget = singleDwellTarget('hand');
@@ -545,14 +851,15 @@ describe('THE PRESCRIBED EXERCISE MAY NOT ANSWER FOR THE PATIENT', () => {
       aspect: PREVIEW_ASPECT,
       authored: [handTarget],
       seconds: 16,
-      frame: (t) => {
+      frame: (t, circles) => {
+        const ring = circles[0];
         const reach = Math.max(0, Math.min(1, (t - 6) / 1.5));
         return handFrame({
           movement: 'hand_open_close',
           amount: repAmount(t, SLOW_REP),
-          centerX: 0.5 + (handTarget.x - 0.5) * reach,
+          centerX: 0.5 + (ring.x - 0.5) * reach,
           scale: 1,
-          dy: (handTarget.y - 0.63) * reach,
+          dy: (ring.y - 0.63) * reach,
           aspect: PREVIEW_ASPECT,
         });
       },
@@ -570,22 +877,25 @@ describe('THE PRESCRIBED EXERCISE MAY NOT ANSWER FOR THE PATIENT', () => {
      * here: hands on the thighs (`SEATED_HAND_RESTS`), one raised to the ring, the legs marching with
      * the circumduction that used to fire this by accident.
      */
-    const target = singleDwellTarget('leg');
-    const from = SEATED_HAND_RESTS.thighs.left;
+    const from = SEATED_HAND_RESTS.chair_arms.left;
     const fixture = drive({
       mode: 'leg',
       aspect: PREVIEW_ASPECT,
       authored: pairedDwellTargets('leg'),
       seconds: 14,
-      frame: (t) => {
+      frame: (t, circles) => {
+        const ring = circles[0];
         const reach = Math.max(0, Math.min(1, (t - 6) / 1));
         return {
           tMs: t * 1000,
+          // The hands rest on the CHAIR ARMS, not the thighs: a thigh-resting hand is carried by the
+          // leg and the coupling gate refuses it, which is the point of the case below.
           pose: seatedPose({
             kneeLift: repAmount(t, SLOW_REP),
             abduction: repAmount(t, SLOW_REP),
             side: 'left',
-            handAt: { side: 'left', x: from.x + (target.x - from.x) * reach, y: from.y + (target.y - from.y) * reach },
+            hands: 'chair_arms',
+            handAt: { side: 'left', x: from.x + (ring.x - from.x) * reach, y: from.y + (ring.y - from.y) * reach },
           }),
           hands: [],
         };
@@ -632,7 +942,13 @@ describe('reach: the hold has to be performable from the posture the app prescri
     // What it used to be: the single target at (0.5, 0.3) r 0.18 — straight up, unsupported, in the
     // upper third of the frame; and the pair at (0.73, 0.3) r 0.15, 0.45 frame-heights from the palm.
     const beforePair = approach(rest, { x: 0.73, y: 0.3, radius: 0.15 }, PREVIEW_ASPECT);
-    expect(now.travel).toBeLessThan(beforePair.travel);
+    // THE LIFT is what the table cannot help with, and it is what this test is about: less of it than
+    // either of the positions this replaced. The TRAVEL is now slightly further, and deliberately —
+    // the ring had to move out to clear a resting palm by the lateral floor once it was big enough to
+    // see — but it is travel ACROSS a table that is carrying the forearm, which is the axis the mode
+    // exists on, and it is still well inside the reach bound every other placement is held to.
+    expect(now.travel).toBeLessThan(DWELL_LIMB_REACH);
+    expect(now.travel - beforePair.travel).toBeLessThan(0.05);
     expect(now.lift).toBeLessThan(beforePair.lift);
     // No target asks the patient to hold a hand in the upper third of the frame.
     for (const target of placements('hand')) expect(target.y + target.radius).toBeGreaterThan(1 / 3);
@@ -642,19 +958,46 @@ describe('reach: the hold has to be performable from the posture the app prescri
     expect(now.lift).toBeGreaterThan(0.1); // …and it is a real move, not a twitch
   });
 
-  it('leg mode: a raised hand reaches it from the lap, which is the only gesture leg mode has left', () => {
+  it('leg mode: a raised hand reaches it from every rest, which is the only gesture leg mode has left', () => {
     const target = singleDwellTarget('leg');
-    // A hand resting in the lap, raised: no exercise, no holding a limb against gravity in a posture
+    // A hand resting somewhere, raised: no exercise, no holding a limb against gravity in a posture
     // the prescription cares about. Since the knees stopped being pointers this is the whole gesture,
-    // so it has to be performable — by an unaffected arm if the affected one will not do it.
+    // so it has to be performable — by an unaffected arm if the affected one will not do it. 0.45 is
+    // the same bound `DWELL_LIMB_REACH` holds a RELOCATED ring to, so the two agree.
     for (const rest of HAND_RESTS) {
       const travel = approach(rest.left, target, PREVIEW_ASPECT).travel;
-      expect(travel, `from ${rest.what}`).toBeLessThan(0.45);
+      expect(travel, `from ${rest.what}`).toBeLessThan(DWELL_LIMB_REACH);
     }
-    // …and it is a deliberate move rather than a twitch: the nearest resting hand is still outside the
-    // band by more than the margin the gate demands.
-    const nearest = Math.min(...HAND_RESTS.map((r) => dwellDistance(r.left, target, PREVIEW_ASPECT)));
-    expect(nearest).toBeGreaterThan(target.radius);
+    /**
+     * AND WHERE A REST POSITION IS INSIDE THE AUTHORED RING, THE GATE OWNS IT — which is a change of
+     * claim, made deliberately when the ring grew to a size a patient can see (it is now 0.16, and a
+     * hand on a high chair arm sits 0.133 from the primary centre). This test used to assert the
+     * geometry away: "the nearest resting hand is still outside the drawn circle". That was only ever
+     * true for the four rest positions in this file, at one framing, and the app has to hold for a
+     * body it has never seen. So what is asserted is what actually protects the patient: a ring
+     * standing on where a limb LIVES accumulates nothing, and the layout moves it somewhere it does
+     * not — measured, per body, in "SITTING STILL confirms nothing either".
+     */
+    // No rest position is inside the drawn circle, and none is even inside the BAND: that is what the
+    // authored position had to buy to let the ring grow (see the radius note in DwellTarget.tsx).
+    for (const rest of HAND_RESTS) {
+      const d = dwellDistance(rest.left, target, PREVIEW_ASPECT);
+      expect(d, rest.what).toBeGreaterThan(target.radius * DWELL_DEFAULTS.exitRatio + DWELL_CLEAR_MARGIN);
+    }
+    // And where a body DOES live on the ring — a lower armrest, a chair the clinic did not choose —
+    // the gate owns it: the ring accumulates nothing and the layout moves it somewhere it does not.
+    const onTheRing = { x: target.x - 0.02, y: target.y + 0.02 };
+    const habitat = new DwellHabitat();
+    for (let i = 0; i <= 60; i++) habitat.noteOne('hand:left', onTheRing, i * 0.1);
+    const summaries = habitat.all(6, PREVIEW_ASPECT);
+    const opts = { xScale: PREVIEW_ASPECT, axis: dwellAxisFor('leg'), extra: DWELL_CLEAR_EXTRA, fits: (c: DwellCircle) => dwellCircleFits(c, PREVIEW_ASPECT) };
+    expect(dwellTargetClear(target, summaries, opts).clear).toBe(false);
+    const moved = placeDwellCircle(target, summaries, opts);
+    expect(moved.placeable).toBe(true);
+    expect(dwellTargetClear(moved.circle, summaries, opts).clear).toBe(true);
+    // …and where it moves to is still reachable from that hand, and still not overhead.
+    expect(dwellPlaceable(moved.circle)).toBe(true);
+    expect(approach(onTheRing, moved.circle, PREVIEW_ASPECT).travel).toBeLessThan(DWELL_LIMB_REACH);
   });
 });
 
@@ -805,7 +1148,21 @@ describe('where the ring is drawn', () => {
     for (const aspect of ASPECTS) {
       for (const mode of ['hand', 'leg'] as const) {
         for (const authored of placements(mode)) {
-          const target = retargetForAspect(authored, aspect);
+          /**
+           * THE CIRCLE THE LAYOUT WOULD ACTUALLY PUT THERE, not the authored one.
+           *
+           * On a sensor TALLER than the 4:3 preview the crop magnifies the frame onto the glass, and a
+           * hand-mode ring authored far enough out to clear a resting palm lands with its caption off
+           * the edge. `DwellLayout.reset` solves that once, against no habitat — so what has to be
+           * drawable whole is what the layout opens with, and this drives it rather than assuming the
+           * authored number survives every sensor.
+           */
+          const layout = new DwellLayout([{ id: 'one', authored }], {
+            xScale: aspect,
+            axis: dwellAxisFor(mode),
+            fits: (c: DwellCircle) => dwellCircleFits(c, aspect),
+          });
+          const target = layout.circleFor('one') as DwellCircle;
           cleanup();
           render(
             <DwellTarget choice={{ ...CHOICE, target: authored }} state={state({ target, xScale: aspect })} testId="t" />,
@@ -823,6 +1180,124 @@ describe('where the ring is drawn', () => {
           expect(leftPct, where).toBeGreaterThan(0);
           expect(leftPct + widthPctOfFrameWidth, where).toBeLessThan(100);
         }
+      }
+    }
+  });
+});
+
+/* ================= the ring may move off the patient, and must be able to come back ================= */
+
+describe('a relocated ring is bounded, and comes home', () => {
+  /**
+   * TRACED IN THE RUNNING APP, and the second half of this round's report: a thigh-coupled hand at a
+   * slow pace tripped `occupied`, and `placeDwellCircle` slid the primary (0.72, 0.32) -> (0.72, 0.215)
+   * -> (0.787, 0.14). With a 0.115 radius that is the top quarter of the frame at the far edge, 0.518
+   * frame heights from the resting hand that has to reach it — the position DwellTarget.tsx condemns in
+   * its own words — and `DwellLayout` never moved a circle back, so it stayed there for the life of the
+   * screen.
+   */
+  const opts = (aspect: number) => ({
+    xScale: aspect,
+    axis: dwellAxisFor('leg'),
+    exitRatio: DWELL_DEFAULTS.exitRatio,
+    extra: DWELL_CLEAR_EXTRA,
+    crowdedGraceSec: 0.5,
+    moveIntervalSec: 1.5,
+    fits: (c: DwellCircle) => dwellCircleFits(c, aspect),
+  });
+
+  /**
+   * Run a layout for `seconds` with one hand living wherever `where` says at that instant — noted every
+   * step, because a limb the habitat has not seen for five seconds stops constraining anything (which
+   * is correct, and which makes a hand fed once look like a hand that left the room).
+   */
+  function run(
+    layout: DwellLayout,
+    habitat: DwellHabitat,
+    where: (t: number) => DwellPoint,
+    from: number,
+    to: number,
+    aspect: number,
+    busy = false,
+  ): { moves: number; last: DwellHabitatSummary[] } {
+    let moves = 0;
+    let last: DwellHabitatSummary[] = [];
+    for (let t = from; t <= to; t += 0.08) {
+      habitat.noteOne('hand:left', where(t), t);
+      last = habitat.all(t, aspect);
+      if (layout.survey(last, t, busy).moved) moves += 1;
+    }
+    return { moves, last };
+  }
+
+  it('moves off a hand that lives on the ring, and STAYS INSIDE THE BOUNDS while doing it', () => {
+    const aspect = PREVIEW_ASPECT;
+    const authored = pairedDwellTargets('leg');
+    const layout = new DwellLayout(authored.map((c, i) => ({ id: `t${i}`, authored: c })), opts(aspect));
+    const habitat = new DwellHabitat();
+    const { moves, last } = run(layout, habitat, () => ({ x: 0.7, y: 0.34 }), 0, 20, aspect);
+    expect(moves).toBeGreaterThan(0);
+    for (const circle of layout.circles()) {
+      // Not overhead, still reachable, and not on the far side of the preview from where it was.
+      expect(dwellPlaceable(circle)).toBe(true);
+      expect(dwellWithinLimbReach(circle, last, aspect)).toBe(true);
+    }
+    const primary = layout.circleFor('t0') as DwellCircle;
+    expect(Math.hypot((primary.x - authored[0].x) * aspect, primary.y - authored[0].y)).toBeLessThanOrEqual(DWELL_MAX_REACH + 1e-9);
+    // The traced landing spot is refused outright now, by the rule and not by luck.
+    expect(dwellPlaceable({ x: 0.787, y: 0.14, radius: 0.115 })).toBe(false);
+  });
+
+  it('AND COMES BACK when the patient moves their hand away', () => {
+    const aspect = PREVIEW_ASPECT;
+    const authored = pairedDwellTargets('leg');
+    const layout = new DwellLayout(authored.map((c, i) => ({ id: `t${i}`, authored: c })), opts(aspect));
+    // The patient's hand lives on the primary for twenty seconds…
+    const habitat = new DwellHabitat();
+    run(layout, habitat, () => ({ x: 0.7, y: 0.34 }), 0, 20, aspect);
+    const displaced = layout.circleFor('t0') as DwellCircle;
+    expect(displaced.y).not.toBeCloseTo(authored[0].y, 6);
+    // …and then they put it back in their lap. Nothing is crowded any more, which is exactly the state
+    // in which the old code stopped solving — so the ring stayed out at the edge for the rest of the
+    // session and the patient had to go and find it.
+    const { moves } = run(layout, habitat, () => ({ x: 0.58, y: 0.72 }), 20.08, 80, aspect);
+    expect(moves).toBeGreaterThan(0);
+    const home = layout.circleFor('t0') as DwellCircle;
+    expect(home.x).toBeCloseTo(authored[0].x, 6);
+    expect(home.y).toBeCloseTo(authored[0].y, 6);
+  });
+
+  it('will not wander home in the middle of somebody’s hold, or jitter on the way', () => {
+    const aspect = PREVIEW_ASPECT;
+    const authored = pairedDwellTargets('leg');
+    const layout = new DwellLayout(authored.map((c, i) => ({ id: `t${i}`, authored: c })), opts(aspect));
+    const habitat = new DwellHabitat();
+    run(layout, habitat, () => ({ x: 0.7, y: 0.34 }), 0, 20, aspect);
+    const displaced = layout.circleFor('t0') as DwellCircle;
+    // `busy` = a hold is accumulating. Moving the ring would throw away the ring they are filling.
+    const held = run(layout, habitat, () => ({ x: 0.58, y: 0.72 }), 20.08, 50, aspect, true);
+    expect(held.moves).toBe(0);
+    expect(layout.circleFor('t0')).toEqual(displaced);
+    // And a homecoming waits out the same quiet interval a move does, so a ring never flickers: a
+    // 30-second walk home is a handful of steps, not one per survey.
+    const free = run(layout, habitat, () => ({ x: 0.58, y: 0.72 }), 50.08, 80, aspect);
+    expect(free.moves).toBeGreaterThan(0);
+    expect(free.moves).toBeLessThan(12);
+  });
+
+  it('never opens with a circle it cannot draw whole on the camera it was given', () => {
+    // A taller-than-4:3 sensor crops the top and bottom, so a ring authored far out has its caption
+    // off the glass. `reset` solves that once, against no habitat: this is where a screen OPENS.
+    for (const aspect of ASPECTS) {
+      for (const mode of ['hand', 'leg'] as const) {
+        const layout = new DwellLayout(
+          pairedDwellTargets(mode).map((c, i) => ({ id: `t${i}`, authored: c })),
+          { ...opts(aspect), axis: dwellAxisFor(mode) },
+        );
+        for (const circle of layout.circles()) {
+          expect(dwellCircleFits(circle, aspect), `${mode} @${aspect.toFixed(2)} ${JSON.stringify(circle)}`).toBe(true);
+        }
+        expect(dwellTargetsOverlap(layout.circles()[0], layout.circles()[1], DWELL_DEFAULTS.exitRatio, aspect)).toBe(false);
       }
     }
   });
@@ -895,6 +1370,79 @@ describe('two targets that mean opposite things', () => {
     const shapes = (el: HTMLElement) =>
       [...el.querySelectorAll('[data-mark] path')].map((p) => p.getAttribute('d')).join('|');
     expect(shapes(forward)).not.toBe(shapes(backward));
+  });
+
+  it('BIG ENOUGH TO SEE AND AIM AT — measured in pixels on the tablet this is built for', () => {
+    /**
+     * WHAT THIS FIXES. `index.css` caps the preview at 33vh on a short viewport so the legend fits, so
+     * at 1024x768 the preview is 337x253 and the old 0.115 radius drew a 58 px circle: about 0.6
+     * degrees of visual angle at a metre, against assistive-technology guidance of 1.5 degrees and up
+     * (>= 26 mm, ~100 px on a 10-inch tablet) for a dwell-activated control. The ring the entire
+     * hands-free path depends on was less than half the smallest size a low-vision patient is expected
+     * to be able to acquire.
+     *
+     * What bounds it is the GATE, not the layout: every unit of radius costs 1.25 units of clear water
+     * (the exit band) in a frame that already contains two hands, two knees and a chair, and hand mode
+     * pays a further 0.75 palm lengths of measured wander on the only axis it may count. The numbers
+     * below are the largest the sitting-still sweep can still place for every body it drives.
+     */
+    const PREVIEW_H_768 = 253; // 33vh of 768, the cap in index.css
+    const PREVIEW_H_800 = 264;
+    const diameter = (c: DwellCircle, boxH: number) => 2 * c.radius * boxH;
+    const leg = pairedDwellTargets('leg');
+    const hand = pairedDwellTargets('hand');
+    expect(diameter(leg[0], PREVIEW_H_768)).toBeGreaterThan(74);
+    expect(diameter(leg[0], PREVIEW_H_800)).toBeGreaterThan(78);
+    expect(diameter(hand[0], PREVIEW_H_768)).toBeGreaterThan(64);
+    // Both secondaries are a real circle to hold as well as a small one to look at: bigger than the
+    // 46 px the old secondary drew, and smaller than every primary (which is what `toneOf` reads).
+    for (const pair of [leg, hand]) {
+      expect(diameter(pair[1], PREVIEW_H_768)).toBeGreaterThan(46);
+      expect(pair[1].radius).toBeLessThan(Math.min(leg[0].radius, hand[0].radius));
+    }
+    // …and every one of them is nearly double what it was, which is the claim being made.
+    for (const pair of [leg, hand]) expect(pair[0].radius).toBeGreaterThan(0.115 * 1.1);
+  });
+
+  it('the tone mark is a FILLED shape most of the ring wide, so identity survives 1/5 scale', () => {
+    /**
+     * At a fifth of the size — a screenshot, or a patient across the room — the primary ring is about
+     * 16 px across and the secondary 11 px. The old mark was a 22-unit-wide chevron pair stroked at 4
+     * units: under 4 px at that scale, which is what made the two rings "two grey dots differing only
+     * in diameter". Size says they are different; only the mark says WHICH, and one of them ends the
+     * session. So it is filled rather than stroked (a solid shape survives a bilinear downscale where a
+     * thin line vanishes), it spans nearly half the ring, and it is the only thing in the lower half.
+     */
+    for (const tone of ['go', 'back'] as const) {
+      const el = draw({}, { ...CHOICE, target: pairedDwellTargets('leg')[tone === 'go' ? 0 : 1], tone });
+      const mark = el.querySelector('[data-mark]') as SVGGElement;
+      expect(mark.getAttribute('data-mark')).toBe(tone);
+      // FILLED, not stroked: the fill is a colour and the stroke is only the dark halo under it.
+      expect(mark.getAttribute('fill')).toMatch(/#f|#ffffff/i);
+      expect(Number(mark.getAttribute('stroke-width'))).toBeLessThan(4);
+      // Its extent, read off the actual path/rect geometry, against the ring radius (46 viewBox units).
+      const xs: number[] = [];
+      for (const node of mark.querySelectorAll('path')) {
+        for (const m of (node.getAttribute('d') ?? '').matchAll(/(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)/g)) xs.push(Number(m[1]));
+      }
+      for (const node of mark.querySelectorAll('rect')) {
+        xs.push(Number(node.getAttribute('x')), Number(node.getAttribute('x')) + Number(node.getAttribute('width')));
+      }
+      const width = Math.max(...xs) - Math.min(...xs);
+      expect(width, tone).toBeGreaterThan(2 * 46 * 0.4);
+      // …and still well inside the circle that is actually tested: nothing may imply a bigger target.
+      expect(Math.max(...xs.map(Math.abs)), tone).toBeLessThan(46 - 8);
+    }
+    // The two are different SHAPES, in every phase — it is what the ring is, not what it is doing.
+    const shapeOf = (el: HTMLElement) =>
+      [...el.querySelectorAll('[data-mark] path, [data-mark] rect')]
+        .map((n) => n.getAttribute('d') ?? `${n.getAttribute('x')}/${n.getAttribute('width')}`)
+        .join('|');
+    const go = shapeOf(draw({}, { ...CHOICE, tone: 'go' }));
+    for (const over of [{ tracked: false }, { blocked: 'occupied' as const }, { blocked: 'coupled' as const }, { holding: true, progress: 0.5 }]) {
+      expect(shapeOf(draw(over, { ...CHOICE, tone: 'back' }))).not.toBe(go);
+      expect(draw(over, { ...CHOICE, tone: 'back' }).querySelector('[data-mark]')).not.toBeNull();
+    }
   });
 
   it('draws the secondary visibly smaller', () => {
@@ -1072,7 +1620,7 @@ describe('dwellCadence', () => {
 function session(over: Partial<DwellSession> = {}): DwellSession {
   // A session with a tracker in it: the legend distinguishes "no frames", "nothing to confirm yet"
   // (no live trackers) and "here is what to hold", and the first two have their own tests below.
-  return { states: { go: state() }, limb: null, live: true, xScale: PREVIEW_ASPECT, frameIntervalSec: 1 / 30, ...over };
+  return { states: { go: state() }, limb: null, coupled: null, live: true, xScale: PREVIEW_ASPECT, frameIntervalSec: 1 / 30, ...over };
 }
 
 describe('DwellLegend', () => {
@@ -1115,7 +1663,9 @@ describe('DwellLegend', () => {
     const leg = screen.getByTestId('dwell-legend');
     expect(leg.textContent).toMatch(/Move a hand into the circle/);
     expect(leg.textContent).not.toMatch(/a hand or a knee/);
-    expect(screen.getByTestId('dwell-legend-limbs').textContent).toMatch(/your knees are doing the exercise/);
+    expect(screen.getByTestId('dwell-legend-limbs').textContent).toMatch(/a knee held in the circle cannot be told apart from a repetition/);
+    // …and it names the support the hand has to be on, and rules out the one the leg carries.
+    expect(screen.getByTestId('dwell-legend-limbs').textContent).toMatch(/not on your thigh/);
     useStore.getState().setMode('hand');
     cleanup();
     render(<DwellLegend session={session()} what="x" />);
@@ -1142,7 +1692,8 @@ describe('DwellLegend', () => {
     expect(el.dataset.state).toBe('searching');
     const say = screen.getByTestId('dwell-legend-bring-hand').textContent ?? '';
     expect(say).toMatch(/Bring a hand into the picture/);
-    expect(say).toMatch(/thigh|arm of the chair/);
+    expect(say).toMatch(/arm of the chair|table/);
+    expect(say).toMatch(/NOT on your thigh/);
     expect(say).toMatch(/the left circle to go on/);
     expect(say).toMatch(/knees cannot do this/);
     // …and it is the first thing in the block, which is what makes it visible without scrolling on a
@@ -1156,8 +1707,17 @@ describe('DwellLegend', () => {
     // pushed the block off the bottom of a 768 px screen), but still says the buttons are there.
     const small = screen.getByTestId('dwell-legend-limbs').textContent ?? '';
     expect(small).toMatch(/Either side may do this/);
-    expect(small).toMatch(/the buttons still work/i);
-    expect(small).not.toMatch(/cannot be told apart from a repetition/);
+    /**
+     * AND IT NO LONGER POINTS AT A CONTROL THAT MAY BE SWITCHED OFF.
+     *
+     * "If no hand can come into the picture, the buttons still work" was false in the one state where
+     * a stranded patient reads it: on a blocked device the camera check sets `disabled={readiness.gate}`
+     * on its forward button, so the only thing left IS the circle. Unless the screen says otherwise
+     * (`touch`), the sentence promises no particular button.
+     */
+    expect(small).toMatch(/has to be done on the screen/);
+    expect(small).toMatch(/can have its own button switched off/);
+    expect(small).not.toMatch(/buttons still work/i);
 
     // It is the RINGS' state, not the pick's: a hand that drops out for one frame leaves `limb` null
     // while every ring is still tracking, and there the legend goes on telling the patient to hold.
@@ -1241,6 +1801,70 @@ describe('DwellLegend', () => {
     const el = screen.getByTestId('dwell-legend');
     expect(el.dataset.state).toBe('offline');
     expect(el.textContent).toMatch(/Hands-free is not available right now/);
-    expect(el.textContent).toMatch(/Use the buttons/);
+    expect(el.textContent).toMatch(/Restarting the camera/);
+    // Not "use the buttons": see the note in the test above. A screen that KNOWS its button is off
+    // says so instead, and a screen that knows it works may promise it.
+    expect(el.textContent).not.toMatch(/Use the buttons/);
+    cleanup();
+    render(<DwellLegend session={session({ live: false })} what="x" touch="off" />);
+    expect(screen.getByTestId('dwell-legend-touch').textContent).toMatch(/switched off at the moment/);
+    cleanup();
+    render(<DwellLegend session={session({ live: false })} what="x" touch="on" />);
+    expect(screen.getByTestId('dwell-legend-touch').textContent).toMatch(/A button on this screen does the same thing/);
+  });
+
+  it('SAYS THE BUTTON IS OFF where the screen has switched it off, instead of promising it', () => {
+    /**
+     * `DwellTarget.tsx:1008` and `:1011` used to read "If your hands are out of the picture, use the
+     * buttons." and "the buttons still work." — beside a camera check that disables its own forward
+     * button on a blocked device (`CameraCheck.tsx`, `disabled={readiness.gate}`). A patient alone on a
+     * blocked device, with no hand in the picture, was being pointed at a greyed-out control: the one
+     * state in which that sentence is the only thing left to act on, and it was not true.
+     */
+    useStore.getState().setMode('leg');
+    cleanup();
+    render(<DwellLegend session={session({ states: { go: state({ tracked: false }) } })} what="x" touch="off" />);
+    const blocked = screen.getByTestId('dwell-legend-limbs').textContent ?? '';
+    expect(blocked).toMatch(/switched off at the moment/);
+    expect(blocked).toMatch(/the circles are the only way on/);
+    expect(blocked).not.toMatch(/buttons still work/i);
+    cleanup();
+    render(<DwellLegend session={session()} what="x" touch="on" />);
+    expect(screen.getByTestId('dwell-legend-limbs').textContent).toMatch(/A button on this screen does the same thing/);
+  });
+
+  it('a hand the EXERCISE is carrying is named, with the remedy, not told to hold harder', () => {
+    // The measured verdict (`DwellCoupling`) reaching the patient: a hand resting on the thigh is
+    // carried by hip flexion, so nothing it does can be told from a repetition. "Move a hand into the
+    // circle and keep it there" is an instruction that cannot be followed by a limb that is not an
+    // independent witness — what the patient can act on is the SUPPORT.
+    useStore.getState().setMode('leg');
+    cleanup();
+    render(
+      <DwellLegend
+        session={session({
+          states: { go: state({ blocked: 'coupled', tracked: true }) },
+          limb: { point: { x: 0.64, y: 0.5 }, side: 'left', label: 'your left hand', key: 'hand:left', scale: null },
+          coupled: {
+            key: 'hand:left',
+            coupled: true,
+            explained: 0.19,
+            r2: 0.99,
+            reference: 'lane:0:seated_march:left/y',
+            samples: 40,
+            settled: true,
+          },
+        })}
+        what="the left circle to go on"
+      />,
+    );
+    const el = screen.getByTestId('dwell-legend');
+    expect(el.dataset.state).toBe('coupled');
+    const say = screen.getByTestId('dwell-legend-carried').textContent ?? '';
+    expect(say).toMatch(/Your left hand is moving with your exercise/);
+    expect(say).toMatch(/carried by your leg/);
+    expect(say).toMatch(/arm of the chair|armrest|table/);
+    expect(say).toMatch(/other hand will do/);
+    expect(el.textContent).not.toMatch(/Move .* into the circle and keep it/);
   });
 });

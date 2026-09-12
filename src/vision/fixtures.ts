@@ -100,8 +100,22 @@ export interface SeatedPoseParams {
    * ('the bodies the pipeline is driven with'), so a fixture hand rests where that proof says hands
    * rest. 'out_of_view' is the other real state: hands out of the picture, which is what the old
    * framing instruction invited and what the camera check now has to say out loud.
+   *
+   * AND A RESTING HAND IS NOT WORLD-FIXED — see `SEATED_HAND_SUPPORTS`. What holds the hand up decides
+   * whether the leg prescription moves it, and the rig that said "the hands stay where they were"
+   * whatever the leg did is the rig that hid this feature's third failure.
    */
   hands?: SeatedHandRest | 'out_of_view';
+  /**
+   * WHERE ALONG THE THIGH a thigh-supported hand sits: 0 = at the hip (the one point on the thigh that
+   * does not move), 1 = at the knee. Defaults to the rest position's own fraction
+   * (`SEATED_HAND_SUPPORTS`). Only meaningful for a rest whose support is 'thigh'.
+   *
+   * It exists so the sweeps can vary it, because THIS IS THE VARIABLE THE PROOF WAS MISSING: a hand at
+   * fraction f rises by f x the knee's travel and is carried laterally by f x the knee's circumduction,
+   * and a rig that pinned the wrist at the hip pinned exactly the quantity under test.
+   */
+  handThighFraction?: number;
   /**
    * ONE HAND RAISED TO A POINT (image coordinates) — the confirm gesture, and nothing else: the other
    * hand stays where it rests, the legs are untouched, and the scene is not translated. Aiming a hand
@@ -109,6 +123,15 @@ export interface SeatedPoseParams {
    * the hips and the other hand with it, and can carry them out of frame.
    */
   handAt?: { side: Side; x: number; y: number };
+  /**
+   * ONE hand out of the picture, the other resting where `hands` says.
+   *
+   * The state that matters for the hands-free path: a patient with only one hand the camera can see.
+   * If that hand is the one resting on the thigh, the app has no other limb to fall back on, so the
+   * rings have to stand down and SAY so rather than let the exercise answer for them. `hands:
+   * 'out_of_view'` hides both and cannot express it.
+   */
+  hideHand?: Side;
   /** Visibility assigned to all landmarks (default 0.95). */
   visibility?: number;
 }
@@ -122,6 +145,40 @@ export const SEATED_HAND_RESTS: Readonly<Record<SeatedHandRest, Readonly<Record<
   chair_arms: { left: { x: 0.7, y: 0.45 }, right: { x: 0.3, y: 0.45 } },
   folded: { left: { x: 0.54, y: 0.55 }, right: { x: 0.46, y: 0.55 } },
 });
+
+/** What is holding a resting hand up — which is what decides whether the exercise moves it. */
+export type SeatedHandSupport =
+  /** The patient's own thigh: hip flexion and circumduction CARRY THE HAND. */
+  | 'thigh'
+  /** A chair arm, an armrest, a table: furniture, so the hand stays where it is in the world. */
+  | 'fixed'
+  /** Nothing but the arms, in front of the body: carried by a trunk lean, not by the leg. */
+  | 'trunk';
+
+/**
+ * WHAT HOLDS EACH RESTING HAND UP, AND HOW MUCH OF THE LEG'S MOTION IT THEREFORE INHERITS.
+ *
+ * This table is the fixture fix for the third round of the same defect. A hand resting ON THE THIGH is
+ * part of the thigh's kinematic chain: hip flexion rotates the thigh about the hip, so a hand at
+ * fraction f along the hip->knee segment rises by f x the knee's vertical travel, and hip circumduction
+ * (the compensation this app promises never to penalise) carries it sideways by f x the knee's lateral
+ * travel at the same time. The rig used to hold every wrist at a world-fixed point and say "nothing
+ * else in the figure moves", which made the hands-free proof a proof about a body that does not exist:
+ * the 324-case sweep varied movement, side, pace, compensation, aspect and rest position and hard-coded
+ * the one quantity the claim depends on.
+ *
+ * `fraction` is where along the thigh the hand sits — a hand rests mid-to-distal thigh (0.7), a hand in
+ * the LAP sits on the proximal thighs (0.35) and moves less, and a hand on a CHAIR ARM or a table moves
+ * not at all. Those are the numbers the sweeps start from; `SeatedPoseParams.handThighFraction`
+ * overrides them so f itself can be swept.
+ */
+export const SEATED_HAND_SUPPORTS: Readonly<Record<SeatedHandRest, Readonly<{ support: SeatedHandSupport; fraction: number }>>> =
+  Object.freeze({
+    thighs: { support: 'thigh', fraction: 0.7 },
+    lap: { support: 'thigh', fraction: 0.35 },
+    chair_arms: { support: 'fixed', fraction: 0 },
+    folded: { support: 'trunk', fraction: 0 },
+  });
 
 /** Visibility given to an arm that is out of the picture — below MIN_VISIBILITY, so nothing reads it. */
 const HIDDEN_VISIBILITY = 0.05;
@@ -182,25 +239,41 @@ export function seatedPose(params: SeatedPoseParams = {}): Landmark[] {
   /**
    * THE ARMS, which a seated leg patient has and this rig used to leave on the placeholder.
    *
-   * Both hands rest where `SEATED_HAND_RESTS` says, carried sideways with the trunk by the same `lean`
-   * the shoulders move by (the arm hangs from the shoulder). `handAt` raises ONE hand to a point and
-   * takes its elbow with it; nothing else in the figure moves, so a hand can be put on a dwell target
-   * without dragging the knees, the hips and the other hand across the frame.
+   * A resting hand is placed BY ITS SUPPORT (`SEATED_HAND_SUPPORTS`), and that is the whole point of
+   * this block:
+   *   - 'thigh'  — the hand is carried by the thigh. Its offset from the hip at rest is preserved, and
+   *                then it moves with f x (knee - hip): UP with hip flexion, SIDEWAYS with hip
+   *                circumduction or abduction. A hand on the thigh is not a witness that is independent
+   *                of the leg prescription; it is part of the leg.
+   *   - 'fixed'  — a chair arm, an armrest, a table. The hand stays put whatever the leg and the trunk
+   *                do, which is why this is the support the app now asks for.
+   *   - 'trunk'  — folded in front of the body, so it swings with the same `lean` the shoulders do.
+   * `handAt` raises ONE hand to a point and takes its elbow with it; the knees, the hips and the other
+   * hand stay where they were, so a hand can be put on a dwell target without dragging the body.
    */
   const hands = params.hands ?? 'thighs';
   const hidden = hands === 'out_of_view';
+  const support = hidden ? SEATED_HAND_SUPPORTS.lap : SEATED_HAND_SUPPORTS[hands];
+  const thighF = params.handThighFraction ?? support.fraction;
   for (const side of ['left', 'right'] as Side[]) {
     const raised = params.handAt && params.handAt.side === side ? params.handAt : null;
+    const gone = hidden || (params.hideHand === side && !raised);
     const sign = side === 'left' ? 1 : -1;
     const shoulder = side === 'left' ? p[POSE.LEFT_SHOULDER] : p[POSE.RIGHT_SHOULDER];
+    const hip = side === 'left' ? p[POSE.LEFT_HIP] : p[POSE.RIGHT_HIP];
+    const knee = side === 'left' ? p[POSE.LEFT_KNEE] : p[POSE.RIGHT_KNEE];
+    // How much of this leg's own travel the hand inherits, and how much of the trunk's.
+    const carry = support.support === 'thigh' ? thighF : 0;
+    const sway = support.support === 'trunk' ? lean : 0;
+    const restAt = hidden ? SEATED_HAND_RESTS.lap[side] : SEATED_HAND_RESTS[hands][side];
     // Out of the picture: below the bottom edge (a frame cropped to hips, knees and feet), and
     // reported at a visibility nothing in the app will read (MIN_VISIBILITY is 0.5).
     const at = raised
       ? { x: raised.x, y: raised.y }
-      : hidden
-        ? { x: SEATED_HAND_RESTS.lap[side].x + lean, y: 1.18 }
-        : { x: SEATED_HAND_RESTS[hands][side].x + lean, y: SEATED_HAND_RESTS[hands][side].y };
-    const armVis = raised || !hidden ? vis : HIDDEN_VISIBILITY;
+      : gone
+        ? { x: restAt.x + sway, y: 1.18 }
+        : { x: restAt.x + sway + carry * (knee.x - hip.x), y: restAt.y + carry * (knee.y - hip.y) };
+    const armVis = gone ? HIDDEN_VISIBILITY : vis;
     // Hands on the thighs / on a raised target are forward of the hips, toward the camera.
     const wristZ = raised ? -0.05 : -0.12;
     const idx = side === 'left'

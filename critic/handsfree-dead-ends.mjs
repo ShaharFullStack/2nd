@@ -21,11 +21,19 @@
  *      "Camera check" on the first lane and "Back a movement" on a later one, and that an advance
  *      made hands-free can be UNDONE hands-free.
  *   3a. STOPPING THE SONG MID-PLAY WITH NOTHING BUT A LIMB. The patient stops moving; the rest offer
- *      appears in the panel the renderer reserves beside the board; holding its circle pauses the song
- *      (never ends it), and a second hold carries on. Asserts the offer and its ring are on screen.
+ *      appears in the strip the board gives up for it; holding its circle pauses the song (never ends
+ *      it), and a second hold carries on. Asserts the offer and its ring are on screen, that the ring
+ *      is big enough to aim at from a metre (it was ~11 px of radius in the old 129x97 reserved panel,
+ *      about 0.4° against a 1.5° floor), and that no part of the board is behind the panel — the two
+ *      halves that used to be traded against each other.
  *   3. THE SONG STOPPING ITSELF. Hides the page (the lifecycle event, not an input), asserts the run
  *      pauses itself and that the dialog carries a live pair of targets on screen, then RESUMES the
- *      song by holding a limb and ENDS the session by holding a limb.
+ *      song by holding a limb.
+ *   3c. ENDING THE SESSION, WHICH IS THE ONE DESTRUCTIVE SELECT ON THE SCREEN. Asserts that one hold
+ *      only ASKS, that the second hold only starts a countdown, that NOTHING has reached the patient's
+ *      history or their trend at either stage, that the grace window's only target is the way back —
+ *      and then takes the ending back with a limb and proves the song came back with the record still
+ *      empty, before going through it deliberately.
  *   3b. THE ONE THING THAT CANNOT BE DONE HANDS-FREE. Suspends the AudioContext the way a browser
  *      does and asserts the screen SAYS so in those words, and that the whole screen is the control.
  *      This is the only place the harness performs a second touch — the point being that it must.
@@ -86,17 +94,24 @@ async function installBody(page) {
       side: 'left', lift: 0, dx: 0, dy: 0, injected: 0,
       /** Which hand is doing the reaching, and where it is (null = both hands on the thighs). */
       handSide: 'left', hand: null,
+      /** What is holding the resting hands up: furniture ('chair_arms') the leg cannot move, or the
+       *  thighs, which carry the hand and are therefore refused as a pointer (`DwellCoupling`). */
+      support: 'chair_arms',
       points: () => ({
         knee: body.side === 'left' ? lm.POSE.LEFT_KNEE : lm.POSE.RIGHT_KNEE,
       }),
-      pose: () => fx.seatedPose({ kneeLift: body.lift, side: body.side, handAt: body.hand ?? undefined }),
+      pose: () => fx.seatedPose({ kneeLift: body.lift, side: body.side, hands: body.support, handAt: body.hand ?? undefined }),
       /** Both hands back on the thighs: out of every ring, which is what opens the entry gate. */
       rest: () => { body.hand = null; },
       /** Pick the hand that will reach, and put it at that hand's own resting position. */
-      reach: (side) => { body.handSide = side; body.hand = { side, ...fx.SEATED_HAND_RESTS.thighs[side] }; },
+      reach: (side) => { body.handSide = side; body.hand = { side, ...fx.SEATED_HAND_RESTS[body.support][side] }; },
       at: (name) => {
         if (name === 'wrist') {
-          const p = body.hand ?? fx.SEATED_HAND_RESTS.thighs[body.handSide];
+          // READ THE POSE, NEVER THE REST TABLE: a hand resting on the THIGH is carried by hip
+          // flexion and circumduction (`SEATED_HAND_SUPPORTS`), so the table's number is where the
+          // hand would be if the leg were down. That assumption is what this harness inherited.
+          const idx = body.handSide === 'left' ? lm.POSE.LEFT_WRIST : lm.POSE.RIGHT_WRIST;
+          const p = body.pose()[idx];
           return { x: p.x + body.dx, y: p.y + body.dy };
         }
         const idx = body.points()[name];
@@ -284,6 +299,34 @@ async function main() {
     log('verdict:', JSON.stringify(verdict));
     notes.push(`blocked headline: ${verdict.headline}`);
     if (verdict.buttonDisabled !== true) failures.push('the therapist gate did not close on a blocked device');
+    /**
+     * ...AND THE GATE MAY NOT BE THE ONLY BUTTON ON THE SCREEN. The dwell legend under the preview
+     * ends "If your hands are out of the picture, use the buttons", and on a blocked device the only
+     * button above the fold was the gated one: the buttons that DID work were in the readiness card
+     * in the right column, ~400 px below the fold at 1024x768. A caption may not point at a disabled
+     * control. So the escape now sits beside the gate it escapes, above the fold, and is asserted as
+     * such — enabled, on screen, and not the primary green button.
+     */
+    const escape = await page.evaluate(() => {
+      const el = document.querySelector('[data-testid="camera-continue-anyway"]');
+      if (!el) return null;
+      const r = el.getBoundingClientRect();
+      return {
+        disabled: el.disabled === true,
+        primary: el.className.includes('btn-primary'),
+        text: el.textContent,
+        visible: r.top >= 0 && r.bottom <= window.innerHeight && r.width > 0,
+        top: Math.round(r.top),
+      };
+    });
+    log('above-the-fold escape', JSON.stringify(escape));
+    if (!escape) failures.push('a blocked camera check offers no working forward BUTTON above the fold, while its legend says to use the buttons');
+    else {
+      if (escape.disabled) failures.push('the above-the-fold escape from the blocked gate is itself disabled');
+      if (!escape.visible) failures.push(`the escape from the blocked gate is off screen at 1024x768 (top ${escape.top})`);
+      if (escape.primary) failures.push('the escape from a blocked device is the primary green button — the gate is meant to stop somebody walking forward unaware');
+      if (!/anyway/i.test(escape.text ?? '')) failures.push(`the escape reads "${escape.text}" rather than saying it is going on anyway`);
+    }
 
     const go = await box(page, 'camera-dwell-continue');
     const back = await box(page, 'camera-dwell-restart');
@@ -468,6 +511,43 @@ async function main() {
           if (!b) failures.push(`${n} is not on the play screen`);
           else if (!b.visible) failures.push(`${n} is off screen at 1024x768 (top ${b.top}, bottom ${b.bottom}, viewport ${b.vh})`);
         }
+        /**
+         * AND IT HAS TO BE BIG ENOUGH TO AIM AT. Measured in the running app at 1024x768 before this
+         * was fixed: the offer lived in the renderer's reserved panel, which gave it a 129x97 preview
+         * and a ring of ~11 px radius — about 0.4° of visual angle at a metre, against an
+         * assistive-technology floor of 1.5°. "Never covers the board" had been bought by making the
+         * only mid-song safety control invisible. The board now MAKES ROOM (the canvas is narrowed and
+         * the renderer re-laid-out into what is left), so this asserts both halves: the ring has its
+         * degrees, and no part of the board is behind the panel.
+         */
+        const ringSize = await page.evaluate(() => {
+          const host = document.querySelector('[data-testid="rest-dwell-stop"]');
+          const track = host?.querySelector('.dwell-track');
+          const canvas = document.querySelector('[data-testid="play-canvas"]');
+          const panel = document.querySelector('[data-testid="rest-offer"]');
+          if (!track || !canvas || !panel) return null;
+          const t = track.getBoundingClientRect();
+          const c = canvas.getBoundingClientRect();
+          const p = panel.getBoundingClientRect();
+          return {
+            ringRadiusPx: Math.round((t.width / 2) * 10) / 10,
+            preview: (() => { const f = host.closest('.camera-frame')?.getBoundingClientRect(); return f ? `${Math.round(f.width)}x${Math.round(f.height)}` : null; })(),
+            canvas: `${Math.round(c.width)}x${Math.round(c.height)} at ${Math.round(c.left)}`,
+            boardBehindThePanel: !(p.right <= c.left + 1 || p.left >= c.right - 1 || p.bottom <= c.top + 1 || p.top >= c.bottom - 1),
+          };
+        });
+        log('rest ring', JSON.stringify(ringSize));
+        if (!ringSize) failures.push('could not measure the rest offer\'s ring at all');
+        else {
+          // ~0.35 mm per CSS px on a clinic tablet: 35 px of radius is ~1.4°, i.e. the floor with the
+          // slack the layout is allowed to take out of it on a 1024-wide board.
+          if (ringSize.ringRadiusPx < 35) {
+            failures.push(`the mid-song safety control's ring is ${ringSize.ringRadiusPx} px of radius in a ${ringSize.preview} preview — under the 1.5° floor a patient has to aim at it from a metre`);
+          }
+          if (ringSize.boardBehindThePanel) {
+            failures.push('the rest offer is drawn over the board — a note behind it would be recorded as unanswered');
+          }
+        }
         await shoot(page, '07b-rest-offer');
 
         // THE HANDS-FREE "NO": one repetition of the prescribed movement takes the offer away. This is
@@ -570,9 +650,79 @@ async function main() {
         Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true });
       });
       await page.waitForFunction(() => window.__beatRehab.getScore?.()?.phase === 'paused', null, { timeout: 10000 }).catch(() => {});
+
+      // ---- 3c. ENDING THE SESSION IS DESTRUCTIVE, SO IT IS ASKED TWICE AND THEN UNDOABLE -------
+      // The round-three critic reproduced a FALSE dwell confirm of this exact circle at 3.30 s into
+      // the first repetition of a seated march with hip circumduction — the compensation this app
+      // promises never to penalise — and the app filed a truncated session the patient never chose to
+      // end, into their history and their trend, with no undo. What is driven here is the whole gate,
+      // INCLUDING the undo: confirm the end, then take it back with a limb and prove the session came
+      // back with nothing written; then do it again and let it through.
+      const recordNow = () => page.evaluate(() => ({
+        history: window.__beatRehab.getState().history.length,
+        last: window.__beatRehab.getState().lastResult !== null,
+        phase: window.__beatRehab.getScore?.()?.phase ?? null,
+      }));
+      const before = await recordNow();
       try {
-        await hold(page, 'pause-dwell-end', async () => (await screenOf(page)) === 'results', 45000);
-        log('ENDED the session hands-free');
+        await hold(page, 'pause-dwell-end', async () => !!(await page.$('[data-testid="end-confirm"]')), 45000);
+        log('the end circle ASKS: one hold raises "Stop the session here?" and writes nothing');
+      } catch (e) { failures.push(`the end circle did not raise the confirmation step: ${e.message}`); }
+      const asked = await recordNow();
+      if (asked.history !== before.history || asked.last !== before.last) {
+        failures.push(`one hold on the end circle already wrote to the record (history ${before.history} -> ${asked.history})`);
+      }
+      if (asked.phase === 'ended') failures.push('one hold on the end circle already finished the run');
+      await shoot(page, '08c-end-asked');
+
+      // THE SECOND HOLD, on the smaller circle on the other side of the preview.
+      try {
+        await hold(page, 'pause-dwell-end-confirm', async () => !!(await page.$('[data-testid="end-grace"]')), 45000);
+        log('the second hold starts a countdown — and still writes nothing');
+      } catch (e) { failures.push(`the second hold did not reach the grace window: ${e.message}`); }
+      const counting = await recordNow();
+      if (counting.history !== before.history || counting.last !== before.last) {
+        failures.push(`the grace window had already written to the record (history ${before.history} -> ${counting.history})`);
+      }
+      if (counting.phase === 'ended') failures.push('the grace window had already finished the run');
+      const graceTargets = await page.evaluate(() => ({
+        keep: document.querySelector('[data-testid="pause-dwell-keep"]')?.getAttribute('data-phase') ?? null,
+        endStill: !!document.querySelector('[data-testid="pause-dwell-end-confirm"]'),
+        left: document.querySelector('[data-testid="end-grace-left"]')?.textContent ?? null,
+      }));
+      log('grace window', JSON.stringify(graceTargets));
+      if (graceTargets.keep === null) failures.push('the grace window offers no hands-free way back at all');
+      else if (graceTargets.keep === 'off') failures.push('the grace window\'s way back is a dead ring');
+      if (graceTargets.endStill) failures.push('the grace window still offers the destructive circle — a second chance to confirm inside its own undo window');
+      if (!graceTargets.left) failures.push('the grace window does not say how long is left');
+      await shoot(page, '08d-end-grace');
+
+      // THE UNDO, WITH A LIMB: the session comes back and nothing was written.
+      try {
+        await hold(page, 'pause-dwell-keep', async () =>
+          (await page.evaluate(() => window.__beatRehab.getScore?.()?.phase === 'playing')) === true, 45000);
+        log('TOOK THE ENDING BACK hands-free — the patient got their session back');
+      } catch (e) { failures.push(`the ending could not be undone hands-free: ${e.message}`); }
+      const undone = await recordNow();
+      if (undone.history !== before.history || undone.last !== before.last) {
+        failures.push(`an ending that was taken back still left a record behind (history ${before.history} -> ${undone.history})`);
+      }
+      if (undone.phase !== 'playing') failures.push(`taking the ending back did not give the song back (phase ${undone.phase})`);
+      await shoot(page, '08e-end-undone');
+
+      // ...and then, deliberately, all the way through.
+      await page.evaluate(() => {
+        Object.defineProperty(document, 'visibilityState', { value: 'hidden', configurable: true });
+        document.dispatchEvent(new Event('visibilitychange'));
+        Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true });
+      });
+      await page.waitForFunction(() => window.__beatRehab.getScore?.()?.phase === 'paused', null, { timeout: 10000 }).catch(() => {});
+      try {
+        await hold(page, 'pause-dwell-end', async () => !!(await page.$('[data-testid="end-confirm"]')), 45000);
+        await hold(page, 'pause-dwell-end-confirm', async () => !!(await page.$('[data-testid="end-grace"]')), 45000);
+        // Nothing more to hold: the window runs out by itself, which is the hands-free "yes".
+        await page.waitForFunction(() => window.__beatRehab.getState().screen === 'results', null, { timeout: 30000 });
+        log('ENDED the session hands-free: two holds and a grace window nobody took back');
       } catch (e) { failures.push(`hands-free END from the pause dialog: ${e.message}`); }
     }
 

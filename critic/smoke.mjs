@@ -50,6 +50,25 @@ async function waitForServer(url, timeoutMs = 60_000) {
   throw new Error(`server at ${url} did not come up`);
 }
 
+/**
+ * END THE SESSION FROM THE PAUSE DIALOG — THREE DELIBERATE ACTS, NOT ONE.
+ *
+ * Ending a run writes a truncated summary into the patient's history and their trend and leaves the
+ * runner `ended`, which nothing in the app comes back from; the round-three critic reproduced a FALSE
+ * dwell confirm of that exact control. So it now asks ("End & see results…"), then asks again ("Yes,
+ * stop the session"), and then holds the session open for a grace window in which the only hands-free
+ * target is the way back — nothing is written until that window expires or "Stop now" is pressed.
+ * Walking all three here is also the assertion that the first two write nothing: the results screen
+ * is waited for only after the last of them.
+ */
+async function endSession(page) {
+  await page.getByTestId('end-session').click();
+  await page.waitForSelector('[data-testid="end-confirm"]', { timeout: 5000 });
+  await page.getByTestId('end-confirm-btn').click();
+  await page.waitForSelector('[data-testid="end-grace"]', { timeout: 5000 });
+  await page.getByTestId('end-now').click();
+}
+
 async function main() {
   mkdirSync(SHOT_DIR, { recursive: true });
 
@@ -159,7 +178,7 @@ async function main() {
     // End the session from the pause overlay and check the therapist's report is produced and stored.
     await page.keyboard.press('Escape');
     await page.waitForSelector('[data-testid="pause-overlay"]', { timeout: 5000 });
-    await page.getByTestId('end-session').click();
+    await endSession(page);
     await page.waitForSelector('[data-testid="results-screen"]', { timeout: 10_000 });
     await page.screenshot({ path: RESULTS_SHOT });
     log('screenshot ->', RESULTS_SHOT);
@@ -196,7 +215,7 @@ async function main() {
     if (again.phase !== 'playing' && again.phase !== 'countdown') failures.push(`replay phase ${again.phase}`);
     await page.keyboard.press('Escape');
     await page.waitForSelector('[data-testid="pause-overlay"]', { timeout: 5000 });
-    await page.getByTestId('end-session').click();
+    await endSession(page);
     await page.waitForSelector('[data-testid="results-screen"]', { timeout: 10_000 });
 
     await page.getByTestId('open-history-from-results').click();

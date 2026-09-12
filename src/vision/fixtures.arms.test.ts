@@ -16,7 +16,7 @@
 import { describe, expect, it } from 'vitest';
 import { dwellDistance, dwellLimbs } from './dwell.ts';
 import { extractFeature } from './features.ts';
-import { SEATED_HAND_RESTS, seatedHandAt, seatedHandsOutOfView, seatedPose } from './fixtures.ts';
+import { SEATED_HAND_RESTS, SEATED_HAND_SUPPORTS, seatedHandAt, seatedHandsOutOfView, seatedPose } from './fixtures.ts';
 import { MIN_VISIBILITY, POSE } from './landmarks.ts';
 import type { DetectionResult } from './mediapipe.ts';
 
@@ -98,12 +98,80 @@ describe('the seated rig has hands', () => {
     }
   });
 
-  it('carries the hands with the trunk when the trunk leans, because arms hang from shoulders', () => {
-    const lean = seatedPose({ trunkLean: 1 });
-    const straight = seatedPose();
-    const dx = lean[POSE.LEFT_SHOULDER].x - straight[POSE.LEFT_SHOULDER].x;
-    expect(dx).toBeGreaterThan(0.1);
-    expect(lean[POSE.LEFT_WRIST].x - straight[POSE.LEFT_WRIST].x).toBeCloseTo(dx, 10);
-    expect(lean[POSE.RIGHT_WRIST].x - straight[POSE.RIGHT_WRIST].x).toBeCloseTo(dx, 10);
+  /**
+   * WHAT IS HOLDING THE HAND UP IS WHAT MOVES IT — the fixture defect that hid this feature's third
+   * failure. The rig used to hold every wrist at a world-fixed point (carried only by the trunk lean),
+   * so a hand "on the thigh" was the one thing a seated leg exercise could not move. A hand on the
+   * thigh is part of the thigh: hip flexion rotates the thigh about the hip and takes the hand with it.
+   */
+  describe('a resting hand is carried by whatever is holding it up', () => {
+    const wrist = (pose: ReturnType<typeof seatedPose>, side: 'left' | 'right') =>
+      pose[side === 'left' ? POSE.LEFT_WRIST : POSE.RIGHT_WRIST];
+
+    it('ON THE THIGH: rises by f x the knee’s travel, and is carried sideways by circumduction', () => {
+      for (const f of [0.35, 0.7, 0.85, 1]) {
+        for (const side of ['left', 'right'] as const) {
+          const rest = seatedPose({ side, hands: 'thighs', handThighFraction: f });
+          const lifted = seatedPose({ side, hands: 'thighs', handThighFraction: f, kneeLift: 1 });
+          const knee = side === 'left' ? POSE.LEFT_KNEE : POSE.RIGHT_KNEE;
+          const kneeRise = rest[knee].y - lifted[knee].y;
+          expect(kneeRise, `${side} knee`).toBeCloseTo(0.28, 10);
+          // The hand rises by exactly its fraction of the knee's rise. THIS is the quantity the old
+          // rig pinned at zero, and at f=1 it is 0.28 of a frame height — more than two dwell radii.
+          expect(wrist(rest, side).y - wrist(lifted, side).y, `${side} f=${f}`).toBeCloseTo(f * kneeRise, 10);
+          // …and circumduction carries it laterally at the same time, by the same fraction.
+          const circ = seatedPose({ side, hands: 'thighs', handThighFraction: f, kneeLift: 1, abduction: 1 });
+          const kneeOut = circ[knee].x - lifted[knee].x;
+          expect(Math.abs(kneeOut), `${side} knee out`).toBeCloseTo(0.15, 10);
+          expect(wrist(circ, side).x - wrist(lifted, side).x, `${side} f=${f} lateral`).toBeCloseTo(f * kneeOut, 10);
+          // The OTHER hand, on the other (resting) thigh, does not move: only the exercising leg carries.
+          const other = side === 'left' ? 'right' : 'left';
+          expect(wrist(circ, other)).toEqual(wrist(rest, other));
+        }
+      }
+      // A hand IN THE LAP sits on the proximal thigh, so it is carried too — less, but not by nothing.
+      const lap = seatedPose({ hands: 'lap' });
+      const lapLifted = seatedPose({ hands: 'lap', kneeLift: 1 });
+      const carried = wrist(lap, 'left').y - wrist(lapLifted, 'left').y;
+      expect(carried).toBeGreaterThan(0.05);
+      expect(carried).toBeLessThan(0.28 * 0.7);
+    });
+
+    it('ON A CHAIR ARM: world-fixed — not moved by the leg, and not by the trunk either', () => {
+      const base = seatedPose({ hands: 'chair_arms' });
+      for (const variant of [
+        seatedPose({ hands: 'chair_arms', kneeLift: 1 }),
+        seatedPose({ hands: 'chair_arms', kneeLift: 1, abduction: 1 }),
+        seatedPose({ hands: 'chair_arms', abduction: -1 }),
+        seatedPose({ hands: 'chair_arms', kneeExtension: 1, toeLift: 1, heelLift: 1 }),
+        seatedPose({ hands: 'chair_arms', trunkLean: 1 }),
+        seatedPose({ hands: 'chair_arms', side: 'right', kneeLift: 1, abduction: 1 }),
+      ]) {
+        expect(wrist(variant, 'left')).toEqual(wrist(base, 'left'));
+        expect(wrist(variant, 'right')).toEqual(wrist(base, 'right'));
+      }
+      // That independence is the whole reason the app asks for this support (POSTURE_INFO.seated_leg).
+      expect(SEATED_HAND_SUPPORTS.chair_arms.support).toBe('fixed');
+    });
+
+    it('FOLDED in front of the body: carried by the trunk lean, since nothing else holds it', () => {
+      const lean = seatedPose({ hands: 'folded', trunkLean: 1 });
+      const straight = seatedPose({ hands: 'folded' });
+      const dx = lean[POSE.LEFT_SHOULDER].x - straight[POSE.LEFT_SHOULDER].x;
+      expect(dx).toBeGreaterThan(0.1);
+      expect(wrist(lean, 'left').x - wrist(straight, 'left').x).toBeCloseTo(dx, 10);
+      expect(wrist(lean, 'right').x - wrist(straight, 'right').x).toBeCloseTo(dx, 10);
+      // A trunk lean does NOT move a hand the thigh is holding: the thigh is where it was.
+      const thighLean = seatedPose({ hands: 'thighs', trunkLean: 1 });
+      expect(wrist(thighLean, 'left')).toEqual(wrist(seatedPose({ hands: 'thighs' }), 'left'));
+    });
+
+    it('a RAISED hand is where it was put, whatever the leg is doing', () => {
+      for (const lift of [0, 0.5, 1]) {
+        const pose = seatedPose({ kneeLift: lift, abduction: lift, handAt: { side: 'left', x: 0.72, y: 0.32 } });
+        expect(wrist(pose, 'left').x).toBeCloseTo(0.72, 12);
+        expect(wrist(pose, 'left').y).toBeCloseTo(0.32, 12);
+      }
+    });
   });
 });

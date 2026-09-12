@@ -625,10 +625,32 @@ export interface PointerObservation {
   fraction: number;
   /** Which limb the confirm gesture uses here — it decides what the remedy sentence has to say. */
   mode: Mode;
+  /**
+   * Share of the same window in which the limb the rings were following was MOVING WITH THE PRESCRIBED
+   * EXERCISE, and so could not answer anything (`DwellCoupling`, `DwellSession.coupled`). Omitted by a
+   * caller that cannot say, and then nothing is claimed about it either way.
+   *
+   * WHY A PRESENT POINTER IS NOT YET AN ANSWERABLE ONE. In leg mode the ring follows a hand, and a hand
+   * resting ON THE THIGH is carried by the thigh — hip flexion lifts it, circumduction swings it — so
+   * the app refuses it as a pointer rather than let a repetition confirm a step. That patient HAS a hand
+   * in the picture: `fraction` is 1, and the old verdict therefore promised "the patient can answer
+   * every step by holding a circle" over a ring that would stand itself down the moment they started
+   * exercising. A promise about a measurement the app itself will decline is exactly the class of lie
+   * this screen exists to prevent, so the two are now separate facts.
+   */
+  carriedFraction?: number | null;
 }
 
 /** Below this share of the window, the screen says the hands-free path is not dependable. */
 export const POINTER_PRESENT_FRACTION = 0.9;
+/**
+ * Above this share of the window spent being CARRIED by the prescribed movement, the screen stops
+ * promising that the patient can answer it. It is deliberately low: the coupling verdict only appears
+ * once the limb has actually travelled with the exercise (`DwellCoupling` needs about a second of
+ * window and a quarter of a dwell radius of explained travel), so any sustained share of it is a
+ * patient whose only pointer is on their thigh — and the therapist is in the room right now.
+ */
+export const POINTER_CARRIED_FRACTION = 0.2;
 
 export function cameraReadiness(
   q: TrackingQuality | null,
@@ -665,13 +687,36 @@ function withPointerVerdict(base: DeviceReadiness, p: PointerObservation | null)
   // 'measuring' claims nothing about anything yet, and the pointer window is not full either.
   if (!p || !Number.isFinite(p.fraction) || base.kind === 'measuring') return base;
   const hand = p.mode === 'leg' ? 'a hand' : 'the hand';
+  const carried = Number.isFinite(p.carriedFraction ?? NaN) ? (p.carriedFraction as number) : null;
   if (p.fraction >= POINTER_PRESENT_FRACTION) {
+    // A HAND IN THE PICTURE THAT THE EXERCISE IS MOVING IS NOT AN ANSWER. Same window, same session the
+    // rings are driven from: if the limb they were following was being carried by the prescribed
+    // movement for a real share of it, this screen may not promise that the patient can answer alone —
+    // and the remedy is the support, which is a thing the therapist can fix in the room, now.
+    if (carried !== null && carried >= POINTER_CARRIED_FRACTION) {
+      const pct = Math.round(carried * 100);
+      return {
+        ...base,
+        kind: base.kind === 'ready' ? 'degraded' : base.kind,
+        headline:
+          base.kind === 'ready'
+            ? `This device will run the session, but the hand in the picture is moving with the exercise, so it cannot answer the circles.`
+            : base.headline,
+        wont: [
+          ...base.wont,
+          `${hand[0].toUpperCase()}${hand.slice(1)} is in the picture, but for ${pct} % of this check it travelled with the prescribed movement — a hand resting on the thigh is carried by the thigh — so the circles refuse it: a hold made with it could not be told apart from a repetition.`,
+        ],
+        action: base.action
+          ? `${base.action} Rest that hand on the arm of the chair, an armrest or a table instead — anything the leg does not move — or use the other hand.`
+          : `Rest that hand on the arm of the chair, an armrest or a table instead — anything the leg does not move — or use the other hand. It clears as soon as the hand stops travelling with the exercise.`,
+      };
+    }
     return {
       ...base,
       will: [
         ...base.will,
         p.mode === 'leg'
-          ? 'A hand is in the picture, so the patient can answer every step by holding a circle — no one has to press anything for them.'
+          ? 'A hand is in the picture and is not being moved by the exercise, so the patient can answer every step by holding a circle — no one has to press anything for them.'
           : 'The hand is in the picture, so the patient can answer every step by holding a circle — no one has to press anything for them.',
       ],
     };
@@ -686,7 +731,7 @@ function withPointerVerdict(base: DeviceReadiness, p: PointerObservation | null)
       }`
     : `${hand[0].toUpperCase()}${hand.slice(1)} was in the picture for only ${pct} % of this check, so a hold keeps losing what it is following: the ring fills in fits and starts and can take far longer than the countdown inside it says.`;
   const action = gone
-    ? `Bring one hand into the picture — resting on the thigh or the arm of the chair is enough, either side will do — and the circles start following it. Until then the patient cannot answer a single screen alone: somebody has to press the buttons for them. This clears by itself as soon as a hand is in frame.`
+    ? `Bring one hand into the picture, resting on the arm of the chair, an armrest or a table — NOT on the thigh, which the leg carries — and either side will do; the circles start following it. Until then the patient cannot answer a single screen alone: somebody has to press the buttons for them. This clears by itself as soon as a hand is in frame.`
     : `Move the camera or the chair so one hand stays inside the preview for the whole session. Until it does, plan on pressing the buttons for the patient.`;
   return {
     ...base,

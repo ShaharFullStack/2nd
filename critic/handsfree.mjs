@@ -24,12 +24,19 @@
  * its public `processDetection(result, ctxTime)` — the same entry point the real detect loop calls,
  * on the same AudioContext clock.
  *
- * WITH ARMS, which is what makes this a test of the supported gesture. The rig used to leave every arm
- * landmark on an unplaced (0.5, 0.2) placeholder, so the only way to aim anything was to translate the
- * whole body — dragging the knees, the hips and that placeholder around the frame — while the app
- * follows a HAND and nothing else in leg mode. Now both hands rest on the thighs
- * (`SEATED_HAND_RESTS`) and one of them is raised to the ring and held there (`handAt`), which is
- * exactly what the screens ask a seated patient to do; nothing else in the figure moves with it. Everything downstream is the shipping code: feature extraction,
+ * WITH ARMS, RESTING ON SOMETHING THE LEG CANNOT MOVE, which is what makes this a test of the
+ * supported gesture. The rig used to leave every arm landmark on an unplaced (0.5, 0.2) placeholder, so
+ * the only way to aim anything was to translate the whole body — dragging the knees, the hips and that
+ * placeholder around the frame — while the app follows a HAND and nothing else in leg mode. It then
+ * gained arms that rested on the THIGHS and were world-fixed, which is a body that does not exist: hip
+ * flexion rotates the thigh about the hip and carries a hand resting on it, and that assumption is
+ * exactly what hid this feature's third failure. So the hands now rest on the CHAIR ARMS
+ * (`SEATED_HAND_RESTS.chair_arms`, `SEATED_HAND_SUPPORTS`) — the support `POSTURE_INFO.seated_leg`
+ * asks for — one of them is raised to the ring and held there (`handAt`), and `at('wrist')` reads the
+ * wrist landmark out of the pose instead of the rest table, so the harness aims at where the hand
+ * ACTUALLY is whatever the leg is doing. The thigh-resting body is driven as an attack in
+ * critic/handsfree-thigh.mjs, where the app is expected to refuse it.
+ * Everything downstream is the shipping code: feature extraction,
  * the unit-free filter, the ROM calibrator, the lane triggers and whatever the dwell target derives
  * its pointer from. The harness moves a limb and waits; it never calls a confirm handler. The one
  * thing it cannot do is produce photons, so Chromium's fake webcam supplies the real camera the app
@@ -193,26 +200,39 @@ async function installBody(page) {
        */
       handSide: 'left',
       hand: null,
+      /**
+       * WHERE THE RESTING HANDS ARE, AND WHAT IS HOLDING THEM UP. 'chair_arms' is furniture: the leg
+       * cannot move it, which is what `POSTURE_INFO.seated_leg` now asks for and the only support a
+       * hold can be made from. 'thighs' is the body the third round of this feature failed on — the
+       * thigh carries the hand, the app measures that and refuses the limb — and it is driven here
+       * deliberately, expecting to be refused rather than expecting to work.
+       */
+      support: 'chair_arms',
       /** Landmark indices this harness can aim with, in the order it tries them. */
       points: () => ({
         knee: body.side === 'left' ? lm.POSE.LEFT_KNEE : lm.POSE.RIGHT_KNEE,
         ankle: body.side === 'left' ? lm.POSE.LEFT_ANKLE : lm.POSE.RIGHT_ANKLE,
         nose: lm.POSE.NOSE,
       }),
-      pose: () => fx.seatedPose({ kneeLift: body.lift, side: body.side, handAt: body.hand ?? undefined }),
-      /** Both hands back on their thighs — out of every ring, which is what opens the entry gate. */
+      pose: () => fx.seatedPose({ kneeLift: body.lift, side: body.side, hands: body.support, handAt: body.hand ?? undefined }),
+      /** Both hands back on their supports — out of every ring, which is what opens the entry gate. */
       rest: () => {
         body.hand = null;
       },
       /** Choose the hand that will reach, and put it at that hand's own resting position. */
       reach: (side) => {
         body.handSide = side;
-        body.hand = { side, ...fx.SEATED_HAND_RESTS.thighs[side] };
+        body.hand = { side, ...fx.SEATED_HAND_RESTS[body.support][side] };
       },
       /** Where a named landmark currently is, in normalized camera coordinates. */
       at: (name) => {
         if (name === 'wrist' || name === 'hand') {
-          const p = body.hand ?? fx.SEATED_HAND_RESTS.thighs[body.handSide];
+          // READ THE POSE, NEVER THE REST TABLE. A resting hand is not world-fixed: on the THIGH it is
+          // carried by hip flexion and circumduction (`SEATED_HAND_SUPPORTS`), so the table's number is
+          // where the hand would be if the leg were down — which is the assumption that hid this
+          // feature's third failure and which this harness inherited wholesale.
+          const idx = body.handSide === 'left' ? lm.POSE.LEFT_WRIST : lm.POSE.RIGHT_WRIST;
+          const p = body.pose()[idx];
           return { x: p.x + body.dx, y: p.y + body.dy };
         }
         const idx = body.points()[name];
@@ -425,6 +445,7 @@ const probeDwell = ({ ids }) => {
     aim,
     progress: progressOf(pick),
     phase: pick.getAttribute('data-phase'),
+    block: pick.getAttribute('data-dwell-block'),
     hasProgress: progressOf(pick) !== null,
   };
 };
@@ -537,8 +558,13 @@ async function dwellConfirm(page, { what, ids, settled, budgetMs = 30_000, filli
   }
   if (await settled()) return { how: 'the target confirmed', progress: best };
   const p = await readDwell(page, ids);
+  const why = await page.evaluate(() => {
+    const el = document.querySelector('[data-coupled]:not([data-coupled=""])');
+    return el ? el.getAttribute('data-coupled') : null;
+  });
   throw new NotBuiltYet(
-    `the dwell target for "${what}" never confirmed. It is on screen ("${probe.matchedBy}", phase "${p.phase ?? '?'}") and the ` +
+    `the dwell target for "${what}" never confirmed. It is on screen ("${probe.matchedBy}", phase "${p.phase ?? '?'}"` +
+      `${p.block ? `, blocked: ${p.block}` : ''}${why ? `; the app measured ${why}` : ''}) and the ` +
       `harness held a limb on it${usedX !== null ? ` at x=${usedX.toFixed(2)}, y=${probe.aim.y.toFixed(2)}` : ''} for ` +
       `${Math.round(budgetMs / 1000)} s, but the ring only ever reached ${(best * 100).toFixed(0)}%` +
       `${p.found && !p.hasProgress ? ' (it publishes no data-progress, so the harness could not see it filling at all)' : ''}. ` +

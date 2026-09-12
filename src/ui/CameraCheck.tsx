@@ -9,6 +9,7 @@ import { requiredPostures } from '../vision/features.ts';
 import { POSTURE_INFO } from '../vision/features.ts';
 import type { VisionStatus } from '../input/types.ts';
 import type { InvalidCalibration } from '../input/VisionInput.ts';
+import { MAX_SUBJECT_HANDS, extraHandsInFrame } from '../vision/mediapipe.ts';
 import type { DetectionResult } from '../vision/mediapipe.ts';
 import { drawDetection, liveFrameAspect } from './overlay.ts';
 import CameraFallback from './CameraFallback.tsx';
@@ -92,6 +93,14 @@ export default function CameraCheck() {
   const [anyLandmarks, setAnyLandmarks] = useState<number | null>(null);
   /** Lanes the runtime is refusing to score, with the reason (see the refusal block in the panel). */
   const [refusals, setRefusals] = useState<InvalidCalibration[]>([]);
+  /**
+   * Hands in the picture beyond the `MAX_SUBJECT_HANDS` one person has — the app's only evidence of a
+   * second person in front of the camera (see vision/mediapipe.ts). Read off the same detection this
+   * screen is already painting, on the same 300 ms poll, so it costs nothing per frame. It is a LOWER
+   * BOUND: the model is only ever asked for one hand more than the session uses, so a fourth hand
+   * arrives as a third, which is why the sentence below says "at least".
+   */
+  const [extraHands, setExtraHands] = useState(0);
   /** The thrown value, not a string: CameraFallback classifies a DOMException by its `name`. */
   const [error, setError] = useState<unknown>(null);
   const [starting, setStarting] = useState(true);
@@ -165,6 +174,8 @@ export default function CameraCheck() {
       // when this screen opened could never clear the gate again however well it ran afterwards.
       setObserved(recorder.current.recent());
       setAnyLandmarks(recorder.current.anyLandmarksFraction());
+      const extra = extraHandsInFrame(latest.current);
+      setExtraHands((prev) => (prev === extra ? prev : extra));
       const bad = vision.getInvalidCalibrations();
       setRefusals((prev) =>
         prev.length === bad.length && prev.every((r, i) => r.lane === bad[i].lane && r.reason === bad[i].reason)
@@ -392,19 +403,49 @@ export default function CameraCheck() {
         title="Frame the patient"
         onBack={() => goto('setup')}
         right={
-          /* THE GATE. Not a nag: at this point the next screen measures a rest position and three
+          /* THE GATE, AND THE WAY PAST IT, SIDE BY SIDE.
+             ---------------------------------------------
+             THE GATE STAYS. At this point the next screen measures a rest position and three
              repetitions off landmarks that are not arriving, or off frames further apart than the
              widest hit window the prescription grants — an appointment spent to find out. It fires
-             only on a positive finding and every one of them clears by itself. */
-          <button
-            className="btn btn-primary btn-lg"
-            onClick={() => goto('rom')}
-            disabled={readiness.gate}
-            title={readiness.gate ? readiness.headline : undefined}
-            data-testid="camera-continue"
-          >
-            Calibrate movement →
-          </button>
+             only on a positive finding and every one of them clears by itself, and it is right that
+             the green button is the one it closes: its job is to stop somebody walking forward
+             UNAWARE.
+
+             WHAT WAS WRONG WAS THE SENTENCE NEXT TO IT. The dwell legend under the preview ends "If
+             your hands are out of the picture, use the buttons" — and on a blocked device the only
+             button above the fold was this one, switched off. The buttons that DID work (go on
+             anyway, restart the camera, run on the keyboard) were in the readiness card in the right
+             column, ~400 px below the fold at 1024x768, where the legend's remedy is no remedy at
+             all. A caption may not point at a disabled control.
+
+             So the escape moves up here, beside the gate it escapes, worded exactly as the patient's
+             own forward ring is worded ("Go on anyway") and deliberately not the primary green
+             button. Nothing is loosened: the gate closes the same control it closed before, the cost
+             is stated under the preview (`blockedNote`) and in the card, and the buttons and the
+             words now agree. A `measuring` gate needs no escape — it clears in a second or two of
+             readings and says so on the button rather than sitting there unexplained. */
+          <>
+            {readiness.gate && readiness.kind === 'blocked' && (
+              <button
+                className="btn btn-lg"
+                onClick={() => goto('rom')}
+                title={readiness.wont.join(' ')}
+                data-testid="camera-continue-anyway"
+              >
+                Go on anyway →
+              </button>
+            )}
+            <button
+              className="btn btn-primary btn-lg"
+              onClick={() => goto('rom')}
+              disabled={readiness.gate}
+              title={readiness.gate ? readiness.headline : undefined}
+              data-testid="camera-continue"
+            >
+              {readiness.gate && readiness.kind === 'measuring' ? 'Checking this device…' : 'Calibrate movement →'}
+            </button>
+          </>
         }
       />
 
@@ -479,7 +520,27 @@ export default function CameraCheck() {
           <Toast kind="bad">
             <strong data-testid="camera-blocked-note">{blockedNote}</strong> Left circle: go on anyway — the song plays
             and every movement is still counted, but today&rsquo;s timing and ranges carry that. Right circle: restart the
-            camera.
+            camera. {/* The two BUTTONS at the top of the screen do the same two things, worded the
+            same way, and are deliberately not named again here: this block and the dwell legend under
+            it share one 768 px screen with the preview, and a line spent repeating a control that is
+            already visible and already labelled "Go on anyway" is a line taken off the sentence that
+            says which circle is which. */}
+          </Toast>
+        )}
+
+        {/* MORE HANDS THAN ONE PERSON HAS. The circles follow ANY hand (`dwellLimbs`) — on purpose,
+            because either of the patient's own hands may answer one — so a carer's or a therapist's
+            hand can fill a ring, and nothing in hand landmarks says whose a hand is. This is the only
+            thing the app can honestly say about it, and it is said where the person who can fix it is
+            standing. See `MAX_SUBJECT_HANDS` in vision/mediapipe.ts. */}
+        {extraHands > 0 && (
+          <Toast kind="bad">
+            <strong data-testid="camera-extra-hands">
+              At least {extraHands + MAX_SUBJECT_HANDS} hands are in the picture, so somebody other than the patient is
+              in front of the camera.
+            </strong>{' '}
+            The circles cannot tell whose hand is whose, and a hand that is not the patient&rsquo;s can fill one. Move
+            everybody else out of the picture before the patient is left to answer these on their own.
           </Toast>
         )}
 

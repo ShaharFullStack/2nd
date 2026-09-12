@@ -27,8 +27,18 @@ import type { LaneSpec } from '../engine/types.ts';
 import CameraFallback from './CameraFallback.tsx';
 import { reconcileDelegateHint } from './CameraCheck.tsx';
 import { CameraPreview } from './CameraPreview.tsx';
-import { DwellLegend, DwellTarget, pairedDwellTargets, singleDwellTarget, useDwellTargets } from './DwellTarget.tsx';
+import {
+  DwellLegend,
+  DwellTarget,
+  PREVIEW_ASPECT,
+  pairedDwellTargets,
+  singleDwellTarget,
+  useDwellTargets,
+} from './DwellTarget.tsx';
 import type { DwellChoice } from './DwellTarget.tsx';
+import { MAX_SUBJECT_HANDS, extraHandsInFrame } from '../vision/mediapipe.ts';
+import type { DetectionResult } from '../vision/mediapipe.ts';
+import { POSE, isVisible } from '../vision/landmarks.ts';
 import { Meter, Toast, laneName } from './common.tsx';
 
 /**
@@ -133,19 +143,28 @@ const PIP_METERS_HEIGHT = 62;
  *     the meters are drawn from. A patient who is working never sees it. This is not a guess about
  *     placement (which is the thing that goes wrong); it is a gate on the patient's own movement, and
  *     it is the only condition under which the circle is drawn at all.
- *  2. IT IS DISMISSED BY A REPETITION. One scored rep takes it off the screen, hold in progress and
- *     all. So the way to refuse the offer is to carry on with the exercise, which is the one thing a
- *     patient who does not want to stop is already doing — a hands-free "no" that needs no target.
+ *  2. IT IS DISMISSED BY MOVEMENT. Any lane value travelling `REST_OFFER_BAND`, or any prescribed
+ *     LIMB travelling `REST_OFFER_LIMB_BAND`, inside `REST_OFFER_MOVE_SEC` takes it off the screen,
+ *     hold in progress and all — and so does a scored repetition. So the way to refuse the offer is
+ *     to carry on with the exercise, which is the one thing a patient who does not want to stop is
+ *     already doing: a hands-free "no" that needs no target. It used to be a SCORED rep and nothing
+ *     else, which left the circle live all song under a patient substituting a movement their lane
+ *     cannot see (see `REST_OFFER_LIMB_BAND`).
  *  3. WHAT IT CONFIRMS IS A PAUSE, NEVER AN END. The hold stops the song where it stands and raises
- *     the pause dialog, which has its own pair of targets: carry on, or stop and see the results.
- *     Ending the session still takes a second, separate, deliberate hold on a different circle. The
- *     worst a false confirm can cost is a pause the patient can undo the same way they made it, with
- *     nothing scored and nothing missed while it is up.
- *  4. IT IS NOT ON THE HIGHWAY. It occupies the panel the renderer reserves beside the board
- *     (`Highway.overlayPanel`) — the camera thumbnail's own box, which is guaranteed clear of the
- *     notes, the receptors and the lane labels. It never covers a note the patient could still answer,
- *     because a note hidden by a rest offer would be recorded as unanswered, and that would be this
- *     app telling a lie about a limb.
+ *     the pause dialog, whose own pair of targets is carry on, or ASK to stop — and asking is then
+ *     answered twice more and held open for `END_GRACE_SEC` before anything is written (see the note
+ *     beside it). The worst a false confirm can cost here is a pause the patient can undo the same way
+ *     they made it, with nothing scored and nothing missed while it is up.
+ *  4. IT DOES NOT COVER THE BOARD — THE BOARD MAKES ROOM FOR IT. This used to read "it occupies the
+ *     panel the renderer reserves beside the board", and that panel is a 150 px gutter: the ring it
+ *     drew there measured ~10 px of radius at 1024x768, about 0.4° of visual angle at a metre against
+ *     an assistive-technology floor of 1.5°. "Never covers the board" had been bought by making the
+ *     only mid-song safety control invisible, which is not a trade this app is allowed to make. So the
+ *     canvas itself is narrowed (or shortened, in portrait) while the offer is up and the renderer is
+ *     re-laid-out into what is left (`restOfferStripPx`): the ring gets its degrees AND no note is
+ *     hidden, because there is no board behind the offer rather than a board the offer sits on top of.
+ *     A note hidden by a rest offer would be recorded as unanswered, and that would be this app
+ *     telling a lie about a limb.
  */
 /** No repetition and no movement worth the name for this long, and the offer appears. */
 const REST_OFFER_STILL_SEC = 7;
@@ -157,6 +176,234 @@ const REST_OFFER_STILL_SEC = 7;
 const REST_OFFER_BAND = 0.12;
 /** How often the lane values are sampled for the test above. */
 const REST_OFFER_SAMPLE_MS = 150;
+/**
+ * ...AND HOW LITTLE IT TAKES TO PUT THE OFFER BACK AWAY, once it is up.
+ *
+ * THE HOLE THIS CLOSES. The offer used to come down on a SCORED REPETITION and on nothing else
+ * (`if (restOfferRef.current) return;` skipped the stillness test for as long as the circle was on
+ * screen). A patient prescribed `hip_abduction` who substitutes hip flexion — a textbook
+ * substitution, and one of the things this app exists to observe — moves a whole thigh and produces
+ * NO lane event, because the lane measures lateral travel and the thigh went forward. So the offer
+ * stayed up, live, for the rest of the song while the patient exercised under it: a circle a
+ * compensating limb can reach, sitting on the screen precisely while the limb is compensating.
+ *
+ * The offer's own claim is "only rest moving again and this goes", so the test that takes it down has
+ * to be MOVEMENT rather than a scored rep: any lane's value travelling `REST_OFFER_BAND` of this
+ * patient's own range inside this window puts it away. Shorter than `REST_OFFER_STILL_SEC` because it
+ * is answering a different question — "has the patient started again?", not "have they stopped?" —
+ * and a hold in progress is 1.8 s, so a patient who means to hold is not interrupted by their own
+ * tremor (the band is well above one) while a patient who has resumed the exercise is.
+ */
+const REST_OFFER_MOVE_SEC = 1.2;
+/**
+ * ...AND THE HALF A LANE VALUE CANNOT SEE AT ALL.
+ *
+ * The cited case is the one a lane value is blind to: hip ABDUCTION is prescribed, the patient
+ * substitutes hip FLEXION, and the lane — which measures lateral knee travel — reads the same number
+ * throughout. A thigh crosses the frame and every lane value stays inside `REST_OFFER_BAND`. So the
+ * second test is on the LIMBS THEMSELVES: the knees, ankles and hips, which are what every prescribed
+ * leg movement and every compensation moves, and which the dwell pointer (a HAND — see `dwellLimbs`)
+ * never touches. A patient reaching for the circle does not trip this; a patient exercising does,
+ * whatever the lane makes of it.
+ *
+ * THE BAND IS DELIBERATELY COARSE, in frame heights, and that is a statement about the picture rather
+ * than about the patient — which is only acceptable because of which way it fails. 8 % of the frame is
+ * far more than landmark jitter and far less than a repetition, and the one thing it can do wrong is
+ * take a circle DOWN, which costs a patient nothing they cannot get back by keeping still for
+ * `REST_OFFER_STILL_SEC`. It is never used to put the offer UP: the gate for that stays on the lane
+ * values alone, so a patient in spasm — whose limbs never stop moving and who needs this control most
+ * — is still offered it.
+ *
+ * Hand mode has no equivalent and does not get one: there the pointer and the exercised limb are the
+ * same hand, so "the limb moved" cannot tell a reach from a repetition, and the lane-value test is
+ * the only honest one available.
+ */
+const REST_OFFER_LIMB_BAND = 0.08;
+/**
+ * The pose landmarks watched for the test above: the joints the four LEG movements move (knee height
+ * is `seated_march`, lateral knee travel is `hip_abduction`, the ankle carries `knee_extension` and
+ * `ankle_dorsiflexion`) plus the hips, which is where trunk lean shows. Not the wrists, and not the
+ * shoulders that carry them: those are the pointer.
+ */
+const REST_OFFER_LIMB_POINTS: readonly number[] = Object.freeze([
+  POSE.LEFT_HIP,
+  POSE.RIGHT_HIP,
+  POSE.LEFT_KNEE,
+  POSE.RIGHT_KNEE,
+  POSE.LEFT_ANKLE,
+  POSE.RIGHT_ANKLE,
+]);
+
+/**
+ * The watched joints' coordinates as one flat reading, in the same shape `laneValuesQuiet` consumes
+ * (so one predicate covers both tests). A joint the model cannot see contributes NaN rather than a
+ * stale number — `laneValuesQuiet` skips non-finite entries, so a limb out of frame is not movement.
+ */
+export function limbTrackValues(result: DetectionResult | null | undefined): number[] {
+  const pose = result?.pose;
+  const out: number[] = [];
+  for (const i of REST_OFFER_LIMB_POINTS) {
+    const p = pose?.[i];
+    const seen = p && isVisible(p);
+    out.push(seen ? p.x : Number.NaN, seen ? p.y : Number.NaN);
+  }
+  return out;
+}
+
+/**
+ * THE FLOOR UNDER EVERY DWELL RING A PATIENT MID-SONG HAS TO AIM AT, in CSS px of RADIUS.
+ *
+ * WHAT WAS MEASURED. The rest offer — the ONLY mid-song safety control in the app — lived in the
+ * renderer's reserved panel, and at 1024x768 that panel gave it a 128x85 px preview with a ring of
+ * about 10 px radius: roughly 0.4° of visual angle at a metre, against an assistive-technology floor
+ * of 1.5°. At a fifth of the size it is a smudge. "Never covers the board" had been bought by making
+ * the safety control invisible, which is not a trade this app is allowed to make.
+ *
+ * 42 px of radius is ~1.7° at a metre on a clinic tablet (~0.35 mm per CSS px), i.e. the floor with
+ * something in hand. The ring's radius on the glass is `DwellCircle.radius` (frame HEIGHTS) times the
+ * preview box's height, so this is a statement about how big the PREVIEW has to be, and the preview
+ * is 4:3 — see `restOfferStripPx`.
+ */
+export const MIN_DWELL_RING_PX = 42;
+/** Gap kept between the rest offer's panel and the edges of the screen and the board. */
+const REST_OFFER_GAP = 12;
+/** `.rest-offer` padding (10 px a side) plus `.pip`'s 1 px border: panel width minus preview width. */
+const REST_OFFER_CHROME_PX = 22;
+/** The heading, the limb badge and the two-line note above and below the preview. */
+const REST_OFFER_WORDS_PX = 150;
+/**
+ * The most of the canvas the board will give up, and the least it will keep. The offer is only ever
+ * up in a stretch where the prescribed exercise is provably not being performed, so a board at half
+ * width for those seconds costs the patient nothing they are using; a board narrower than this stops
+ * being a board.
+ */
+const REST_OFFER_MAX_SHARE = 0.5;
+const BOARD_MIN_PX = 360;
+/**
+ * The smallest ring the side-by-side layout is allowed to produce before it is abandoned altogether
+ * — about 1.1° at a metre, the size the pause dialog's own circles used to be. Below it (a phone-width
+ * screen, where the board's half IS the screen) sharing the width is not a layout, it is a pretence:
+ * the song is stopped instead and the dialog's full-screen circles do the asking. Nothing is hidden
+ * either way — a stopped song has no note to cover.
+ */
+const MIN_USABLE_RING_PX = 28;
+
+/**
+ * HOW THE MID-SONG SAFETY CONTROL IS MADE BIG ENOUGH TO SEE WITHOUT HIDING A NOTE.
+ *
+ * The two constraints are both real and they were traded against each other rather than resolved. The
+ * panel exists because A NOTE BEHIND AN OVERLAY IS RECORDED AS UNANSWERED, and an unanswered note on
+ * this screen is a statement about a limb — so the offer may not be drawn over the board. And the
+ * panel is a 150 px gutter, so a ring placed in it cannot be aimed at.
+ *
+ * NEITHER SIDE IS GIVEN UP: THE BOARD MAKES ROOM. While the offer is up the canvas itself is narrowed
+ * (or, in portrait, shortened) to the strip this function reserves and the renderer is re-sized into
+ * what is left, so every note, every receptor and every lane label is still drawn, still in the right
+ * place at the right song time, and still answerable — there is no note behind the offer because there
+ * is no board behind the offer. The board is smaller for those seconds, which is the cost and it is
+ * real: it is spent in the one stretch where the patient has provably stopped answering (that is the
+ * offer's own gate), and any movement at all puts everything back.
+ *
+ * Returns the strip to reserve, the preview width that fits inside it, and the ring radius that
+ * preview actually yields — the caller asserts on the last one rather than assuming the first.
+ */
+export function restOfferStripPx(
+  viewportW: number,
+  viewportH: number,
+  targetRadius: number,
+  minRingPx = MIN_DWELL_RING_PX,
+): { axis: 'side' | 'top'; strip: number; previewPx: number; ringPx: number } {
+  const w = Number.isFinite(viewportW) ? viewportW : 0;
+  const h = Number.isFinite(viewportH) ? viewportH : 0;
+  const r = Number.isFinite(targetRadius) && targetRadius > 0 ? targetRadius : 0;
+  // The preview WIDTH that puts a ring of `minRingPx` on the glass: `radius` is in frame heights and
+  // the box is 4:3, so the height comes first and the width follows from it.
+  const want = r > 0 ? (minRingPx / r) * PREVIEW_ASPECT : 0;
+  const fixed = 2 * REST_OFFER_GAP + REST_OFFER_CHROME_PX;
+  /**
+   * BESIDE THE BOARD, which is the right answer on every landscape screen: the board is wider than it
+   * needs to be and the offer's words are a narrow column. Bounded by the share of the WIDTH the
+   * board will give up and by the screen being tall enough to hold the preview and its words.
+   */
+  const sidePreview = Math.max(
+    0,
+    Math.min(
+      want,
+      Math.min(w * REST_OFFER_MAX_SHARE, w - BOARD_MIN_PX) - fixed,
+      (h - 2 * REST_OFFER_GAP - REST_OFFER_WORDS_PX) * PREVIEW_ASPECT,
+    ),
+  );
+  /**
+   * ...AND ABOVE IT ON A PORTRAIT TABLET, where the other axis is the one with room to spare. Half of
+   * 820 px leaves a 364 px preview and a ~31 px ring (1.26° — under the floor), while half of 1180 px
+   * of HEIGHT leaves the ring its full size with the board still 641 px tall. The board narrows or
+   * shortens; either way it is re-laid-out and nothing is behind the panel.
+   */
+  const topPreview = Math.max(
+    0,
+    Math.min(
+      want,
+      w - fixed,
+      (Math.min(h * REST_OFFER_MAX_SHARE, h - BOARD_MIN_PX) - 2 * REST_OFFER_GAP - REST_OFFER_WORDS_PX) *
+        PREVIEW_ASPECT,
+    ),
+  );
+  // Whichever puts the bigger ring in front of the patient. Ties go to 'side' — a board that keeps its
+  // full height keeps the whole length of the approach the patient reads a note's timing off.
+  const axis = topPreview > sidePreview ? 'top' : 'side';
+  const previewPx = Math.max(sidePreview, topPreview);
+  const strip =
+    previewPx <= 0
+      ? 0
+      : axis === 'side'
+        ? Math.round(previewPx + fixed)
+        : Math.round(previewPx / PREVIEW_ASPECT + REST_OFFER_WORDS_PX + 2 * REST_OFFER_GAP);
+  return { axis, strip, previewPx: Math.round(previewPx), ringPx: (previewPx / PREVIEW_ASPECT) * r };
+}
+
+/**
+ * ENDING A SESSION IS THE ONE DESTRUCTIVE SELECT ON THIS SCREEN, AND IT IS NOW UNDOABLE.
+ *
+ * WHAT IT USED TO BE. The pause dialog's second circle was `onConfirm: () => runner.quit()`, which
+ * runs `finish('quit')`: a truncated `RunSummary` is written into the patient's history and into
+ * their trend, the mixer is stopped, and the runner is `ended` — a state nothing in the app can come
+ * back from. One hold, no confirmation, no undo. The critic reproduced a FALSE confirm of that exact
+ * circle at 3.30 s into the first repetition of a seated march with hip circumduction — the
+ * compensation this app promises never to penalise — and the app filed a session the patient never
+ * chose to end. Meanwhile the calibration screen tells the patient, in so many words, that "a confirm
+ * made by accident can always be undone without touching the screen".
+ *
+ * SO IT IS BOTH DOUBLE-GATED AND UNDOABLE, because the two protect against different things and this
+ * is the one act worth paying for twice.
+ *
+ *  1. THE FIRST HOLD ASKS, IT DOES NOT ACT. "Stop here" raises a second, differently worded screen
+ *     with its own pair of circles — the forward one is CARRY ON, the smaller one is the one that
+ *     stops — so two deliberate holds on two differently placed, differently shaped rings stand
+ *     between a resting limb and a session that ended. Nothing is written by either of them.
+ *  2. THEN A GRACE WINDOW, IN WHICH THE ONLY TARGET ON SCREEN IS THE WAY BACK. For
+ *     `END_GRACE_SEC` the session is still there: still paused, still resumable, nothing in the
+ *     record, and the ONE circle drawn is "carry on with the song". A patient who ends their session
+ *     by accident gets it back by holding the circle they can already see, without touching the
+ *     tablet — and a patient who meant it does nothing at all and the window runs out.
+ *  3. ONLY THEN IS ANYTHING WRITTEN. `runner.quit()` is reachable from exactly two places in this
+ *     file, and both are the far end of everything above: the moment the grace window expires, and a
+ *     "Stop now" TAP during it — a third deliberate act, by somebody who can reach the screen, after
+ *     two holds. Every other exit from the dialog — either circle, Escape, the pause button, Resume —
+ *     returns a running song with nothing filed.
+ *
+ * The window is deliberately long enough to notice a screen change and act on it with a limb (a hold
+ * itself takes 1.8 s) and short enough that a patient who meant to stop is not left waiting.
+ */
+const END_GRACE_SEC = 10;
+
+/** Where the ending sits between "the patient is paused" and "the record has been written". */
+type EndStage =
+  /** Not ending. The pause dialog offers carry-on and stop-here. */
+  | 'none'
+  /** "Stop here" was confirmed: asking, nothing written, the session fully intact. */
+  | 'confirm'
+  /** Confirmed twice: counting down, nothing written yet, the only target is the way back. */
+  | 'grace';
 
 /** One reading of every lane's normalized value, with the moment it was taken. */
 export interface LaneValueSample {
@@ -197,6 +444,39 @@ export function laneValuesQuiet(
     if (hi > lo && hi - lo >= band) return false;
   }
   return true;
+}
+
+/**
+ * The tail of `samples` covering the last `sec`, INCLUDING the newest reading older than that — so
+ * `laneValuesQuiet`'s "the window is covered" test can be asserted on the slice rather than assumed.
+ */
+export function samplesSince(
+  samples: readonly LaneValueSample[],
+  now: number,
+  sec: number,
+): LaneValueSample[] {
+  let start = -1;
+  for (let i = 0; i < samples.length; i++) if (now - samples[i].t >= sec) start = i;
+  return start < 0 ? [] : samples.slice(start);
+}
+
+/**
+ * "THE PATIENT HAS STARTED MOVING AGAIN" — the opposite of `laneValuesQuiet`, and NOT simply its
+ * negation: a window that is not covered is no evidence either way, and reading it as movement would
+ * take the rest offer off the screen every time the camera dropped a second of frames.
+ *
+ * True only when the last `sec` is fully covered by readings AND some lane travelled `band` of this
+ * patient's own calibrated range across it.
+ */
+export function laneValuesMoved(
+  samples: readonly LaneValueSample[],
+  now: number,
+  sec: number,
+  band: number,
+): boolean {
+  const window = samplesSince(samples, now, sec);
+  if (window.length < 2 || !(now - window[0].t >= sec)) return false;
+  return !laneValuesQuiet(window, now, sec, band);
 }
 /**
  * THE THUMBNAIL'S FLOOR, in pixels, reserved out of the panel beside the meters.
@@ -652,21 +932,20 @@ export default function PlayScreen() {
    * is what the patient sees.
    */
   const [pipBox, setPipBox] = useState<OverlayPanelBox | null>(null);
-  /**
-   * The rest offer's own box, asked for from the same placement rule with a wider ceiling.
-   *
-   * It sits where the thumbnail sits — the renderer's guarantee is what makes that box usable at all
-   * — but it is allowed to take the whole gutter when there is one, because this panel is READ by a
-   * patient two metres away deciding whether to stop, while the thumbnail it replaces is glanced at
-   * by a therapist standing over it. On a board that leaves no more than the 150 px minimum, the two
-   * are the same size and the offer's wording is written to fit that.
-   */
-  const [restBox, setRestBox] = useState<OverlayPanelBox | null>(null);
   const syncPipBox = useCallback(() => {
     const hw = runnerRef.current?.highway;
     setPipBox(hw ? hw.overlayPanel() : null);
-    setRestBox(hw ? hw.overlayPanel({ maxWidth: 420 }) : null);
   }, []);
+  /**
+   * The screen the board and the rest offer share out between them. `.play-root` is `position: fixed;
+   * inset: 0`, so this is the viewport — and it is read from the WINDOW rather than from the canvas
+   * on purpose: the canvas is the thing being narrowed, so measuring the strip from it would feed the
+   * reservation its own output.
+   */
+  const [viewport, setViewport] = useState(() => ({
+    w: typeof window === 'undefined' ? 1024 : window.innerWidth,
+    h: typeof window === 'undefined' ? 768 : window.innerHeight,
+  }));
 
   /**
    * ONE VOICE (see `LaneMeters`): the picture-in-picture bars are drawn from the very looks the
@@ -710,6 +989,53 @@ export default function PlayScreen() {
    * `reconcileDelegateHint`.
    */
   const [visionDelegate, setVisionDelegate] = useState<'GPU' | 'CPU' | null>(null);
+  /**
+   * HANDS IN THE PICTURE THAT ONE PERSON CANNOT ACCOUNT FOR — the app's only evidence that somebody
+   * other than the patient is in front of the camera (`MAX_SUBJECT_HANDS`, vision/mediapipe.ts).
+   *
+   * A carer steadying a shoulder or a therapist reaching across is the ordinary clinic case, and
+   * `dwellLimbs` offers EVERY detected hand as a pointer — deliberately, because either of the
+   * patient's own hands may answer a circle. So a hand that is not the patient's can complete a hold,
+   * and there is nothing in hand landmarks that says whose a hand is. What this counts is only the
+   * surplus: three hands in frame is not an identification, it is proof that one of them is not the
+   * patient's, and it is enough to stand down the one confirm whose cost cannot be taken back.
+   *
+   * It is a LOWER BOUND: the model is only ever asked for one hand more than the session uses, so a
+   * fourth hand in the room arrives as a third. Sampled through a ref and published at the status
+   * poll's rate: a per-frame `setState` on the play screen would re-render the chrome at the camera's
+   * frame rate for a number that is 0 all session.
+   */
+  const [extraHands, setExtraHands] = useState(0);
+  const extraHandsRef = useRef(0);
+  /** The watched joints' latest coordinates; see `limbTrackValues`. Empty until a frame arrives. */
+  const limbTrackRef = useRef<number[]>([]);
+  useEffect(() => {
+    if (inputMode !== 'camera') {
+      extraHandsRef.current = 0;
+      setExtraHands(0);
+      return;
+    }
+    // The scripted sources and the unit-test fakes publish no frames at all; absent is not zero, but
+    // it is also not a reason to refuse anything (see `hasExtraHandCount`).
+    const vision = runtime.peekVision() as {
+      onFrame?: (cb: (s: unknown, t: number, r: DetectionResult) => void) => () => void;
+    } | null;
+    if (!vision || typeof vision.onFrame !== 'function') return;
+    const off = vision.onFrame((_samples, _ctxTime, result) => {
+      extraHandsRef.current = extraHandsInFrame(result);
+      // The prescribed limbs' own positions, for the half of "the patient has started again" that no
+      // lane value can see (see `REST_OFFER_LIMB_BAND`). Kept on a ref and sampled by the rest
+      // offer's poll, so nothing here runs React at the camera's frame rate.
+      limbTrackRef.current = limbTrackValues(result);
+    });
+    const id = setInterval(() => {
+      setExtraHands((prev) => (prev === extraHandsRef.current ? prev : extraHandsRef.current));
+    }, TRACKING_SAMPLE_MS);
+    return () => {
+      off();
+      clearInterval(id);
+    };
+  }, [inputMode, input]);
   useEffect(() => {
     const src = selfReporting(input);
     if (!src) {
@@ -949,6 +1275,7 @@ export default function PlayScreen() {
     });
 
     const onResize = () => {
+      setViewport({ w: window.innerWidth, h: window.innerHeight });
       runnerRef.current?.resize();
       // The board's hardware band, its gutter and the rock gauge all move with the canvas size, so
       // the panel that has to stay clear of them is re-placed on the same event, not pinned in CSS.
@@ -1020,6 +1347,63 @@ export default function PlayScreen() {
   }, [inputMode, setHandsFree]);
 
   /**
+   * HOW FAR THROUGH ENDING THE SESSION WE ARE — see the note beside `END_GRACE_SEC`. Nothing is
+   * written at any value of this; only the grace window running out writes anything.
+   */
+  const [endStage, setEndStage] = useState<EndStage>('none');
+  const [graceLeftSec, setGraceLeftSec] = useState(END_GRACE_SEC);
+  /**
+   * EVERY WAY BACK INTO THE SONG IS A WAY OUT OF ENDING IT. A resume by any means — the circle, the
+   * button, Escape, the pause button — puts this back to 'none', so the ending can never be half-armed
+   * over a playing song.
+   */
+  useEffect(() => {
+    if (!paused) setEndStage('none');
+  }, [paused]);
+  /**
+   * THE GRACE WINDOW, AND THE ONE PLACE IN THIS FILE THAT ENDS A RUN.
+   *
+   * This is the only place a run ends WITHOUT somebody asking for it a third time (the other is the
+   * "Stop now" tap below). Until this timer expires the session is intact: paused, resumable, nothing
+   * in the patient's history and nothing in their trend. The countdown is shown, so what is about to
+   * happen is a fact on the screen rather than a surprise.
+   */
+  useEffect(() => {
+    if (endStage !== 'grace') {
+      setGraceLeftSec(END_GRACE_SEC);
+      return;
+    }
+    let left = END_GRACE_SEC;
+    let last = performance.now();
+    setGraceLeftSec(left);
+    const id = setInterval(() => {
+      const now = performance.now();
+      const dt = (now - last) / 1000;
+      last = now;
+      // THE COUNTDOWN STOPS WHENEVER THE WAY BACK DOES. If the browser suspends the AudioContext
+      // mid-window, the stalled-clock screen goes full-bleed over this dialog — it is the whole
+      // control, deliberately — and the circle that takes the ending back is behind it, answerable
+      // only by a touch the patient may not be able to make. A clock a patient cannot restart must
+      // not also be a clock that spends their session: the window is frozen, not merely hidden, and
+      // it resumes with its remaining seconds intact once the song does.
+      if (hudRef.current?.clockStalled === true) return;
+      left -= dt;
+      if (left > 0) {
+        setGraceLeftSec(left);
+        return;
+      }
+      clearInterval(id);
+      setGraceLeftSec(0);
+      runnerRef.current?.quit();
+    }, 100);
+    return () => clearInterval(id);
+  }, [endStage]);
+  /** Back into the song from any stage of the ending, by any means. */
+  const carryOn = useCallback(() => {
+    setEndStage('none');
+    void runnerRef.current?.resume();
+  }, []);
+  /**
    * THE SONG STOPS ITSELF, AND SOMEBODY HAS TO BE ABLE TO START IT AGAIN.
    *
    * `GameRunner` pauses the run the moment the page is hidden — a tablet that locks, an OS
@@ -1044,23 +1428,55 @@ export default function PlayScreen() {
   const pauseChoices: DwellChoice[] = useMemo(() => {
     if (inputMode !== 'camera' || !paused) return [];
     const [go, back] = pairedDwellTargets(mode);
+    const keep: DwellChoice = {
+      id: 'keep',
+      target: go,
+      label: 'Carry on',
+      onConfirm: carryOn,
+      tone: 'go',
+    };
+    // THE GRACE WINDOW OFFERS THE WAY BACK AND NOTHING ELSE. One circle, and it is the safe one: a
+    // second chance to false-confirm the destructive act during the undo window for the first one
+    // would be the same bug with an extra step. A patient who meant to stop holds nothing and waits.
+    if (endStage === 'grace') return [keep];
+    if (endStage === 'confirm') {
+      return [
+        keep,
+        {
+          id: 'end-confirm',
+          target: back,
+          // A SECOND HOLD, on the smaller ring, on the other side of the preview, under a heading
+          // that says what it does. Even this one only starts the countdown.
+          label: 'Yes, stop',
+          onConfirm: () => setEndStage('grace'),
+          tone: 'back',
+          // AND NOT WHILE SOMEBODY ELSE'S HAND IS IN THE PICTURE (see `extraHands` below). This is
+          // the only choice in the app that is stood down for it, because it is the only one whose
+          // cost is a patient's session; refusing the way FORWARD or the way BACK over a carer would
+          // manufacture the dead ends the hands-free path exists to remove.
+          enabled: extraHands === 0,
+          disabledNote: 'Another hand is in the picture',
+        },
+      ];
+    }
     return [
       {
         id: 'resume',
         target: go,
         label: 'Carry on',
-        onConfirm: () => void runnerRef.current?.resume(),
+        onConfirm: carryOn,
         tone: 'go',
       },
       {
         id: 'end',
         target: back,
         label: 'Stop here',
-        onConfirm: () => runnerRef.current?.quit(),
+        // IT ASKS, IT DOES NOT ACT. See the note beside `END_GRACE_SEC`.
+        onConfirm: () => setEndStage('confirm'),
         tone: 'back',
       },
     ];
-  }, [inputMode, paused, mode]);
+  }, [inputMode, paused, mode, endStage, carryOn, extraHands]);
   const pauseDwell = useDwellTargets(pauseChoices);
 
   /**
@@ -1084,9 +1500,16 @@ export default function PlayScreen() {
     const now = () => performance.now() / 1000;
     /** Lane values over the stillness window, oldest first. */
     let samples: { t: number; values: number[] }[] = [];
+    /**
+     * The prescribed LIMBS' own coordinates over the dismissal window — the half a lane value cannot
+     * see (see `REST_OFFER_LIMB_BAND`). A separate buffer because it is read with a different band
+     * and, deliberately, never used to put the offer up.
+     */
+    let limbs: { t: number; values: number[] }[] = [];
     let lastRepAt = now();
     const clear = () => {
       samples = [];
+      limbs = [];
       lastRepAt = now();
     };
     // A REPETITION IS THE PATIENT'S "NO". It takes the offer off the screen, hold in progress and all,
@@ -1114,7 +1537,23 @@ export default function PlayScreen() {
       // Keep one sample older than the window, so "the window is covered" can be asserted rather than
       // assumed from a count of samples.
       while (samples.length > 1 && t - samples[1].t >= REST_OFFER_STILL_SEC) samples.shift();
-      if (restOfferRef.current) return;
+      if (limbTrackRef.current.length > 0) limbs.push({ t, values: limbTrackRef.current.slice() });
+      while (limbs.length > 1 && t - limbs[1].t >= REST_OFFER_MOVE_SEC) limbs.shift();
+      // ALREADY UP: the question is no longer "has the patient stopped?" but "have they started
+      // again?", and the answer is MOVEMENT, not a scored repetition (see `REST_OFFER_MOVE_SEC`). Two
+      // tests, because one of them is blind to the case the critic named: the lane VALUES, and — for
+      // a substitution that no lane can score, hip flexion where hip abduction was prescribed — the
+      // prescribed LIMBS' own positions (`REST_OFFER_LIMB_BAND`). Either one puts the circle away.
+      if (restOfferRef.current) {
+        if (
+          laneValuesMoved(samples, t, REST_OFFER_MOVE_SEC, REST_OFFER_BAND) ||
+          laneValuesMoved(limbs, t, REST_OFFER_MOVE_SEC, REST_OFFER_LIMB_BAND)
+        ) {
+          clear();
+          setRestOffer(false);
+        }
+        return;
+      }
       if (t - lastRepAt < REST_OFFER_STILL_SEC) return;
       if (!laneValuesQuiet(samples, t, REST_OFFER_STILL_SEC, REST_OFFER_BAND)) return;
       setRestOffer(true);
@@ -1131,8 +1570,30 @@ export default function PlayScreen() {
    * It sits where every forward target in this app sits (the left of the mirrored preview), so it is
    * the same circle, in the same place, that the patient has held on every screen on the way here.
    */
+  /**
+   * THE STRIP THE BOARD GIVES UP WHILE THE OFFER IS UP (see `restOfferStripPx`). Computed from the
+   * target the offer will actually draw, so the ring's size on the glass is derived from the circle
+   * the tracker tests rather than from a number typed next to it.
+   */
+  const restStrip = useMemo(
+    () => restOfferStripPx(viewport.w, viewport.h, singleDwellTarget(mode).radius),
+    [viewport.w, viewport.h, mode],
+  );
+  /**
+   * IS THERE ROOM FOR A TARGET BESIDE THE BOARD AT ALL? On a clinic tablet, comfortably. On a phone-
+   * width screen the board's half of the split is the whole screen and the strip comes out too narrow
+   * to hold a ring anybody could aim at — and a ring nobody can aim at is not a safety control, it is
+   * the smudge this whole change exists to remove. So on those screens the offer is not drawn beside
+   * the board; the song is stopped instead (see the effect below), which hides no note because there
+   * is no note left running, and the pause dialog's own full-screen circles do the asking.
+   */
+  const restBeside = restStrip.ringPx >= MIN_USABLE_RING_PX;
+  const restVisible = restOffer && restBeside;
+  useEffect(() => {
+    if (restOffer && !restBeside) runnerRef.current?.pause();
+  }, [restOffer, restBeside]);
   const restChoices: DwellChoice[] = useMemo(() => {
-    if (!restOffer) return [];
+    if (!restVisible) return [];
     return [
       {
         id: 'stop',
@@ -1142,22 +1603,50 @@ export default function PlayScreen() {
         tone: 'go',
       },
     ];
-  }, [restOffer, mode]);
+  }, [restVisible, mode]);
   const restDwell = useDwellTargets(restChoices);
+  /** px of canvas the offer has taken; 0 whenever it is not up. */
+  const boardInset = restVisible ? restStrip.strip : 0;
+  /**
+   * ...AND THE RENDERER IS TOLD, which is the whole point: the board is re-laid-out into what is
+   * left, so nothing is behind the offer. One frame late on purpose — the canvas's new CSS box has to
+   * exist before `resize()` reads `clientWidth` off it.
+   */
+  useEffect(() => {
+    const id = requestAnimationFrame(() => {
+      runnerRef.current?.resize();
+      syncPipBox();
+    });
+    return () => cancelAnimationFrame(id);
+  }, [boardInset, syncPipBox]);
 
   if (phase === 'camera') return <CameraFallback error={cameraError} onRetry={retryCamera} retries={attempt} />;
 
   const countdown = hud?.countdown ?? 0;
   const { alertsMaxHeight, videoMinPx: pipVideoMin, noteMinPx: pipNoteMin } = pipPanelBudget(pipBox ? pipBox.maxHeight : null);
-  /** The rest offer's box — the same corner, allowed to be wider (see `restBox`). */
-  const restStyle = restBox
-    ? {
-        left: Math.round(restBox.left),
-        bottom: Math.round(restBox.bottom),
-        width: Math.round(restBox.width),
-        maxHeight: Math.round(restBox.maxHeight),
-      }
-    : {};
+  /**
+   * The rest offer's box: the strip the board has just given up, not a corner of the board. It is
+   * pinned to the screen rather than asked of `Highway.overlayPanel`, because the guarantee it needs
+   * ("nothing of the board is behind this") now comes from the canvas being narrowed beside it (or
+   * shortened above it) rather than from a gutter the renderer left — see `restOfferStripPx`.
+   */
+  const restStyle: CSSProperties =
+    restStrip.axis === 'top'
+      ? {
+          // Centred over the board it is sitting above, and only as wide as the preview needs: a
+          // full-width panel would put the ring off to one side of a screen the patient is facing.
+          left: Math.round(Math.max(REST_OFFER_GAP, (viewport.w - restStrip.previewPx - REST_OFFER_CHROME_PX) / 2)),
+          top: REST_OFFER_GAP,
+          bottom: 'auto',
+          width: restStrip.previewPx + REST_OFFER_CHROME_PX,
+          maxHeight: Math.max(0, restStrip.strip - 2 * REST_OFFER_GAP),
+        }
+      : {
+          left: REST_OFFER_GAP,
+          bottom: REST_OFFER_GAP,
+          width: Math.max(0, restStrip.strip - 2 * REST_OFFER_GAP),
+          maxHeight: Math.max(0, viewport.h - 2 * REST_OFFER_GAP),
+        };
   const pipStyle = {
     ...(pipBox
       ? {
@@ -1176,7 +1665,25 @@ export default function PlayScreen() {
 
   return (
     <div className="play-root">
-      <canvas className="play-canvas" ref={canvasRef} data-testid="play-canvas" />
+      {/* THE BOARD MAKES ROOM FOR THE SAFETY CONTROL RATHER THAN HIDING BEHIND IT. While the rest
+          offer is up the canvas starts to the RIGHT of the strip the offer has taken and the renderer
+          is re-sized into what is left (see `restOfferStripPx`), so every note, receptor and lane
+          label is still drawn and still answerable — there is no note behind the offer because there
+          is no board behind it. Inline, because the strip is measured at runtime from the ring the
+          patient has to aim at; `.play-canvas` is `inset: 0` and is what these two properties
+          override. */}
+      <canvas
+        className="play-canvas"
+        ref={canvasRef}
+        data-testid="play-canvas"
+        style={
+          boardInset <= 0
+            ? undefined
+            : restStrip.axis === 'top'
+              ? { top: boardInset, height: `calc(100% - ${boardInset}px)` }
+              : { left: boardInset, width: `calc(100% - ${boardInset}px)` }
+        }
+      />
 
       <div className="play-chrome">
         {phase === 'running' && countdown > 0 && (
@@ -1203,7 +1710,7 @@ export default function PlayScreen() {
           {paused ? '▶' : '❚❚'}
         </button>
 
-        {inputMode === 'camera' && input && !restOffer && (
+        {inputMode === 'camera' && input && !restVisible && (
           <div className="pip" ref={pipRef} style={pipStyle} data-testid="play-pip">
             {/* THE WORDS FOR WHAT THE RINGS CANNOT SAY. A faulted lane's receptor goes to "no
                 reading" with a "!" in it (see the status poll above); that is the honest thing to
@@ -1261,16 +1768,17 @@ export default function PlayScreen() {
           </div>
         )}
 
-        {/* THE PATIENT'S WAY TO STOP, IN THE ONE BOX ON THIS SCREEN THAT IS GUARANTEED CLEAR OF THE
-            BOARD (see the note beside REST_OFFER_STILL_SEC). It takes the thumbnail's place rather
-            than sitting next to it: there is one <video> in the app, the thumbnail letterboxes it
-            (`object-fit: contain`, which is not the crop the targets are placed through) and the
-            panel's other tenants — the input warnings and the lane meters — are the therapist's
-            instruments. A single repetition puts all three back.
-            EVERY WORD HERE HAS TO FIT A 150 px GUTTER, which is what some boards leave: short lines,
-            no paragraph, and the two facts the rings cannot carry (what the hold does, and which limb
-            is being followed) in the fewest words that are still true. */}
-        {inputMode === 'camera' && input && restOffer && (
+        {/* THE PATIENT'S WAY TO STOP, IN THE STRIP THE BOARD GAVE UP FOR IT (see the note beside
+            REST_OFFER_STILL_SEC and `restOfferStripPx`). It replaces the whole picture-in-picture
+            panel rather than sitting next to it: there is one <video> in the app, the thumbnail
+            letterboxes it (`object-fit: contain`, which is not the crop the targets are placed
+            through) and the panel's other tenants — the input warnings and the lane meters — are the
+            therapist's instruments. Movement puts all three back.
+            THE WORDS ARE STILL SHORT, because the patient they are written for is in pain and two
+            metres away and cannot work a scrollbar: short lines, no paragraph, and the facts the rings
+            cannot carry — what the hold does, which limb is being followed, and why the board just
+            moved — in the fewest words that are still true. */}
+        {inputMode === 'camera' && input && restVisible && (
           <div className="pip rest-offer" style={restStyle} data-testid="rest-offer">
             <h3 className="rest-offer-head">Do you need to stop?</h3>
             <CameraPreview overlay>
@@ -1296,13 +1804,20 @@ export default function PlayScreen() {
                 {restDwell.limb ? `Following your ${restDwell.limb.label.replace(/^your /, '')}` : 'No hand in view'}
               </span>
             )}
-            {/* SHORT ENOUGH TO BE READ WITHOUT SCROLLING in the narrowest box the board leaves —
-                measured at 1024x768, where the gutter is 151 px and the panel's own scroll is a
-                control this patient cannot work. */}
+            {/* SHORT ENOUGH TO BE READ WITHOUT SCROLLING — the panel now has the strip the board gave
+                up rather than a 151 px gutter, but the patient it is written for is in pain and two
+                metres away, and the panel's own scroll is a control they cannot work. */}
             <p className="rest-offer-note" data-testid="rest-offer-note">
               {restDwell.live
                 ? 'Hold the circle and the song stops where it is — nothing scored, nothing missed, and you can carry on from there. Only resting? Move again and this goes.'
                 : 'No frames are arriving, so the circle cannot be held. The pause button still works.'}
+            </p>
+            {/* WHY THE BOARD JUST GOT NARROWER, said where the two people in the room can see it. A
+                board that changes size under a patient mid-song is a thing they will notice, and the
+                honest reason is worth one line: nothing was hidden to make room for this circle. */}
+            <p className="rest-offer-note dim" data-testid="rest-offer-board-note">
+              The board moved over to make room — nothing is hidden behind this, and no note is missed
+              for being covered.
             </p>
           </div>
         )}
@@ -1389,9 +1904,114 @@ export default function PlayScreen() {
           </div>
         )}
 
-        {paused && (
+        {/* ENDING THE SESSION, ASKED AND THEN UNDOABLE — see the note beside `END_GRACE_SEC`.
+            It REPLACES the pause card rather than stacking on it: the app has exactly one <video>
+            (see CameraPreview) and two live previews would fight over the element, and a patient
+            reading "Stop the session?" must not also be reading "Paused" under a different pair of
+            circles. Nothing on either of these two screens writes anything. */}
+        {paused && endStage !== 'none' && (
           <div className="overlay" data-testid="pause-overlay">
-            <div className="card stack">
+            <div
+              className="card stack"
+              data-testid={endStage === 'grace' ? 'end-grace' : 'end-confirm'}
+              /* THE ORDER IS THE POINT. Heading, then the circle, then the legend, then the buttons —
+                 measured at 1024x768, where everything on this card has to fit above the fold because
+                 the person it is written for cannot scroll and the thing they are looking for is the
+                 way back. The prose comes last and is one sentence. Scrollable anyway, so a shorter
+                 window hides text rather than a control. */
+              style={{ maxHeight: '92vh', overflowY: 'auto' }}
+            >
+              {/* ONE LINE. Measured at 1024x768: a two-line heading puts the buttons under the fold,
+                  and what the circle does is the legend's job three inches below it. */}
+              <h2 style={{ margin: 0 }}>
+                {endStage === 'grace' ? (
+                  <>
+                    Stopping in <span data-testid="end-grace-left">{Math.ceil(graceLeftSec)}</span> s
+                  </>
+                ) : (
+                  'Stop the session here?'
+                )}
+              </h2>
+              {pauseChoices.length > 0 && (
+                <div className="stack" data-testid="end-handsfree" style={{ gap: 6, alignItems: 'center' }}>
+                  {/* AS BIG AS THE CARD CAN MAKE IT. This dialog covers the board and the song is
+                      stopped, so there is no note behind it to hide and nothing is bought by a small
+                      ring: 430 px of preview puts ~52 px of ring radius on the glass, comfortably over
+                      the 1.5° floor the rest offer is held to (`MIN_DWELL_RING_PX`) — while leaving
+                      the legend AND the buttons above the fold at 768, which is what every number on
+                      this card was trimmed to. */}
+                  <div style={{ width: 'min(430px, 100%)' }}>
+                    <CameraPreview overlay>
+                      {pauseChoices.map((choice) => (
+                        <DwellTarget
+                          key={choice.id}
+                          choice={choice}
+                          state={pauseDwell.states[choice.id]}
+                          reducedMotion={reducedMotion}
+                          xScale={pauseDwell.xScale}
+                          testId={`pause-dwell-${choice.id}`}
+                        />
+                      ))}
+                    </CameraPreview>
+                  </div>
+                </div>
+              )}
+              <div className="row">
+                {/* Two words, not five: `grow` against a wider sibling wrapped "Carry on with the
+                    song" onto five lines at 1024x768. */}
+                <button className="btn btn-primary btn-lg grow" onClick={carryOn} data-testid="end-carry-on">
+                  Carry on
+                </button>
+                {endStage === 'grace' ? (
+                  <button className="btn btn-lg" onClick={() => runnerRef.current?.quit()} data-testid="end-now">
+                    Stop now
+                  </button>
+                ) : (
+                  <button className="btn btn-lg" onClick={() => setEndStage('grace')} data-testid="end-confirm-btn">
+                    Yes, stop the session
+                  </button>
+                )}
+              </div>
+              {/* THE LEGEND SPILLS, AND IT IS THE RIGHT THING TO SPILL. Its length is set by
+                  `DwellLegend`'s own state (in the not-seeing-you state it is four lines plus a badge
+                  plus small print, measured at 411 px), and this card has ~700 px for a heading, a
+                  ring a patient can aim at, two buttons and a sentence. The ring carries its own
+                  caption inside it, so what a scroll can hide here is an explanation of a control the
+                  patient can already see and a fallback for somebody who can reach the screen. */}
+              {pauseChoices.length > 0 && (
+                <DwellLegend
+                  session={pauseDwell}
+                  what={
+                    endStage === 'grace'
+                      ? 'the circle to carry on'
+                      : 'the left circle to carry on, the smaller right one to stop'
+                  }
+                  testId="pause-dwell-legend"
+                />
+              )}
+              {extraHands > 0 && endStage === 'confirm' && (
+                <Toast kind="bad">
+                  <strong data-testid="end-extra-hands">
+                    At least {extraHands + MAX_SUBJECT_HANDS} hands are in the picture, so more than one person is in
+                    front of the camera.
+                  </strong>{' '}
+                  The circles follow any hand and cannot tell whose is whose, so the one that stops the session is
+                  stood down until only the patient is in view. The buttons above still work.
+                </Toast>
+              )}
+              <p className="muted" style={{ margin: 0 }}>
+                <strong>Nothing has been written down yet.</strong>{' '}
+                {endStage === 'grace'
+                  ? 'Carry on and the song picks up exactly where it stopped, with every movement so far still counted. Do nothing and the session ends and the results come up.'
+                  : 'Ending a session cannot be undone once it is written down and a circle can be filled by accident, so this is asked twice — and then held open long enough to take back.'}
+              </p>
+            </div>
+          </div>
+        )}
+
+        {paused && endStage === 'none' && (
+          <div className="overlay" data-testid="pause-overlay">
+            <div className="card stack" style={{ maxHeight: '92vh', overflowY: 'auto' }}>
               <h2>Paused</h2>
               {/* WHO PRESSED PAUSE. A session that stopped on its own is a different fact from one a
                   therapist stopped, and the therapist coming back to a stopped screen is owed the
@@ -1415,7 +2035,12 @@ export default function PlayScreen() {
                   Everything that EXPLAINS the pause now sits under the two circles. */}
               {pauseChoices.length > 0 && (
                 <div className="stack" data-testid="pause-handsfree" style={{ gap: 8, alignItems: 'center' }}>
-                  <div style={{ width: 'min(320px, 100%)' }}>
+                  {/* 520 px, NOT 320. This dialog covers the board and the song is stopped, so there
+                      is no note behind it to hide and nothing was bought by a small preview: at 320 px
+                      the rings were ~28 px of radius, about 1.1° of visual angle at a metre, under the
+                      1.5° floor the rest offer is now held to (`MIN_DWELL_RING_PX`). The card scrolls
+                      and the circles are first, so the height this costs comes out of prose. */}
+                  <div style={{ width: 'min(520px, 100%)' }}>
                     <CameraPreview overlay>
                       {pauseChoices.map((choice) => (
                         <DwellTarget
@@ -1429,21 +2054,31 @@ export default function PlayScreen() {
                       ))}
                     </CameraPreview>
                   </div>
-                  <DwellLegend
-                    session={pauseDwell}
-                    what="the left circle to carry on with the song, the right one to stop and see the results"
-                    testId="pause-dwell-legend"
-                  />
                 </div>
               )}
               <div className="row">
                 <button className="btn btn-primary btn-lg grow" onClick={() => void runnerRef.current?.resume()}>
                   Resume
                 </button>
-                <button className="btn btn-lg" onClick={() => runnerRef.current?.quit()} data-testid="end-session">
-                  End &amp; see results
+                {/* THE SAME TWO GATES THE CIRCLE GOES THROUGH. A tap is more deliberate than a hold,
+                    but it writes the same irreversible record into the same patient's trend, and the
+                    therapist tapping it is as able to tap the wrong thing as anybody. It asks. */}
+                <button className="btn btn-lg" onClick={() => setEndStage('confirm')} data-testid="end-session">
+                  End &amp; see results…
                 </button>
               </div>
+              {/* THE LEGEND GOES UNDER THE BUTTONS, for the same reason the circles go above
+                  everything: both escapes have to be above the fold and the legend is what explains
+                  them. Its length is `DwellLegend`'s to decide and it runs to 340-410 px in its
+                  not-seeing-you state — measured at 1024x768, where leaving it between the preview
+                  and the buttons put Resume off the bottom of the screen. */}
+              {pauseChoices.length > 0 && (
+                <DwellLegend
+                  session={pauseDwell}
+                  what="the left circle to carry on with the song, the smaller right one to ask to stop — it asks first, and nothing is written until it is answered twice"
+                  testId="pause-dwell-legend"
+                />
+              )}
               {/* THE WORDS FOR THE MARK THE PAUSE PUTS ON EVERY METER. While the session is stopped the
                   camera keeps running and the patient keeps moving, but the engine discards every input
                   — so both live meters blank to "no reading" (a broken ring with the pause bars in it,

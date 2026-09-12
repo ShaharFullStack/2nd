@@ -351,7 +351,12 @@ describe('MOVEMENT_INFO', () => {
     const setup = POSTURE_INFO.seated_leg.setup;
     expect(setup).toMatch(/hips, knees and feet/);
     expect(setup).toMatch(/\bhand\b/);
-    expect(setup).toMatch(/thigh|arm of the chair/);
+    // IT NAMES A SUPPORT THE LEG CANNOT MOVE, AND RULES OUT THE ONE IT CAN. The old text offered the
+    // thigh and the chair arm as equals; a hand on the thigh is carried by hip flexion and by
+    // circumduction, and it filled the primary circle in 3.23 s on the first repetition.
+    expect(setup).toMatch(/arm of the chair|armrest|table/);
+    expect(setup).toMatch(/NOT on your thigh/);
+    expect(setup).toMatch(/cannot be told apart from a repetition/);
     // …and it says why the knees cannot do it, so the instruction is not an arbitrary demand.
     expect(setup).toMatch(/knees cannot/);
     // The hand postures already have the prescribed hand in frame by construction.

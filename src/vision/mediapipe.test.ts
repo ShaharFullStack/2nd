@@ -1,5 +1,18 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { DetectLoop, createDetector, labelToPatientSide, openCamera, pickHand, pickHandResult, resetMediaPipeCache, waitForVideoReady } from './mediapipe.ts';
+import {
+  DetectLoop,
+  MAX_SUBJECT_HANDS,
+  createDetector,
+  extraHandsInFrame,
+  hasExtraHandCount,
+  labelToPatientSide,
+  openCamera,
+  pickHand,
+  pickHandResult,
+  resetMediaPipeCache,
+  resolveHandLabels,
+  waitForVideoReady,
+} from './mediapipe.ts';
 import type { DetectionResult, HandDetection, LandmarkDetector } from './mediapipe.ts';
 import { handPose } from './fixtures.ts';
 
@@ -441,18 +454,64 @@ describe('createDetector', () => {
     expect(mp.state.tasks[0].closed).toBe(true);
   });
 
-  it('hand mode requests 2 hands from the local model and maps handedness', async () => {
+  /**
+   * ONE MORE HAND THAN THE SESSION CAN USE, so a second person in front of the camera is VISIBLE.
+   * See `MAX_SUBJECT_HANDS`: the circles follow any hand, a carer's hand can fill one, and with a
+   * two-hand request a third hand could only ever arrive by displacing one of the patient's inside a
+   * list of two — the app was structurally unable to notice it. The surplus is counted and dropped,
+   * never handed to the features, the lanes or the dwell pointer.
+   */
+  it('hand mode asks for one hand more than the session uses, and hands on only what it uses', async () => {
     const det = await createDetector({ mode: 'hand' });
     const opts = mp.state.created[0].opts;
     expect((opts.baseOptions as { modelAssetPath: string }).modelAssetPath).toBe('/models/hand_landmarker.task');
     expect(opts.runningMode).toBe('VIDEO');
-    expect(opts.numHands).toBe(2);
+    expect(opts.numHands).toBe(MAX_SUBJECT_HANDS + 1);
     const res = det.detect(frame, 10);
     expect(res.pose).toBeNull();
     expect(res.hands).toHaveLength(1);
     expect(res.hands[0].label).toBe('Left');
     expect(res.hands[0].score).toBeCloseTo(0.87, 6);
+    // One hand is one person's: nothing is claimed about anybody else being there.
+    expect(res.extraHands).toBe(0);
+    expect(extraHandsInFrame(res)).toBe(0);
     det.close();
+  });
+
+  /**
+   * A LEG-MODE RESULT CARRIES THE COUNT TOO, and it is 0: `numPoses: 1` means a carer cannot ADD a
+   * limb to a pose result, only become the subject of one (which is VisionInput's subject guard).
+   * It matters that the field is present rather than absent — absent means nothing counted, and
+   * `hasExtraHandCount` is how a screen tells the two apart.
+   */
+  it('reports the hand count on a leg-mode result as well, so absent never reads as "nobody else"', async () => {
+    const det = await createDetector({ mode: 'leg' });
+    const res = det.detect(frame, 10);
+    expect(hasExtraHandCount(res)).toBe(true);
+    expect(res.extraHands).toBe(0);
+    expect(hasExtraHandCount({ tMs: 0, pose: null, hands: [] })).toBe(false);
+    expect(extraHandsInFrame({ tMs: 0, pose: null, hands: [] })).toBe(0);
+    det.close();
+  });
+
+  /**
+   * TWO HANDS MAY NOT WEAR ONE NAME — see `resolveHandLabels`. MediaPipe labels each hand
+   * independently and commonly gives both the same handedness; `dwellLimbs` keys its pointer identity
+   * off that label, and two hands sharing one key are SMOOTHED INTO ONE by `DwellTracker` — a phantom
+   * limb halfway between a carer's hand and the patient's, which can sit on a target neither is on.
+   */
+  it('drops a handedness label that two hands are wearing at once, so neither is keyed as a side', () => {
+    const same = resolveHandLabels([hand('Right', 0.95, 0.3), hand('Right', 0.72, 0.7)]);
+    expect(same.map((h) => h.score)).toEqual([0, 0]);
+    // The landmarks and the raw label are untouched: nothing is invented, only the trust withdrawn.
+    expect(same.map((h) => h.label)).toEqual(['Right', 'Right']);
+    expect(same[0].landmarks).toHaveLength(21);
+    // Two hands the model told apart are left exactly as they are — same array, no copy.
+    const distinct = [hand('Left', 0.91, 0.3), hand('Right', 0.88, 0.7)];
+    expect(resolveHandLabels(distinct)).toBe(distinct);
+    // A lone hand is never contested with itself.
+    const lone = [hand('Right', 0.95, 0.5)];
+    expect(resolveHandLabels(lone)).toBe(lone);
   });
 
   it('caches the fileset per wasm path until resetMediaPipeCache()', async () => {

@@ -511,6 +511,18 @@ export const FINE_SMOOTHING: SmoothingSpec = Object.freeze({ kind: 'ema2', alpha
  * which is the stranding the whole gesture exists to prevent. The camera check states the same fact
  * about the framing it can actually SEE (`cameraReadiness`, `PointerObservation`), because an
  * instruction is not evidence that it was followed.
+ *
+ * AND WHY IT NAMES THE SUPPORT, AND RULES OUT THE THIGH. This text used to offer "on your thigh or the
+ * arm of the chair" as though the two were interchangeable. They are not, and the difference is the
+ * whole of this feature's third failure: hip flexion rotates the thigh about the hip, so a hand resting
+ * at fraction f along the hip->knee segment rises by f x the knee's travel and is swung sideways by
+ * circumduction at the same time. Driven through the shipping classes, a seated march with
+ * circumduction and a hand on the thigh filled the PRIMARY circle in 3.23 s on the first repetition —
+ * at every frame rate, in both frame aspects, on either side. A chair arm, an armrest or a table is
+ * furniture: the leg cannot move it, and that independence is the only thing that makes a hold a
+ * different event from a repetition. The instruction is still only half of it — the pointer's
+ * independence is also MEASURED from the landmarks and a carried hand is refused (`DwellCoupling`),
+ * because three rounds of this feature were lost to trusting a premise about the body.
  */
 export type MovementPosture = 'seated_leg' | 'palm_to_camera' | 'hand_over_edge';
 
@@ -518,7 +530,7 @@ export const POSTURE_INFO: Readonly<Record<MovementPosture, { label: string; set
   seated_leg: {
     label: 'Seated, facing the camera',
     setup:
-      'Sit facing the camera so your hips, knees and feet are in view, and rest a hand where the camera can see it — on your thigh or the arm of the chair. That hand is what holds the circles on screen, so you never have to touch the tablet; your knees cannot do it, because they are doing the exercise.',
+      'Sit facing the camera so your hips, knees and feet are in view, and rest a hand where the camera can see it — on the arm of the chair, an armrest or a table, and NOT on your thigh. That hand is what holds the circles on screen, so you never have to touch the tablet: it has to be resting on something your leg does not move, because a hand carried by your thigh cannot be told apart from a repetition. Your knees cannot do it at all, for the same reason — they are doing the exercise.',
   },
   palm_to_camera: { label: 'Palm to the camera', setup: 'Rest your forearm on the table with your palm facing the camera.' },
   hand_over_edge: { label: 'Hand over the table edge', setup: 'Rest your forearm on the table with your hand over the edge, fingers pointing at the camera.' },

@@ -49,8 +49,81 @@ export interface DetectionResult {
    * Used by the 3D angle features (knee_extension, ankle_dorsiflexion); image-space z is a fallback.
    */
   poseWorld?: Landmark[] | null;
-  /** Detected hands (hand mode); empty when none. */
+  /** Detected hands (hand mode); empty when none. Never more than `MAX_SUBJECT_HANDS`. */
   hands: HandDetection[];
+  /**
+   * HOW MANY HANDS WERE IN THE PICTURE THAT ONE PERSON CANNOT ACCOUNT FOR — 0 almost always, and the
+   * only evidence in this app that somebody other than the patient is in front of the camera.
+   *
+   * See `MAX_SUBJECT_HANDS`. Absent (rather than 0) when nothing looked: the scripted sources, a
+   * replay, a fixture built by hand. Absent must never be read as "nobody else is there".
+   */
+  extraHands?: number;
+}
+
+/**
+ * HOW MANY HANDS ONE PERSON HAS, and why this file has to have an opinion about it.
+ *
+ * The patient is meant to be alone with the tablet, and in a clinic they are routinely not: a carer
+ * steadies a shoulder, a therapist reaches across to adjust the chair. `dwellLimbs` (vision/dwell.ts)
+ * offers EVERY detected hand as a pointer — deliberately, because either of the patient's own hands
+ * may answer a circle — so a hand that is not the patient's can park on a target and complete a hold.
+ * The app cannot tell whose hand a hand is from hand landmarks. What it CAN tell, and previously could
+ * not, is that there are more hands in the picture than one person has; that is the only honest
+ * statement available, and it is the precondition for refusing anything.
+ *
+ * So the detector asks the model for one hand MORE than the session can use, keeps the ones the
+ * session can use, and reports the surplus as a COUNT rather than feeding it to the lanes or the
+ * pointer (`extraHandsInFrame`). Everything downstream sees exactly the list it saw before.
+ */
+export const MAX_SUBJECT_HANDS = 2;
+
+/**
+ * Hands in the picture that one person cannot account for. 0 when the frame is unremarkable, and 0
+ * for a result that carries no count (a fixture, a replay) — `hasExtraHandCount` is how a caller
+ * tells "nobody else is there" from "nothing looked", because the two must not read the same.
+ */
+export function extraHandsInFrame(result: DetectionResult | null | undefined): number {
+  const n = result?.extraHands;
+  return typeof n === 'number' && Number.isFinite(n) && n > 0 ? Math.round(n) : 0;
+}
+
+/** True when this result was produced by something that counted the hands in frame at all. */
+export function hasExtraHandCount(result: DetectionResult | null | undefined): boolean {
+  return typeof result?.extraHands === 'number' && Number.isFinite(result.extraHands);
+}
+
+/**
+ * TWO HANDS MAY NOT WEAR ONE NAME.
+ *
+ * MediaPipe commonly labels both detected hands with the same handedness — it is a per-hand
+ * classifier with no constraint tying the two together — and every consumer of that label keys off it:
+ * `pickHandResult` falls back to image position (which is correct and already documented), but
+ * `dwellLimbs` builds its identity key from it (`hand:right`), and two hands sharing one key are
+ * SMOOTHED INTO ONE POINTER by `DwellTracker`. A carer's hand and the patient's hand then average into
+ * a phantom limb halfway between them, which can sit on a target neither of them is on.
+ *
+ * A label the model has given to two hands at once does not identify either of them, so the SCORE —
+ * which is exactly the "how far do you trust this label" channel, and which every reader of the label
+ * already gates on — is dropped to zero for both. Nothing is invented and nothing is asserted: the
+ * hands keep their landmarks and their raw labels, they get distinct pointer keys, and they are
+ * captioned "a hand" instead of being told to the patient as a side. Lane assignment is unchanged,
+ * because two hands labelled the same side already resolved by position.
+ *
+ * Returns the same array (not a copy) when there is nothing to resolve.
+ */
+export function resolveHandLabels(hands: readonly HandDetection[]): readonly HandDetection[] {
+  if (hands.length < 2) return hands;
+  const seen = new Map<string, number>();
+  for (const h of hands) {
+    const key = h.label.toLowerCase();
+    if (key === '') continue;
+    seen.set(key, (seen.get(key) ?? 0) + 1);
+  }
+  let contested = false;
+  for (const n of seen.values()) if (n > 1) contested = true;
+  if (!contested) return hands;
+  return hands.map((h) => ((seen.get(h.label.toLowerCase()) ?? 0) > 1 ? { ...h, score: 0 } : h));
 }
 
 /** Anything MediaPipe accepts as an image source; kept loose so fakes can pass anything. */
@@ -80,6 +153,12 @@ export interface DetectorOptions {
   handModelPath?: string;
   /** 'auto' (default) tries GPU then falls back to CPU. */
   delegate?: 'GPU' | 'CPU' | 'auto';
+  /**
+   * How many hands the SESSION can use — never more than `MAX_SUBJECT_HANDS`, and the model is asked
+   * for one more than this so a third hand in the picture can be seen and reported rather than
+   * silently displacing one of the patient's (see `MAX_SUBJECT_HANDS`). The surplus never reaches the
+   * result's `hands`.
+   */
   numHands?: number;
   minDetectionConfidence?: number;
   minTrackingConfidence?: number;
@@ -244,9 +323,11 @@ export async function createDetector(opts: DetectorOptions): Promise<LandmarkDet
       map: (res, ts) => {
         const pose = res.landmarks.length > 0 ? res.landmarks[0].map(toLandmark) : null;
         const poseWorld = pose && res.worldLandmarks.length > 0 ? res.worldLandmarks[0].map(toLandmark) : null;
-        return { tMs: ts, pose, poseWorld, hands: [] };
+        // `numPoses: 1` — one subject, so a carer in frame cannot add a limb here; they can only
+        // BECOME the subject, which is what VisionInput's subject-continuity guard is for.
+        return { tMs: ts, pose, poseWorld, hands: [], extraHands: 0 };
       },
-      empty: (ts) => ({ tMs: ts, pose: null, poseWorld: null, hands: [] }),
+      empty: (ts) => ({ tMs: ts, pose: null, poseWorld: null, hands: [], extraHands: 0 }),
     });
   }
 
@@ -254,7 +335,12 @@ export async function createDetector(opts: DetectorOptions): Promise<LandmarkDet
     mp.HandLandmarker.createFromOptions(fileset, {
       baseOptions: { modelAssetPath: opts.handModelPath ?? DEFAULT_HAND_MODEL, delegate: d },
       runningMode: 'VIDEO',
-      numHands: opts.numHands ?? 2,
+      // ONE MORE THAN THE SESSION CAN USE. See `MAX_SUBJECT_HANDS`: the extra slot is not for the
+      // patient, it is so a hand that is nobody's business being there is VISIBLE to the app instead
+      // of taking a patient's hand's place in a list of two. It costs a landmark pass only on the
+      // frames a third hand is actually in, and the surplus is dropped before anything downstream
+      // (features, lanes, the dwell pointer) can read it.
+      numHands: Math.min(MAX_SUBJECT_HANDS, Math.max(1, Math.round(opts.numHands ?? MAX_SUBJECT_HANDS))) + 1,
       minHandDetectionConfidence: opts.minDetectionConfidence ?? 0.5,
       minTrackingConfidence: opts.minTrackingConfidence ?? 0.5,
     });
@@ -266,13 +352,19 @@ export async function createDetector(opts: DetectorOptions): Promise<LandmarkDet
     delegate,
     createCpu: preferred === 'GPU' ? null : () => createHand('CPU') as unknown as Promise<VideoTask<HandResult>>,
     map: (res, ts) => {
-      const hands: HandDetection[] = res.landmarks.map((lms, i) => {
+      const all: HandDetection[] = res.landmarks.map((lms, i) => {
         const cat = res.handedness[i]?.[0];
         return { landmarks: lms.map(toLandmark), label: cat?.categoryName ?? '', score: cat?.score ?? 0 };
       });
-      return { tMs: ts, pose: null, hands };
+      // THE SURPLUS IS COUNTED, NOT PASSED ON. Which of three hands belongs to the patient is not
+      // something hand landmarks can answer, so nothing here guesses: the list handed downstream is
+      // the model's own first `MAX_SUBJECT_HANDS`, i.e. exactly what a two-hand request would have
+      // returned, and the fact that there was a third is reported so the screens can say so and can
+      // refuse the one confirm that cannot be taken back.
+      const hands = [...resolveHandLabels(all.slice(0, MAX_SUBJECT_HANDS))];
+      return { tMs: ts, pose: null, hands, extraHands: Math.max(0, all.length - MAX_SUBJECT_HANDS) };
     },
-    empty: (ts) => ({ tMs: ts, pose: null, hands: [] }),
+    empty: (ts) => ({ tMs: ts, pose: null, hands: [], extraHands: 0 }),
   });
 }
 

@@ -129,7 +129,8 @@
  * not pass its "not known yet" default of 1 as though it were a square sensor: see `liveXScale` in
  * DwellTarget.tsx, which waits for a frame before believing it.
  */
-import type { Mode, Side } from '../engine/types.ts';
+import type { LaneSpec, Mode, Side } from '../engine/types.ts';
+import { extractFeature } from './features.ts';
 import { HAND, MIN_VISIBILITY, POSE } from './landmarks.ts';
 import type { Landmark } from './landmarks.ts';
 import { labelToPatientSide } from './mediapipe.ts';
@@ -232,6 +233,14 @@ export type DwellBlock =
    * This is the gate that no fixture sweep can be, and the one the exercise cannot open.
    */
   | 'occupied'
+  /**
+   * THE LIMB MOVES WITH THE PRESCRIBED EXERCISE, measured over the readiness window
+   * (`DwellCoupling`) — a hand resting on the thigh is carried by the thigh, so a hold made with it
+   * cannot be told apart from a repetition. Set by the caller through `setCoupled`; nothing
+   * accumulates while it is true. The remedy is a support the leg cannot move, and the screen says
+   * so: no placement and no amount of holding can fix it.
+   */
+  | 'coupled'
   /** The limb has not been seen outside the target since the tracker was armed. */
   | 'entry';
 
@@ -308,6 +317,26 @@ export function retargetForAspect(c: DwellCircle, xScale: number, authored = DWE
 }
 
 /**
+ * THE SAME TARGET AS THE PREVIEW WILL DRAW IT — position AND size.
+ *
+ * `retargetForAspect` keeps the offset from the centre a constant physical distance. This adds the
+ * other half, which the size requirement made load-bearing: a frame TALLER than the 4:3 preview box is
+ * cropped top and bottom, so the surviving strip is magnified onto the glass and `radius` frame
+ * heights become `radius / visY` box heights. A ring authored to be 100 px across at 4:3 would be
+ * 133 px at 1:1 and would not fit on the screen beside its own caption.
+ *
+ * So the authored radius is read as a fraction of the PREVIEW BOX — which is the thing a patient's eye
+ * has to resolve and aim at, and the only frame in which "26 mm at arm's length" means anything — and
+ * converted here into the frame heights everything downstream measures in. On a 4:3 or wider sensor
+ * (every sensor a webcam actually delivers) `visY` is 1 and this is exactly `retargetForAspect`.
+ */
+export function retargetForPreview(c: DwellCircle, xScale: number, authored = DWELL_AUTHORED_ASPECT): DwellCircle {
+  const placed = retargetForAspect(c, xScale, authored);
+  if (!Number.isFinite(xScale) || xScale <= 0 || xScale >= authored) return placed;
+  return { x: placed.x, y: placed.y, radius: c.radius * (xScale / authored) };
+}
+
+/**
  * Do two targets share any ground — including their hysteresis bands?
  *
  * Two targets on one screen ("continue" and "redo this lane") are driven by the SAME pointer and each
@@ -342,6 +371,8 @@ export class DwellTracker {
   private seenOutside = false;
   /** Set by `setOccupied`: a limb's measured habitat reaches this target, so no hold may count. */
   private occupied = false;
+  /** Set by `setCoupled`: the limb pointing at this target is being moved by the exercise. */
+  private coupled = false;
   /** Which limb the samples in the buffer came from (null = the caller does not distinguish). */
   private limbKey: string | null = null;
   private blockedUntil = -Infinity;
@@ -387,6 +418,20 @@ export class DwellTracker {
    */
   setOccupied(occupied: boolean): void {
     this.occupied = occupied === true;
+  }
+
+  /**
+   * THE LIMB DOING THE POINTING IS BEING CARRIED BY THE EXERCISE — so nothing it does may count.
+   *
+   * Told by the caller, which is the only party that can see the pointer and the prescribed movement
+   * in the same frame (`DwellCoupling` + `dwellReferences`). While it is set the hold does not
+   * accumulate and any progress decays, exactly as `occupied` does — but for a reason no placement can
+   * cure: it is not that the circle is in the wrong place, it is that this limb is not an independent
+   * witness. The screen's remedy is to ask for the hand to be supported by something the leg does not
+   * move, which is what `POSTURE_INFO.seated_leg` asks for in the first place.
+   */
+  setCoupled(coupled: boolean): void {
+    this.coupled = coupled === true;
   }
 
   /** The last state produced. Frozen; a renderer may hold it between updates. */
@@ -565,13 +610,18 @@ export class DwellTracker {
     }
 
     const refractory = t < this.blockedUntil;
+    // COUPLED OUTRANKS OCCUPIED, and both outrank the entry gate: of the three, "this limb is being
+    // moved by the exercise" is the one the patient cannot fix by moving the limb or by waiting for
+    // the ring to slide somewhere clear, so it is the one the screen has to say.
     const blocked: DwellBlock | null = refractory
       ? 'refractory'
-      : this.occupied
-        ? 'occupied'
-        : requireEntry && !this.seenOutside
-          ? 'entry'
-          : null;
+      : this.coupled
+        ? 'coupled'
+        : this.occupied
+          ? 'occupied'
+          : requireEntry && !this.seenOutside
+            ? 'entry'
+            : null;
     const holding = fresh && this.insideFlag && blocked === null;
 
     let confirmed = false;
@@ -778,6 +828,17 @@ export interface PickDwellLimbOptions {
   xScale?: number;
   /** How far the previously-picked limb may have moved and still be recognised as the same one. */
   continuityRadius?: number;
+  /**
+   * Limbs that may not be followed while any other limb is available (`DwellCoupling.coupledKeys`):
+   * a hand the exercise is carrying is not a witness, so the OTHER hand — the one on the chair arm —
+   * takes the pick even while the carried one is sitting inside a circle.
+   *
+   * It is a preference and not a removal, because a limb nobody may follow still has to be NAMED: if
+   * every candidate is refused, the pick falls back to the ordinary ranking so the screen can say
+   * which hand it is watching and why the ring will not fill (`DwellTracker.setCoupled`). Reporting
+   * "no hand in view" for a hand that is plainly in view is the untruth this app keeps refusing.
+   */
+  avoid?: ReadonlySet<string> | readonly string[];
 }
 
 /** Default `continuityRadius`: about a fifth of the frame height between one frame and the next. */
@@ -802,13 +863,18 @@ export function pickDwellLimb(
   opts: PickDwellLimbOptions = {},
 ): DwellLimb | null {
   if (limbs.length === 0) return null;
-  if (targets.length === 0) return limbs[0];
+  const avoid = opts.avoid instanceof Set ? opts.avoid : new Set(opts.avoid ?? []);
+  // A limb the exercise is carrying is set aside while any other limb is in the frame; with nothing
+  // else to follow, every limb is back in the running and the caller has to say why it cannot count.
+  const free = avoid.size > 0 ? limbs.filter((l) => !avoid.has(l.key)) : limbs;
+  const pool0: readonly DwellLimb[] = free.length > 0 ? free : limbs;
+  if (targets.length === 0) return pool0[0];
   const xScale = opts.xScale ?? 1;
   const continuity = opts.continuityRadius ?? DWELL_CONTINUITY_RADIUS;
   const previous = finitePoint(opts.previous ?? null) ? (opts.previous as DwellPoint) : null;
   const previousKey = opts.previousKey ?? null;
 
-  const scored = limbs.map((limb) => {
+  const scored = pool0.map((limb) => {
     let nearest = Infinity;
     let inside = false;
     for (const target of targets) {
@@ -875,6 +941,77 @@ export const DWELL_LATERAL_FLOOR_PALMS = 0.75;
  * the patient moves the limb somewhere it was not, rather than nudging it a centimetre.
  */
 export const DWELL_CLEAR_EXTRA = 0.08;
+/**
+ * HOW FAR A RING MAY BE MOVED FROM WHERE THE LAYOUT AUTHORED IT, in frame heights. Was 0.6, which is
+ * most of the frame and is how a circle walked into a corner: traced in the running app, a primary
+ * slid 0.72,0.32 -> 0.72,0.215 -> 0.787,0.14, i.e. into the top of the picture at the far edge, 0.518
+ * frame heights from the resting hand that has to reach it. A ring that has run away from the patient
+ * is not a remedy for a ring that was standing on them; past this distance the honest answer is
+ * `placeable: false` and a screen that says so.
+ *
+ * This is the weaker of the three bounds and it is about RECOGNITION — the patient has to find the
+ * circle they learned. The two that are about the BODY are `dwellPlaceable` (never a ring whose whole
+ * area is up in the top third of the picture, i.e. never an unsupported arm held overhead for two
+ * seconds) and `DWELL_LIMB_REACH` (never a ring further from the nearest limb than that limb can
+ * travel). All three have to hold, and it is the last two that the traced walk into the corner broke:
+ * 0.518 frame heights from the hand that had to reach it is not a distance, it is a different screen.
+ */
+export const DWELL_MAX_REACH = 0.35;
+/**
+ * The same cap for the LATERAL axis, and it is deliberately looser — it is the old unbounded 0.6, kept.
+ * Leg mode's escape axis is vertical and every unit of it is an arm raised further against gravity;
+ * hand mode's is a slide ACROSS a table that is carrying the forearm the whole way, which is why that
+ * is the axis the mode was given in the first place. A hand-mode ring may therefore travel most of the
+ * way across the frame to get clear of a palm the framing put on top of it, and a leg-mode ring may
+ * not climb. Measured: capping the lateral axis at 0.45 instead cost the hands-free path on 3 % of the
+ * sitting-still sweep's bodies (a palm framed off-centre at 1.6x scale has to be escaped sideways and
+ * there is nowhere else to go), and bought nothing — the corner the rings walked into was a VERTICAL
+ * climb, and what stops that is `dwellPlaceable` and `DWELL_LIMB_REACH`, not a shorter leash.
+ */
+export const DWELL_MAX_REACH_LATERAL = 0.6;
+/**
+ * A RELOCATED RING MAY NOT ASK FOR AN ARM HELD UP IN THE TOP OF THE PICTURE.
+ *
+ * The same rule the authored positions are chosen by, and DwellTarget.tsx states it in its own words:
+ * an unsupported arm held in the upper third of the frame for nearly two seconds is a therapy
+ * exercise, not a click. A ring must therefore still reach into the middle third (`y + radius`), and
+ * must not be pushed off the bottom either; the drawing constraint (`fits`) is separate and both apply.
+ */
+export const DWELL_UPPER_THIRD = 1 / 3;
+export const DWELL_LOWER_LIMIT = 0.95;
+
+/** Is this a place a seated patient can be asked to hold a limb for `holdSec`? */
+export function dwellPlaceable(c: DwellCircle): boolean {
+  return c.y + c.radius > DWELL_UPPER_THIRD && c.y - c.radius < DWELL_LOWER_LIMIT;
+}
+
+/**
+ * HOW FAR A LIMB MAY BE ASKED TO TRAVEL TO A RING, in frame heights, measured from where that limb
+ * LIVES to the near edge of the circle.
+ *
+ * 0.45 is not a new number: it is the bound the reach test in DwellTarget.test.tsx already holds the
+ * AUTHORED positions to, from every rest position a seated patient's hands take. A relocated ring is
+ * held to the same standard, because the patient who has to reach it is the same patient — and because
+ * "the circle moved somewhere clear" stops being a remedy at the point where nobody can get to it.
+ */
+export const DWELL_LIMB_REACH = 0.45;
+
+/**
+ * Can SOME limb in view still get to this circle? True when there is nothing in view to reach with —
+ * a screen with no limbs measured yet is not evidence that a placement is unreachable.
+ */
+export function dwellWithinLimbReach(
+  c: DwellCircle,
+  summaries: readonly DwellHabitatSummary[],
+  xScale = 1,
+  limit = DWELL_LIMB_REACH,
+): boolean {
+  if (summaries.length === 0) return true;
+  for (const s of summaries) {
+    if (dwellDistance(s.home, c, xScale) - c.radius <= limit) return true;
+  }
+  return false;
+}
 /** How long a limb's positions are remembered. Long enough that a 2 s reach is a small minority. */
 export const DWELL_HABITAT_WINDOW_SEC = 20;
 /** Positions are recorded no faster than this, so a 60 fps camera and a 5 fps one weigh the same. */
@@ -1049,6 +1186,341 @@ export class DwellHabitat {
   }
 }
 
+/* ---------------- is this limb INDEPENDENT of the prescribed exercise? ---------------- */
+
+/**
+ * WHY AN INSTRUCTION IS NOT A GUARANTEE, AND WHAT IS MEASURED INSTEAD.
+ *
+ * Leg mode follows the HANDS because the knees cannot answer (see the header). That is only a
+ * separation while the hand is held up by something the exercise does not move. A hand resting ON THE
+ * THIGH is not: hip flexion rotates the thigh about the hip, so a hand at fraction f along the
+ * hip->knee segment rises by f x the knee's travel, and hip circumduction — the compensation this app
+ * promises never to penalise — carries it sideways at the same time. Driven through the shipping
+ * classes, a seated march with circumduction and a hand on the thigh confirmed the PRIMARY circle at
+ * t = 3.23 s on the first repetition, at every frame rate and every frame aspect; on the pause dialog
+ * the secondary circle ends the session and writes a truncated record.
+ *
+ * `POSTURE_INFO.seated_leg` now asks for a support the leg cannot move (a chair arm, an armrest, a
+ * table) and says why the thigh is not one. But the last three rounds of this feature were each lost
+ * to trusting a premise about the body instead of measuring it, so the instruction is only half:
+ *
+ *   THE POINTER'S INDEPENDENCE IS MEASURED FROM THE LANDMARKS, over a rolling readiness window, and a
+ *   limb that is moving WITH the prescribed movement may not point at anything.
+ *
+ * The measurement is a regression of the pointer's FRAME-TO-FRAME TRAVEL on the reference signal's
+ * (`dwellReferences`: the prescribed lane features, plus the raw hip-relative travel of knee, ankle
+ * and foot so that a hand carried by a segment nobody prescribed is caught too). Increments rather
+ * than levels, deliberately: a hand that is carried tracks the exercise on every frame, up AND down,
+ * so its increments are proportional to the reference's; a hand that the patient DELIBERATELY RAISES
+ * makes one excursion of its own while the exercise goes on around it, and over the window its
+ * increments are mostly zero where the reference's are not. That is the difference between
+ * `explained` ~ the whole reach and `explained` ~ nothing, and it is what keeps this gate from
+ * refusing the very gesture it exists to protect.
+ *
+ * Two numbers decide, and both have to be met:
+ *   - R2, how much of the pointer's travel the exercise ACCOUNTS FOR (a carried hand: ~1);
+ *   - `explained`, how far the pointer travels BECAUSE of the exercise, in frame heights — so a hand
+ *     resting at the hip end of the thigh, which moves a millimetre, is not called coupled on the
+ *     strength of a perfect correlation with nothing.
+ * Units cancel in `explained` (frame heights per feature unit, times the feature's own range), so a
+ * reference in degrees and one in torso lengths are compared on the same footing.
+ */
+
+/** One reference signal for one frame: what the prescribed exercise is doing, as a scalar. */
+export interface DwellReference {
+  /** Stable name, so a verdict can say WHICH movement the limb was following. */
+  key: string;
+  value: number;
+}
+
+/** How long the pointer and the exercise are compared over — the readiness window. */
+export const DWELL_COUPLING_WINDOW_SEC = 4;
+/** Sampled no faster than this, so a 60 fps camera and a 12 fps one weigh the same. */
+export const DWELL_COUPLING_INTERVAL_SEC = 0.08;
+/** Below this many samples, or this much time, nothing is claimed either way. */
+export const DWELL_COUPLING_MIN_SAMPLES = 12;
+export const DWELL_COUPLING_MIN_SPAN_SEC = 1;
+/** Share of the pointer's travel the exercise must account for before they are "moving together". */
+export const DWELL_COUPLING_MIN_R2 = 0.5;
+/**
+ * Travel (frame heights) the exercise must explain before it matters. A quarter of a dwell radius: a
+ * hand carried this far by a repetition can be carried into a circle by one, and a hand carried less
+ * than this cannot reach anything it was not already on.
+ */
+export const DWELL_COUPLING_MIN_TRAVEL = 0.025;
+/** Once coupled, a limb stays refused this long without new evidence — a verdict, not a flicker. */
+export const DWELL_COUPLING_HOLD_SEC = 1.5;
+/** A limb not seen for this long is forgotten entirely. */
+export const DWELL_COUPLING_FORGET_SEC = 5;
+
+/** What the window says about one limb's independence from the prescription. */
+export interface DwellCouplingVerdict {
+  key: string;
+  /** TRUE = this limb moves with the prescribed exercise and may not answer for the patient. */
+  coupled: boolean;
+  /** Frame heights of this limb's travel the exercise accounts for. */
+  explained: number;
+  /** 0..1 — the share of its travel that is accounted for. */
+  r2: number;
+  /** Which reference signal it was following (null when none was implicated). */
+  reference: string | null;
+  samples: number;
+  /** False while the window is too short to say anything: NOT a clean bill of health. */
+  settled: boolean;
+}
+
+interface CouplingTrack {
+  ts: number[];
+  /** Pointer position in frame-height units (x already multiplied by xScale). */
+  xs: number[];
+  ys: number[];
+  /** Reference values, per reference key, aligned with the arrays above. */
+  refs: Map<string, number[]>;
+  last: number;
+  coupledUntil: number;
+  verdict: DwellCouplingVerdict | null;
+  dirty: boolean;
+}
+
+/**
+ * THE REFERENCE SIGNALS a pointer's travel is correlated against — what the exercise is doing.
+ *
+ * LEG MODE: the prescribed lane features themselves (`lanes`, through the same `extractFeature` the
+ * game is scored from, in the same mirror convention), plus the hip-relative travel of the knee, the
+ * ankle and the foot on both sides. The prescribed features are the literal claim ("this limb does not
+ * move with the prescription"); the raw segments are there because a patient's hand can be carried by
+ * a segment the prescription does not measure — a hand on the shin during ankle work, a hand on a
+ * thigh that flexes as a compensation for the lane that IS prescribed. Everything is measured relative
+ * to the HIP, so a chair scoot or a camera bump — which moves the pointer and the whole body together
+ * — is not mistaken for the patient's exercise carrying their hand.
+ *
+ * HAND MODE: none, and that is not an oversight. There the prescribed hand IS the pointer and always
+ * moves with the prescription; what makes a confirm deliberate there is geometric, along the one axis
+ * the prescription cannot use (`dwellAxisFor`). Correlating the pointer with the exercise would refuse
+ * every limb in the mode, which is not a safety property, it is the end of the feature.
+ */
+export function dwellReferences(
+  result: DetectionResult | null | undefined,
+  mode: Mode,
+  opts: { lanes?: readonly LaneSpec[]; mirrored?: boolean; xScale?: number } = {},
+): DwellReference[] {
+  if (mode !== 'leg') return [];
+  const pose = result?.pose;
+  if (!pose) return [];
+  const xScale = opts.xScale ?? 1;
+  const mirrored = opts.mirrored ?? false;
+  const out: DwellReference[] = [];
+  for (const lane of opts.lanes ?? []) {
+    const value = extractFeature(lane.movement, pose, lane.side, {
+      mirrored,
+      xScale,
+      worldLandmarks: result?.poseWorld ?? null,
+    });
+    if (value !== null && Number.isFinite(value)) out.push({ key: `lane:${lane.index}:${lane.movement}:${lane.side}`, value });
+  }
+  // The segments themselves, hip-relative and in frame heights. `side` here is the IMAGE side; the
+  // verdict is about a limb's travel, not about which of the patient's legs it was, so no mirror
+  // correction is needed (and the labels are only ever shown as a movement name, never as a side).
+  const hips = [pose[POSE.LEFT_HIP], pose[POSE.RIGHT_HIP]].filter(visible);
+  if (hips.length === 0) return out;
+  const hip = { x: hips.reduce((a, h) => a + h.x, 0) / hips.length, y: hips.reduce((a, h) => a + h.y, 0) / hips.length };
+  const segments: Array<[string, number]> = [
+    ['knee', POSE.LEFT_KNEE],
+    ['knee', POSE.RIGHT_KNEE],
+    ['ankle', POSE.LEFT_ANKLE],
+    ['ankle', POSE.RIGHT_ANKLE],
+    ['foot', POSE.LEFT_FOOT_INDEX],
+    ['foot', POSE.RIGHT_FOOT_INDEX],
+  ];
+  let i = 0;
+  for (const [name, idx] of segments) {
+    i += 1;
+    const p = pose[idx];
+    if (!visible(p)) continue;
+    out.push({ key: `${name}${i}:y`, value: p.y - hip.y });
+    out.push({ key: `${name}${i}:x`, value: (p.x - hip.x) * xScale });
+  }
+  return out;
+}
+
+/**
+ * WHETHER EACH LIMB IS MOVING WITH THE PRESCRIBED EXERCISE — measured, limb by limb, frame by frame.
+ *
+ * Fed the same pointer the trackers are fed and the reference signals for the same frame. `verdict`
+ * answers for one limb; a coupled limb is refused as a pointer (`pickDwellLimb`, `avoid`) and, when
+ * there is no other limb to follow, stands the rings down (`DwellTracker.setCoupled`) so the screen
+ * can say what is wrong and what to do about it instead of filling a ring the exercise is driving.
+ *
+ * It is pure and has no clock of its own: see the header note on the wall clock.
+ */
+export class DwellCoupling {
+  private tracks = new Map<string, CouplingTrack>();
+  private windowSec: number;
+  private intervalSec: number;
+  private forgetSec: number;
+  private holdSec: number;
+  private minR2: number;
+  private minTravel: number;
+
+  constructor(
+    opts: {
+      windowSec?: number;
+      intervalSec?: number;
+      forgetSec?: number;
+      holdSec?: number;
+      minR2?: number;
+      minTravel?: number;
+    } = {},
+  ) {
+    this.windowSec = opts.windowSec ?? DWELL_COUPLING_WINDOW_SEC;
+    this.intervalSec = opts.intervalSec ?? DWELL_COUPLING_INTERVAL_SEC;
+    this.forgetSec = opts.forgetSec ?? DWELL_COUPLING_FORGET_SEC;
+    this.holdSec = opts.holdSec ?? DWELL_COUPLING_HOLD_SEC;
+    this.minR2 = opts.minR2 ?? DWELL_COUPLING_MIN_R2;
+    this.minTravel = opts.minTravel ?? DWELL_COUPLING_MIN_TRAVEL;
+  }
+
+  /**
+   * Record one limb against this frame's references.
+   *
+   * The caller leaves out the frames in which the limb is ENGAGED with a target, for the same reason
+   * the habitat does: the deliberate hold is the gesture, not evidence about it. What is left is the
+   * patient sitting, resting and exercising, which is exactly the window this question is about.
+   */
+  noteOne(key: string, point: DwellPoint, refs: readonly DwellReference[], tSec: number, xScale = 1): void {
+    if (!key || !finitePoint(point) || !Number.isFinite(tSec)) return;
+    let track = this.tracks.get(key);
+    if (!track) {
+      track = { ts: [], xs: [], ys: [], refs: new Map(), last: -Infinity, coupledUntil: -Infinity, verdict: null, dirty: true };
+      this.tracks.set(key, track);
+    }
+    track.last = tSec;
+    const n = track.ts.length;
+    if (n > 0 && tSec - track.ts[n - 1] < this.intervalSec) return;
+    track.ts.push(tSec);
+    track.xs.push(point.x * xScale);
+    track.ys.push(point.y);
+    // A reference that was not reported this frame is held at its last value rather than dropped, so
+    // every series stays aligned with the pointer's; a NaN placeholder would poison the regression.
+    for (const [refKey, series] of track.refs) {
+      const found = refs.find((r) => r.key === refKey);
+      const last = series.length > 0 ? series[series.length - 1] : 0;
+      series.push(found && Number.isFinite(found.value) ? found.value : last);
+    }
+    for (const r of refs) {
+      if (track.refs.has(r.key) || !Number.isFinite(r.value)) continue;
+      // A reference seen for the first time starts here: back-filling it with a constant would invent
+      // a stretch of "the exercise was not moving" that nobody observed.
+      const series = new Array<number>(track.ts.length - 1).fill(r.value);
+      series.push(r.value);
+      track.refs.set(r.key, series);
+    }
+    const cutoff = tSec - this.windowSec;
+    let drop = 0;
+    while (drop < track.ts.length && track.ts[drop] < cutoff) drop += 1;
+    if (drop > 0) {
+      track.ts.splice(0, drop);
+      track.xs.splice(0, drop);
+      track.ys.splice(0, drop);
+      for (const series of track.refs.values()) series.splice(0, drop);
+    }
+    track.dirty = true;
+  }
+
+  /** Record every limb in a frame. */
+  note(limbs: readonly DwellLimb[], refs: readonly DwellReference[], tSec: number, xScale = 1): void {
+    for (const limb of limbs) this.noteOne(limb.key, limb.point, refs, tSec, xScale);
+  }
+
+  /** Throw the record away (a new screen, a new camera, a new framing). */
+  clear(): void {
+    this.tracks.clear();
+  }
+
+  /** What the window says about one limb right now, or null when it has never been seen. */
+  verdict(key: string, tSec: number): DwellCouplingVerdict | null {
+    const track = this.tracks.get(key);
+    if (!track) return null;
+    if (Number.isFinite(track.last) && tSec - track.last > this.forgetSec) {
+      this.tracks.delete(key);
+      return null;
+    }
+    if (track.dirty || track.verdict === null) {
+      track.verdict = this.measure(key, track);
+      track.dirty = false;
+      if (track.verdict.coupled) track.coupledUntil = track.last + this.holdSec;
+    }
+    const held = tSec < track.coupledUntil;
+    if (held && !track.verdict.coupled) return { ...track.verdict, coupled: true };
+    return track.verdict;
+  }
+
+  /** Every limb currently refused. */
+  coupledKeys(tSec: number): Set<string> {
+    const out = new Set<string>();
+    for (const key of [...this.tracks.keys()]) {
+      if (this.verdict(key, tSec)?.coupled) out.add(key);
+    }
+    return out;
+  }
+
+  private measure(key: string, track: CouplingTrack): DwellCouplingVerdict {
+    const n = track.ts.length;
+    const span = n > 1 ? track.ts[n - 1] - track.ts[0] : 0;
+    const settled = n >= DWELL_COUPLING_MIN_SAMPLES && span >= DWELL_COUPLING_MIN_SPAN_SEC;
+    let best: { explained: number; r2: number; reference: string } | null = null;
+    if (settled) {
+      // Only consecutive samples close enough in time to be one motion contribute an increment; a gap
+      // (a lost limb, a stalled camera) is a join between two motions nobody observed.
+      const maxGap = this.intervalSec * 3;
+      const pairs: number[] = [];
+      for (let i = 1; i < n; i++) {
+        if (track.ts[i] - track.ts[i - 1] <= maxGap) pairs.push(i);
+      }
+      if (pairs.length >= DWELL_COUPLING_MIN_SAMPLES - 1) {
+        for (const [axis, series] of [
+          ['x', track.xs],
+          ['y', track.ys],
+        ] as Array<[string, number[]]>) {
+          const travel = Math.max(...series) - Math.min(...series);
+          if (!(travel >= this.minTravel)) continue;
+          for (const [refKey, refSeries] of track.refs) {
+            let sxx = 0;
+            let sxy = 0;
+            let syy = 0;
+            for (const i of pairs) {
+              const dr = refSeries[i] - refSeries[i - 1];
+              const da = series[i] - series[i - 1];
+              sxx += dr * dr;
+              sxy += da * dr;
+              syy += da * da;
+            }
+            if (!(sxx > 0) || !(syy > 0)) continue;
+            const r2 = (sxy * sxy) / (sxx * syy);
+            const slope = sxy / sxx;
+            const refRange = Math.max(...refSeries) - Math.min(...refSeries);
+            // Never credit the exercise with more of the pointer's travel than the pointer HAS: the
+            // regression is over increments, and an oscillating reference could otherwise imply a
+            // reach the limb never made.
+            const explained = Math.min(Math.abs(slope) * refRange, travel);
+            if (r2 < this.minR2 || explained < this.minTravel) continue;
+            if (!best || explained > best.explained) best = { explained, r2, reference: `${refKey}/${axis}` };
+          }
+        }
+      }
+    }
+    return {
+      key,
+      coupled: best !== null,
+      explained: best?.explained ?? 0,
+      r2: best?.r2 ?? 0,
+      reference: best?.reference ?? null,
+      samples: n,
+      settled,
+    };
+  }
+}
+
 /**
  * IS THIS LIMB ENGAGING WITH A TARGET, rather than living somewhere?
  *
@@ -1074,6 +1546,70 @@ export function dwellEngaged(
     if (dwellDistance(point, c, xScale) <= c.radius * exitRatio) return true;
   }
   return false;
+}
+
+/**
+ * HOW LONG AFTER AN ANSWER A LIMB IN A TARGET IS STILL PART OF THAT ANSWER.
+ *
+ * A hold is 1.8 s and the tracker is inert for 1.5 s after it completes, during which the patient's
+ * limb is usually still sitting on the ring they have just answered. This covers both with room to
+ * spare, and nothing legitimate lasts longer: a gesture that has not completed by then has stopped
+ * accumulating anyway.
+ */
+export const DWELL_GESTURE_SEC = 2.6;
+
+/**
+ * IS THIS LIMB ANSWERING, OR DOES IT LIVE HERE? — and the answer is not about WHERE it is.
+ *
+ * `dwellEngaged` says "this limb is in a target". Leg mode used to read that alone as "this limb was
+ * raised here deliberately, so it is not evidence about where the limb lives", and drop the frame.
+ * That premise holds only while the rings are too small to contain a resting hand, and they are not:
+ * the ring had to grow to be visible at all (DwellTarget.tsx, the radius note). Driven through these
+ * classes with the position-only rule, every sample of a hand resting inside the drawn circle was
+ * discarded, the habitat concluded the hand lived somewhere else, the gate declared the ring clear —
+ * and the hand parked in the ring filled it five times in thirty seconds. Bounding the exclusion by
+ * TIME instead still left a window: the hand was excluded for the first 2.6 s of the screen, which is
+ * long enough for it to leave once, come back, and confirm.
+ *
+ * So the exclusion is tied to the thing it exists to protect: AN ANSWER IN FLIGHT. The circularity
+ * being avoided is "the reach toward a ring teaches the record that the limb lives on the ring, so the
+ * requirement grows by exactly the gesture" — and that can only happen while a hold is accumulating,
+ * or in the moment after one, when the limb is still on the target it has just answered. A limb
+ * sitting in a ring that is accumulating NOTHING is not making a gesture, whatever else it is doing,
+ * and the record must have it: that is the only way the gate can find out and move the ring off.
+ */
+export class DwellEngagement {
+  private answeredAt = -Infinity;
+  private graceSec: number;
+
+  constructor(graceSec = DWELL_GESTURE_SEC) {
+    this.graceSec = graceSec;
+  }
+
+  /**
+   * Tell it an answer is in flight: called every frame on which any tracker is accumulating a hold or
+   * is inert after one (the caller's `busy`).
+   */
+  noteAnswering(tSec: number): void {
+    if (Number.isFinite(tSec)) this.answeredAt = tSec;
+  }
+
+  /** True = this frame is part of an answer, and the habitat must not learn from it. */
+  gesture(
+    _key: string,
+    point: DwellPoint,
+    circles: readonly DwellCircle[],
+    tSec: number,
+    xScale = 1,
+    exitRatio = DWELL_DEFAULTS.exitRatio,
+  ): boolean {
+    if (!dwellEngaged(point, circles, xScale, exitRatio)) return false;
+    return tSec - this.answeredAt <= this.graceSec;
+  }
+
+  clear(): void {
+    this.answeredAt = -Infinity;
+  }
 }
 
 export interface DwellClearanceOptions {
@@ -1149,6 +1685,10 @@ export interface DwellPlacementOptions extends DwellClearanceOptions {
   step?: number;
   /** Furthest the target may be moved from where the layout authored it, in frame heights. */
   reach?: number;
+  /** Where a target may be put at all, beyond fitting on the screen (default `dwellPlaceable`). */
+  within?: (c: DwellCircle) => boolean;
+  /** How far a limb may be asked to travel to reach it (default `DWELL_LIMB_REACH`). */
+  limbReach?: number;
 }
 
 export interface DwellPlacement {
@@ -1182,8 +1722,9 @@ export function placeDwellCircle(
   const axis = opts.axis ?? 'radial';
   const extra = opts.extra ?? 0;
   const step = opts.step ?? 0.015;
-  const reach = opts.reach ?? 0.6;
+  const reach = opts.reach ?? (axis === 'lateral' ? DWELL_MAX_REACH_LATERAL : DWELL_MAX_REACH);
   const fits = opts.fits ?? (() => true);
+  const within = opts.within ?? dwellPlaceable;
   const taken = opts.taken ?? [];
   const exitRatio = opts.exitRatio ?? DWELL_DEFAULTS.exitRatio;
   const moveOn: 'x' | 'y' = axis === 'lateral' ? 'x' : 'y';
@@ -1209,14 +1750,21 @@ export function placeDwellCircle(
   // right answer is the smallest move that clears them, not the first one the loops happen to reach.
   const candidates: Array<{ d: number; cross: number; cost: number }> = [];
   for (const d of offsets) {
-    for (const cross of crosses) candidates.push({ d, cross, cost: Math.hypot(d, cross) + (cross === 0 ? 0 : 1e-4) });
+    for (const cross of crosses) {
+      // `reach` bounds the MOVE, not each axis of it: a step along the escape axis and a step across
+      // it both take the ring away from where the patient learned it.
+      const moved = Math.hypot(d, cross);
+      if (moved > reach + 1e-9) continue;
+      candidates.push({ d, cross, cost: moved + (cross === 0 ? 0 : 1e-4) });
+    }
   }
   candidates.sort((a, b) => a.cost - b.cost);
 
   let best: { circle: DwellCircle; clearance: DwellClearance; score: number; moved: number } | null = null;
   for (const { d, cross } of candidates) {
     const circle = at(d, cross);
-    if (!fits(circle)) continue;
+    if (!fits(circle) || !within(circle)) continue;
+    if (!dwellWithinLimbReach(circle, summaries, xScale, opts.limbReach)) continue;
     if (taken.some((other) => dwellTargetsOverlap(circle, other, exitRatio, xScale))) continue;
     const clearance = dwellTargetClear(circle, summaries, opts);
     const score = clearance.actual - clearance.required;
@@ -1227,7 +1775,9 @@ export function placeDwellCircle(
     }
   }
   if (!best) {
-    // Nothing on the axis can even be drawn (a radius that does not fit the frame at all).
+    // Nothing within reach can even be drawn (a radius that does not fit the frame at all, or a band
+    // with nowhere holdable in it). The authored position stands and says whether it is holdable —
+    // a ring the patient cannot be asked to reach is not an improvement on one they cannot hold.
     const clearance = dwellTargetClear(authored, summaries, opts);
     return { circle: authored, clearance, placeable: clearance.clear, moved: 0 };
   }
@@ -1298,9 +1848,34 @@ export class DwellLayout {
     this.reset();
   }
 
-  /** Back to the authored layout, re-expressed in the frame the camera is delivering. */
+  /** Where the screen asked for this target, in the frame the camera is actually delivering. */
+  private home(t: DwellLayoutTarget): DwellCircle {
+    return retargetForPreview(t.authored, this.opts.xScale ?? 1);
+  }
+
+  /**
+   * Back to the authored layout, re-expressed in the frame the camera is delivering — EXCEPT where the
+   * authored spot cannot be drawn whole in that frame.
+   *
+   * A target is authored in the 4:3 preview box, which is the frame every camera this app opens either
+   * delivers or is cropped to. A sensor TALLER than that loses the top and bottom to the crop, and a
+   * ring near the edge of the authored frame then has its caption (or its own arc) off the glass. The
+   * layout used to start there anyway and only ever re-place a circle that was standing on a limb, so
+   * a ring that was undrawable on that camera stayed undrawable. Solving once here — against no
+   * habitat, so it is purely "where can this be drawn" — is the difference between a screen that opens
+   * with a ring the patient cannot see whole and one that opens with it nudged into the picture.
+   */
   reset(): void {
-    this.placed = new Map(this.targets.map((t) => [t.id, retargetForAspect(t.authored, this.opts.xScale ?? 1)]));
+    const fits = this.opts.fits;
+    const placed = new Map<string, DwellCircle>();
+    const taken: DwellCircle[] = [];
+    for (const t of this.targets) {
+      const home = this.home(t);
+      const circle = !fits || fits(home) ? home : placeDwellCircle(home, [], { ...this.opts, taken }).circle;
+      taken.push(circle);
+      placed.set(t.id, circle);
+    }
+    this.placed = placed;
     this.placeable = new Map(this.targets.map((t) => [t.id, true]));
     this.crowdedSince = NaN;
     this.movedAt = -Infinity;
@@ -1341,17 +1916,57 @@ export class DwellLayout {
       occupied.set(t.id, !room.clear);
       if (!room.clear) crowded = true;
     }
-    if (!crowded) {
-      this.crowdedSince = NaN;
-      return { occupied, placeable: new Map(this.placeable), moved: false };
-    }
-    if (!Number.isFinite(this.crowdedSince)) this.crowdedSince = tSec;
     const grace = this.opts.crowdedGraceSec ?? DWELL_CROWDED_GRACE_SEC;
     const interval = this.opts.moveIntervalSec ?? DWELL_MOVE_INTERVAL_SEC;
+    if (!crowded) {
+      this.crowdedSince = NaN;
+      /**
+       * AND A CIRCLE THAT WAS MOVED HAS TO BE ABLE TO COME BACK.
+       *
+       * This class used to solve placements ONLY while a target was standing on a limb, so every move
+       * was permanent for the life of the screen: a patient who happened to be resting a hand near a
+       * ring pushed it away, put their hand back in their lap, and the ring stayed out at the edge of
+       * the frame for the rest of the session — which is how the walk into the corner became a
+       * one-way trip. The search is anchored on the authored position and ordered nearest-first, so
+       * re-solving a displaced layout against a patient who has moved returns it home the moment home
+       * is clear again.
+       *
+       * It only ever moves CLOSER to where the screen authored it (`toward`), so nothing wanders while
+       * nothing is wrong, and it waits out the same quiet interval a move does so a ring never
+       * jitters between two placements the patient is trying to aim at.
+       */
+      const displaced = this.targets.some((t) => {
+        if (t.enabled === false) return false;
+        const was = this.placed.get(t.id) as DwellCircle;
+        const home = this.home(t);
+        const fits = this.opts.fits;
+        // A ring that is only away from home because home cannot be DRAWN on this camera is where it
+        // belongs; nothing is gained by re-solving that every interval for the life of the screen.
+        if (fits && !fits(home)) return false;
+        return Math.abs(was.x - home.x) > 1e-6 || Math.abs(was.y - home.y) > 1e-6;
+      });
+      if (!displaced || busy || tSec - this.movedAt < interval) {
+        return { occupied, placeable: new Map(this.placeable), moved: false };
+      }
+      return this.solve(summaries, tSec, occupied, true);
+    }
+    if (!Number.isFinite(this.crowdedSince)) this.crowdedSince = tSec;
     if (busy || tSec - this.crowdedSince < grace || tSec - this.movedAt < interval) {
       return { occupied, placeable: new Map(this.placeable), moved: false };
     }
+    return this.solve(summaries, tSec, occupied, false);
+  }
 
+  /**
+   * Re-place every target against the habitat. `toward` = this is a homecoming rather than an escape,
+   * so the result is only adopted where it brings a circle CLOSER to the authored position.
+   */
+  private solve(
+    summaries: readonly DwellHabitatSummary[],
+    tSec: number,
+    occupied: Map<string, boolean>,
+    toward: boolean,
+  ): DwellSurvey {
     const taken: DwellCircle[] = [];
     const next = new Map<string, DwellCircle>();
     const placeable = new Map<string, boolean>();
@@ -1362,18 +1977,26 @@ export class DwellLayout {
     // between moving the ring that has to move and wedging it against one that did not.
     const order = [...this.targets].sort((a, b) => Number(occupied.get(b.id) === true) - Number(occupied.get(a.id) === true));
     for (const t of order) {
-      const authored = retargetForAspect(t.authored, this.xScale);
+      const authored = this.home(t);
       if (t.enabled === false) {
         // A disabled ring is measured against nothing and can confirm nothing; it keeps the authored
         // spot rather than wandering about the preview while it is doing nothing.
         next.set(t.id, authored);
         continue;
       }
+      const was = this.placed.get(t.id) as DwellCircle;
       const placement = placeDwellCircle(authored, summaries, { ...this.opts, taken });
+      const wasFrom = Math.hypot((was.x - authored.x) * this.xScale, was.y - authored.y);
+      // A homecoming that would not actually bring this ring home is not worth moving a ring for.
+      if (toward && placement.moved >= wasFrom - 1e-6) {
+        taken.push(was);
+        next.set(t.id, was);
+        placeable.set(t.id, this.placeable.get(t.id) ?? true);
+        continue;
+      }
       taken.push(placement.circle);
       next.set(t.id, placement.circle);
       placeable.set(t.id, placement.placeable);
-      const was = this.placed.get(t.id) as DwellCircle;
       if (Math.abs(was.x - placement.circle.x) > 1e-6 || Math.abs(was.y - placement.circle.y) > 1e-6) changed = true;
     }
     this.placeable = placeable;

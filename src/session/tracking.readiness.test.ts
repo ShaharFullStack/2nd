@@ -220,7 +220,11 @@ describe('cameraReadiness: whether anything can answer the screen', () => {
     expect(r.wont.join(' ')).toMatch(/Nothing on this screen or after it can be confirmed without touching it/);
     expect(r.wont.join(' ')).toMatch(/a knee held in a circle cannot be told apart from a repetition/);
     expect(r.action).toMatch(/Bring one hand into the picture/);
-    expect(r.action).toMatch(/thigh|arm of the chair/);
+    // IT NAMES A SUPPORT THE LEG CANNOT MOVE. "resting on the thigh or the arm of the chair is enough"
+    // was this file's own sentence, and the thigh half of it is what filled the primary circle in
+    // 3.23 s on the first repetition of a seated march (vision/dwell.ts).
+    expect(r.action).toMatch(/arm of the chair|armrest|table/);
+    expect(r.action).toMatch(/NOT on the thigh/);
     expect(r.action).toMatch(/somebody has to press the buttons/);
     expect(r.action).toMatch(/clears by itself/);
   });
@@ -261,6 +265,32 @@ describe('cameraReadiness: whether anything can answer the screen', () => {
     const r = cameraReadiness(q(), MEDIUM, pointer(0, 'hand'));
     expect(r.wont.join(' ')).not.toMatch(/knee/);
     expect(r.wont.join(' ')).toMatch(/the hand was never in the picture/);
+  });
+
+  it('A HAND THE EXERCISE IS CARRYING IS NOT AN ANSWER, and the ready badge says so', () => {
+    /**
+     * The patient has a hand in the picture for the whole check — resting on their thigh, where the old
+     * framing instruction put it. `fraction` is 1, so this screen used to promise "the patient can
+     * answer every step by holding a circle"; the rings, measuring the same session, refuse that hand
+     * the moment the leg starts working (`DwellCoupling`). The screen may not promise what the app will
+     * decline, and the remedy is a thing the therapist can fix in the room, now.
+     */
+    const r = cameraReadiness(q(), MEDIUM, { pointer: { fraction: 1, mode: 'leg', carriedFraction: 0.8 } });
+    expect(r.kind).toBe('degraded');
+    expect(r.will.join(' ')).not.toMatch(/can answer every step/);
+    expect(r.headline).toMatch(/moving with the exercise/);
+    expect(r.wont.join(' ')).toMatch(/travelled with the prescribed movement/);
+    expect(r.wont.join(' ')).toMatch(/carried by the thigh/);
+    expect(r.action).toMatch(/arm of the chair|armrest|table/);
+    expect(r.action).toMatch(/other hand/);
+    // It is a warning, not a gate: the hands-free escapes a gate must leave are these same circles.
+    expect(r.gate).toBe(false);
+    // A hand that was carried for a moment (a knee passing under it, one noisy window) is not this.
+    expect(cameraReadiness(q(), MEDIUM, { pointer: { fraction: 1, mode: 'leg', carriedFraction: 0.05 } }).kind).toBe('ready');
+    // And a caller that cannot say claims nothing either way — the old behaviour, unchanged.
+    const silent = cameraReadiness(q(), MEDIUM, pointer(1));
+    expect(silent.kind).toBe('ready');
+    expect(silent.will.join(' ')).toMatch(/A hand is in the picture/);
   });
 
   it('claims nothing while it is still measuring the device', () => {
