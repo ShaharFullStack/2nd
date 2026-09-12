@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { windowsForLanes } from '../engine/difficulty.ts';
 import { runtime } from '../session/runtime.ts';
-import { TrackingRecorder, cameraReadiness } from '../session/tracking.ts';
+import { READINESS_SAMPLES, TrackingRecorder, cameraReadiness } from '../session/tracking.ts';
 import type { DeviceReadiness } from '../session/tracking.ts';
 import type { TrackingQuality } from '../session/types.ts';
 import { useStore } from '../state/store.ts';
@@ -263,9 +263,34 @@ export default function CameraCheck() {
     };
   }, [lanes, difficulty, windowScale]);
 
+  /**
+   * IS THERE ANYTHING FOR THE CIRCLES TO FOLLOW — measured, before the patient is left alone.
+   *
+   * Readiness used to be about the DEVICE and the prescribed lanes only, so this screen could pass a
+   * camera as ready, hand a patient a hands-free session, and leave them holding a limb at a ring that
+   * cannot fill. In leg mode that is not an edge case but the common one: the dwell pointer is a HAND
+   * (a knee cannot answer — vision/dwell.ts), and the app's own framing instruction talked about hips,
+   * knees and feet. A patient who followed it had no pointer at all.
+   *
+   * So the verdict is told whether a pointer EXISTS, from the same session the rings are driven from —
+   * `dwell.limb` is literally what the ring is following — sampled over the same rolling window the
+   * rest of the verdict uses rather than glanced at, because a hand passing behind a knee for one frame
+   * is not a patient with no hand. Nothing is claimed until the window is full, and a camera restart
+   * starts a new one (a new framing is a new question).
+   *
+   * It WARNS rather than gates; the justification is in `withPointerVerdict`, and the short version is
+   * that the hands-free escapes a blocked verdict is required to leave are these very circles.
+   */
+  const [pointerFraction, setPointerFraction] = useState<number | null>(null);
+  const pointerNow = useRef<boolean | null>(null);
+
   const readiness: DeviceReadiness = useMemo(
-    () => cameraReadiness(starting ? null : observed, windows, { anyLandmarksFraction: anyLandmarks }),
-    [starting, observed, windows, anyLandmarks],
+    () =>
+      cameraReadiness(starting ? null : observed, windows, {
+        anyLandmarksFraction: anyLandmarks,
+        pointer: pointerFraction === null ? null : { fraction: pointerFraction, mode },
+      }),
+    [starting, observed, windows, anyLandmarks, pointerFraction, mode],
   );
 
   /**
@@ -320,6 +345,33 @@ export default function CameraCheck() {
     ];
   }, [mode, readiness.gate, starting, goto, retry]);
   const dwell = useDwellTargets(dwellChoices);
+  /**
+   * The ring's own pointer, read every render and averaged on the poll below. `null` = the dwell
+   * session has no frames at all, and then NOTHING is claimed about a hand: "no hand is in the
+   * picture" would be blaming the framing for a camera that has stopped delivering, which is a
+   * different fault with a different remedy — and one the device verdict beside it already names.
+   */
+  pointerNow.current = dwell.live ? dwell.limb !== null : null;
+  useEffect(() => {
+    if (starting) {
+      setPointerFraction(null);
+      return;
+    }
+    let seen: boolean[] = [];
+    const id = setInterval(() => {
+      const now = pointerNow.current;
+      if (now === null) {
+        seen = [];
+        setPointerFraction(null);
+        return;
+      }
+      seen.push(now);
+      if (seen.length > READINESS_SAMPLES) seen.shift();
+      // Nothing is said until the window is full: "no hand yet" is how every check starts.
+      setPointerFraction(seen.length < READINESS_SAMPLES ? null : seen.filter(Boolean).length / seen.length);
+    }, 300);
+    return () => clearInterval(id);
+  }, [starting, attempt]);
 
   /**
    * WHAT GOING ON ANYWAY COSTS, said where the patient is already looking.

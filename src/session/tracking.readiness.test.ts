@@ -180,3 +180,93 @@ describe('cameraReadiness tells the truth about what it measured', () => {
     expect(r.action).toMatch(/keyboard/i);
   });
 });
+
+/**
+ * IS THERE A HAND IN THE PICTURE TO ANSWER WITH?
+ *
+ * The verdict used to be about the DEVICE and the prescribed lanes only, so a camera check could pass a
+ * stream as READY, hand a patient a hands-free session and leave them holding a limb at a ring that
+ * cannot fill: in leg mode the dwell pointer is a HAND (a knee cannot answer — vision/dwell.ts) and the
+ * app's own framing instruction asked only for hips, knees and feet. A patient who followed it had no
+ * pointer at all, and found out alone.
+ */
+describe('cameraReadiness: whether anything can answer the screen', () => {
+  const pointer = (fraction: number, mode: 'leg' | 'hand' = 'leg') => ({ pointer: { fraction, mode } });
+
+  it('says nothing either way when the screen did not say', () => {
+    // A caller with no hands-free targets on it makes no claim, and neither does this.
+    const r = cameraReadiness(q(), MEDIUM);
+    expect(r.kind).toBe('ready');
+    expect(r.will.join(' ')).not.toMatch(/hand/i);
+    expect(r.wont).toEqual([]);
+  });
+
+  it('a hand in the picture is stated as something this device WILL support', () => {
+    const r = cameraReadiness(q(), MEDIUM, pointer(1));
+    expect(r.kind).toBe('ready');
+    expect(r.gate).toBe(false);
+    expect(r.will.join(' ')).toMatch(/A hand is in the picture/);
+    expect(r.will.join(' ')).toMatch(/no one has to press anything/);
+    expect(r.wont).toEqual([]);
+  });
+
+  it('NO hand in the picture costs the ready badge, names the knee rule, and says what to do', () => {
+    const r = cameraReadiness(q(), MEDIUM, pointer(0));
+    // The device is fine; the session is not answerable. "Ready" over that would be the worst promise
+    // this screen can make, so it cannot read ready.
+    expect(r.kind).toBe('degraded');
+    expect(r.headline).not.toMatch(/support the whole prescription/);
+    expect(r.headline).toMatch(/nobody in the picture can answer it/);
+    expect(r.wont.join(' ')).toMatch(/Nothing on this screen or after it can be confirmed without touching it/);
+    expect(r.wont.join(' ')).toMatch(/a knee held in a circle cannot be told apart from a repetition/);
+    expect(r.action).toMatch(/Bring one hand into the picture/);
+    expect(r.action).toMatch(/thigh|arm of the chair/);
+    expect(r.action).toMatch(/somebody has to press the buttons/);
+    expect(r.action).toMatch(/clears by itself/);
+  });
+
+  it('DOES NOT GATE on it — the hands-free escapes a gate must leave ARE these circles', () => {
+    /**
+     * A blocked verdict on this screen is required to leave a hands-free way forward and a hands-free
+     * way back, and on the camera check those two ways are the dwell pair. A gate raised because there
+     * is no pointer would be a gate whose own mandatory escapes cannot be used — the dead end the whole
+     * gesture exists to prevent. It is also a thing the patient fixes by moving a hand, unlike a device
+     * processing one frame every five seconds, and nothing downstream is unmeasurable without it: every
+     * lane still calibrates and still scores while both hands are out of the picture.
+     */
+    expect(cameraReadiness(q(), MEDIUM, pointer(0)).gate).toBe(false);
+    expect(cameraReadiness(q({ fpsMedian: 12, fpsLow: 9 }), MEDIUM, pointer(0)).gate).toBe(false);
+    // …and on a device that IS blocked, the pointer changes nothing about the gate either way.
+    const slow = cameraReadiness(q({ fpsMedian: 5, fpsLow: 4, inferenceMsMedian: 190 }), MEDIUM, pointer(0));
+    expect(slow.kind).toBe('blocked');
+    expect(slow.gate).toBe(true);
+    // But the therapist is told, HERE, that the "go on anyway" circle cannot be held: that offer and
+    // this absence are the same sentence's two halves.
+    expect(slow.wont.join(' ')).toMatch(/Nothing on this screen or after it can be confirmed without touching it/);
+    expect(slow.action).toMatch(/Bring one hand into the picture/);
+  });
+
+  it('a hand that keeps leaving the frame is a different sentence from one that was never there', () => {
+    const r = cameraReadiness(q(), MEDIUM, pointer(0.5));
+    expect(r.kind).toBe('degraded');
+    expect(r.wont.join(' ')).toMatch(/only 50 % of this check/);
+    expect(r.wont.join(' ')).toMatch(/fits and starts/);
+    expect(r.wont.join(' ')).not.toMatch(/never in the picture/);
+    expect(r.action).toMatch(/Move the camera or the chair/);
+    // A hand present for nearly the whole window is not worth a caveat.
+    expect(cameraReadiness(q(), MEDIUM, pointer(0.95)).kind).toBe('ready');
+  });
+
+  it('in hand mode it does not lecture about knees', () => {
+    const r = cameraReadiness(q(), MEDIUM, pointer(0, 'hand'));
+    expect(r.wont.join(' ')).not.toMatch(/knee/);
+    expect(r.wont.join(' ')).toMatch(/the hand was never in the picture/);
+  });
+
+  it('claims nothing while it is still measuring the device', () => {
+    const r = cameraReadiness(q({ samples: 2 }), MEDIUM, pointer(0));
+    expect(r.kind).toBe('measuring');
+    expect(r.wont).toEqual([]);
+    expect(r.will).toEqual([]);
+  });
+});

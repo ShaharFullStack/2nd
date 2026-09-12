@@ -22,7 +22,14 @@
  * HOW THE PATIENT IS SIMULATED. Not the mouse: synthetic MediaPipe landmarks of a seated patient
  * (src/vision/fixtures.ts, the rig the vision unit tests use) are fed to the live VisionInput through
  * its public `processDetection(result, ctxTime)` — the same entry point the real detect loop calls,
- * on the same AudioContext clock. Everything downstream is the shipping code: feature extraction,
+ * on the same AudioContext clock.
+ *
+ * WITH ARMS, which is what makes this a test of the supported gesture. The rig used to leave every arm
+ * landmark on an unplaced (0.5, 0.2) placeholder, so the only way to aim anything was to translate the
+ * whole body — dragging the knees, the hips and that placeholder around the frame — while the app
+ * follows a HAND and nothing else in leg mode. Now both hands rest on the thighs
+ * (`SEATED_HAND_RESTS`) and one of them is raised to the ring and held there (`handAt`), which is
+ * exactly what the screens ask a seated patient to do; nothing else in the figure moves with it. Everything downstream is the shipping code: feature extraction,
  * the unit-free filter, the ROM calibrator, the lane triggers and whatever the dwell target derives
  * its pointer from. The harness moves a limb and waits; it never calls a confirm handler. The one
  * thing it cannot do is produce photons, so Chromium's fake webcam supplies the real camera the app
@@ -180,23 +187,49 @@ async function installBody(page) {
       dy: 0,
       injected: 0,
       lastError: null,
+      /**
+       * Which hand is reaching, and where it is. `null` = both hands resting on the thighs, which is
+       * where a seated patient's hands are while their legs work and where every hold starts from.
+       */
+      handSide: 'left',
+      hand: null,
       /** Landmark indices this harness can aim with, in the order it tries them. */
       points: () => ({
         knee: body.side === 'left' ? lm.POSE.LEFT_KNEE : lm.POSE.RIGHT_KNEE,
         ankle: body.side === 'left' ? lm.POSE.LEFT_ANKLE : lm.POSE.RIGHT_ANKLE,
-        wrist: body.side === 'left' ? lm.POSE.LEFT_WRIST : lm.POSE.RIGHT_WRIST,
         nose: lm.POSE.NOSE,
       }),
-      pose: () => fx.seatedPose({ kneeLift: body.lift, side: body.side }),
+      pose: () => fx.seatedPose({ kneeLift: body.lift, side: body.side, handAt: body.hand ?? undefined }),
+      /** Both hands back on their thighs — out of every ring, which is what opens the entry gate. */
+      rest: () => {
+        body.hand = null;
+      },
+      /** Choose the hand that will reach, and put it at that hand's own resting position. */
+      reach: (side) => {
+        body.handSide = side;
+        body.hand = { side, ...fx.SEATED_HAND_RESTS.thighs[side] };
+      },
       /** Where a named landmark currently is, in normalized camera coordinates. */
       at: (name) => {
+        if (name === 'wrist' || name === 'hand') {
+          const p = body.hand ?? fx.SEATED_HAND_RESTS.thighs[body.handSide];
+          return { x: p.x + body.dx, y: p.y + body.dy };
+        }
         const idx = body.points()[name];
         if (idx === undefined) return null;
         const p = body.pose()[idx];
         return { x: p.x + body.dx, y: p.y + body.dy };
       },
-      /** Translate the scene so `name` sits at (x, y). The features are body-scaled, so this is free. */
+      /**
+       * Put `name` at (x, y). A HAND MOVES BY ITSELF — that is the gesture, and it leaves the knees, the
+       * hips and the other hand exactly where they were. Anything else has to be aimed by translating
+       * the whole scene, which is what this harness used to have to do to a body with no arms.
+       */
       aim: (name, x, y) => {
+        if (name === 'wrist' || name === 'hand') {
+          body.hand = { side: body.handSide, x: x - body.dx, y: y - body.dy };
+          return true;
+        }
         const idx = body.points()[name];
         if (idx === undefined) return false;
         const p = body.pose()[idx];
@@ -248,13 +281,15 @@ async function installBody(page) {
  * in it, after which the injected patient is the only frame source.
  *
  * Stopping after the FIRST frame is deliberate: `DetectLoop` only computes a frame RATE from the
- * second frame onward, so the camera check is left with an inference time and no fps — and its
- * device-readiness gate (which compares one frame interval against the widest hit window the
- * prescription grants, and would close on a machine this slow) has nothing to judge. That gate is a
- * true statement about a device, it is not the gesture under test, and a harness that let it decide
- * would pass or fail with the container's load average. What it costs this run is stated in the
- * summary: the readiness verdict is not exercised here. On a machine with a GPU none of this fires
- * and the loop keeps running.
+ * second frame onward, so the camera check is left with an inference time and no fps. That does NOT
+ * keep the device-readiness gate quiet, which this harness used to assume: a stream processing zero
+ * frames a second is blocked in its own right ("No frames are being processed on this camera"), and a
+ * stream at one frame every five seconds is blocked for being slower than any hit window. Both are
+ * true statements about this container, neither is the gesture under test, and demanding the
+ * therapist's button be enabled made the run pass or fail on where its poll happened to land. So the
+ * verdict is now REPORTED, and what is asserted is the thing the app promises about it: a blocked
+ * device still leaves the patient a live forward ring that says what going on costs. On a machine with
+ * a GPU none of this fires, the loop keeps running, and the verdict clears on its own
  */
 async function quietCameraIfStarved(page) {
   return page.evaluate(
@@ -275,7 +310,7 @@ async function quietCameraIfStarved(page) {
             vision.loop.stop();
             const after = vision.getStats();
             return resolve(
-              `one camera frame costs ${stats.inferenceMs.toFixed(0)} ms on this machine (${vision.getStatus().delegate}), which starves the page, so the real detect loop was stopped after ${after.frames} frame(s) and the injected patient is the only frame source from here on. The camera check is therefore left with no frame RATE to judge this device by, and its device-readiness gate is not exercised by this run.`,
+              `one camera frame costs ${stats.inferenceMs.toFixed(0)} ms on this machine (${vision.getStatus().delegate}), which starves the page, so the real detect loop was stopped after ${after.frames} frame(s) and the injected patient is the only frame source from here on. The camera check is therefore left with a real inference cost and no frame RATE, which it correctly calls a blocked device; what this run proves is the patient's path off one.`,
             );
           }
           if (performance.now() - t0 > 120_000) {
@@ -291,6 +326,9 @@ const setLimb = (page, patch) =>
   page.evaluate((p) => {
     Object.assign(window.__hfBody, p);
   }, patch);
+
+/** Both hands down on the thighs. A rest hold is not performed with a hand still up at a ring. */
+const handsDown = (page) => page.evaluate(() => window.__hfBody.rest());
 
 /** One comfortable repetition: up over ~320 ms, held, down again, then a pause at rest. */
 async function rep(page) {
@@ -439,15 +477,20 @@ async function dwellConfirm(page, { what, ids, settled, budgetMs = 30_000, filli
   let usedX = null;
   let filledShotTaken = false;
   let fillingSeen = null;
-  // Leg mode parks a knee, hand mode a palm; the harness offers the pose landmark each mode follows.
-  for (const limb of ['knee', 'wrist']) {
+  // THE HAND IS THE POINTER (`dwellLimbs`), in both modes: in leg mode because a knee cannot be told
+  // apart from a repetition, in hand mode because the prescribed hand is the only limb there is. The
+  // knee is still tried afterwards, and is expected to fail — that is the fix's own claim.
+  for (const limb of ['wrist', 'knee']) {
     for (const x of probe.aim.xs) {
       if (Date.now() > deadline) break;
-      // Out of the target first, so the hold is an entry and not where the limb happened to be.
-      await glide(page, limb, 0.5, 0.04, 4);
+      // Out of the target first, so the hold is an entry and not where the limb happened to be. For the
+      // hand that means its own resting position on the thigh, which is where the patient starts.
+      if (limb === 'wrist') await page.evaluate((tx) => window.__hfBody.reach(tx >= 0.5 ? 'left' : 'right'), x);
+      else await glide(page, limb, 0.5, 0.04, 4);
       await wait(400);
       if (await settled()) return { how: 'confirmed before the hold began', progress: best };
-      await glide(page, limb, x, probe.aim.y, 6);
+      let held = { x, y: probe.aim.y };
+      await glide(page, limb, held.x, held.y, 6);
 
       // Hold. A dwell IS a hold: nothing moves again until the target says something.
       let holdUntil = Date.now() + 4500;
@@ -474,6 +517,15 @@ async function dwellConfirm(page, { what, ids, settled, budgetMs = 30_000, filli
           filledShotTaken = true;
           await shoot(page, fillingShot);
           fillingSeen = p.progress;
+        }
+        // THE RING IS ALLOWED TO MOVE: `DwellLayout` slides a circle off a limb that lives under it,
+        // and the patient can see it move. A harness that goes on holding the old spot measures nothing.
+        if (p.aim && p.aim.from === 'data-dwell-x/data-dwell-y') {
+          const moved = Math.hypot((p.aim.xs[0] - held.x) * (4 / 3), p.aim.y - held.y);
+          if (moved > 0.03) {
+            held = { x: p.aim.xs[0], y: p.aim.y };
+            await glide(page, limb, held.x, held.y, 3);
+          }
         }
         // Filling: this is the right place to stand. Hold to the whole budget instead of moving on.
         if (p.progress !== null && p.progress > 0.02 && !filling) {
@@ -539,6 +591,8 @@ async function main() {
   const failures = [];
   let taps = 0;
   let quieted = null;
+  /** Everything this run could not do for real on this machine, printed at the end. */
+  const cannot = [];
   let ledger = { gestures: [], events: [] };
   try {
     const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
@@ -601,7 +655,10 @@ async function main() {
     // second spent waiting here is another second of inference, and the decision has to be made while
     // the loop has produced exactly one frame.
     quieted = await quietCameraIfStarved(page);
-    if (quieted) log('  ', quieted);
+    if (quieted) {
+      log('  ', quieted);
+      cannot.push(quieted);
+    }
     await installBody(page);
     await page.waitForFunction(() => (window.__hfBody?.injected ?? 0) > 5, null, { timeout: 60_000 });
     // "Sees the patient" is asked of the screen, not of a private flag: the hands-free legend names
@@ -629,15 +686,65 @@ async function main() {
       `the hands-free legend reads "${(limb ?? '(nothing)').trim()}" off the injected landmarks; VisionInput reason "${vstatus?.reason}", ${vstatus?.untracked} lane(s) untracked`,
     );
 
-    // The device's own verdict has to clear before the gesture is even reachable. It is about the
-    // camera, not the gesture, so a blocked gate is reported as a blocked DEVICE.
-    const ungated = await page
-      .waitForFunction(() => document.querySelector('[data-testid="camera-continue"]')?.disabled === false, null, { timeout: 40_000 })
+    /**
+     * THE DEVICE VERDICT, AND WHAT IT IS ALLOWED TO COST THE PATIENT.
+     *
+     * This used to demand that the THERAPIST's green button be enabled, and fail the run otherwise. On
+     * this container that is a coin toss and a claim about the wrong thing: one MediaPipe inference
+     * costs ~5 s here, the real detect loop has just been stopped (above) precisely because that starves
+     * the page, and every honest verdict about such a device — "no frames are being processed", "one
+     * frame every 5000 ms" — is BLOCKED. The harness was passing only when its poll happened to land in
+     * the few hundred milliseconds before the first health reading arrived, which is evidence of
+     * nothing. (Measured both ways on the same machine, same commit.)
+     *
+     * What the app actually promises, and what is therefore asserted here instead, is that a blocked
+     * DEVICE never blocks the PATIENT: the forward target stays alive (never the structurally dead
+     * `enabled:false` ring whose progress is pinned at 0), and it says in the patient's own words what
+     * going on costs. The gesture itself is proved by the hold that follows this, which fails loudly if
+     * the ring cannot fill. The gate's own screens are exercised for real in
+     * critic/handsfree-dead-ends.mjs, whose whole subject is the blocked camera check.
+     */
+    // Read a SETTLED verdict: "checking what this device can do… (4 of 8 readings)" gates too, by
+    // design, and asserting on that transient is how this check used to pass and fail at random.
+    const settled = await page
+      .waitForFunction(
+        () => ['ready', 'degraded', 'blocked'].includes(document.querySelector('[data-testid="camera-readiness"]')?.getAttribute('data-readiness') ?? ''),
+        null,
+        { timeout: 40_000 },
+      )
       .then(() => true)
       .catch(() => false);
-    if (!ungated) {
-      const why = await page.evaluate(() => document.querySelector('[data-testid="camera-readiness-headline"]')?.textContent ?? '(no headline)');
-      failures.push(`the camera check still gates the way forward on this DEVICE, before any gesture: ${why}`);
+    if (!settled) cannot.push('the device verdict never settled out of "checking" inside 40 s on this machine, so what it says is not asserted below');
+    const verdict = await page.evaluate(() => {
+      const el = document.querySelector('[data-testid="camera-dwell-continue"]');
+      return {
+        gated: document.querySelector('[data-testid="camera-continue"]')?.disabled === true,
+        kind: document.querySelector('[data-testid="camera-readiness"]')?.getAttribute('data-readiness'),
+        headline: document.querySelector('[data-testid="camera-readiness-headline"]')?.textContent ?? '(none)',
+        phase: el?.getAttribute('data-phase') ?? null,
+        label: el?.textContent ?? null,
+        cost: document.querySelector('[data-testid="camera-blocked-note"]')?.textContent ?? null,
+      };
+    });
+    if (!verdict.gated) {
+      record('the device verdict cleared', `readiness "${verdict.kind}": ${verdict.headline}`);
+    } else {
+      cannot.push(
+        `the device verdict on this machine is "${verdict.kind}" (${verdict.headline}) — correct for a container at ~5 s an ` +
+          `inference, and it closes the therapist's button. What is proved below is therefore the patient's path off a ` +
+          `BLOCKED device, which is the harder case and the one the feature was found broken in.`,
+      );
+      if (verdict.phase === null) failures.push('a blocked device left the camera check with no forward dwell target at all');
+      else if (verdict.phase === 'off') failures.push(`the forward target is structurally dead on a blocked device (phase "${verdict.phase}") — no amount of holding can fill it`);
+      else if (!/Go on anyway/.test(verdict.label ?? '')) failures.push(`a blocked device's forward target reads "${verdict.label}" rather than saying it is going on anyway`);
+      else if (verdict.kind === 'blocked' && !verdict.cost) failures.push('nothing above the fold says what going on anyway costs');
+      else {
+        record(
+          'a blocked device still offers the patient a way on',
+          `the forward ring is live (phase "${verdict.phase}") and says "Go on anyway"` +
+            (verdict.cost ? '; what it costs is on screen under the preview' : ''),
+        );
+      }
     }
 
     // ---- camera check -> ROM, hands free ------------------------------------------------------
@@ -658,6 +765,7 @@ async function main() {
       // Back to rest, in the middle of the frame, and hold still until the screen stops saying so.
       await glide(page, 'knee', 0.5, 0.5, 4);
       await setLimb(page, { side, lift: 0, dx: 0, dy: 0 });
+      await handsDown(page);
       // The screen's own eyebrow, which is what the patient is reading. (It is CSS-uppercased, so the
       // match is case-insensitive.)
       const asked = await page
@@ -798,9 +906,9 @@ async function main() {
   console.log('[handsfree] steps:');
   for (const s of steps) console.log(`  ${s.step}\n      confirmed by: ${s.how}`);
   console.log('');
-  if (quieted) {
+  if (cannot.length) {
     console.log('[handsfree] what this run could not do for real:');
-    console.log(`  - ${quieted}`);
+    for (const c of cannot) console.log(`  - ${c}`);
     console.log('');
   }
   console.log('[handsfree] screenshots:');

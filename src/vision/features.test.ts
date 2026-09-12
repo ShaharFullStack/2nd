@@ -340,6 +340,24 @@ describe('MOVEMENT_INFO', () => {
     }
   });
 
+  it('the LEG setup asks for a hand in the picture, because that is what confirms a step', () => {
+    /**
+     * It does not measure the hand and never will. But a patient alone answers every screen by holding
+     * a limb inside a circle, and in leg mode that limb can only be a HAND — a knee that could fill a
+     * circle would fill it on every repetition (vision/dwell.ts). This text used to ask for "hips, knees
+     * and feet" and nothing else, so a patient who followed the app's own framing instruction sat down
+     * with no way to confirm anything and found out alone, on the pause dialog.
+     */
+    const setup = POSTURE_INFO.seated_leg.setup;
+    expect(setup).toMatch(/hips, knees and feet/);
+    expect(setup).toMatch(/\bhand\b/);
+    expect(setup).toMatch(/thigh|arm of the chair/);
+    // …and it says why the knees cannot do it, so the instruction is not an arbitrary demand.
+    expect(setup).toMatch(/knees cannot/);
+    // The hand postures already have the prescribed hand in frame by construction.
+    for (const p of ['palm_to_camera', 'hand_over_edge'] as const) expect(POSTURE_INFO[p].setup).toMatch(/hand|palm/);
+  });
+
   it('laneConflicts warns about physically coupled lanes on the same limb', () => {
     const lanes = (...specs: Array<[number, Movement, Side]>): LaneSpec[] => specs.map(([index, movement, side]) => ({ index, movement, side }));
     // Same limb, coupled movements: a knee lift almost always carries lateral drift.

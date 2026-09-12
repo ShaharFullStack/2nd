@@ -87,9 +87,44 @@ export interface SeatedPoseParams {
   trunkLean?: number;
   /** Which leg the parameters apply to (default 'left'); the other leg stays at rest. */
   side?: Side;
+  /**
+   * WHERE THE HANDS ARE — and they are somewhere, which is the point.
+   *
+   * A seated patient exercising their legs has two arms in the picture, and in leg mode those hands are
+   * the ONLY thing that can answer a dwell target (`dwellLimbs` stopped returning knees). This rig used
+   * to leave every arm landmark on its unplaced (0.5, 0.2) placeholder, so a harness driving it could
+   * only aim a knee — i.e. could not perform the one gesture the app supports, while a real patient
+   * framed as the app asks them to be framed can.
+   *
+   * The four rest positions are the ones the dwell envelope is swept over in DwellTarget.test.tsx
+   * ('the bodies the pipeline is driven with'), so a fixture hand rests where that proof says hands
+   * rest. 'out_of_view' is the other real state: hands out of the picture, which is what the old
+   * framing instruction invited and what the camera check now has to say out loud.
+   */
+  hands?: SeatedHandRest | 'out_of_view';
+  /**
+   * ONE HAND RAISED TO A POINT (image coordinates) — the confirm gesture, and nothing else: the other
+   * hand stays where it rests, the legs are untouched, and the scene is not translated. Aiming a hand
+   * by translating the whole body (which is what a harness with no arms has to do) moves the knees,
+   * the hips and the other hand with it, and can carry them out of frame.
+   */
+  handAt?: { side: Side; x: number; y: number };
   /** Visibility assigned to all landmarks (default 0.95). */
   visibility?: number;
 }
+
+/** Where a seated patient's hands rest while their LEGS are working, in image coordinates. */
+export type SeatedHandRest = 'thighs' | 'lap' | 'chair_arms' | 'folded';
+
+export const SEATED_HAND_RESTS: Readonly<Record<SeatedHandRest, Readonly<Record<Side, { x: number; y: number }>>>> = Object.freeze({
+  thighs: { left: { x: 0.64, y: 0.62 }, right: { x: 0.36, y: 0.62 } },
+  lap: { left: { x: 0.58, y: 0.72 }, right: { x: 0.42, y: 0.72 } },
+  chair_arms: { left: { x: 0.7, y: 0.45 }, right: { x: 0.3, y: 0.45 } },
+  folded: { left: { x: 0.54, y: 0.55 }, right: { x: 0.46, y: 0.55 } },
+});
+
+/** Visibility given to an arm that is out of the picture — below MIN_VISIBILITY, so nothing reads it. */
+const HIDDEN_VISIBILITY = 0.05;
 
 function lm(x: number, y: number, z: number, visibility = 0.95): Landmark {
   return { x, y, z, visibility };
@@ -143,8 +178,45 @@ export function seatedPose(params: SeatedPoseParams = {}): Landmark[] {
   const active = params.side ?? 'left';
   build('left', active === 'left');
   build('right', active === 'right');
+
+  /**
+   * THE ARMS, which a seated leg patient has and this rig used to leave on the placeholder.
+   *
+   * Both hands rest where `SEATED_HAND_RESTS` says, carried sideways with the trunk by the same `lean`
+   * the shoulders move by (the arm hangs from the shoulder). `handAt` raises ONE hand to a point and
+   * takes its elbow with it; nothing else in the figure moves, so a hand can be put on a dwell target
+   * without dragging the knees, the hips and the other hand across the frame.
+   */
+  const hands = params.hands ?? 'thighs';
+  const hidden = hands === 'out_of_view';
+  for (const side of ['left', 'right'] as Side[]) {
+    const raised = params.handAt && params.handAt.side === side ? params.handAt : null;
+    const sign = side === 'left' ? 1 : -1;
+    const shoulder = side === 'left' ? p[POSE.LEFT_SHOULDER] : p[POSE.RIGHT_SHOULDER];
+    // Out of the picture: below the bottom edge (a frame cropped to hips, knees and feet), and
+    // reported at a visibility nothing in the app will read (MIN_VISIBILITY is 0.5).
+    const at = raised
+      ? { x: raised.x, y: raised.y }
+      : hidden
+        ? { x: SEATED_HAND_RESTS.lap[side].x + lean, y: 1.18 }
+        : { x: SEATED_HAND_RESTS[hands][side].x + lean, y: SEATED_HAND_RESTS[hands][side].y };
+    const armVis = raised || !hidden ? vis : HIDDEN_VISIBILITY;
+    // Hands on the thighs / on a raised target are forward of the hips, toward the camera.
+    const wristZ = raised ? -0.05 : -0.12;
+    const idx = side === 'left'
+      ? { elbow: POSE.LEFT_ELBOW, wrist: POSE.LEFT_WRIST }
+      : { elbow: POSE.RIGHT_ELBOW, wrist: POSE.RIGHT_WRIST };
+    p[idx.wrist] = lm(at.x, at.y, wristZ, armVis);
+    p[idx.elbow] = lm(shoulder.x + (at.x - shoulder.x) * 0.55 + sign * 0.025, shoulder.y + (at.y - shoulder.y) * 0.55, wristZ / 2, armVis);
+  }
   return p;
 }
+
+/** A seated figure with one hand raised to a point — the whole of the leg-mode confirm gesture. */
+export const seatedHandAt = (x: number, y: number, side: Side = 'left', params: SeatedPoseParams = {}) =>
+  seatedPose({ ...params, handAt: { side, x, y } });
+/** A seated figure framed on hips, knees and feet: legs in view, hands out of the picture. */
+export const seatedHandsOutOfView = (params: SeatedPoseParams = {}) => seatedPose({ ...params, hands: 'out_of_view' });
 
 /**
  * Metric "world" landmarks for the same seated figure (MediaPipe worldLandmarks: metres, hip-centred).

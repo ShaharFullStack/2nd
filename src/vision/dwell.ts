@@ -26,10 +26,16 @@
  * two sets are disjoint by construction rather than by measurement, on the first repetition, at any
  * pace, with any compensation.
  *
- * The cost is stated rather than hidden: leg mode needs a HAND in the picture for the hands-free path,
- * and `POSTURE_INFO.seated_leg` only asks for hips, knees and feet. When no hand is in frame the
- * legend says so and the buttons remain. A confirm nobody made is worse than a confirm nobody can
- * make.
+ * The cost is stated rather than hidden, and it is now also PAID. Leg mode needs a HAND in the picture
+ * for the hands-free path, so the framing the app ASKS for is a framing that path survives:
+ * `POSTURE_INFO.seated_leg` asks for a hand resting where the camera can see it (thigh, chair arm) and
+ * not only for hips, knees and feet. An instruction is not evidence that it was followed, so the camera
+ * check MEASURES whether a pointer is there — off the same session the rings are driven from — and says
+ * so before the patient is left alone (`cameraReadiness`, `PointerObservation`). It warns rather than
+ * gates, because the hands-free ways forward and back that a blocked verdict is required to leave ARE
+ * these circles, and because the patient fixes it by raising a hand. When no hand is in frame the
+ * legend's FIRST line says what to do about it and the buttons remain. A confirm nobody made is worse
+ * than a confirm nobody can make.
  *
  * In HAND mode the prescribed limb is the only limb there is, so the separation cannot be by identity
  * and is geometric instead — but along the ONE AXIS the prescription cannot move the palm. The four

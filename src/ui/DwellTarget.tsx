@@ -918,6 +918,25 @@ export function DwellLegend({
     );
   }
   const limb = session.limb;
+  /**
+   * NOTHING IS BEING FOLLOWED — the rings' "not seeing you", said as something the patient can DO.
+   *
+   * This is the state the leg-mode gap lands a patient in: they sat down framed on their hips, knees
+   * and feet, exactly as the app asked them to, and there is no hand in the picture for the circles to
+   * follow. The legend used to answer that with "Move a hand into the circle and keep it there", which
+   * is an instruction about the circle when the problem is the PICTURE — and the one sentence that said
+   * so ("If your hands are out of the picture, use the buttons") sat in the small print at the bottom
+   * of the block, below the fold on a 768 px tablet. So the remedy moves into the first line, beside
+   * the badge that says no hand is in view, where the patient is already looking.
+   *
+   * The test is the RINGS' OWN: `phaseOf` draws "not seeing you" when a target has not seen its limb
+   * inside `graceSec`, so this says what they say, and it is ahead of every other state for the same
+   * reason `lost` is ahead of `occupied` there — a target cannot be said to be sitting on a limb, or
+   * waiting for one to leave, while the camera is not reporting one at all. (`session.limb` going
+   * momentarily null is NOT this state: one dropped detection is not a lost hand, which is the whole
+   * point of the grace window, and the badge below already names the limb or its absence.)
+   */
+  const unseen = states.every((s) => !s.tracked);
   // Anything that can be held is waiting for the limb to leave the ring first — say what the rings say.
   const mustLeave = states.every((s) => s.blocked === 'entry' && s.tracked);
   // …or every ring is standing on a limb that lives there, which is a different sentence again: the
@@ -930,10 +949,16 @@ export function DwellLegend({
     <div
       className="dwell-legend"
       data-testid={testId}
-      data-state={crowded ? 'occupied' : mustLeave ? 'reenter' : limb ? 'tracking' : 'searching'}
+      data-state={unseen ? 'searching' : crowded ? 'occupied' : mustLeave ? 'reenter' : limb ? 'tracking' : 'searching'}
     >
       <strong>
-        {crowded ? (
+        {unseen ? (
+          <span data-testid={`${testId}-bring-hand`}>
+            {mode === 'leg'
+              ? `Bring a hand into the picture — nothing can be held while the camera cannot see one. Rest it on your thigh or the arm of the chair, then hold ${what}. Your knees cannot do this: they are doing the exercise.`
+              : `Bring your hand back into the picture — nothing can be held while the camera cannot see it. Then hold ${what}, without touching the screen.`}
+          </span>
+        ) : crowded ? (
           <>
             Hold {what} — no need to touch the screen. The circle is on top of{' '}
             {limb ? 'the limb below' : 'a limb that is already there'}, so holding it would mean nothing: it is moving
@@ -971,11 +996,17 @@ export function DwellLegend({
             : ' which is slower than the ring can count: it fills as the frames arrive, so the hold takes longer than the countdown inside it says.'}
         </span>
       )}
+      {/* The small print, and it STAYS SMALL PRINT: in the not-seeing-you state the first line above
+          already carries the whole explanation, and repeating it here pushed the block 46 px past the
+          bottom of a 768 px tablet — so the one thing that is not said above (either limb will do, and
+          the buttons are still there) is all that is left here. Measured in the running app. */}
       <span className="dim" data-testid={`${testId}-limbs`}>
         Either side may do this, including the unaffected one.{' '}
-        {mode === 'leg'
-          ? 'It has to be a hand: your knees are doing the exercise, and a knee held in the circle cannot be told apart from a repetition, so the circles do not follow them. If your hands are out of the picture, use the buttons.'
-          : 'The buttons still work too.'}
+        {unseen
+          ? 'If no hand can come into the picture, the buttons still work.'
+          : mode === 'leg'
+            ? 'It has to be a hand: your knees are doing the exercise, and a knee held in the circle cannot be told apart from a repetition, so the circles do not follow them. If your hands are out of the picture, use the buttons.'
+            : 'The buttons still work too.'}
       </span>
     </div>
   );

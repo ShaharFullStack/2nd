@@ -53,7 +53,7 @@ import {
   retargetForAspect,
 } from '../vision/dwell.ts';
 import type { DwellCircle, DwellPoint, DwellState } from '../vision/dwell.ts';
-import { handPose, reNormalizeAspect, seatedPose, translateLandmarks } from '../vision/fixtures.ts';
+import { SEATED_HAND_RESTS, handPose, reNormalizeAspect, seatedHandsOutOfView, seatedPose, translateLandmarks } from '../vision/fixtures.ts';
 import { POSE } from '../vision/landmarks.ts';
 import type { DetectionResult } from '../vision/mediapipe.ts';
 import type { Mode, Side } from '../engine/types.ts';
@@ -558,6 +558,55 @@ describe('THE PRESCRIBED EXERCISE MAY NOT ANSWER FOR THE PATIENT', () => {
       },
     });
     expect(slid.confirms).toBeGreaterThanOrEqual(1);
+  });
+
+  it('…and the FIXTURE RIG can perform it, which is what the critic harnesses have to drive', () => {
+    /**
+     * The proof above builds its hands itself (`legFrame` overwrites the wrist landmarks), so it could
+     * pass while the shared rig had no arms at all — and it did: `seatedPose` left every arm landmark on
+     * an unplaced (0.5, 0.2) placeholder, so critic/handsfree.mjs and critic/handsfree-dead-ends.mjs,
+     * which inject that rig, could only aim a KNEE and could not perform the one gesture leg mode has.
+     * A harness that cannot drive the supported gesture is not evidence, so the rig itself is driven
+     * here: hands on the thighs (`SEATED_HAND_RESTS`), one raised to the ring, the legs marching with
+     * the circumduction that used to fire this by accident.
+     */
+    const target = singleDwellTarget('leg');
+    const from = SEATED_HAND_RESTS.thighs.left;
+    const fixture = drive({
+      mode: 'leg',
+      aspect: PREVIEW_ASPECT,
+      authored: pairedDwellTargets('leg'),
+      seconds: 14,
+      frame: (t) => {
+        const reach = Math.max(0, Math.min(1, (t - 6) / 1));
+        return {
+          tMs: t * 1000,
+          pose: seatedPose({
+            kneeLift: repAmount(t, SLOW_REP),
+            abduction: repAmount(t, SLOW_REP),
+            side: 'left',
+            handAt: { side: 'left', x: from.x + (target.x - from.x) * reach, y: from.y + (target.y - from.y) * reach },
+          }),
+          hands: [],
+        };
+      },
+    });
+    expect(fixture.confirms).toBeGreaterThanOrEqual(1);
+
+    // AND THE FRAMING THE APP USED TO ASK FOR: hips, knees and feet in view, hands out of the picture.
+    // Nothing is being followed, so nothing can be held — no pointer, no progress, no confirm. This is
+    // the state POSTURE_INFO.seated_leg invited and the camera check now has to announce before the
+    // patient is left alone with it.
+    const framed = drive({
+      mode: 'leg',
+      aspect: PREVIEW_ASPECT,
+      authored: pairedDwellTargets('leg'),
+      seconds: 14,
+      frame: (t) => ({ tMs: t * 1000, pose: seatedHandsOutOfView({ kneeLift: repAmount(t, SLOW_REP), side: 'left' }), hands: [] }),
+    });
+    expect(framed.tracked).toBe(0);
+    expect(framed.maxProgress).toBe(0);
+    expect(framed.confirms).toBe(0);
   });
 });
 
@@ -1073,6 +1122,54 @@ describe('DwellLegend', () => {
     const el = screen.getByTestId('dwell-legend');
     expect(el.textContent).not.toMatch(/knee/);
     expect(el.textContent).toMatch(/a hand/);
+    useStore.getState().setMode('leg');
+  });
+
+  it('with NO limb in view it says what to do about the PICTURE, in the first line', () => {
+    /**
+     * The gap the leg-mode fix left. A patient framed as `POSTURE_INFO.seated_leg` used to ask — hips,
+     * knees and feet — has no hand in the picture, so no ring can fill; and since `dwellLimbs` stopped
+     * returning knees there is nothing else that could. "Move a hand into the circle and keep it there"
+     * is an instruction about the circle when the problem is the picture, and the one sentence that
+     * said so lived in the small print at the bottom of the block, below the fold at 1024x768.
+     *
+     * So it is the FIRST line, beside the badge, and it names the remedy the patient can act on alone.
+     */
+    useStore.getState().setMode('leg');
+    cleanup();
+    render(<DwellLegend session={session({ states: { go: state({ tracked: false }) } })} what="the left circle to go on" />);
+    const el = screen.getByTestId('dwell-legend');
+    expect(el.dataset.state).toBe('searching');
+    const say = screen.getByTestId('dwell-legend-bring-hand').textContent ?? '';
+    expect(say).toMatch(/Bring a hand into the picture/);
+    expect(say).toMatch(/thigh|arm of the chair/);
+    expect(say).toMatch(/the left circle to go on/);
+    expect(say).toMatch(/knees cannot do this/);
+    // …and it is the first thing in the block, which is what makes it visible without scrolling on a
+    // 768 px tablet: the limb badge that says "No hand in view" comes after it.
+    const first = el.querySelector('strong');
+    expect(first?.contains(screen.getByTestId('dwell-legend-bring-hand'))).toBe(true);
+    expect(el.textContent?.indexOf('Bring a hand')).toBeLessThan(el.textContent?.indexOf('No hand in view') ?? -1);
+    // It must not tell a patient with nothing in the picture to hold anything yet.
+    expect(el.textContent).not.toMatch(/Move a hand into the circle and keep it/);
+    // …and the small print does not repeat the explanation the first line now carries (which is what
+    // pushed the block off the bottom of a 768 px screen), but still says the buttons are there.
+    const small = screen.getByTestId('dwell-legend-limbs').textContent ?? '';
+    expect(small).toMatch(/Either side may do this/);
+    expect(small).toMatch(/the buttons still work/i);
+    expect(small).not.toMatch(/cannot be told apart from a repetition/);
+
+    // It is the RINGS' state, not the pick's: a hand that drops out for one frame leaves `limb` null
+    // while every ring is still tracking, and there the legend goes on telling the patient to hold.
+    cleanup();
+    render(<DwellLegend session={session()} what="x" />);
+    expect(screen.queryByTestId('dwell-legend-bring-hand')).toBeNull();
+    expect(screen.getByTestId('dwell-legend').textContent).toMatch(/Move a hand into the circle/);
+
+    useStore.getState().setMode('hand');
+    cleanup();
+    render(<DwellLegend session={session({ states: { go: state({ tracked: false }) } })} what="x" />);
+    expect(screen.getByTestId('dwell-legend-bring-hand').textContent).toMatch(/Bring your hand back into the picture/);
     useStore.getState().setMode('leg');
   });
 

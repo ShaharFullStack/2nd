@@ -23,6 +23,7 @@
  *  - a stretch with no usable landmarks is not "no movement", it is "not measured", and the share of
  *    the session that was actually tracked is the honest qualifier on the rep count.
  */
+import type { Mode } from '../engine/types.ts';
 import { MIN_USABLE_DETECT_FPS } from '../vision/mediapipe.ts';
 import type { CalibrationMeasurement } from '../vision/calibration.ts';
 import type { VisionStatus } from '../input/types.ts';
@@ -597,12 +598,114 @@ export interface ReadinessObservation {
    * skeleton. This is what tells those two states apart.
    */
   anyLandmarksFraction?: number | null;
+  /**
+   * Whether the patient can ANSWER this screen without touching it (see `pointerNote`). Omitted by a
+   * caller with no hands-free targets on it, and then nothing is claimed either way.
+   */
+  pointer?: PointerObservation | null;
 }
+
+/**
+ * IS THERE ANYTHING FOR THE CIRCLES TO FOLLOW? — the half of "is this device ready" that is about the
+ * FRAMING rather than the hardware.
+ *
+ * A dwell target is held with a limb the prescription does not move: in leg mode that is a HAND, by
+ * construction, because a seated patient puts a knee somewhere only by performing a prescribed leg
+ * movement (vision/dwell.ts). So a leg-mode patient framed the way this app used to ask them to be
+ * framed — "hips, knees and feet in view" — can have no pointer at all, and every ring on every screen
+ * after this one is then a circle that cannot fill. That is the stranding the hands-free path exists to
+ * prevent, and the camera check is the last place a therapist is still in the room to hear about it.
+ *
+ * `fraction` is the share of the readiness window in which the targets had a limb to follow, taken from
+ * the SAME session the rings are driven from — so this verdict and the ring cannot disagree about the
+ * same hand.
+ */
+export interface PointerObservation {
+  /** 0..1 over the readiness window. */
+  fraction: number;
+  /** Which limb the confirm gesture uses here — it decides what the remedy sentence has to say. */
+  mode: Mode;
+}
+
+/** Below this share of the window, the screen says the hands-free path is not dependable. */
+export const POINTER_PRESENT_FRACTION = 0.9;
 
 export function cameraReadiness(
   q: TrackingQuality | null,
   w: ReadinessWindows,
   obs: ReadinessObservation = {},
+): DeviceReadiness {
+  return withPointerVerdict(deviceReadiness(q, w, obs), obs.pointer ?? null);
+}
+
+/**
+ * WHAT IT COSTS THAT NOTHING IS THERE TO HOLD — folded into the device verdict, never a gate.
+ *
+ * IT WARNS, IT DOES NOT GATE, and the reason is the gate's own rule. Every blocked verdict on this
+ * screen must still leave a hands-free way FORWARD and a hands-free way BACK, and on the camera check
+ * those two ways ARE the dwell pair. A gate raised because there is no pointer would therefore be a
+ * gate whose own mandatory escapes cannot be used — it would manufacture the dead end the feature
+ * exists to prevent, and it would do it at exactly the moment the patient has no hand in frame.
+ *
+ * The other two reasons it is not a gate, and why that is not a softening:
+ *  - THE PATIENT CAN FIX IT BY MOVING. Unlike a device processing one frame every five seconds, this
+ *    clears in a second, by raising a hand — it is a framing fact, and the useful response to a
+ *    framing fact is a sentence, not a barrier. It also comes and goes as a hand drifts in and out of
+ *    frame, and a gate that flaps is a gate people learn to click through.
+ *  - NOTHING DOWNSTREAM IS UNMEASURABLE. Every prescribed lane still calibrates, still triggers and
+ *    still scores with both hands out of the picture; a therapist-attended session in that framing is
+ *    perfectly sound. What is lost is who presses the buttons — which is a staffing fact for the
+ *    therapist, not a measurement fact, and blocking a measurable session over it would be a number
+ *    (and a verdict) that lies in the other direction.
+ * What it must not do is let the card read READY over it: a screen that says "this device will support
+ * the whole prescription" and then hands a patient alone a ring nothing can fill is the worst case in
+ * this feature. So it costs the ready badge, takes a ✕ line and carries the remedy.
+ */
+function withPointerVerdict(base: DeviceReadiness, p: PointerObservation | null): DeviceReadiness {
+  // 'measuring' claims nothing about anything yet, and the pointer window is not full either.
+  if (!p || !Number.isFinite(p.fraction) || base.kind === 'measuring') return base;
+  const hand = p.mode === 'leg' ? 'a hand' : 'the hand';
+  if (p.fraction >= POINTER_PRESENT_FRACTION) {
+    return {
+      ...base,
+      will: [
+        ...base.will,
+        p.mode === 'leg'
+          ? 'A hand is in the picture, so the patient can answer every step by holding a circle — no one has to press anything for them.'
+          : 'The hand is in the picture, so the patient can answer every step by holding a circle — no one has to press anything for them.',
+      ],
+    };
+  }
+  const pct = Math.round(p.fraction * 100);
+  const gone = p.fraction <= 0;
+  const wont = gone
+    ? `Nothing on this screen or after it can be confirmed without touching it: ${hand} was never in the picture during this check.${
+        p.mode === 'leg'
+          ? ' In leg mode only a hand can answer — a knee held in a circle cannot be told apart from a repetition, so the circles do not follow one.'
+          : ''
+      }`
+    : `${hand[0].toUpperCase()}${hand.slice(1)} was in the picture for only ${pct} % of this check, so a hold keeps losing what it is following: the ring fills in fits and starts and can take far longer than the countdown inside it says.`;
+  const action = gone
+    ? `Bring one hand into the picture — resting on the thigh or the arm of the chair is enough, either side will do — and the circles start following it. Until then the patient cannot answer a single screen alone: somebody has to press the buttons for them. This clears by itself as soon as a hand is in frame.`
+    : `Move the camera or the chair so one hand stays inside the preview for the whole session. Until it does, plan on pressing the buttons for the patient.`;
+  return {
+    ...base,
+    // The ready badge is the one thing this costs (see above): the device is fine, the session is not
+    // answerable. Everything else about the verdict — including the gate — is left exactly as it was.
+    kind: base.kind === 'ready' ? 'degraded' : base.kind,
+    headline:
+      base.kind === 'ready'
+        ? `This device will run the session, but nobody in the picture can answer it: ${gone ? `${hand} is not in view` : `${hand} keeps leaving the view`}.`
+        : base.headline,
+    wont: [...base.wont, wont],
+    action: base.action ? `${base.action} ${action}` : action,
+  };
+}
+
+function deviceReadiness(
+  q: TrackingQuality | null,
+  w: ReadinessWindows,
+  obs: ReadinessObservation,
 ): DeviceReadiness {
   if (!q || q.samples === 0) {
     return {

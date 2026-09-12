@@ -497,15 +497,29 @@ export const FINE_SMOOTHING: SmoothingSpec = Object.freeze({ kind: 'ema2', alpha
  * The physical SETUP a movement is measured in. Two movements with different postures cannot both be
  * performed by the same limb in one session: the patient can only hold one of them, and whichever they
  * hold makes the other movement unobservable (or, worse, makes the other lane's feature respond to it).
- *   'seated_leg'      : seated, facing the camera, hips/knees (and feet) in view.
+ *   'seated_leg'      : seated, facing the camera, hips/knees (and feet) in view — AND A HAND.
  *   'palm_to_camera'  : forearm on the table, palm to the camera, fingers up.
  *   'hand_over_edge'  : forearm on the table, hand over the edge, fingers pointing at the camera.
  * The two hand postures are 90 degrees apart about the wrist, which is exactly the wrist_extension axis.
+ *
+ * WHY THE LEG SETUP ASKS FOR A HAND IT DOES NOT MEASURE. Nothing about a knee range needs a wrist in
+ * frame. But a patient working alone answers every screen by holding a limb inside a circle, and in leg
+ * mode that limb can only be a HAND: a seated patient puts a knee somewhere only by performing a
+ * prescribed leg movement, so a knee that could fill a circle would fill it on every repetition
+ * (vision/dwell.ts). The framing this text asks for therefore has to be a framing the hands-free path
+ * survives — "hips, knees and feet" alone invited a patient to sit down with no way to answer anything,
+ * which is the stranding the whole gesture exists to prevent. The camera check states the same fact
+ * about the framing it can actually SEE (`cameraReadiness`, `PointerObservation`), because an
+ * instruction is not evidence that it was followed.
  */
 export type MovementPosture = 'seated_leg' | 'palm_to_camera' | 'hand_over_edge';
 
 export const POSTURE_INFO: Readonly<Record<MovementPosture, { label: string; setup: string }>> = Object.freeze({
-  seated_leg: { label: 'Seated, facing the camera', setup: 'Sit facing the camera so your hips, knees and feet are in view.' },
+  seated_leg: {
+    label: 'Seated, facing the camera',
+    setup:
+      'Sit facing the camera so your hips, knees and feet are in view, and rest a hand where the camera can see it — on your thigh or the arm of the chair. That hand is what holds the circles on screen, so you never have to touch the tablet; your knees cannot do it, because they are doing the exercise.',
+  },
   palm_to_camera: { label: 'Palm to the camera', setup: 'Rest your forearm on the table with your palm facing the camera.' },
   hand_over_edge: { label: 'Hand over the table edge', setup: 'Rest your forearm on the table with your hand over the edge, fingers pointing at the camera.' },
 });

@@ -34,9 +34,20 @@
  *   5. The same screens at 1280x800.
  *
  * HOW THE PATIENT IS SIMULATED: synthetic MediaPipe landmarks (src/vision/fixtures.ts) fed to the
- * live VisionInput through `processDetection`, exactly as critic/handsfree.mjs does. The body is
- * rigid, so it is always parked BELOW a target before being moved into it — a sideways park changes
- * which limb is nearest and the dwell tracker re-arms its entry gate on a change of limb.
+ * live VisionInput through `processDetection`, exactly as critic/handsfree.mjs does.
+ *
+ * AND IT IS A HAND THAT ANSWERS, because in leg mode nothing else can. `dwellLimbs` returns the HANDS
+ * (a seated patient puts a knee somewhere only by performing a prescribed leg movement), and this
+ * harness used to drive a rig with no arms at all: every arm landmark sat on the fixture's unplaced
+ * (0.5, 0.2) placeholder, so the only way to aim anything was to TRANSLATE THE WHOLE BODY, which
+ * dragged the knees, the hips and that placeholder around the frame — and out of it, which is exactly
+ * why `camera-dwell-restart`, `rom-dwell-next`, `rest-dwell-stop` and `pause-dwell-resume` reported
+ * "never confirmed; ring reached 0%". It was a harness that could not perform the gesture it was
+ * testing, which is not evidence of anything.
+ *
+ * So the rig now has arms (`SEATED_HAND_RESTS`, `handAt`): both hands rest on the thighs, and a hold is
+ * performed the way the app asks for it — one hand raised from its resting position to the ring and
+ * held there, with the legs still marching. Nothing else in the figure moves while it happens.
  */
 import { spawn } from 'node:child_process';
 import { mkdirSync } from 'node:fs';
@@ -73,17 +84,29 @@ async function installBody(page) {
     const lm = await import('/src/vision/landmarks.ts');
     const body = {
       side: 'left', lift: 0, dx: 0, dy: 0, injected: 0,
+      /** Which hand is doing the reaching, and where it is (null = both hands on the thighs). */
+      handSide: 'left', hand: null,
       points: () => ({
         knee: body.side === 'left' ? lm.POSE.LEFT_KNEE : lm.POSE.RIGHT_KNEE,
-        wrist: body.side === 'left' ? lm.POSE.LEFT_WRIST : lm.POSE.RIGHT_WRIST,
       }),
-      pose: () => fx.seatedPose({ kneeLift: body.lift, side: body.side }),
+      pose: () => fx.seatedPose({ kneeLift: body.lift, side: body.side, handAt: body.hand ?? undefined }),
+      /** Both hands back on the thighs: out of every ring, which is what opens the entry gate. */
+      rest: () => { body.hand = null; },
+      /** Pick the hand that will reach, and put it at that hand's own resting position. */
+      reach: (side) => { body.handSide = side; body.hand = { side, ...fx.SEATED_HAND_RESTS.thighs[side] }; },
       at: (name) => {
+        if (name === 'wrist') {
+          const p = body.hand ?? fx.SEATED_HAND_RESTS.thighs[body.handSide];
+          return { x: p.x + body.dx, y: p.y + body.dy };
+        }
         const idx = body.points()[name];
         const p = body.pose()[idx];
         return { x: p.x + body.dx, y: p.y + body.dy };
       },
       aim: (name, x, y) => {
+        // A HAND MOVES BY ITSELF. Only the knee has to be aimed by translating the scene, and that is
+        // the fallback this harness keeps only to show that a knee cannot confirm.
+        if (name === 'wrist') { body.hand = { side: body.handSide, x: x - body.dx, y: y - body.dy }; return true; }
         const idx = body.points()[name];
         const p = body.pose()[idx];
         body.dx = x - p.x; body.dy = y - p.y; return true;
@@ -141,39 +164,56 @@ const box = (page, id) => page.evaluate((i) => {
   return { top: Math.round(r.top), bottom: Math.round(r.bottom), left: Math.round(r.left), w: Math.round(r.width), h: Math.round(r.height), vh: window.innerHeight, visible: r.top >= 0 && r.bottom <= window.innerHeight && r.width > 0 };
 }, id);
 
-/** Hold the limb on a target until `settled()`. Returns how. */
+/** Where a target is drawn right now, in the video coordinates the landmarks are in. */
+const readTarget = (page, id) => page.evaluate((i) => {
+  const el = document.querySelector(`[data-testid="${i}"]`);
+  if (!el) return null;
+  return {
+    x: Number(el.getAttribute('data-dwell-x')),
+    y: Number(el.getAttribute('data-dwell-y')),
+    r: Number(el.getAttribute('data-dwell-radius')),
+    p: Number(el.getAttribute('data-progress')),
+    phase: el.getAttribute('data-phase'),
+  };
+}, id);
+
+/** Hold a limb on a target until `settled()`. Returns how. */
 async function hold(page, id, settled, budgetMs = 40000) {
-  const aim = await page.evaluate((i) => {
-    const el = document.querySelector(`[data-testid="${i}"]`);
-    if (!el) return null;
-    return { x: Number(el.getAttribute('data-dwell-x')), y: Number(el.getAttribute('data-dwell-y')), phase: el.getAttribute('data-phase') };
-  }, id);
-  if (!aim) throw new Error(`no target ${id}`);
+  const first = await readTarget(page, id);
+  if (!first) throw new Error(`no target ${id}`);
   const deadline = Date.now() + budgetMs;
   let best = 0, filling = null;
-  // The limb the app FOLLOWS has to be the same one at the park and at the target: the dwell tracker
-  // re-arms its entry gate when the pointer changes limb, and a gate re-armed while the new limb is
-  // already inside the circle can never open. The synthetic body is rigid, so parking it below the
-  // target keeps the same hand nearest throughout — which is also what the app asks a seated patient
-  // to do (`pairedDwellTargets`: in leg mode the hands are free and the targets are where a raised
-  // hand reaches).
+  // A HAND FIRST, because in leg mode a hand is the only thing the circles follow. The knee is tried
+  // afterwards purely to show what the fix claims: it cannot confirm, and it is not allowed to.
   for (const limb of ['wrist', 'knee']) {
     if (Date.now() > deadline) break;
-    await glide(page, limb, aim.x, Math.min(0.95, aim.y + 0.22), 4);
+    if (limb === 'wrist') {
+      // The patient reaches with the nearer hand, from where that hand rests. Starting at rest is what
+      // makes the hold an ENTRY rather than a limb that happened to be sitting in the ring.
+      await page.evaluate((x) => window.__hfBody.reach(x >= 0.5 ? 'left' : 'right'), first.x);
+    } else {
+      await page.evaluate(() => window.__hfBody.rest());
+      await glide(page, limb, first.x, Math.min(0.95, first.y + 0.22), 4);
+    }
     await wait(700);
     if (await settled()) return { how: 'settled before the hold', best };
+    let aim = await readTarget(page, id) ?? first;
     await glide(page, limb, aim.x, aim.y, 6);
     let until = Date.now() + 5000;
     while (Date.now() < until && Date.now() < deadline) {
       await wait(120);
-      if (await settled()) return { how: `held the ${limb} on ${id} at ${aim.x},${aim.y}`, best: Math.max(best, 1), filling };
-      const p = await page.evaluate((i) => {
-        const el = document.querySelector(`[data-testid="${i}"]`);
-        return el ? { p: Number(el.getAttribute('data-progress')), phase: el.getAttribute('data-phase') } : null;
-      }, id);
-      if (p && p.p > best) best = p.p;
-      if (p && p.p >= 0.25 && p.p <= 0.9 && filling === null) filling = p.p;
-      if (p && p.p > 0.02) until = deadline;
+      if (await settled()) return { how: `held the ${limb} on ${id} at ${aim.x.toFixed(2)},${aim.y.toFixed(2)}`, best: Math.max(best, 1), filling };
+      const p = await readTarget(page, id);
+      if (!p) break;
+      if (p.p > best) best = p.p;
+      if (p.p >= 0.25 && p.p <= 0.9 && filling === null) filling = p.p;
+      if (p.p > 0.02) until = deadline;
+      // THE RING IS ALLOWED TO MOVE (`DwellLayout` slides a circle off a limb that lives under it), and
+      // a patient can see it move. A harness that keeps holding the old spot is measuring nothing.
+      if (Math.hypot((p.x - aim.x) * (4 / 3), p.y - aim.y) > p.r * 0.3) {
+        aim = p;
+        await glide(page, limb, aim.x, aim.y, 3);
+      }
     }
   }
   throw new Error(`${id} never confirmed; ring reached ${(best * 100).toFixed(0)}%`);
@@ -328,7 +368,10 @@ async function main() {
     else if (!romLimb.visible) failures.push(`the ROM limb badge is off screen at 1024x768 (top ${romLimb.top}, bottom ${romLimb.bottom}, viewport ${romLimb.vh})`);
 
     // Measure lane 1 for real, then hold forward to lane 2, then hold BACK to lane 1.
-    const still = () => page.evaluate(() => { window.__hfBody.dx = 0; window.__hfBody.dy = 0; window.__hfBody.side = 'left'; window.__hfBody.lift = 0; });
+    const still = () => page.evaluate(() => {
+      window.__hfBody.dx = 0; window.__hfBody.dy = 0; window.__hfBody.side = 'left'; window.__hfBody.lift = 0;
+      window.__hfBody.rest();   // hands back on the thighs: a rest hold is not a hand held up at a ring
+    });
     const rep = async () => {
       for (let i = 1; i <= 8; i++) { await page.evaluate((l) => { window.__hfBody.lift = l; }, i / 8); await wait(40); }
       await wait(260);
