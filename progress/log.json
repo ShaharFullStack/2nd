@@ -1,5 +1,5 @@
 {
- "updated": "2026-09-11T22:51Z",
+ "updated": "2026-09-12T00:39Z",
  "pieces": {
   "engine": {
    "round": 5,
@@ -217,6 +217,12 @@
    "kind": "info",
    "text": "Third four-lens review: 2 of 4 would now ship, up from 0 of 4. The patient reviewer: 'the best this app has been, and for the first time it feels like something I would actually want to play tomorrow.' The song now ends with a payoff that leads with movements performed; comparisons against an abandoned session are labelled; tracking quality qualifies the figures it should; time to the first note is 4.1 s, down from 38.7 s. The two holdouts block on narrow, specific things — a 'saved' badge that prints whether or not the write succeeded, a calibration carrying no record of how well it was measured.",
    "image": "shots/highway-final.png"
+  },
+  {
+   "time": "2026-09-12T00:39Z",
+   "piece": "orchestrator",
+   "kind": "info",
+   "text": "Pushed to main. 1654 tests, typecheck, production build, and both browser harnesses green. Four rounds of four-lens review behind it; the last vote was 2 of 4 to ship, with the two holdouts blocking on a 'saved to history' badge that printed whether or not the write succeeded and a calibration that carried no record of how well it was measured — both since addressed, not yet re-voted."
   }
  ]
 }
