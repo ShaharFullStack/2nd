@@ -414,7 +414,7 @@ async function glide(page, limb, x, y, steps = 6) {
  * The limb is first parked well AWAY from the target: a knee at rest can already be sitting where the
  * ring is drawn, and a hold that starts from there is not a choice the patient made.
  */
-async function dwellConfirm(page, { what, ids, settled, budgetMs = 30_000 }) {
+async function dwellConfirm(page, { what, ids, settled, budgetMs = 30_000, fillingShot = null }) {
   const probe = await readDwell(page, ids);
   if (!probe.found) {
     throw new NotBuiltYet(
@@ -437,6 +437,8 @@ async function dwellConfirm(page, { what, ids, settled, budgetMs = 30_000 }) {
   const deadline = Date.now() + budgetMs;
   let best = 0;
   let usedX = null;
+  let filledShotTaken = false;
+  let fillingSeen = null;
   // Leg mode parks a knee, hand mode a palm; the harness offers the pose landmark each mode follows.
   for (const limb of ['knee', 'wrist']) {
     for (const x of probe.aim.xs) {
@@ -454,7 +456,9 @@ async function dwellConfirm(page, { what, ids, settled, budgetMs = 30_000 }) {
         await wait(120);
         if (await settled()) {
           return {
-            how: `held the ${limb} on the ring at ${x.toFixed(2)},${probe.aim.y.toFixed(2)} (${probe.aim.from}) until it filled`,
+            how:
+              `held the ${limb} on "${probe.matchedBy}" at ${x.toFixed(2)},${probe.aim.y.toFixed(2)} (${probe.aim.from}) until it filled` +
+              (fillingSeen !== null ? ` (caught part-full at ${(fillingSeen * 100).toFixed(0)}%)` : ''),
             progress: Math.max(best, 1),
           };
         }
@@ -463,6 +467,13 @@ async function dwellConfirm(page, { what, ids, settled, budgetMs = 30_000 }) {
         if (p.progress !== null && p.progress > best) {
           best = p.progress;
           usedX = x;
+        }
+        // A picture of the ring PART FULL, which is the only proof that the hold is the patient's and
+        // not a click: a full ring and an empty one both happen without anyone holding anything.
+        if (fillingShot && !filledShotTaken && p.progress !== null && p.progress >= 0.25 && p.progress <= 0.9) {
+          filledShotTaken = true;
+          await shoot(page, fillingShot);
+          fillingSeen = p.progress;
         }
         // Filling: this is the right place to stand. Hold to the whole budget instead of moving on.
         if (p.progress !== null && p.progress > 0.02 && !filling) {
@@ -635,6 +646,7 @@ async function main() {
       what: 'going on from the camera check',
       ids: ['camera-dwell-continue', 'dwell-camera-continue'],
       settled: () => onScreen(page, 'rom'),
+      fillingShot: '03-camera-check-ring-filling',
     });
     await shoot(page, '03-camera-check-confirmed');
     record('camera check confirmed hands-free', `${toRom.how}; the app went to the ROM screen on its own`);
@@ -687,6 +699,7 @@ async function main() {
         what: last ? 'going on from the last lane to the latency check' : `going on from lane ${i + 1} to lane ${i + 2}`,
         ids: ['rom-dwell-next', 'dwell-rom-next'],
         settled,
+        fillingShot: `04-rom-lane-${i + 1}-ring-filling`,
       });
       record(`lane ${i + 1} accepted hands-free`, `${confirm.how}; the app moved on with no click`);
     }
@@ -713,6 +726,7 @@ async function main() {
       ids: ['latency-dwell-accept', 'latency-dwell-carry-on', 'dwell-latency-accept'],
       settled: intoPlay,
       budgetMs: 45_000,
+      fillingShot: '05-latency-ring-filling',
     });
     latencyHow += accepted.how;
     record('latency check passed hands-free', latencyHow);

@@ -13,3 +13,4 @@ playwright-report
 critic/screenshots/*.png
 critic/_tmp_*
 critic/scratch/
+.critic-tmp/

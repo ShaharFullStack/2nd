@@ -119,6 +119,7 @@ npm run critic:audio   # proves the per-lane ducking end to end: real Web Audio 
 npm run critic:uneven  # a seeded shared tablet whose latest session was tracked at 11.8 fps: no
                        # comparison across it may render as a plain gain, at 1024/1280/1920
 npm run critic:firstnote  # throttled 8 Mbit/s: bytes after Start and Start → first note
+npm run critic:handsfree  # one tap on Home, then a body: camera check → calibration → song
 ```
 
 Each of these starts and stops its own dev server. `critic:smoke` drives the whole flow and
@@ -127,6 +128,35 @@ asserts the engine scored, the clock froze on pause, and the session was saved.
 feeding the engine, and reads the live Web Audio gains to confirm the missing lane's
 instrument dips in proportion, that no other lane's instrument moves with it, and that the
 rest of the band keeps going.
+
+### Nobody has a hand free
+
+In hand mode the patient's hands **are** the input device, and in leg mode they are seated out of
+reach of the screen — so every click between the camera check and the first note either breaks the
+pose the app has just asked them to hold or needs a second person in the room. That is what the
+dwell targets are for, and `npm run critic:handsfree` is the check that they actually work for a
+body rather than for a mouse.
+
+It runs a real camera session in headless Chromium against a fake webcam and spends exactly **one**
+real user input: a tap on Home, before the patient is in position, because the browser will not
+start an AudioContext without a genuine gesture. Everything after that is a body. Synthetic
+MediaPipe landmarks of a seated patient are fed to the live camera input through its own
+`processDetection`, so the same feature extraction, filters, ROM calibrator and lane triggers run as
+on a real webcam; the harness moves a knee onto the ring it can see on screen and holds it there,
+and it never calls a confirm handler. A listener installed before any app code counts every trusted
+input event and the run fails if more than that one tap ever reaches the page.
+
+What it asserts: that the camera check names a limb to hold, that the dwell target on each of the
+camera check, both ROM lanes and the latency check fills and confirms by itself, that every
+prescribed lane entered the song with a range the engine accepted, that the app recorded the session
+as hands-free, and that the Play screen is running the song. It screenshots each step into
+`critic/handsfree/`, including the ring part-full, because a full ring and an empty one both happen
+without anyone holding anything.
+
+On a machine with no graphics acceleration one camera frame costs seconds of main thread, which
+starves the page the injected patient arrives through. The harness lets the real camera open and run
+one real inference, and stops the detect loop there if that frame was too expensive — so the run
+says out loud that the camera check's device-readiness gate was not exercised on that machine.
 
 ### Time to the first note
 
