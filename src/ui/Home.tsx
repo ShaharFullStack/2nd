@@ -106,8 +106,9 @@ export default function Home() {
         </div>
         {inputMode === 'camera' && (
           <p className="muted" style={{ margin: 0, maxWidth: 620, fontSize: '1.05rem' }} data-testid="only-tap-note">
-            <b>This is the only time the screen has to be touched.</b> Press it before the patient gets into position:
-            the browser will not start the sound without one real press, and the song clock is that sound. From the
+            <b>Setting up takes a few presses; the session itself takes none.</b> Choosing the patient, the movements
+            and the song is done by hand, before anyone gets into position — and one of those presses has to be a real
+            one, because the browser will not start the sound without it and the song clock is that sound. From the
             camera check onwards the patient confirms every step themselves, by holding a hand or a knee inside a circle
             on the camera preview until the ring fills. The buttons all keep working for whoever is in the room.
           </p>
