@@ -585,13 +585,14 @@ async function main() {
 
     // ---- the patient appears in front of the camera -------------------------------------------
     await page.waitForFunction(() => !!window.__beatRehab.runtime.peekVision?.(), null, { timeout: 90_000 });
-    await installBody(page);
-    await page.waitForFunction(() => (window.__hfBody?.injected ?? 0) > 5, null, { timeout: 60_000 });
-    // One real camera frame measures this machine; the loop stops there if it is too slow to leave
-    // running. See quietCameraIfStarved — it must happen before the hands-free legend is asked
-    // anything, because the dwell watchdog feeds its trackers nothing on a stream this sparse.
+    // Watch for the FIRST real camera frame and decide there whether this machine can afford to keep
+    // inferring (see quietCameraIfStarved). It is armed before anything else touches the page: every
+    // second spent waiting here is another second of inference, and the decision has to be made while
+    // the loop has produced exactly one frame.
     quieted = await quietCameraIfStarved(page);
     if (quieted) log('  ', quieted);
+    await installBody(page);
+    await page.waitForFunction(() => (window.__hfBody?.injected ?? 0) > 5, null, { timeout: 60_000 });
     // "Sees the patient" is asked of the screen, not of a private flag: the hands-free legend names
     // the limb its targets are following, and that sentence is the patient's only evidence that the
     // gesture is available to them at all.
