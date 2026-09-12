@@ -1,5 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { cleanup, render, screen } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import type { LaneResultSummary, SessionResult, TrackingQuality } from '../session/types.ts';
 import { DEFAULT_SETTINGS, defaultLanes, useStore } from '../state/store.ts';
 import ResultsScreen from './Results.tsx';
@@ -69,9 +69,16 @@ beforeEach(() => {
     settings: { ...DEFAULT_SETTINGS },
     history: [],
     lastResult: null,
+    lastSave: null,
+    persistenceFailed: false,
+    patients: [{ id: 'p1', name: 'R.K.', createdAt: 1, lastUsedAt: 1 }],
+    activePatientId: 'p1',
   });
 });
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 describe('the Results screen leads with the work, not with a grade', () => {
   it('puts movements performed and range achieved above the fold, and folds the score away', () => {
@@ -622,5 +629,172 @@ describe('today is compared against a whole session, and the screen says which o
     const tag = screen.getByTestId('results-reps-delta-qualifier');
     expect(tag.textContent).toContain('counted differently');
     expect(tag.getAttribute('title')).toContain('26');
+  });
+});
+
+
+/**
+ * THE BADGE THAT CLAIMS THE RECORD EXISTS HAS TO READ THE WRITE.
+ *
+ * It was a constant: a green "Saved to history" span in the markup, drawn whether or not
+ * `localStorage` took the write. Refuse the write — a full quota is realistic on a shared clinic
+ * tablet, where the 100-session cap is PER PATIENT — and the screen still said saved over a record
+ * that existed nowhere but in this tab's memory. A therapist who walks away believing a record
+ * exists when it does not is the worst failure this app has.
+ */
+describe('the Results screen says what really happened to the record', () => {
+  const refuseStorage = (): void => {
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+      throw new DOMException('quota', 'QuotaExceededError');
+    });
+  };
+
+  /** Record a session through the real write path, so the badge is reading a real verdict. */
+  const recordSession = (r: SessionResult = result()): void => {
+    useStore.getState().addResult(r);
+  };
+
+  it('claims the save only when the write landed', () => {
+    recordSession();
+    render(<ResultsScreen />);
+    expect(screen.getByTestId('results-save-state').textContent).toContain('Saved to history');
+    expect(screen.queryByTestId('results-save-problem')).toBeNull();
+    expect(screen.queryByTestId('results-save-retry')).toBeNull();
+  });
+
+  it('says the session is NOT on the device when the quota refuses it', () => {
+    refuseStorage();
+    recordSession();
+    render(<ResultsScreen />);
+    const badge = screen.getByTestId('results-save-state');
+    expect(badge.textContent).toContain('NOT saved');
+    expect(badge.className).toContain('badge-bad');
+    expect(badge.textContent).not.toContain('Saved to history');
+    // ...and it says what a therapist can DO about it, on the screen that makes the claim.
+    expect(screen.getByTestId('results-save-problem')).toBeTruthy();
+    expect(screen.getByTestId('results-save-retry')).toBeTruthy();
+    expect(screen.getByTestId('results-save-export')).toBeTruthy();
+    expect(screen.getByTestId('results-save-free-space')).toBeTruthy();
+    // The card explains that leaving the screen loses the work, and how to free space.
+    expect(screen.getByTestId('results-save').textContent).toContain('only copy of this session');
+    expect(screen.getByTestId('results-save').textContent).toContain('100 sessions per patient');
+  });
+
+  it('flips to saved when the retry lands, and says how many tries it took', () => {
+    refuseStorage();
+    recordSession();
+    render(<ResultsScreen />);
+    expect(screen.getByTestId('results-save-state').textContent).toContain('NOT saved');
+
+    vi.restoreAllMocks();
+    fireEvent.click(screen.getByTestId('results-save-retry'));
+    expect(screen.getByTestId('results-save-state').textContent).toContain('Saved to history');
+    expect(screen.getByTestId('results-save-state').textContent).toContain('attempt 2');
+    expect(screen.getByTestId('results-save-note').textContent).toContain('now in this patient');
+  });
+
+  it('says so, and does not claim a save, when a retry is refused again', () => {
+    refuseStorage();
+    recordSession();
+    render(<ResultsScreen />);
+    fireEvent.click(screen.getByTestId('results-save-retry'));
+    expect(screen.getByTestId('results-save-state').textContent).toContain('NOT saved');
+    expect(screen.getByTestId('results-save-note').textContent).toContain('Still refused');
+  });
+
+  it('hands the therapist the session as a file when the device will not keep it', () => {
+    refuseStorage();
+    recordSession();
+    render(<ResultsScreen />);
+    // jsdom has no real download; the button must not throw and must report the outcome either way.
+    fireEvent.click(screen.getByTestId('results-save-export'));
+    expect(screen.getByTestId('results-save')).toBeTruthy();
+  });
+
+  it('never borrows another session’s verdict: an unstamped record reads as unknown', () => {
+    // A record that did not come through this tab's write path (reloaded, re-filed, or set by a
+    // harness) has no verdict, and "unknown" is the only honest badge for it.
+    useStore.setState({ lastResult: result(), history: [result()], lastSave: null });
+    render(<ResultsScreen />);
+    expect(screen.getByTestId('results-save-state').textContent).toContain('unknown');
+    expect(screen.getByTestId('results-save-state').textContent).not.toContain('Saved to history');
+    expect(screen.getByTestId('results-save-export')).toBeTruthy();
+  });
+});
+
+/**
+ * "TODAY, MOVEMENT BY MOVEMENT" IS A CROSS-SESSION COMPARISON LIKE EVERY OTHER ONE ON THIS SCREEN.
+ *
+ * Every cell in it subtracts two sessions, and it used to carry nothing about how those two were
+ * measured or whether the earlier one ran to the end of its chart — while the range tiles two cards
+ * up had lost their green for exactly that reason.
+ */
+describe('the per-movement card carries the same qualifiers as the rest of the screen', () => {
+  it('is unqualified when the two sessions really are like for like', () => {
+    useStore.setState({ lastResult: result(), history: [result(), lastWeek()] });
+    render(<ResultsScreen />);
+    expect(screen.queryByTestId('results-today-qualifier')).toBeNull();
+    expect(screen.queryByTestId('results-today-comparison-note')).toBeNull();
+    expect(screen.getByTestId('results-today-lane-0').textContent).toContain('+12 vs last time');
+  });
+
+  it('qualifies the header and every delta when the two were not tracked alike', () => {
+    useStore.setState({ lastResult: result(), history: [result(), { ...lastWeek(), tracking: poorTracking() }] });
+    render(<ResultsScreen />);
+    expect(screen.getByTestId('results-today-qualifier').textContent).toBeTruthy();
+    // The reps delta and the range delta in the rows carry it too — a therapist reading the table
+    // need not have read the card header, and must not read "+12" as a clean finding.
+    const row = screen.getByTestId('results-today-lane-0');
+    expect(row.textContent).toContain('+12 vs last time ·');
+    expect(row.querySelectorAll('.delta-qualified').length).toBeGreaterThan(0);
+    // ...and the sentence that explains it sits under the rows it qualifies.
+    expect(screen.getByTestId('results-today-comparison-note').textContent).toMatch(/camera|tracked|equipment/i);
+  });
+
+  it('qualifies it when last time ended early, not only when the camera was poor', () => {
+    const aborted = { ...lastWeek(), completed: false, endReason: 'quit' as const, durationSec: 24, reps: 19 };
+    useStore.setState({ lastResult: result(), history: [result(), aborted] });
+    render(<ResultsScreen />);
+    expect(screen.getByTestId('results-today-qualifier').textContent).toContain('ended early');
+  });
+});
+
+/**
+ * THE SUB-RESOLUTION CAPTION MAY NOT OVERSTATE THE BOUND. It printed "the change is under 1.00" for a
+ * body-scaled ratio — a hundred times the step this screen prints in, and a whole unit of a quantity
+ * whose entire calibrated range is routinely under 1.0.
+ */
+describe('a change too small for the movement’s own units states the true bound', () => {
+  /** A seated march (ratio unit) whose best rep moved by well under 0.005 of the feature. */
+  const ratioPair = () => {
+    const today = lane({ movement: 'seated_march', movementName: 'Left Seated march', romBest: 0.61, romMean: 0.5, calibratedMin: 0.1, calibratedMax: 0.5 });
+    // 0.01 of the calibrated range is 0.004 of the feature: over the half-point floor, under the
+    // 0.01 this screen prints a body-scaled ratio to — the exact case the caption exists for.
+    const then = { ...today, romBest: 0.6 };
+    return {
+      today: result({ lanes: [today] }),
+      then: { ...lastWeek(), lanes: [then] },
+    };
+  };
+
+  it('states 0.005 for a ratio, never 1.00', () => {
+    const { today, then } = ratioPair();
+    useStore.setState({ lastResult: today, history: [today, then] });
+    render(<ResultsScreen />);
+    const tile = screen.getByTestId('results-range-lane-0');
+    expect(tile.textContent).toContain('pt vs last time');
+    expect(tile.textContent).toContain('under 0.005');
+    expect(tile.textContent).not.toContain('under 1.00');
+  });
+
+  it('states half a degree for a joint angle, never a whole one', () => {
+    // 0.3° on a 50° range: under the degree the screen prints to, over the half-point floor.
+    const today = result();
+    const then = { ...lastWeek(), lanes: [lane({ romBest: 0.75 - 0.3 / 50 })] };
+    useStore.setState({ lastResult: today, history: [today, then] });
+    render(<ResultsScreen />);
+    const tile = screen.getByTestId('results-range-lane-0');
+    expect(tile.textContent).toContain('under 0.5°');
+    expect(tile.textContent).not.toContain('under 1°');
   });
 });

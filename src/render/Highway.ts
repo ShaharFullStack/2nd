@@ -185,6 +185,19 @@ export interface FinaleSpec {
    * below the sentence, because this screen belongs to a rehab session and not to a scoreboard.
    */
   stats: FinaleStat[];
+  /**
+   * WHAT IS STILL HAPPENING TO `stats[0]` WHILE THE CARD IS ON SCREEN, in the caller's own words.
+   *
+   * The ending keeps counting: a camera does not stop seeing the patient when the music stops, and
+   * the movements made over the payoff go into this session's record (`GameRunner.onInput`, and the
+   * hero figure visibly ticks up as they are made). The board behind the curtain, meanwhile, used to
+   * blank every receptor to "no reading" for the whole sequence — the screen telling the patient
+   * nothing registers while the number in front of them counted what they did. The receptors now
+   * stay live, and this line says the same thing in words, under the figure it is about.
+   *
+   * Optional, and never invented here: a caller with nothing to say leaves it out.
+   */
+  heroNote?: string;
   /** ONE sentence about what this patient did today. Never a grade, never conditional on scoring. */
   achievement: string;
   /** A quieter second line under it (optional). */
@@ -3719,6 +3732,7 @@ export class Highway {
     const hasRow = rowStats.length > 0;
     const hasAchievement = spec.achievement.length > 0;
     const hasNote = hasAchievement && !!spec.achievementNote;
+    const heroNote = hero && spec.heroNote ? spec.heroNote : '';
     const panelW = Math.min(W - 40 * u, 700 * u);
     // THE NOTE IS MEASURED BEFORE THE PANEL IS SIZED, because it is the one block whose height the
     // canvas decides: it wraps to as many lines as the qualifier needs at this width, and the panel
@@ -3730,11 +3744,13 @@ export class Highway {
     const noteLineH = Math.max(16 * u, fontPx(noteStyle.font) * 1.32);
     const noteGap = 8 * u;
     const noteBlockH = noteLines.length > 0 ? noteGap + noteLines.length * noteLineH : 0;
+    /** One line, under the hero's label. Counted into the panel exactly like the achievement note. */
+    const heroNoteH = heroNote ? 20 * u : 0;
     // Every block's height, in the same numbers the cursor below advances by, so the panel is
     // exactly as tall as what is drawn in it at any canvas size.
     const panelH = Math.min(
       H - 40 * u,
-      (134 + (hero ? 86 : 0) + (hasRow ? 84 : 0) + (hasAchievement ? 76 : 0) + 74) * u + noteBlockH,
+      (134 + (hero ? 86 : 0) + (hasRow ? 84 : 0) + (hasAchievement ? 76 : 0) + 74) * u + noteBlockH + heroNoteH,
     );
     const top = Math.max(20 * u, (H - panelH) / 2 - 10 * u);
     const panelIn = clamp(t / FINALE_CURTAIN_SEC, 0, 1);
@@ -3799,8 +3815,22 @@ export class Highway {
           1,
           heroIn * 0.95,
         );
+        // WHAT IS STILL TRUE OF THAT NUMBER, on the same beat as the number. Drawn from the same
+        // fade so it cannot arrive after the figure it qualifies.
+        if (heroNote) {
+          const hnStyle = this.style('finaleNote');
+          this.text.draw(
+            ctx,
+            this.fitFinale(2 + FINALE_MAX_STATS, heroNote, hnStyle, panelW - 48 * u),
+            cx,
+            y + 32 * u + heroNoteH,
+            hnStyle,
+            1,
+            heroIn * 0.9,
+          );
+        }
       }
-      y += 86 * u;
+      y += 86 * u + heroNoteH;
     }
 
     // The session's other counts, arriving one at a time along one row under the hero.

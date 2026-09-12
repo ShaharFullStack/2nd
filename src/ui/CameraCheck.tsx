@@ -1,5 +1,9 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { windowsForLanes } from '../engine/difficulty.ts';
 import { runtime } from '../session/runtime.ts';
+import { TrackingRecorder, cameraReadiness } from '../session/tracking.ts';
+import type { DeviceReadiness } from '../session/tracking.ts';
+import type { TrackingQuality } from '../session/types.ts';
 import { useStore } from '../state/store.ts';
 import { requiredPostures } from '../vision/features.ts';
 import { POSTURE_INFO } from '../vision/features.ts';
@@ -16,6 +20,7 @@ export default function CameraCheck() {
   const lanes = useStore((s) => s.lanes);
   const calibrations = useStore((s) => s.calibrations);
   const difficulty = useStore((s) => s.difficulty);
+  const windowScale = useStore((s) => s.windowScale);
   const settings = useStore((s) => s.settings);
   const updateSettings = useStore((s) => s.updateSettings);
   const setInputMode = useStore((s) => s.setInputMode);
@@ -24,6 +29,17 @@ export default function CameraCheck() {
   const canvas = useRef<HTMLCanvasElement>(null);
   const latest = useRef<DetectionResult | null>(null);
   const [status, setStatus] = useState<VisionStatus | null>(null);
+  /**
+   * WHAT THIS DEVICE IS ACTUALLY DOING, accumulated rather than glanced at.
+   *
+   * A single `getStatus()` is one 300 ms window and flickers between "person detected" and not on
+   * every frame the model loses; a decision about whether an appointment can be spent here cannot be
+   * taken off one of those. This is the SAME recorder the play screen uses to write the session's
+   * tracking block, so what this screen promises and what the record later reports are graded by one
+   * rule. Reset on every retry, because a new camera is a new device as far as this claim goes.
+   */
+  const recorder = useRef(new TrackingRecorder());
+  const [observed, setObserved] = useState<TrackingQuality | null>(null);
   /** Lanes the runtime is refusing to score, with the reason (see the refusal block in the panel). */
   const [refusals, setRefusals] = useState<InvalidCalibration[]>([]);
   /** The thrown value, not a string: CameraFallback classifies a DOMException by its `name`. */
@@ -84,7 +100,10 @@ export default function CameraCheck() {
     const poll = setInterval(() => {
       const vision = runtime.peekVision();
       if (!vision) return;
-      setStatus(vision.getStatus());
+      const s = vision.getStatus();
+      setStatus(s);
+      recorder.current.sample(s);
+      setObserved(recorder.current.summary());
       const bad = vision.getInvalidCalibrations();
       setRefusals((prev) =>
         prev.length === bad.length && prev.every((r, i) => r.lane === bad[i].lane && r.reason === bad[i].reason)
@@ -102,6 +121,8 @@ export default function CameraCheck() {
       setStarting(true);
       setStatus(null);
       setRefusals([]);
+      recorder.current = new TrackingRecorder();
+      setObserved(null);
     };
   }, [mode, lanes, calibrations, difficulty, settings.mirrored, attempt]);
 
@@ -116,6 +137,8 @@ export default function CameraCheck() {
     setError(null);
     setStatus(null);
     setRefusals([]);
+    recorder.current = new TrackingRecorder();
+    setObserved(null);
     setStarting(true);
     setStartedAt(Date.now());
     setAttempt((n) => n + 1);
@@ -140,6 +163,27 @@ export default function CameraCheck() {
   const tracking = status?.tracking === true;
   const postures = requiredPostures(lanes);
 
+  /**
+   * THE NARROWEST WINDOWS THIS PRESCRIPTION ACTUALLY GRANTS. Not the difficulty's base numbers: a
+   * fine-motor lane gets ×1.6 and the therapist's window scale multiplies both, so the lane that
+   * first stops being reachable is the one with the smallest window in force. That is the lane the
+   * promise on this screen has to be made about.
+   */
+  const windows = useMemo(() => {
+    if (lanes.length === 0) return { perfectMs: 0, goodMs: 0, difficulty };
+    const per = windowsForLanes(lanes, difficulty, windowScale);
+    return {
+      perfectMs: Math.round(Math.min(...per.map((w) => w.perfectMs))),
+      goodMs: Math.round(Math.min(...per.map((w) => w.goodMs))),
+      difficulty,
+    };
+  }, [lanes, difficulty, windowScale]);
+
+  const readiness: DeviceReadiness = useMemo(
+    () => cameraReadiness(starting ? null : observed, windows),
+    [starting, observed, windows],
+  );
+
   // A camera that never started is not a corner of the camera-check screen — it is the screen.
   if (error !== null) return <CameraFallback error={error} onRetry={retry} retries={attempt} />;
 
@@ -150,7 +194,17 @@ export default function CameraCheck() {
         title="Frame the patient"
         onBack={() => goto('setup')}
         right={
-          <button className="btn btn-primary btn-lg" onClick={() => goto('rom')} data-testid="camera-continue">
+          /* THE GATE. Not a nag: at this point the next screen measures a rest position and three
+             repetitions off landmarks that are not arriving, or off frames further apart than the
+             widest hit window the prescription grants — an appointment spent to find out. It fires
+             only on a positive finding and every one of them clears by itself. */
+          <button
+            className="btn btn-primary btn-lg"
+            onClick={() => goto('rom')}
+            disabled={readiness.gate}
+            title={readiness.gate ? readiness.headline : undefined}
+            data-testid="camera-continue"
+          >
             Calibrate movement →
           </button>
         }
@@ -166,8 +220,10 @@ export default function CameraCheck() {
               <div className="card stack" style={{ maxWidth: 420 }}>
                 <h3 style={{ margin: 0 }}>Starting the camera…</h3>
                 <p className="muted" style={{ margin: 0 }}>
-                  Asking the browser for the camera, then loading the movement model. The first run on a
-                  device downloads that model (about 8 MB) and can take a minute; after that it is cached.
+                  Asking the browser for the camera, then loading the MediaPipe runtime and the movement
+                  model. The first run on a device transfers both — {mode === 'leg' ? '17 MB' : '19 MB'} in
+                  this mode ({mode === 'leg' ? '11.5 MB of runtime plus a 5.5 MB pose model' : '11.5 MB of runtime plus a 7.5 MB hand model'}) —
+                  and can take a minute on a clinic link; after that it is cached and this step is instant.
                 </p>
                 <div className="row">
                   <span className="badge mono" data-testid="camera-elapsed">
@@ -243,6 +299,81 @@ export default function CameraCheck() {
               .map((w, i) => (
                 <Toast key={i}>{w}</Toast>
               ))}
+          </div>
+
+          {/*
+            WHAT THIS DEVICE WILL AND WILL NOT SUPPORT — the statement this screen did not make.
+            Everywhere else in the flow either gates or says what comes next; here a therapist could
+            walk a patient forward off a stream running at 1–2 fps with nothing detected, and find out
+            at the end of the appointment. It is built from the same rolling observation the session's
+            own tracking block is built from, so the promise and the later record cannot disagree.
+          */}
+          <div
+            className="card stack"
+            style={readiness.kind === 'blocked' ? { borderColor: 'var(--bad)' } : undefined}
+            data-testid="camera-readiness"
+            data-readiness={readiness.kind}
+          >
+            <div className="row">
+              <h3 style={{ margin: 0 }}>This device</h3>
+              <div className="grow" />
+              <span
+                className={
+                  readiness.kind === 'ready'
+                    ? 'badge badge-ok'
+                    : readiness.kind === 'blocked'
+                      ? 'badge badge-bad'
+                      : readiness.kind === 'degraded'
+                        ? 'badge badge-warn'
+                        : 'badge'
+                }
+                data-testid="camera-readiness-badge"
+              >
+                {readiness.kind === 'measuring' ? 'checking' : readiness.kind}
+              </span>
+            </div>
+            <p style={{ margin: 0 }} data-testid="camera-readiness-headline">
+              {readiness.headline}
+            </p>
+            {readiness.will.length > 0 && (
+              <ul className="list-reset dim" data-testid="camera-readiness-will">
+                {readiness.will.map((line, i) => (
+                  <li key={i}>✓ {line}</li>
+                ))}
+              </ul>
+            )}
+            {readiness.wont.length > 0 && (
+              <ul className="list-reset" data-testid="camera-readiness-wont">
+                {readiness.wont.map((line, i) => (
+                  <li key={i}>✕ {line}</li>
+                ))}
+              </ul>
+            )}
+            {readiness.action && (
+              <span className="dim" data-testid="camera-readiness-action">
+                {readiness.action}
+              </span>
+            )}
+            {/* A GATE MUST NOT BE A DEAD END. The camera can be re-requested, and a keyboard run
+                still plays the song — it simply measures no range of motion, and says so. */}
+            {readiness.gate && readiness.kind === 'blocked' && (
+              <div className="row">
+                <button className="btn" onClick={() => void retry()} data-testid="camera-readiness-retry">
+                  Restart the camera
+                </button>
+                <button
+                  className="btn btn-ghost"
+                  onClick={() => {
+                    runtime.disposeVision();
+                    setInputMode('keyboard');
+                    goto('play');
+                  }}
+                  data-testid="camera-readiness-keyboard"
+                >
+                  Run on the keyboard instead (no range of motion is measured)
+                </button>
+              </div>
+            )}
           </div>
 
           <div className="card stack">

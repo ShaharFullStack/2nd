@@ -830,7 +830,11 @@ export class GameRunner {
       // AND THE PATIENT IS TOLD THE SONG IS OVER. A camera session has nothing that says "stop"
       // except the music stopping, and the reps made over the payoff are counted into this session
       // (`onInput`) — so the line that says the ending can be skipped also says they can ease off.
-      hint: 'Ease off when you\u2019re ready \u00b7 tap the screen or press any key for the report',
+      // AND THE COUNT IS STILL RUNNING, SAID UNDER THE COUNT. The receptors behind this card stay
+      // live because they are still measuring (see `draw`), and the hero figure keeps climbing; the
+      // one thing that HAS stopped is scoring, because the chart has no notes left.
+      heroNote: 'still counting \u2014 no notes left to hit',
+      hint: 'Ease off when you\u2019re ready \u2014 movements still count \u00b7 tap or press any key for the report',
     };
   }
 
@@ -949,8 +953,18 @@ export class GameRunner {
     // not scored, not recorded), so on those frames the receptor row's live gauge would be promising
     // a rep that cannot happen. The renderer is told, and blanks the row to "no reading". See
     // `RenderFrame.inputSuspended`.
-    f.inputSuspended =
-      this.phase === 'paused' || this.phase === 'idle' || this.phase === 'ended' || this.phase === 'finale';
+    //
+    // 'finale' USED TO BE IN THIS LIST, AND IT WAS THE ONE ENTRY THAT WAS NOT TRUE.
+    //
+    // The song-end sequence counts: `onInput` returns early only AFTER the engine has judged, `onRep`
+    // records every rep the input source reports, and the card's own MOVEMENTS figure is rebuilt and
+    // visibly ticks up as the patient keeps going (`refreshFinale`). So for 6.6 seconds the board
+    // told the patient "nothing you do registers" — four broken rings with pause bars — while the
+    // number in the middle of the screen counted exactly what they were doing, and the report
+    // afterwards kept it. A pause is a state in which a movement is discarded; the ending is not one,
+    // and the two must not wear the same mark. What is true of the ending — no notes are left to
+    // score, the movements still count — is said in words on the card (`FinaleSpec.heroNote`).
+    f.inputSuspended = this.phase === 'paused' || this.phase === 'idle' || this.phase === 'ended';
     this.highway.draw(f);
   }
 

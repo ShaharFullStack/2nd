@@ -12,7 +12,20 @@ import {
   previewRomNudge,
   withPatient,
 } from '../vision/calibration.ts';
-import type { CalibrationMismatch, CalibrationStatus, RomCalibration, RomNudgePreview } from '../vision/calibration.ts';
+import type {
+  CalibrationMeasurement,
+  CalibrationMismatch,
+  CalibrationStatus,
+  RomCalibration,
+  RomNudgePreview,
+} from '../vision/calibration.ts';
+import {
+  CALIBRATION_NOT_RECORDED,
+  calibrationConditions,
+  calibrationGrade,
+  calibrationSentence,
+} from '../session/tracking.ts';
+import type { TrackingGrade } from '../session/tracking.ts';
 import { FINGERTIP_NAME, MOVEMENT_INFO, movementCalibrationInstruction } from '../vision/features.ts';
 import { CameraPreview } from './CameraPreview.tsx';
 import { Meter, ProgressRing, Screen, Toast, TopBar, laneName } from './common.tsx';
@@ -29,6 +42,46 @@ interface Live {
   status: CalibrationStatus;
   value: number;
   tracking: boolean;
+  /**
+   * How well THIS attempt is being measured, as it is being measured. A therapist can move the chair,
+   * turn on a light or close a browser tab while the range is still being built; they cannot after it
+   * has been stamped onto the record as the denominator of everything that follows.
+   */
+  measurement: CalibrationMeasurement | null;
+}
+
+const GRADE_CLASS: Readonly<Record<TrackingGrade, string>> = Object.freeze({
+  good: 'badge badge-ok',
+  fair: 'badge badge-warn',
+  poor: 'badge badge-bad',
+});
+
+/**
+ * HOW WELL A RANGE WAS MEASURED, wherever a range is shown.
+ *
+ * `null` is NOT "good": a range with no measurement block was typed in by hand or captured before
+ * this device recorded one, and it says so in those words.
+ */
+function CalibrationQualityChip({
+  measurement,
+  testId,
+}: {
+  measurement: CalibrationMeasurement | null | undefined;
+  testId?: string;
+}) {
+  if (!measurement) {
+    return (
+      <span className="badge badge-warn" title={CALIBRATION_NOT_RECORDED} data-testid={testId}>
+        quality not recorded
+      </span>
+    );
+  }
+  const grade = calibrationGrade(measurement);
+  return (
+    <span className={GRADE_CLASS[grade]} title={calibrationConditions(measurement)} data-testid={testId}>
+      measured {grade}
+    </span>
+  );
 }
 
 /**
@@ -115,7 +168,12 @@ export default function RomCalibrationScreen() {
       const smoothed = pipeline?.last.smoothed ?? null;
       const provisional = cal.getProvisional();
       const value = smoothed !== null && provisional ? cal.normalize(smoothed) : 0;
-      setLive({ status: cal.getStatus(), value, tracking: pipeline?.last.tracking ?? false });
+      setLive({
+        status: cal.getStatus(),
+        value,
+        tracking: pipeline?.last.tracking ?? false,
+        measurement: cal.getMeasurement(),
+      });
     }, 80);
 
     return () => {
@@ -361,6 +419,15 @@ export default function RomCalibrationScreen() {
             <span className="dim">
               The gold line is where a hit registers at this difficulty ({Math.round(threshold * 100)}% of the calibrated range).
             </span>
+            {/* HOW WELL THIS RANGE IS BEING MEASURED, WHILE IT CAN STILL BE FIXED. The chair, the
+                light and the browser tabs are all movable now and none of them is movable once the
+                range is stamped onto the record as the denominator of every later percentage. */}
+            {status && status.phase !== 'done' && live?.measurement && (
+              <span className="dim" data-testid="rom-live-quality">
+                <CalibrationQualityChip measurement={live.measurement} testId="rom-live-quality-chip" />{' '}
+                {calibrationConditions(live.measurement)} — this is the stream the range is being built from.
+              </span>
+            )}
           </div>
 
           {status?.error === 'insufficient_range' && (
@@ -385,6 +452,23 @@ export default function RomCalibrationScreen() {
             </Toast>
           )}
 
+          {/* THE QUALITY OF THE DENOMINATOR, ON THE SCREEN THAT ACCEPTS IT. `laneDone` is the range the
+              runtime has taken for this lane — the scale every ROM figure, export and trend line for
+              this movement is a percentage of. A range from three ragged reps on an 11 fps stream and
+              one from a clean stream produce identical min→max readouts, and nothing else in the app
+              can tell them apart afterwards. */}
+          {laneDone && (
+            <div className="stack" style={{ gap: 4 }} data-testid="rom-accepted-quality">
+              <div className="row">
+                <span className="eyebrow">How this range was measured</span>
+                <CalibrationQualityChip measurement={laneDone.measurement} testId="rom-accepted-quality-chip" />
+              </div>
+              <span className="dim" data-testid="rom-accepted-quality-note">
+                {laneDone.measurement ? calibrationSentence(laneDone.measurement) : CALIBRATION_NOT_RECORDED}
+              </span>
+            </div>
+          )}
+
           {/* Any OTHER lane the runtime is refusing — including one killed by a setting changed after
               it was calibrated (flip the mirror switch and every stored range belongs to the other
               limb). Without this the therapist would have to walk back through the lanes to find it. */}
@@ -404,6 +488,26 @@ export default function RomCalibrationScreen() {
               <strong data-testid="rom-reuse-problem">Last session's range cannot be reused here:</strong>{' '}
               {previousProblem.reason}.
             </Toast>
+          )}
+
+          {/* REUSING A RANGE IS ADOPTING ITS MEASUREMENT. The checks above establish that the stored
+              range describes this patient, this limb and this quantity; none of them says how well it
+              was measured, and reusing it makes its frame rate and its rep spread the denominator of
+              today's session too. */}
+          {previous && !laneDone && !previousProblem && (
+            <div className="stack" style={{ gap: 4 }} data-testid="rom-reuse-quality">
+              <div className="row">
+                <span className="eyebrow">Last session's range</span>
+                <span className="dim mono">
+                  {formatFeature(previous.min, info.unit)} → {formatFeature(previous.max, info.unit)}
+                </span>
+                <CalibrationQualityChip measurement={previous.measurement} testId="rom-reuse-quality-chip" />
+              </div>
+              <span className="dim" data-testid="rom-reuse-quality-note">
+                {previous.measurement ? calibrationSentence(previous.measurement) : CALIBRATION_NOT_RECORDED} Reusing it
+                makes it today&rsquo;s denominator too.
+              </span>
+            </div>
           )}
 
           {persistenceFailed && (
@@ -497,6 +601,9 @@ export default function RomCalibrationScreen() {
                       {formatFeature(cal.max, MOVEMENT_INFO[l.movement].unit)}
                     </span>
                   )}
+                  {/* Every lane's denominator, graded, in the one list that shows them all: a session
+                      whose four ranges were measured differently is not four comparable lanes. */}
+                  {cal && <CalibrationQualityChip measurement={cal.measurement} testId={`rom-lane-quality-${i}`} />}
                 </li>
               );
             })}

@@ -4799,6 +4799,46 @@ describe('the song-end sequence', () => {
   });
 
   /**
+   * THE HERO FIGURE KEEPS CLIMBING, SO THE CARD SAYS WHAT IS STILL HAPPENING TO IT.
+   *
+   * The ending counts the movements made over it and the board behind the card stays live, so the
+   * one thing the patient needs told is which half has stopped: the notes, not the movements. It is
+   * the caller's sentence (the renderer invents no words), drawn under the hero's own label so it is
+   * read with the number it is about, and the panel grows to hold it rather than overlapping the row
+   * beneath.
+   */
+  it('draws the hero note under the hero label, inside the panel', () => {
+    for (const [w, h] of [[1024, 768], [1280, 800]] as const) {
+      const { hw, scratch } = setup(w, h);
+      hw.resize(w, h, 1);
+      const note = 'still counting — no notes left to hit';
+      const hint = 'Ease off when you\u2019re ready \u2014 movements still count \u00b7 tap or press any key for the report';
+      hw.startFinale({ ...SPEC, heroNote: note, hint });
+      run(hw, FINALE_SEC * 0.9, makeFrame({ lanes: LANES, songTime: 10, thresholdFraction: 0.5 }));
+      const drawn = scratch
+        .flatMap((c) => c.ctx.calls.filter((k) => k.name === 'fillText').map((k) => String(k.args[0])));
+      expect(drawn.some((t) => t.includes('still counting')), `${w}x${h}`).toBe(true);
+      // Whole, not ellipsised: it is a statement, and half of it is a different statement.
+      expect(drawn.some((t) => t === note), `${w}x${h} unclipped`).toBe(true);
+      // ...and the label it belongs to is still there, under the figure.
+      expect(drawn.some((t) => t.includes('MOVEMENTS')), `${w}x${h} label`).toBe(true);
+      // The hint makes the same statement in a whole sentence, and it has to survive the fit too:
+      // "movements still cou…" is the promise this card exists to stop making.
+      expect(drawn.some((t) => t === hint), `${w}x${h} hint unclipped`).toBe(true);
+    }
+  });
+
+  it('leaves the card exactly as it was when there is no hero note to draw', () => {
+    const { hw, scratch } = setup(1280, 800);
+    hw.resize(1280, 800, 1);
+    hw.startFinale(SPEC);
+    run(hw, FINALE_SEC * 0.6, makeFrame({ lanes: LANES, songTime: 10, thresholdFraction: 0.5 }));
+    expect(wrote(scratch, 'SONG COMPLETE')).toBe(true);
+    const drawn = scratch.flatMap((c) => c.ctx.calls.filter((k) => k.name === 'fillText').map((k) => String(k.args[0])));
+    expect(drawn.some((t) => t.includes('still counting'))).toBe(false);
+  });
+
+  /**
    * AND IT IS LEGIBLE FROM TWO METRES. At `px(14, 11)` on a 1024 canvas the qualifier rendered at
    * 11 px in 55 %-alpha grey — the smallest and faintest text on a card written to be read across a
    * treatment room by a patient who may have low vision.

@@ -1,5 +1,6 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_SETTINGS, MAX_HISTORY, calibrationKey, defaultLanes, normalizeLanes, useStore } from './store.ts';
+import { storageKey } from './persist.ts';
 import type { SessionResult } from '../session/types.ts';
 import type { RomCalibration } from '../vision/calibration.ts';
 
@@ -149,5 +150,118 @@ describe('store', () => {
     expect(config.lanes).toHaveLength(2);
     expect(config.difficulty).toBe('medium');
     expect(config.songId).toBeTruthy();
+  });
+});
+
+
+/**
+ * THE WRITE PATH REPORTS WHAT ACTUALLY HAPPENED.
+ *
+ * The Results screen printed a green "Saved to history" badge unconditionally. Refuse the write —
+ * which a shared clinic tablet really does, the retention cap being 100 sessions PER PATIENT — and
+ * the badge still read saved over a record that existed nowhere but in memory. The verdict was
+ * always there (`writeJson` returns it); it just never left the store.
+ */
+describe('recording a session reports whether it reached the disk', () => {
+  const refuse = (): void => {
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+      throw new DOMException('quota', 'QuotaExceededError');
+    });
+  };
+
+  beforeEach(() => {
+    localStorage.clear();
+    useStore.setState({
+      history: [],
+      lastResult: null,
+      lastSave: null,
+      persistenceFailed: false,
+      patients: [{ id: 'p-test', name: 'Test Patient', createdAt: 1, lastUsedAt: 1 }],
+      activePatientId: 'p-test',
+    });
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  it('says the session was saved when the write landed, against that session’s own id', () => {
+    useStore.getState().addResult(fakeResult('saved-1'));
+    const save = useStore.getState().lastSave;
+    expect(save).toEqual({ id: 'saved-1', ok: true, at: expect.any(Number), attempts: 1 });
+    expect(JSON.parse(localStorage.getItem('beatRehab:history') as string)).toHaveLength(1);
+  });
+
+  it('says the session was NOT saved when the quota refuses it', () => {
+    refuse();
+    useStore.getState().addResult(fakeResult('lost-1'));
+    expect(useStore.getState().lastSave).toMatchObject({ id: 'lost-1', ok: false, attempts: 1 });
+    // The record is still in memory — the Results screen is holding the only copy, which is exactly
+    // why it must say so rather than send the therapist away.
+    expect(useStore.getState().history.map((r) => r.id)).toEqual(['lost-1']);
+    expect(useStore.getState().persistenceFailed).toBe(true);
+  });
+
+  it('retries on demand and reports the second verdict, not the first', () => {
+    refuse();
+    useStore.getState().addResult(fakeResult('lost-2'));
+    expect(useStore.getState().lastSave?.ok).toBe(false);
+
+    // The therapist frees space (or the quota was transient) and taps "Try saving again".
+    vi.restoreAllMocks();
+    expect(useStore.getState().retrySaveLastResult()).toBe(true);
+    expect(useStore.getState().lastSave).toMatchObject({ id: 'lost-2', ok: true, attempts: 2 });
+    expect(JSON.parse(localStorage.getItem('beatRehab:history') as string).map((r: SessionResult) => r.id)).toEqual([
+      'lost-2',
+    ]);
+  });
+
+  it('a retry with nothing to save is a no-op, not a false claim', () => {
+    useStore.setState({ lastResult: null, lastSave: null });
+    expect(useStore.getState().retrySaveLastResult()).toBe(false);
+    expect(useStore.getState().lastSave).toBeNull();
+  });
+
+  it('keeps the verdict stamped with the session it is about', () => {
+    useStore.getState().addResult(fakeResult('first'));
+    refuse();
+    useStore.getState().addResult(fakeResult('second'));
+    // Not "the last write failed" in the abstract: the failure belongs to `second`, and the screen
+    // showing `second` is the one that may not claim a save.
+    expect(useStore.getState().lastSave?.id).toBe('second');
+    expect(useStore.getState().lastSave?.ok).toBe(false);
+  });
+});
+
+/**
+ * A STORED CALIBRATION IS DATA, NOT A SHAPE — the optional sub-fields especially. A range written by
+ * an older build reaches the screens that read it, and `rest.durationSec.toFixed(1)` on a rest block
+ * that predates `durationSec` threw inside the render of the screen that was trying to warn about
+ * that very range. The store no longer casts what it read; it carries only the fields it can vouch
+ * for, and "absent" is a state every reader already handles.
+ */
+describe('ranges reloaded from disk are sanitised, not cast', () => {
+  beforeEach(() => localStorage.clear());
+
+  const adopt = (map: unknown): void => {
+    localStorage.setItem(storageKey('calibrations'), JSON.stringify(map));
+    // The same path a second tab's write takes into this one.
+    window.dispatchEvent(new StorageEvent('storage', { key: storageKey('calibrations'), storageArea: localStorage }));
+  };
+
+  it('drops a rest block that is missing the numbers its readers dereference', () => {
+    adopt({ 'p-test': { 'seated_march:left': { min: 0.1, max: 0.5, samples: 90, rest: { still: false, spread: 0.09 } } } });
+    const cal = useStore.getState().calibrationsByPatient['p-test']['seated_march:left'];
+    expect(cal.min).toBe(0.1);
+    expect(cal.max).toBe(0.5);
+    expect(cal.rest).toBeUndefined();
+  });
+
+  it('keeps a rest block that carries all five numbers', () => {
+    const rest = { still: true, spread: 0.01, drift: 0.002, durationSec: 2.4, samples: 72 };
+    adopt({ 'p-test': { 'seated_march:left': { min: 0.1, max: 0.5, samples: 90, rest } } });
+    expect(useStore.getState().calibrationsByPatient['p-test']['seated_march:left'].rest).toEqual(rest);
+  });
+
+  it('drops a posture this build does not have, rather than indexing on it', () => {
+    adopt({ 'p-test': { 'seated_march:left': { min: 0.1, max: 0.5, samples: 90, posture: 'lying_prone' } } });
+    expect(useStore.getState().calibrationsByPatient['p-test']['seated_march:left'].posture).toBeUndefined();
   });
 });

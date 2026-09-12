@@ -11,6 +11,7 @@ import { DIFFICULTIES, clampWindowScale } from '../engine/difficulty.ts';
 import type { DifficultyName, Fingertip, LaneSpec, Mode, Movement, Side } from '../engine/types.ts';
 import { FINGERTIPS, HAND_MOVEMENTS, LEG_MOVEMENTS } from '../engine/types.ts';
 import type { RomCalibration } from '../vision/calibration.ts';
+import { POSTURE_INFO } from '../vision/features.ts';
 import { LATENCY_MAX_MS, LATENCY_MIN_MS, clampLatencyMs } from '../session/latencyAdvice.ts';
 import { clinicalLaneName } from '../session/results.ts';
 import type { InputMode, Patient, SessionConfig, SessionResult } from '../session/types.ts';
@@ -333,16 +334,81 @@ function validateCalibrationMap(raw: unknown): Record<string, RomCalibration> {
       console.warn(`[store] dropping saved calibration "${k}": it was measured on the ${c.fingertip} finger, not the ${tip} finger. Re-calibrate that lane.`);
       continue;
     }
-    out[k] = c as RomCalibration;
+    // EVERY OPTIONAL SUB-FIELD OF A STORED RANGE IS UNTRUSTED. This map comes off `localStorage` —
+    // written by an older build, hand-edited, or half-migrated — and it used to be cast to
+    // `RomCalibration` whole on the strength of two finite numbers. A `rest` block missing
+    // `durationSec`, or a `posture` naming a posture this build does not have, then reached the
+    // screens that read them and threw on the dereference. A field that cannot be trusted is simply
+    // not carried: absent is a state every reader already handles.
+    out[k] = sanitizeCalibration(c);
   }
   return out;
 }
+
+/**
+ * Drop the optional sub-fields of a stored range that are not the shape this build expects.
+ *
+ * `min`/`max` are checked by the caller; everything else here is optional by design (a legacy or
+ * hand-built calibration simply lacks it), so a malformed one is dropped rather than repaired — a
+ * guessed rest duration or a substituted posture would be a number this app invented.
+ */
+function sanitizeCalibration(c: Partial<RomCalibration>): RomCalibration {
+  const out = { ...c } as RomCalibration;
+  const rest = c.rest;
+  if (rest === undefined || rest === null) {
+    delete (out as { rest?: unknown }).rest;
+  } else if (
+    typeof rest !== 'object' ||
+    typeof (rest as RestQualityLike).still !== 'boolean' ||
+    !Number.isFinite((rest as RestQualityLike).spread) ||
+    !Number.isFinite((rest as RestQualityLike).drift) ||
+    !Number.isFinite((rest as RestQualityLike).durationSec) ||
+    !Number.isFinite((rest as RestQualityLike).samples)
+  ) {
+    console.warn('[store] a saved calibration carries an unreadable rest block; dropping it (the range itself is kept).');
+    delete (out as { rest?: unknown }).rest;
+  }
+  if (c.posture !== undefined && !(c.posture in POSTURE_INFO)) {
+    console.warn(`[store] a saved calibration names an unknown posture "${String(c.posture)}"; dropping the field.`);
+    delete (out as { posture?: unknown }).posture;
+  }
+  if (c.peaks !== undefined && !Array.isArray(c.peaks)) delete (out as { peaks?: unknown }).peaks;
+  if (c.capturedAt !== undefined && !Number.isFinite(c.capturedAt)) delete (out as { capturedAt?: unknown }).capturedAt;
+  return out;
+}
+
+/** The five numbers a stored rest block has to carry before anything may read it. */
+type RestQualityLike = { still: unknown; spread: unknown; drift: unknown; durationSec: unknown; samples: unknown };
 
 /** The same filing check, applied inside each patient's own store of ranges. */
 function validateCalibrationsByPatient(raw: CalibrationsByPatient): CalibrationsByPatient {
   const out: CalibrationsByPatient = {};
   for (const [patientId, map] of Object.entries(raw)) out[patientId] = validateCalibrationMap(map);
   return out;
+}
+
+/**
+ * WHAT ACTUALLY HAPPENED TO THE RECORD OF A FINISHED SESSION.
+ *
+ * The Results screen printed a green "Saved to history" badge unconditionally — a constant string in
+ * the markup, drawn whether or not `localStorage` had taken the write. On a shared clinic tablet the
+ * quota really does run out (the retention cap is 100 sessions PER PATIENT, so several patients on one
+ * device is several hundred records plus the ranges), and private-mode or blocked site data refuses
+ * every write outright. A therapist who walks away believing a record exists when it does not is the
+ * worst failure this app has, and it was one boolean away from being sayable: `writeJson` has always
+ * returned whether the write landed.
+ *
+ * So the write path now reports its verdict, and the screen that makes the claim reads it.
+ */
+export interface SaveOutcome {
+  /** The session this verdict is about — so a stale verdict can never be shown beside a new record. */
+  id: string;
+  /** True when the session really reached `localStorage`. */
+  ok: boolean;
+  /** Epoch ms of the attempt. */
+  at: number;
+  /** How many attempts have been made, including the automatic one. A retry bumps it. */
+  attempts: number;
 }
 
 /** What `applySuggestedLatency` did: the offset before, the offset after, both in milliseconds. */
@@ -434,6 +500,11 @@ export interface AppState {
   settings: Settings;
   history: SessionResult[];
   lastResult: SessionResult | null;
+  /**
+   * Whether `lastResult` actually reached the disk, and how many tries it took. Null before any
+   * session has been recorded in this tab. See `SaveOutcome`.
+   */
+  lastSave: SaveOutcome | null;
   persistenceFailed: boolean;
 
   goto: (screen: Screen) => void;
@@ -479,6 +550,12 @@ export interface AppState {
   applySuggestedLatency: (suggestedMs: number, source?: string) => LatencyChange | null;
   updateSettings: (patch: Partial<Settings>) => void;
   addResult: (r: SessionResult) => void;
+  /**
+   * Try to write the session on the Results screen to disk again, after the therapist has freed some
+   * space (or after nothing at all — a quota refusal can be transient). Returns whether it landed and
+   * updates `lastSave` either way, so the badge is never a guess.
+   */
+  retrySaveLastResult: () => boolean;
   /** Delete ONE stored session (the therapist's undo for a run that was not a session). */
   deleteResult: (id: string) => void;
   /**
@@ -672,10 +749,13 @@ export const useStore = create<AppState>((set, get) => {
    *
    * Safe to call from anywhere `set` is legal — never from inside a `set` updater.
    */
-  const persistHistory = (h: SessionResult[]): void => {
+  const persistHistory = (h: SessionResult[]): boolean => {
     const { ok, merged, changed } = historySync.write(h);
     if (!ok) set({ persistenceFailed: true });
     if (changed) set({ history: merged });
+    // RETURNED, not only flagged. `persistenceFailed` is a device-wide sticky warning; the Results
+    // screen needs the verdict on THIS write, beside the badge that claims it.
+    return ok;
   };
   // Calibrations are persisted through the same failure-reporting path as settings and history: on a
   // shared clinic tablet the quota is small, and a write that silently fails loses every range the
@@ -747,6 +827,7 @@ export const useStore = create<AppState>((set, get) => {
     settings: persistedSettings,
     history: persistedHistory,
     lastResult: null,
+    lastSave: null,
     persistenceFailed: false,
 
     acknowledgeActivePatient: () =>
@@ -1060,12 +1141,27 @@ export const useStore = create<AppState>((set, get) => {
         ? { ...s.historyDropped, [r.patientId]: (s.historyDropped[r.patientId] ?? 0) + drop.size }
         : s.historyDropped;
       set({ history, lastResult: r, historyDropped: drop.size > 0 ? persistDropped(historyDropped) : historyDropped });
-      persistHistory(history);
+      // THE BADGE ON THE NEXT SCREEN IS THIS BOOLEAN. Set before the patient list is touched below,
+      // so a failure to write the patient's `lastUsedAt` (cosmetic) can never be mistaken for a
+      // failure to write the session (the record itself).
+      const saved = persistHistory(history);
+      set({ lastSave: { id: r.id, ok: saved, at: Date.now(), attempts: 1 } });
       // Recording a session is what makes a patient "recent" — the picker orders on it. Read the
       // list back out of the store: the unassigned fallback above may have just added to it.
       const after = get();
       const patients = after.patients.map((p) => (p.id === r.patientId ? { ...p, lastUsedAt: Date.now() } : p));
       set({ patients: persistPatients(patients) });
+    },
+
+    retrySaveLastResult: () => {
+      const s = get();
+      const last = s.lastResult;
+      if (!last) return false;
+      // Written from the store's own history, not from the record alone: the list is what is on disk,
+      // and a session dropped from it by a retention trim must not be re-appended by a retry.
+      const ok = persistHistory(s.history.some((r) => r.id === last.id) ? s.history : [last, ...s.history]);
+      set({ lastSave: { id: last.id, ok, at: Date.now(), attempts: (s.lastSave?.attempts ?? 0) + 1 } });
+      return ok;
     },
 
     deleteResult: (id) => {

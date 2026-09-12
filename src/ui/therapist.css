@@ -240,3 +240,22 @@
   padding-left: 12px;
   max-width: 82ch;
 }
+
+/* ---------- a visit, as a band of rows (History) ---------- */
+
+/*
+ * SEVERAL SONGS IN ONE VISIT ARE NOT SEVERAL VISITS.
+ *
+ * A 97 s song does not fill a 40-minute slot and the Results screen ends with "Play again", so one
+ * appointment lands three or four rows in the session table. The grouping is what makes those rows
+ * readable as one visit, so it has to LOOK like a band and not like another session: a tinted row
+ * with a rule above it, the date in full, and no hover highlight (it is a heading, not a record).
+ */
+.table tr.visit-row td {
+  background: rgba(143, 180, 255, 0.07);
+  border-top: 2px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  padding: 10px 12px;
+  white-space: normal;
+}
+.table tr.visit-row:hover td { background: rgba(143, 180, 255, 0.07); }

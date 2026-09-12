@@ -45,6 +45,57 @@ export interface RestQuality {
   samples: number;
 }
 
+/**
+ * HOW WELL THE CALIBRATION ITSELF WAS MEASURED.
+ *
+ * `min` and `max` are the DENOMINATOR of every ROM figure this app prints, exports and trends: a rep
+ * is reported as a percentage of (max − min), the trend's absolute plot reconstructs degrees from it,
+ * and the therapist's Easier/Harder buttons step by a fraction of it. Session tracking quality
+ * (`session/tracking.ts`) records how well the PLAY was measured — and said nothing at all about the
+ * scale the play was measured against. A range built from three ragged reps on an 11 fps stream that
+ * lost the knee for a third of the hold is not the same denominator as one built from a clean stream,
+ * and until this existed nothing in the record could tell them apart: both stored two numbers and a
+ * `capturedAt`, and every percentage downstream inherited the difference silently.
+ *
+ * WHAT IS CLAIMED, AND WHAT IS NOT. Exactly the three things the calibrator can observe:
+ *  - THE FRAME RATE it was measured at. `max` is the 90th percentile of PEAKS, and a peak between two
+ *    frames is never seen, so a low frame rate biases the top of the range DOWNWARD — the range comes
+ *    out too small and every later rep reads as a larger percentage of it than it was.
+ *  - LANDMARK AVAILABILITY. Frames whose landmarks were unusable are not "no movement", they are
+ *    "not measured"; a hold that was only visible for half its frames produced a zero from half a
+ *    window.
+ *  - THE SPREAD OF THE REPS the top was taken from. Three reps within a few percent of each other are
+ *    a range; three reps spanning half of it are an estimate, and the therapist is the only one who
+ *    can decide which.
+ * No landmark-error estimate is invented, and nothing here is graded in this file: the same module
+ * that grades a session's tracking grades this (`calibrationGrade` in session/tracking.ts), so one
+ * rule decides what "good" means about a camera measurement anywhere in the app.
+ */
+export interface CalibrationMeasurement {
+  /** Frames offered to the calibrator, INCLUDING the ones whose landmarks were unusable. */
+  frames: number;
+  /** Frames whose feature was usable — the samples `min` and `max` were actually computed from. */
+  tracked: number;
+  /** `tracked / frames` (0..1). Below 1 means part of the hold or the reps was not measured at all. */
+  trackedFraction: number;
+  /** Median frames per second at which frames arrived. 0 when fewer than two frames were offered. */
+  fpsMedian: number;
+  /** Tenth-percentile frame rate over the same frames — what the slowest stretch looked like. */
+  fpsLow: number;
+  /** First frame to last frame, in seconds. */
+  durationSec: number;
+  /** Rep peaks the top of the range was taken from. */
+  reps: number;
+  /** Largest detected peak minus smallest (feature units). 0 with fewer than two peaks. */
+  repSpread: number;
+  /**
+   * `repSpread` as a fraction of the calibrated range (max − min): how much of the scale the reps it
+   * was built from disagreed by. Self-contained on purpose — this block is read in an export with no
+   * app around it, and a bare feature-unit spread means nothing without the movement's units beside it.
+   */
+  repSpreadFraction: number;
+}
+
 export interface RomCalibration {
   /** Feature value at rest. */
   min: number;
@@ -61,6 +112,13 @@ export interface RomCalibration {
   manual?: boolean;
   /** Quality of the rest window `min` came from (absent for a hand-built / legacy calibration). */
   rest?: RestQuality | null;
+  /**
+   * How well the calibration MEASUREMENT itself went — the frame rate, the landmark availability and
+   * the rep spread behind this range (see CalibrationMeasurement). Absent means NOT RECORDED (a range
+   * typed in by hand from any phase, or one stored before this existed) and must never be rendered as
+   * a clean measurement.
+   */
+  measurement?: CalibrationMeasurement | null;
   /** Date.now() when the calibration was captured — provenance, so a stale one can be spotted. */
   capturedAt?: number;
   /**
@@ -459,7 +517,24 @@ export function applyRomNudge(
 ): { calibration: RomCalibration; preview: RomNudgePreview } {
   const preview = previewRomNudge(cal, movement, fraction);
   if (preview.disabled) return { calibration: cal, preview };
-  return { calibration: { ...cal, max: preview.nextMax, manual: true }, preview };
+  const next: RomCalibration = { ...cal, max: preview.nextMax, manual: true };
+  // `repSpreadFraction` is the rep spread AS A FRACTION OF THE RANGE, and this button just moved the
+  // range. Carrying the old fraction over would quote a disagreement against a scale that no longer
+  // exists — the exact class of bug the block was added to prevent.
+  if (cal.measurement) next.measurement = measurementForRange(cal.measurement, next.min, next.max);
+  return { calibration: next, preview };
+}
+
+/**
+ * The same measurement block, with `repSpreadFraction` re-expressed against a different range.
+ *
+ * The frames, the frame rate and the rep spread in feature units are FACTS ABOUT THE MEASUREMENT and
+ * do not change when a therapist moves the top of the range; the fraction of the range those reps
+ * disagreed by does, because the range is its denominator.
+ */
+export function measurementForRange(m: CalibrationMeasurement, min: number, max: number): CalibrationMeasurement {
+  const span = max - min;
+  return { ...m, repSpreadFraction: span > 1e-9 ? m.repSpread / span : 0 };
 }
 
 /** A feature value in the movement's own units, for a therapist to read. */
@@ -724,6 +799,7 @@ export function calibrationWarnings(cal: CalibrationRange | null | undefined, mo
   if (!cal) return [];
   const info = MOVEMENT_INFO[movement];
   const out: string[] = [];
+  if (!info) return out;
   // A finger_opposition range with no fingertip recorded is only worth mentioning when the lane is NOT
   // playing the default: the older calibrations that lack the field were all measured on the index.
   if (movement === 'finger_opposition' && cal.fingertip === undefined && (ctx?.fingertip ?? DEFAULT_FINGERTIP) !== DEFAULT_FINGERTIP) {
@@ -742,12 +818,28 @@ export function calibrationWarnings(cal: CalibrationRange | null | undefined, mo
     out.push('This range does not record which patient it was measured on. If it was measured on someone else it describes their range, not this patient\u2019s — re-run the calibration.');
   }
   const fmt = (v: number) => (info.unit === 'deg' ? `${Math.abs(v).toFixed(1)}°` : `${(Math.abs(v) * 100).toFixed(1)}%`);
+  /**
+   * A STORED CALIBRATION IS DATA, NOT A SHAPE. `cal` arrives from `localStorage` — written by an
+   * older build, hand-edited, or half-migrated — so every optional sub-field is `unknown` in
+   * practice however it is typed. This function used to read `rest.durationSec.toFixed(1)` and
+   * `POSTURE_INFO[cal.posture ?? info.posture].label` straight off it, and a legacy range with a
+   * rest block that predates `durationSec` (or a posture this build no longer has) threw inside the
+   * render of the screen that was trying to WARN about that very range.
+   *
+   * Nothing is guessed to fill a gap: a figure that is not there is left out of the sentence, and
+   * the warning — which is about the range, not about the figure — is still given.
+   */
+  const num = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null);
   const rest = cal.rest;
-  if (rest && !rest.still) {
-    out.push(`The resting position was never steady while the zero was measured (it moved by ${fmt(rest.spread)} over ${rest.durationSec.toFixed(1)}s), so 0% may sit inside the movement. Re-do the rest hold.`);
+  if (rest && rest.still !== true) {
+    const spread = num(rest.spread);
+    const secs = num(rest.durationSec);
+    const how = spread === null ? '' : ` (it moved by ${fmt(spread)}${secs === null ? '' : ` over ${secs.toFixed(1)}s`})`;
+    out.push(`The resting position was never steady while the zero was measured${how}, so 0% may sit inside the movement. Re-do the rest hold.`);
   }
-  if (rest && rest.still && Math.abs(rest.drift) > info.minRom * 0.2) {
-    out.push(`The resting position drifted by ${fmt(rest.drift)} during the hold; the zero may be off by about that much.`);
+  const drift = rest && rest.still === true ? num(rest.drift) : null;
+  if (drift !== null && Math.abs(drift) > info.minRom * 0.2) {
+    out.push(`The resting position drifted by ${fmt(drift)} during the hold; the zero may be off by about that much.`);
   }
   if (cal.manual) out.push('The range was set by hand rather than measured, so it has not been checked against the patient\'s movement.');
   if (typeof cal.capturedAt === 'number' && Number.isFinite(cal.capturedAt)) {
@@ -755,10 +847,19 @@ export function calibrationWarnings(cal: CalibrationRange | null | undefined, mo
     if (ageMs > CALIBRATION_STALE_MS) {
       const hours = ageMs / 3600000;
       const age = hours >= 48 ? `${Math.round(hours / 24)} days` : `${Math.round(hours)} hours`;
-      out.push(`This range was measured ${age} ago (${POSTURE_INFO[cal.posture ?? info.posture].label.toLowerCase()}). If the camera or the chair has moved since, re-run the calibration.`);
+      // The stored posture may name one this build does not have; fall back to the movement's own,
+      // and if even that is missing say nothing about posture rather than crash the warning.
+      const posture = (cal.posture && POSTURE_INFO[cal.posture]) || POSTURE_INFO[info.posture];
+      const where = posture ? ` (${posture.label.toLowerCase()})` : '';
+      out.push(`This range was measured ${age} ago${where}. If the camera or the chair has moved since, re-run the calibration.`);
     }
   }
   return out;
+}
+
+/** One decimal place, so a stored measurement block does not carry sixteen digits of float noise. */
+function round1(v: number): number {
+  return Number.isFinite(v) ? Math.round(v * 10) / 10 : 0;
 }
 
 export class RomCalibrator {
@@ -795,6 +896,21 @@ export class RomCalibrator {
   private restEnd = NaN;
   private restTotal = 0;
   private restStill = false;
+  /**
+   * EVERY FRAME OFFERED TO THIS CALIBRATOR, including the ones with no usable landmarks.
+   *
+   * `push` ignores a null feature, which is right for the statistics and wrong for the record: a hold
+   * that was only visible for half its frames used to produce a calibration indistinguishable from one
+   * measured on a clean stream. Counted here (with the intervals between frames, which is the frame
+   * rate the peaks were sampled at) so the range can carry how well it was measured.
+   */
+  private frames = 0;
+  private trackedFrames = 0;
+  private frameFirst = NaN;
+  private frameLast = NaN;
+  /** Gaps between consecutive frames, seconds. Non-positive gaps (a repeated or out-of-order
+      timestamp) are dropped; a long gap is kept, because a stalled stream is the thing being measured. */
+  private frameGaps: number[] = [];
   /** The rest window that actually produced `min`, captured when the rest phase ended. */
   private restAtAdvance: RestQuality | null = null;
   private moveStart = NaN;
@@ -871,6 +987,9 @@ export class RomCalibrator {
    * (tracking lost) are ignored. `comp` = this frame's raw compensation quantities (rest phase only).
    */
   push(feature: number | null, tSec: number, comp?: CompensationSample | null): CalibrationPhase {
+    // Frames that arrive after the range is settled describe nothing about how it was measured.
+    if (this.phase === 'done') return this.phase;
+    this.countFrame(feature, tSec);
     if (feature === null || !Number.isFinite(feature)) return this.phase;
     if (this.phase === 'rest') {
       if (Number.isNaN(this.restStart)) this.restStart = tSec;
@@ -916,6 +1035,53 @@ export class RomCalibrator {
       }
     }
     return this.phase;
+  }
+
+  /** One frame's worth of provenance: was it usable, and how long since the last one. */
+  private countFrame(feature: number | null, tSec: number): void {
+    if (!Number.isFinite(tSec)) return;
+    this.frames++;
+    if (feature !== null && Number.isFinite(feature)) this.trackedFrames++;
+    if (Number.isNaN(this.frameFirst)) this.frameFirst = tSec;
+    else {
+      const gap = tSec - this.frameLast;
+      if (gap > 0) this.frameGaps.push(gap);
+    }
+    this.frameLast = tSec;
+  }
+
+  /**
+   * How well this calibration is being (or was) measured, for the screen that accepts it and for the
+   * range it stamps. Null before any frame has been offered — which is what a hand-typed range has,
+   * and is never the same thing as a clean measurement.
+   *
+   * `min`/`max` are passed in rather than read off the calibrator so `repSpreadFraction` always
+   * describes the range the block is stamped onto: a therapist nudge moves the top after the reps were
+   * measured, and a spread quoted against the pre-nudge range would describe a scale nobody has.
+   */
+  getMeasurement(min?: number | null, max?: number | null): CalibrationMeasurement | null {
+    if (this.frames === 0) return null;
+    const gaps = this.frameGaps;
+    const medianGap = gaps.length > 0 ? median(gaps) : NaN;
+    // The SLOW tail is what a low frame rate feels like, so the 90th-percentile GAP is the 10th-
+    // percentile frame rate. Inverting the median of the rates instead would hide exactly the stalls
+    // that lose a peak.
+    const slowGap = gaps.length > 0 ? percentile(gaps, 0.9) : NaN;
+    const lo = min ?? this.min;
+    const hi = max ?? this.max;
+    const span = lo !== null && lo !== undefined && hi !== null && hi !== undefined ? hi - lo : NaN;
+    const spread = this.peaks.length >= 2 ? Math.max(...this.peaks) - Math.min(...this.peaks) : 0;
+    return {
+      frames: this.frames,
+      tracked: this.trackedFrames,
+      trackedFraction: this.trackedFrames / this.frames,
+      fpsMedian: medianGap > 0 ? round1(1 / medianGap) : 0,
+      fpsLow: slowGap > 0 ? round1(1 / slowGap) : 0,
+      durationSec: Number.isFinite(this.frameLast - this.frameFirst) ? round1(this.frameLast - this.frameFirst) : 0,
+      reps: this.peaks.length,
+      repSpread: spread,
+      repSpreadFraction: span > 1e-9 ? spread / span : 0,
+    };
   }
 
   private computeStillness(): boolean {
@@ -1067,6 +1233,11 @@ export class RomCalibrator {
     this.restTotal = 0;
     this.restStill = false;
     this.restAtAdvance = null;
+    this.frames = 0;
+    this.trackedFrames = 0;
+    this.frameFirst = NaN;
+    this.frameLast = NaN;
+    this.frameGaps = [];
     this.moveStart = NaN;
     this.moveSamples = 0;
     this.moveMax = -Infinity;
@@ -1197,6 +1368,8 @@ export class RomCalibrator {
       compensationBaseline: this.baseline,
       manual: this.manualAdjusted,
       rest: this.restAtAdvance,
+      // Against the range actually being stamped, not the one the reps happened to produce.
+      measurement: this.getMeasurement(min, max),
       capturedAt: this.nowMs(),
       posture: MOVEMENT_INFO[this.movement].posture,
     };

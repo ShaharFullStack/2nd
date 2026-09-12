@@ -81,12 +81,75 @@ describe('the session table leads with what the patient did', () => {
 
   it('states the rep count and the pacing it was asked for in the same cell', () => {
     render(<HistoryScreen />);
-    const row = screen.getByTestId('history-table').querySelector('tbody tr');
+    const row = screen.getByTestId('history-table').querySelector('tbody tr:not(.visit-row)');
     const cells = Array.from(row!.querySelectorAll('td')).map((c) => c.textContent ?? '');
     expect(cells[2]).toContain('141');
     expect(cells[2]).toContain('1.2 s pacing');
     expect(cells[3]).toContain('Left Seated march');
     expect(cells[3]).toContain('41 reps');
+  });
+
+  /**
+   * SEVERAL SONGS IN ONE VISIT ARE NOT SEVERAL VISITS.
+   *
+   * A 97 s song cannot fill a 40-minute slot and the Results screen ends with "Play again", so one
+   * appointment routinely lands three or four rows in this table. Read flat they are three or four
+   * appointments — a claim about attendance the record does not contain.
+   */
+  describe('a visit is one band of rows, not one row', () => {
+    const HOUR = 3_600_000;
+    /** Three runs inside one 40-minute slot, and one the following week. */
+    const twoVisits = (): SessionResult[] => [
+      session({ id: 'w2c', startedAt: 1_700_000_000_000 + 30 * 60_000, endedAt: 1_700_000_000_000 + 32 * 60_000, reps: 120 }),
+      session({ id: 'w2b', startedAt: 1_700_000_000_000 + 15 * 60_000, endedAt: 1_700_000_000_000 + 17 * 60_000, reps: 130 }),
+      session({ id: 'w2a', startedAt: 1_700_000_000_000, endedAt: 1_700_000_000_000 + 2 * 60_000, reps: 141 }),
+      session({ id: 'w1', startedAt: 1_700_000_000_000 - 7 * 24 * HOUR, endedAt: 1_700_000_000_000 - 7 * 24 * HOUR + 120_000, reps: 90 }),
+    ];
+
+    it('groups the runs of one appointment under one header and totals them', () => {
+      useStore.setState({ history: twoVisits() });
+      render(<HistoryScreen />);
+      const headers = Array.from(screen.getByTestId('history-table').querySelectorAll('tr.visit-row'));
+      expect(headers).toHaveLength(2);
+      // Newest visit first, with everything the therapist needs to tell one appointment from three.
+      expect(headers[0].textContent).toContain('3 songs');
+      expect(headers[0].textContent).toContain('391 movements'); // 120 + 130 + 141
+      expect(headers[1].textContent).toContain('1 song');
+      expect(headers[1].textContent).toContain('90 movements');
+      // The runs themselves are all still there, in their own rows.
+      expect(screen.getByTestId('history-table').querySelectorAll('tbody tr:not(.visit-row)')).toHaveLength(4);
+    });
+
+    it('says the grouping was inferred from the clock, because the app is never told otherwise', () => {
+      useStore.setState({ history: twoVisits() });
+      render(<HistoryScreen />);
+      expect(screen.getByTestId('history-visit-legend').textContent).toMatch(/inferred/i);
+      expect(screen.getByTestId('history-visit-legend').textContent).toMatch(/45 minutes/);
+    });
+
+    it('counts runs and visits separately in the header, so neither can stand in for the other', () => {
+      useStore.setState({ history: twoVisits() });
+      render(<HistoryScreen />);
+      expect(screen.getByTestId('history-screen').textContent).toContain('4 runs in 2 visits');
+    });
+
+    it('keeps the header spanning the table when the scoring columns are shown', () => {
+      useStore.setState({ history: twoVisits() });
+      render(<HistoryScreen />);
+      const span = () =>
+        Number(screen.getByTestId('history-table').querySelector('tr.visit-row td')?.getAttribute('colspan'));
+      const headCount = () => screen.getByTestId('history-table').querySelectorAll('thead th').length;
+      expect(span()).toBe(headCount());
+      fireEvent.click(screen.getByTestId('history-toggle-scoring'));
+      expect(span()).toBe(headCount());
+    });
+
+    it('marks a visit whose runs were not all measured on the patient', () => {
+      useStore.setState({ history: [session({ id: 'a' }), session({ id: 'b', startedAt: 1_700_000_000_000 + 300_000, inputMode: 'autoplay' })] });
+      render(<HistoryScreen />);
+      const header = screen.getByTestId('history-table').querySelector('tr.visit-row');
+      expect(header?.textContent).toContain('1 of these runs did not measure the patient');
+    });
   });
 
   it('still quarantines a run the patient did not drive', () => {

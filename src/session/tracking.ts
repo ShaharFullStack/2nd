@@ -24,6 +24,7 @@
  *    the session that was actually tracked is the honest qualifier on the rep count.
  */
 import { MIN_USABLE_DETECT_FPS } from '../vision/mediapipe.ts';
+import type { CalibrationMeasurement } from '../vision/calibration.ts';
 import type { VisionStatus } from '../input/types.ts';
 import type { SessionResult, TrackingQuality } from './types.ts';
 
@@ -292,3 +293,302 @@ function cap(s: string): string {
 
 /** What a screen or an export says when a record carries no tracking block at all. */
 export const TRACKING_NOT_RECORDED = 'Tracking quality was not recorded for this session.';
+
+/* ------------------------------------------------------------------------------------------------
+ * THE CALIBRATION THE WHOLE SCALE IS BUILT ON.
+ *
+ * Everything above judges how well a SESSION was tracked. This judges how well the CALIBRATION was
+ * measured — the range every one of those session figures is a percentage of. It lives here, beside
+ * `trackingGrade`, because the two answer the same question about the same camera and must not drift
+ * apart: one set of thresholds decides what "good" means about a camera measurement anywhere in this
+ * app, and a therapist who has learnt what the word means on one screen can read it on the other.
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * How much the reps behind a range may disagree before the top of that range is an estimate rather
+ * than a measurement, as a fraction of the range itself.
+ *
+ * `max` is the 90th percentile of the detected peaks. With three reps that is very nearly the largest
+ * of them, so the spread between them IS the uncertainty on the top: reps of 0.30, 0.31 and 0.32
+ * against a 0.24 range agree to within 8 % of it, while 0.20, 0.28 and 0.32 disagree by half of it and
+ * a different 90th percentile would have produced a materially different denominator.
+ */
+export const FAIR_REP_SPREAD_FRACTION = 0.25;
+export const POOR_REP_SPREAD_FRACTION = 0.5;
+
+/** The number of reps a range is meant to be built from (RomCalibrator's default). */
+export const EXPECTED_CALIBRATION_REPS = 3;
+
+/**
+ * How much of this range can be read as a measurement.
+ *  - `poor` — the peaks were sampled below the app's own usable frame rate, a fifth of the frames had
+ *             no usable landmarks, the reps disagreed by half the range, or there was only one rep (a
+ *             range with no repeat has no evidence of repeatability at all);
+ *  - `fair` — usable but coarse: the top of the range is a soft number, so read the percentages it is
+ *             the denominator of as approximate;
+ *  - `good` — the range was measured under the conditions the figures downstream assume.
+ */
+export function calibrationGrade(m: CalibrationMeasurement): TrackingGrade {
+  if (
+    m.fpsMedian < MIN_USABLE_DETECT_FPS ||
+    m.trackedFraction < POOR_TRACKED_FRACTION ||
+    m.repSpreadFraction > POOR_REP_SPREAD_FRACTION ||
+    m.reps < 2
+  ) {
+    return 'poor';
+  }
+  if (
+    m.fpsMedian < GOOD_DETECT_FPS ||
+    m.trackedFraction < GOOD_TRACKED_FRACTION ||
+    m.repSpreadFraction > FAIR_REP_SPREAD_FRACTION ||
+    m.reps < EXPECTED_CALIBRATION_REPS
+  ) {
+    return 'fair';
+  }
+  return 'good';
+}
+
+/** The grade of a stored range, or null when it carries no measurement block — never "good". */
+export function calibrationMeasurementGrade(
+  cal: { measurement?: CalibrationMeasurement | null } | null | undefined,
+): TrackingGrade | null {
+  return cal?.measurement ? calibrationGrade(cal.measurement) : null;
+}
+
+/**
+ * "23 fps, landmarks usable for 96 % of it, 3 reps within 9 % of the range" — the conditions the
+ * denominator was measured in, in one clause, for a badge tooltip or a table cell.
+ */
+export function calibrationConditions(m: CalibrationMeasurement): string {
+  const fps = `${m.fpsMedian.toFixed(0)} fps`;
+  const low = m.fpsLow > 0 && m.fpsLow < m.fpsMedian - 2 ? ` (dipping to ${m.fpsLow.toFixed(0)})` : '';
+  const seen = `landmarks usable for ${Math.round(m.trackedFraction * 100)} % of the frames`;
+  const reps =
+    m.reps === 0
+      ? 'no repetitions detected'
+      : m.reps === 1
+        ? '1 repetition (no repeat to compare it with)'
+        : `${m.reps} reps within ${Math.round(m.repSpreadFraction * 100)} % of the range`;
+  return `${fps}${low}, ${seen}, ${reps}`;
+}
+
+/**
+ * THE SENTENCE THAT GOES BESIDE THE RANGE — conditions first, then what they cost the reader.
+ *
+ * It says what follows from the sampling and nothing more. A low frame rate biases the top of a range
+ * DOWNWARD (a peak between two frames is never seen), which makes every later rep read as a larger
+ * percentage of it than it was, and that direction is stated: a therapist deciding whether to re-run
+ * a calibration needs to know which way the error points.
+ */
+export function calibrationSentence(m: CalibrationMeasurement): string {
+  const grade = calibrationGrade(m);
+  const head = `This range was measured at ${calibrationConditions(m)}.`;
+  if (grade === 'good') return head;
+  const why: string[] = [];
+  if (m.fpsMedian < GOOD_DETECT_FPS) {
+    why.push(
+      `at ${m.fpsMedian.toFixed(0)} fps a peak between two frames is never seen, so the top of the range is if anything too low — every later rep then reads as a larger percentage of it than it was`,
+    );
+  }
+  if (m.trackedFraction < GOOD_TRACKED_FRACTION) {
+    why.push(`${Math.round((1 - m.trackedFraction) * 100)} % of the frames had no usable landmarks, so part of the hold and the reps was not measured at all`);
+  }
+  if (m.reps < EXPECTED_CALIBRATION_REPS) {
+    why.push(
+      m.reps <= 1
+        ? 'it rests on a single repetition, so there is no evidence it repeats'
+        : `it rests on ${m.reps} repetitions rather than ${EXPECTED_CALIBRATION_REPS}`,
+    );
+  }
+  if (m.repSpreadFraction > FAIR_REP_SPREAD_FRACTION) {
+    why.push(`the reps it was built from disagreed by ${Math.round(m.repSpreadFraction * 100)} % of the range, so the top of it is an estimate`);
+  }
+  const tail = why.length > 0 ? ` ${cap(why.join('; '))}.` : '';
+  return `${head}${tail} Every percentage measured against this range carries that — re-run the calibration if the conditions can be improved.`;
+}
+
+/** What a screen or an export says when a range carries no measurement block at all. */
+export const CALIBRATION_NOT_RECORDED =
+  'How well this range was measured was not recorded — it was set by hand, or captured before this device recorded it.';
+
+/* ------------------------------------------------------------------------------------------------
+ * BEFORE THE PATIENT IS IN THE CHAIR.
+ *
+ * Everything above is retrospective: it describes a measurement that has already been taken. This is
+ * the forward-looking half, and it exists because the camera check was the only screen in the flow
+ * with neither a gate nor a statement about what came next. Driven with a real webcam at 1–2 fps and
+ * "No person detected", it let the therapist walk straight on to a ROM calibration that cannot be
+ * measured and a song that cannot be played — spending an appointment to find out.
+ *
+ * It is built on the SAME recorder and the SAME thresholds as the session block above, deliberately:
+ * what the camera check calls a degraded stream has to be what the record calls a degraded stream, or
+ * the screen that promises and the record that reports disagree about the same camera.
+ * ---------------------------------------------------------------------------------------------- */
+
+/** Health reports needed before this screen may claim anything about the device (~2.4 s at 300 ms). */
+export const READINESS_SAMPLES = 8;
+
+/** The timing windows in force for the prescription, narrowest lane first — what has to be reachable. */
+export interface ReadinessWindows {
+  /** Narrowest perfect window across the prescribed lanes (± ms). */
+  perfectMs: number;
+  /** Narrowest good window across the prescribed lanes (± ms). */
+  goodMs: number;
+  /** How the difficulty is named on screen, for the sentence. */
+  difficulty: string;
+}
+
+export type ReadinessKind = 'measuring' | 'ready' | 'degraded' | 'blocked';
+
+export interface DeviceReadiness {
+  kind: ReadinessKind;
+  /**
+   * True when going forward cannot produce a measurement on this device as it stands. It is a gate on
+   * a POSITIVE finding only — never on absence of evidence — and every one of them clears by itself
+   * when the thing it names is fixed (the patient sits down, the stream speeds up).
+   */
+  gate: boolean;
+  /** One line, the verdict. */
+  headline: string;
+  /** What this device WILL support, in the prescription's own numbers. */
+  will: string[];
+  /** What it will NOT. Empty when everything prescribed is reachable. */
+  wont: string[];
+  /** What to do about it, when there is something to do. */
+  action: string | null;
+}
+
+/** The frame interval this stream is delivering, in ms (null when no frame rate was observed). */
+function frameIntervalMs(q: TrackingQuality): number | null {
+  return q.fpsMedian > 0 ? Math.round(1000 / q.fpsMedian) : null;
+}
+
+/**
+ * WHAT THIS DEVICE WILL AND WILL NOT SUPPORT, said before the appointment is spent on finding out.
+ *
+ * `q` is the camera check's own rolling observation (the same TrackingRecorder the session uses), or
+ * null before any health report has arrived.
+ */
+export function cameraReadiness(q: TrackingQuality | null, w: ReadinessWindows): DeviceReadiness {
+  if (!q || q.samples === 0) {
+    return {
+      kind: 'measuring',
+      gate: false,
+      headline: 'Checking what this device can do…',
+      will: [],
+      wont: [],
+      action: null,
+    };
+  }
+  const interval = frameIntervalMs(q);
+  const seenPct = Math.round(q.trackedFraction * 100);
+  const cpu = q.delegate === 'CPU';
+
+  // NOTHING HAS BEEN SEEN. Not "the patient is not moving" — the model found no landmarks at all, so
+  // there is no range to calibrate and no lane that can ever trigger. It clears the moment they are
+  // in frame, which is exactly what this screen is for.
+  if (q.trackedFraction === 0 && q.samples >= READINESS_SAMPLES) {
+    return {
+      kind: 'blocked',
+      gate: true,
+      headline: 'Nothing is being tracked on this camera yet.',
+      will: [],
+      wont: [
+        'Range of motion cannot be calibrated: the next screen measures a rest position and three repetitions, and neither exists without landmarks.',
+        'No lane can trigger, so the session would score nothing whatever the patient does.',
+      ],
+      action:
+        'Get the whole limb into frame, lit from the front, and check the preview shows the skeleton before going on. This clears by itself as soon as the model sees the patient.',
+    };
+  }
+
+  if (q.samples < READINESS_SAMPLES) {
+    return {
+      kind: 'measuring',
+      gate: true,
+      headline: `Checking what this device can do… (${q.samples} of ${READINESS_SAMPLES} readings)`,
+      will: [],
+      wont: [],
+      action: null,
+    };
+  }
+
+  // TOO SLOW FOR ANY WINDOW IN FORCE. A movement is only ever seen in the frame it was sampled in, so
+  // once one frame interval is longer than the WIDEST window the prescription grants, a correctly
+  // performed rep cannot be placed inside a hit window at all — the song would judge the camera.
+  if (interval !== null && interval > w.goodMs) {
+    return {
+      kind: 'blocked',
+      gate: true,
+      headline: `This device is processing ${q.fpsMedian.toFixed(0)} frames per second — one frame every ${interval} ms.`,
+      will: [],
+      wont: [
+        `The widest hit window in this prescription is ±${w.goodMs} ms (${w.difficulty}), shorter than the gap between two frames: a correctly performed repetition cannot be placed inside it, so the session would score the camera and not the patient.`,
+        `Range of motion would be measured from ${q.fpsMedian.toFixed(0)} peaks a second, so every range would come out lower than the patient's real one.`,
+      ],
+      action: cpu
+        ? `Inference is running on the CPU at ${q.inferenceMsMedian.toFixed(0)} ms a frame. Close other applications and browser tabs, or run this session on a device with graphics acceleration. The keyboard session below measures no range of motion but plays the song.`
+        : `Close other applications and browser tabs, or run this session on a faster device. The keyboard session below measures no range of motion but plays the song.`,
+    };
+  }
+
+  const will: string[] = [];
+  const wont: string[] = [];
+  if (interval !== null) {
+    will.push(`Timing is resolved no finer than ${interval} ms — one camera frame at ${q.fpsMedian.toFixed(0)} fps.`);
+    if (interval <= w.perfectMs) {
+      will.push(`Both hit windows in this prescription are reachable (perfect ±${w.perfectMs} ms, good ±${w.goodMs} ms on ${w.difficulty}).`);
+    } else {
+      wont.push(
+        `The ±${w.perfectMs} ms perfect window on ${w.difficulty} is shorter than one frame here, so expect "good" rather than "perfect" even on well-timed repetitions. The ±${w.goodMs} ms good window is reachable.`,
+      );
+    }
+    // The SAME fact, on whichever list it belongs to: at a healthy frame rate "a range is a lower
+    // bound" is a statement of scope; below GOOD_DETECT_FPS it is a limit of this device, and a
+    // "with limits" headline over an empty list of limits is the kind of empty warning that gets
+    // trained away.
+    if (q.fpsMedian >= GOOD_DETECT_FPS) {
+      will.push(`Range of motion is the peak of the frames that arrive, so every range is a lower bound on the patient's real one.`);
+    } else {
+      wont.push(
+        `Range of motion is the peak of the frames that arrive, and at ${q.fpsMedian.toFixed(0)} fps a fast repetition can peak between two frames and go unrecorded — every range measured here is a lower bound, and the calibrated range it is measured against is too.`,
+      );
+    }
+  }
+  if (q.fpsLow > 0 && q.fpsLow < q.fpsMedian - 2) {
+    wont.push(`The frame rate dips to ${q.fpsLow.toFixed(0)} fps in the worst stretches, so some repetitions will be measured more coarsely than others.`);
+  }
+  if (q.trackedFraction >= GOOD_TRACKED_FRACTION) {
+    will.push(`Landmarks were usable for ${seenPct} % of this check.`);
+  } else {
+    wont.push(
+      `Landmarks were usable for only ${seenPct} % of this check: the rest was not "no movement", it was not measured. Re-frame the patient before calibrating, or that share of the reps goes unrecorded.`,
+    );
+  }
+  if (cpu) {
+    will.push(`Inference is on the CPU at ${q.inferenceMsMedian.toFixed(0)} ms a frame (no graphics acceleration on this device).`);
+  }
+
+  const grade = trackingGrade(q);
+  if (grade === 'good' && wont.length === 0) {
+    return {
+      kind: 'ready',
+      gate: false,
+      headline: `This device will support the whole prescription: ${trackingConditions(q)}.`,
+      will,
+      wont,
+      action: null,
+    };
+  }
+  return {
+    kind: 'degraded',
+    gate: false,
+    headline: `This device will run the session, with limits: ${trackingConditions(q)}.`,
+    will,
+    wont,
+    action:
+      q.fpsMedian < GOOD_DETECT_FPS
+        ? 'Closing other applications and browser tabs is the one thing that reliably raises the frame rate. The session is recorded with these conditions on it either way.'
+        : 'The session is recorded with these conditions on it, and every figure it produces is qualified by them.',
+  };
+}

@@ -17,6 +17,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { ANSWER_WARMUP_NOTES } from '../engine/scoring.ts';
 import {
+  buildSessionExport,
   endReasonLabel,
   formatDuration,
   formatMs,
@@ -25,17 +26,19 @@ import {
   laneTrendKey,
   mostImprovedRange,
   rangeChange,
+  subResolutionNote,
 } from '../session/results.ts';
 import type { LaneRangeSummary } from '../session/results.ts';
 import { compareTracking, timingResolutionMs } from '../session/tracking.ts';
 import type { TrackingComparison } from '../session/tracking.ts';
 import { isPatientDriven, patientSessions } from '../session/trends.ts';
 import type { LaneResultSummary, SessionResult } from '../session/types.ts';
-import { useStore } from '../state/store.ts';
+import { MAX_HISTORY, useStore } from '../state/store.ts';
 import { FEATURE_UNIT_SHORT, formatFeature } from '../vision/calibration.ts';
 import { Meter, Screen, shortDate, Stars, Toast, TopBar } from './common.tsx';
 import { MeasurementNote } from './ScopeNote.tsx';
 import LatencyHandover from './LatencyHandover.tsx';
+import { copyToClipboard, saveTextFile } from './download.ts';
 
 /** "+12" / "−3" / "—". Deltas are stated as counts, never as a pass mark. */
 function delta(now: number, then: number | null): string | null {
@@ -179,7 +182,12 @@ function gainLabel(s: LaneRangeSummary): { text: string; kind: 'up' | 'down' | '
     // unit it is in — which is NOT the movement's own unit here — goes on the line under it.
     text: `${change.kind === 'up' ? '+' : '−'}${pts} ${pts === 1 ? 'pt' : 'pts'} vs last time`,
     kind: change.kind,
-    note: `in points of this movement’s own calibrated range: the change is under ${formatFeature(1, s.unit)}`,
+    // THE BOUND HAS TO BE THE BOUND. This said `formatFeature(1, s.unit)` — "1°" for degrees, twice
+    // the true bound, and "1.00" for a body-scaled ratio, a hundred times the step this app prints
+    // in and a whole unit of a quantity whose entire calibrated range is routinely under 1.0. It
+    // told the therapist the measurement was useless at exactly the moment it was resolved to 0.005.
+    // `subResolutionNote` derives the sentence from `formatFeature`'s own rounding (session/results.ts).
+    note: subResolutionNote(s.unit),
   };
 }
 
@@ -432,6 +440,10 @@ export default function ResultsScreen() {
   const setSeed = useStore((s) => s.setSeed);
   const seed = useStore((s) => s.seed);
   const history = useStore((s) => s.history);
+  /** WHETHER THIS RECORD IS REALLY ON THE DEVICE — see `SaveOutcome` in state/store.ts. */
+  const lastSave = useStore((s) => s.lastSave);
+  const retrySave = useStore((s) => s.retrySaveLastResult);
+  const [saveNote, setSaveNote] = useState<string | null>(null);
 
   /**
    * WHICH SESSION "LAST TIME" IS — AND WHETHER IT IS A WHOLE SESSION.
@@ -556,6 +568,14 @@ export default function ResultsScreen() {
   ]);
   /** The sentence naming the session being compared against, when that needs saying at all. */
   const basisNote = basisSentence(basis);
+
+  /**
+   * THE VERDICT ON THIS RECORD, AND NEVER A STALE ONE ABOUT A DIFFERENT SESSION. `lastSave` is
+   * stamped with the id it describes, so a record reached some other way — reloaded, re-filed, put
+   * here by a harness — reports "unknown" rather than borrowing the previous session's green badge.
+   */
+  const saved = lastSave && lastSave.id === result.id ? lastSave : null;
+  const saveState: 'saved' | 'failed' | 'unknown' = saved === null ? 'unknown' : saved.ok ? 'saved' : 'failed';
 
   const judged = result.hits + result.misses;
   /** Notes answered with a movement, bounded by the notes offered — null on a pre-`answerRate` record. */
@@ -879,7 +899,17 @@ export default function ResultsScreen() {
         </Toast>
       )}
 
-      {/* TODAY AGAINST LAST TIME, per movement — the question a rehab session is actually asking. */}
+      {/*
+        TODAY AGAINST LAST TIME, per movement — the question a rehab session is actually asking.
+
+        AND IT IS A CROSS-SESSION COMPARISON LIKE EVERY OTHER ONE ON THIS SCREEN. This card was the
+        last unqualified one: every cell in it subtracts two sessions ("+30 vs last time", "was
+        110°") and it carried nothing about how those two sessions were measured or whether the
+        earlier one ran to the end of its chart, while the range tiles two cards up had lost their
+        green for exactly that reason. The architecture's rule is that the qualifier rides on the
+        comparison; these rows ARE comparisons, so they carry the same verdict, from the same
+        `compareTracking`/completeness merge, in the header and on each delta.
+      */}
       <div className="card stack" data-testid="results-today">
         <div className="row">
           <h3>Today, movement by movement</h3>
@@ -894,6 +924,14 @@ export default function ResultsScreen() {
               : result.inputMode === 'camera'
                 ? 'no earlier camera session to compare with yet'
                 : 'comparison is only drawn between camera sessions'}
+            {previous && rangeQualifier && (
+              <>
+                {' '}
+                <span className="badge badge-warn" title={rangeQualifier.note} data-testid="results-today-qualifier">
+                  {rangeQualifier.tag}
+                </span>
+              </>
+            )}
           </span>
         </div>
         <ScrollTable testId="results-today-table">
@@ -920,7 +958,12 @@ export default function ResultsScreen() {
                     </td>
                     <td>
                       <b className="mono">{s.reps}</b>
-                      {was && <div className="dim">{delta(s.reps, was.reps)}</div>}
+                      {was && (
+                        <div className={repsQualifier ? 'dim delta-qualified' : 'dim'} title={repsQualifier?.note}>
+                          {delta(s.reps, was.reps)}
+                          {repsQualifier ? ` · ${repsQualifier.tag}` : ''}
+                        </div>
+                      )}
                     </td>
                     <td>
                       {s.measured ? (
@@ -944,7 +987,10 @@ export default function ResultsScreen() {
                             {s.best === null ? formatPercent(s.bestFraction) : formatFeature(s.best, s.unit)}
                           </span>
                           {s.gain !== null && !belowResolution(s.gain, s.unit) && (
-                            <div className="dim">{signedFeature(s.gain, s.unit)} vs last time</div>
+                            <div className={rangeQualifier ? 'dim delta-qualified' : 'dim'} title={rangeQualifier?.note}>
+                              {signedFeature(s.gain, s.unit)} vs last time
+                              {rangeQualifier ? ` · ${rangeQualifier.tag}` : ''}
+                            </div>
                           )}
                         </>
                       )}
@@ -961,6 +1007,13 @@ export default function ResultsScreen() {
         {basisNote && (
           <span className="dim" data-testid="results-today-basis">
             {basisNote.short}
+          </span>
+        )}
+        {/* The same sentence the range card prints, because these rows span the same two sessions
+            and a therapist reading this table need not have read that card. */}
+        {comparisonNote && (
+          <span className="dim" data-testid="results-today-comparison-note">
+            <span className="badge badge-warn">{comparison?.tag}</span> {comparisonNote}
           </span>
         )}
         {previous && previous.difficulty !== result.difficulty && (
@@ -1104,15 +1157,103 @@ export default function ResultsScreen() {
         )}
       </details>
 
-      <div className="card row">
-        <div className="stack" style={{ gap: 4 }}>
-          <span className="badge badge-ok">Saved to history</span>
-          <span className="attribution">{result.attribution}</span>
+      {/*
+        DID THIS SESSION ACTUALLY REACH THE DEVICE?
+
+        This was a constant green "Saved to history" badge: markup, drawn whether or not the write
+        landed. Stub `localStorage` into refusing (a full quota — realistic on a shared clinic tablet,
+        where the 100-session cap is PER PATIENT — or private mode, or blocked site data) and the
+        badge still read saved, over a record that existed nowhere but in this tab's memory. A
+        therapist who walks away believing a record exists when it does not is the worst failure this
+        app has, and the verdict was always available: `writeJson` returns it, `persistHistory` now
+        passes it on, and `addResult` stores it against this session's own id.
+
+        So the claim is the verdict — and where the verdict is "no" the screen says what the
+        therapist can DO about it, here, before they navigate away from the only copy: try again,
+        take the session off the device by hand, or go and free space.
+      */}
+      <div className="card stack" data-testid="results-save">
+        <div className="row">
+          <div className="stack" style={{ gap: 4 }}>
+            {saveState === 'saved' ? (
+              <span className="badge badge-ok" data-testid="results-save-state">
+                Saved to history{saved && saved.attempts > 1 ? ` — on attempt ${saved.attempts}` : ''}
+              </span>
+            ) : saveState === 'failed' ? (
+              <span className="badge badge-bad" data-testid="results-save-state">
+                NOT saved — this session is not on this device
+              </span>
+            ) : (
+              <span className="badge badge-warn" data-testid="results-save-state">
+                Saved state unknown for this session
+              </span>
+            )}
+            <span className="attribution">{result.attribution}</span>
+          </div>
+          <div className="grow" />
+          <button className="btn" onClick={() => goto('history')}>
+            Session history
+          </button>
         </div>
-        <div className="grow" />
-        <button className="btn" onClick={() => goto('history')}>
-          Session history
-        </button>
+        {saveState !== 'saved' && (
+          <Toast kind="bad">
+            <strong data-testid="results-save-problem">
+              {saveState === 'failed'
+                ? 'This tablet refused to store the session.'
+                : 'This screen cannot confirm the session was stored.'}
+            </strong>{' '}
+            {saveState === 'failed'
+              ? `The browser's storage would not take the write — usually a full quota or site data blocked for this page. This device keeps at most ${MAX_HISTORY} sessions per patient, so deleting or exporting older records frees space. Until it is stored, the only copy of this session is on this screen: leaving it loses the work the patient just did.`
+              : 'This tab did not record the write, so it cannot tell you whether the session reached the browser\u2019s storage. Save a copy before you leave the screen, and check the history screen for it.'}
+            <div className="row" style={{ gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
+              <button
+                className="btn btn-primary"
+                data-testid="results-save-retry"
+                onClick={() => {
+                  const ok = retrySave();
+                  setSaveNote(
+                    ok
+                      ? 'Saved. The session is now in this patient\u2019s history on this device.'
+                      : 'Still refused. Save the file below and keep it — that copy does not depend on this browser.',
+                  );
+                }}
+              >
+                Try saving again
+              </button>
+              <button
+                className="btn"
+                data-testid="results-save-export"
+                onClick={() => {
+                  void (async () => {
+                    const file = buildSessionExport({
+                      result,
+                      reason: 'This session could not be stored on the device it was recorded on. This file is its only copy.',
+                    });
+                    const wrote = saveTextFile(file.filename, file.json, 'application/json');
+                    const copied = await copyToClipboard(file.text);
+                    setSaveNote(
+                      wrote
+                        ? `Saved ${file.filename}${copied ? ', and a readable copy is on the clipboard — paste it into your notes.' : '. This browser refused the clipboard, so open the file to read it.'}`
+                        : copied
+                          ? 'This browser refused the download, but a readable copy of the session is on the clipboard — paste it into your notes now.'
+                          : 'This browser refused both the download and the clipboard. Write the figures above down before leaving this screen.',
+                    );
+                  })();
+                }}
+              >
+                Save this session as a file
+              </button>
+              <button className="btn" data-testid="results-save-free-space" onClick={() => goto('history')}>
+                Free space in the history
+              </button>
+            </div>
+          </Toast>
+        )}
+        {saveNote && (
+          <span className="dim" data-testid="results-save-note">
+            {saveNote}
+          </span>
+        )}
       </div>
     </Screen>
   );

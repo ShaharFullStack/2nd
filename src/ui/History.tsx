@@ -12,8 +12,18 @@
  *  - THE RECORD CAN LEAVE. A file to save and a readable copy on the clipboard, per patient — because
  *    a clinical record that only exists in one browser's localStorage is one cleared cache from gone.
  */
-import { useMemo, useState } from 'react';
-import { buildPatientExport, endReasonLabel, formatDate, formatDuration, formatMs, formatPercent } from '../session/results.ts';
+import { Fragment, useMemo, useState } from 'react';
+import {
+  buildPatientExport,
+  endReasonLabel,
+  formatDate,
+  formatDuration,
+  formatMs,
+  formatPercent,
+  groupVisits,
+  VISIT_LEGEND,
+  visitSummary,
+} from '../session/results.ts';
 import { labelIndex, patientUsage } from '../state/patients.ts';
 import { MAX_HISTORY, useStore } from '../state/store.ts';
 import { Screen, Stars, TopBar } from './common.tsx';
@@ -61,8 +71,21 @@ export default function HistoryScreen() {
     () => (activePatientId ? allHistory.filter((r) => r.patientId === activePatientId) : []),
     [allHistory, activePatientId],
   );
+  /**
+   * SEVERAL SONGS IN ONE VISIT ARE NOT SEVERAL VISITS.
+   *
+   * A song is 97 seconds, the Results screen ends with "Play again", and a physiotherapy slot is
+   * half an hour or more — so one appointment routinely produces three, five, eight rows here. Read
+   * down a flat table those rows are indistinguishable from three, five, eight appointments, and
+   * "eight sessions this fortnight" is then a claim about ATTENDANCE that this record cannot
+   * support. The runs are grouped by the clock (`groupVisits`), and because the grouping is an
+   * INFERENCE — this app is never told when an appointment starts — the table says so underneath.
+   */
+  const visits = useMemo(() => groupVisits(history), [history]);
   const dropped = activePatientId ? (historyDropped[activePatientId] ?? 0) : 0;
   const otherPatients = allHistory.length - history.length;
+  /** Columns a visit header has to span, so it stays one band across the whole table. */
+  const columnCount = showScoring ? 10 : 5;
 
   const exportRecord = async () => {
     if (!patient) return;
@@ -79,7 +102,11 @@ export default function HistoryScreen() {
   return (
     <Screen testId="history-screen">
       <TopBar
-        eyebrow={patient ? `${history.length} session${history.length === 1 ? '' : 's'} for this patient` : 'No patient selected'}
+        eyebrow={
+          patient
+            ? `${history.length} run${history.length === 1 ? '' : 's'} in ${visits.length} visit${visits.length === 1 ? '' : 's'} for this patient`
+            : 'No patient selected'
+        }
         title={patient ? `${label?.display ?? patient.name} — session history` : 'Session history'}
         onBack={() => goto('home')}
         right={
@@ -180,7 +207,24 @@ export default function HistoryScreen() {
               </tr>
             </thead>
             <tbody>
-              {history.map((r) => (
+              {visits.map((visit) => (
+                <Fragment key={visit.id}>
+                  {/* THE APPOINTMENT THIS BAND OF ROWS BELONGS TO. It is a row rather than a nested
+                      table so the columns below it still line up with the header the therapist is
+                      reading them against. */}
+                  <tr className="visit-row" data-testid={`history-visit-${visit.id}`}>
+                    <td colSpan={columnCount}>
+                      <b>Visit — {formatDate(visit.startedAt)}</b>
+                      <span className="dim"> · {visitSummary(visit)}</span>
+                      {visit.cameraSessions < visit.sessions.length && (
+                        <span className="dim">
+                          {' '}
+                          · {visit.sessions.length - visit.cameraSessions} of these runs did not measure the patient
+                        </span>
+                      )}
+                    </td>
+                  </tr>
+                  {visit.sessions.map((r) => (
                 <tr key={r.id}>
                   {/* The per-session delete lives in the FIRST column, not a trailing one: this table
                       scrolls horizontally on a tablet, and an action in the last column is an action
@@ -314,6 +358,8 @@ export default function HistoryScreen() {
                     </>
                   )}
                 </tr>
+                  ))}
+                </Fragment>
               ))}
             </tbody>
             </table>
@@ -335,6 +381,11 @@ export default function HistoryScreen() {
             )}{' '}
             Exported records are the only copy that survives a cleared browser.
             {otherPatients > 0 && ` ${otherPatients} session${otherPatients === 1 ? '' : 's'} belonging to other patients on this tablet are not shown here.`}
+          </div>
+          {/* HOW THE VISITS ABOVE WERE WORKED OUT. The app has timestamps, not an appointment book;
+              saying so is the difference between a grouping and a clinical claim about attendance. */}
+          <div className="dim" data-testid="history-visit-legend">
+            {VISIT_LEGEND}
           </div>
         </>
       )}

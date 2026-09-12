@@ -3,6 +3,7 @@ import type { ScoreResults } from '../engine/scoring.ts';
 import type { LaneRepStats, RunSummary } from './GameRunner.ts';
 import {
   buildPatientExport,
+  buildSessionExport,
   buildSessionResult,
   clinicalLaneName,
   formatDuration,
@@ -10,10 +11,15 @@ import {
   formatPercent,
   laneRangeSummaries,
   laneTrendKey,
+  groupVisits,
   mostImprovedRange,
   rangeChange,
+  subResolutionNote,
+  VISIT_GAP_MS,
+  visitSummary,
 } from './results.ts';
 import type { LaneResultSummary, SessionConfig, SessionResult } from './types.ts';
+import { formatFeature } from '../vision/calibration.ts';
 
 const CONFIG: SessionConfig = {
   patientId: 'p-test',
@@ -564,5 +570,223 @@ describe('laneRangeSummaries', () => {
     const previous = new Map([[laneTrendKey(weak), { ...weak, romBest: 0.8 }]]);
     expect(rangeChange(laneRangeSummaries([weak], previous)[0]).kind).toBe('down');
     expect(rangeChange({ gain: null, gainPct: null, unit: 'deg' }).kind).toBe('none');
+  });
+});
+
+
+/**
+ * EVERY FIGURE IN THE EXPORT CARRIES ITS UNIT.
+ *
+ * This file is pasted into notes and read with no app around it. It used to state the range the
+ * patient WORKED only as a share of a calibration the reader cannot see, and to print the
+ * calibration itself — the one place a unit appeared — as two bare decimals: a knee extension read
+ * "90.00–140.00" and a seated march read "0.10–0.50" in the same column of the same document.
+ */
+describe('the readable export is legible to somebody who has never seen the app', () => {
+  const patient = { id: 'p1', name: 'Jane Okafor', createdAt: 1, lastUsedAt: 2 };
+
+  const withRange = (over: Partial<LaneResultSummary>): SessionResult => {
+    const base = buildSessionResult({
+      summary: summary(),
+      config: CONFIG,
+      inputMode: 'camera',
+      latencyOffsetSec: 0.12,
+      patientName: patient.name,
+      now: () => 1_700_000_000_000,
+      id: 's1',
+    });
+    return { ...base, lanes: [{ ...base.lanes[0], ...over }] };
+  };
+
+  it('states a degree range in degrees, at the joint, with the calibration it is a share of', () => {
+    const out = buildPatientExport({
+      patient,
+      sessions: [
+        withRange({
+          movement: 'knee_extension',
+          movementName: 'Left Knee extension',
+          romMean: 0.6,
+          romBest: 0.75,
+          romSamples: 38,
+          calibratedMin: 90,
+          calibratedMax: 140,
+        }),
+      ],
+      now: () => 1,
+    });
+    // The range worked, in the movement's own units — 90 + 0.6 x 50 and 90 + 0.75 x 50.
+    expect(out.text).toContain('mean rep 120°, best rep 128° (degrees)');
+    expect(out.text).toContain('60% and 75% of the range calibrated for this movement');
+    // ...and the calibration, with its unit and with what each end of it MEANS.
+    expect(out.text).toContain('0% = 90° at rest, 100% = 140° at comfortable maximum (degrees)');
+    // The naked pair is gone.
+    expect(out.text).not.toContain('90.00–140.00');
+  });
+
+  it('names the body-scaled ratio rather than printing a bare decimal', () => {
+    const out = buildPatientExport({
+      patient,
+      sessions: [withRange({ romMean: 0.5, romBest: 1, romSamples: 12, calibratedMin: 0.1, calibratedMax: 0.5 })],
+      now: () => 1,
+    });
+    expect(out.text).toContain('mean rep 0.30, best rep 0.50 (body-scaled ratio)');
+    expect(out.text).toContain('0% = 0.10 at rest, 100% = 0.50 at comfortable maximum (body-scaled ratio)');
+    // And the header says what a body-scaled ratio IS, once, for a reader who has never seen the app.
+    expect(out.text).toMatch(/UNITS: .*body-scaled ratio/);
+    expect(out.text).toContain('torso or palm size');
+  });
+
+  it('says so plainly when a range cannot be given in its own units', () => {
+    const out = buildPatientExport({
+      patient,
+      sessions: [withRange({ romMean: 0.5, romBest: 0.9, romSamples: 12, calibratedMin: null, calibratedMax: null })],
+      now: () => 1,
+    });
+    expect(out.text).toContain('the calibrated bounds were not stored');
+    expect(out.text).not.toContain('undefined');
+    expect(out.text).not.toContain('NaN');
+  });
+
+  it('groups the runs of one appointment under a visit header', () => {
+    const at = (ms: number, id: string): SessionResult => ({ ...withRange({}), id, startedAt: ms, endedAt: ms + 100_000 });
+    const t = 1_700_000_000_000;
+    const out = buildPatientExport({
+      patient,
+      sessions: [at(t + 30 * 60_000, 'c'), at(t + 15 * 60_000, 'b'), at(t, 'a')],
+      now: () => 1,
+    });
+    expect(out.text.match(/^VISIT — /gm)).toHaveLength(1);
+    expect(out.text).toContain('3 songs');
+    expect(out.text).toMatch(/VISITS: .*inferred/);
+  });
+});
+
+/**
+ * ONE SESSION ON ITS OWN, for the moment the device refused to keep it. `buildPatientExport` reads
+ * the stored history, which is exactly what does not exist when the write failed.
+ */
+describe('a single session can leave the device by itself', () => {
+  const one = (): SessionResult =>
+    buildSessionResult({
+      summary: summary(),
+      config: CONFIG,
+      inputMode: 'camera',
+      latencyOffsetSec: 0.12,
+      patientName: 'Jane Okafor',
+      now: () => 1_700_000_000_000,
+      id: 's-lost',
+    });
+
+  it('carries the scope, the units and the reason it was produced', () => {
+    const out = buildSessionExport({ result: one(), reason: 'This session could not be stored.', now: () => 1 });
+    expect(out.text).toContain('Beat Rehab — one session');
+    expect(out.text).toContain('This session could not be stored.');
+    expect(out.text).toMatch(/^SCOPE: /m);
+    expect(out.text).toMatch(/^UNITS: /m);
+    expect(out.text).toContain('Left Seated march');
+    expect(out.filename).toMatch(/^beat-rehab-session-jane-okafor-\d{4}-\d{2}-\d{2}\.json$/);
+  });
+
+  it('is complete JSON holding the whole record, so nothing is lost by the rescue', () => {
+    const out = buildSessionExport({ result: one(), now: () => 1 });
+    const parsed = JSON.parse(out.json) as { format: string; sessions: SessionResult[] };
+    expect(parsed.format).toBe('session-record');
+    expect(parsed.sessions).toHaveLength(1);
+    expect(parsed.sessions[0].id).toBe('s-lost');
+  });
+});
+
+/**
+ * SEVERAL SONGS IN ONE VISIT ARE NOT SEVERAL VISITS — and the rule is the clock, because that is all
+ * this app has. It is never told when an appointment starts.
+ */
+describe('runs are grouped into visits by the clock', () => {
+  const T = 1_700_000_000_000;
+  const run = (id: string, startedAt: number, durationSec = 97, over: Partial<SessionResult> = {}): SessionResult => ({
+    ...buildSessionResult({ summary: summary(), config: CONFIG, inputMode: 'camera', latencyOffsetSec: 0, id, now: () => startedAt }),
+    id,
+    startedAt,
+    endedAt: startedAt + durationSec * 1000,
+    durationSec,
+    reps: 40,
+    ...over,
+  });
+
+  it('puts three songs from one 40-minute slot in one visit, newest visit first', () => {
+    const visits = groupVisits([run('c', T + 30 * 60_000), run('b', T + 15 * 60_000), run('a', T), run('old', T - 7 * 24 * 3_600_000)]);
+    expect(visits).toHaveLength(2);
+    expect(visits[0].sessions.map((s) => s.id)).toEqual(['c', 'b', 'a']);
+    expect(visits[0].reps).toBe(120);
+    expect(visits[0].id).toBe('a'); // keyed on the EARLIEST run, so the key survives a later one arriving
+    expect(visits[1].sessions.map((s) => s.id)).toEqual(['old']);
+  });
+
+  it('splits on a gap longer than the window, and joins on one shorter', () => {
+    const justInside = groupVisits([run('a', T), run('b', T + 97_000 + VISIT_GAP_MS - 60_000)]);
+    expect(justInside).toHaveLength(1);
+    const justOutside = groupVisits([run('a', T), run('b', T + 97_000 + VISIT_GAP_MS + 60_000)]);
+    expect(justOutside).toHaveLength(2);
+  });
+
+  it('is order-independent: the same runs shuffled give the same visits', () => {
+    const runs = [run('a', T), run('b', T + 10 * 60_000), run('c', T + 5 * 24 * 3_600_000)];
+    const forwards = groupVisits(runs).map((v) => v.sessions.map((s) => s.id));
+    const backwards = groupVisits([...runs].reverse()).map((v) => v.sessions.map((s) => s.id));
+    expect(backwards).toEqual(forwards);
+  });
+
+  it('falls back to a run’s own stated length when the record has no end stamp', () => {
+    const noEnd = run('a', T, 97, { endedAt: 0 });
+    const next = run('b', T + 97_000 + 60_000);
+    expect(groupVisits([noEnd, next])).toHaveLength(1);
+  });
+
+  it('counts the camera runs separately, because only those measured the patient', () => {
+    const v = groupVisits([run('a', T), run('b', T + 300_000, 97, { inputMode: 'autoplay' })])[0];
+    expect(v.sessions).toHaveLength(2);
+    expect(v.cameraSessions).toBe(1);
+  });
+
+  it('summarises a visit in one line a therapist can read at a glance', () => {
+    const v = groupVisits([run('a', T), run('b', T + 15 * 60_000)])[0];
+    expect(visitSummary(v)).toContain('2 songs');
+    expect(visitSummary(v)).toContain('80 movements');
+    expect(visitSummary(v)).toContain('3:14 of song');
+  });
+
+  it('is empty for no sessions at all', () => {
+    expect(groupVisits([])).toEqual([]);
+  });
+});
+
+/**
+ * THE SUB-RESOLUTION CAPTION STATES THE BOUND THAT IS ACTUALLY TRUE.
+ *
+ * It printed `formatFeature(1, unit)` — "1°", twice the real bound, and "1.00" for a body-scaled
+ * ratio, a hundred times the step this app prints in and a whole unit of a quantity whose entire
+ * calibrated range is routinely under 1.0. On the common unit it told the therapist the measurement
+ * was useless at the moment it was resolved to 0.005.
+ */
+describe('the sub-resolution note states the real bound, in the movement’s own units', () => {
+  it('is half a degree for a joint angle, which is what rounding to whole degrees hides', () => {
+    const note = subResolutionNote('deg');
+    expect(note).toContain('under 0.5°');
+    expect(note).toContain('finer than the 1° this screen prints degrees to');
+    expect(note).not.toContain('under 1°');
+  });
+
+  it('is 0.005 for a body-scaled ratio, not 1.00', () => {
+    const note = subResolutionNote('ratio');
+    expect(note).toContain('under 0.005');
+    expect(note).toContain('finer than the 0.01 this screen prints a body-scaled ratio to');
+    expect(note).not.toContain('1.00');
+  });
+
+  it('agrees with the rule the screens actually apply — anything it covers rounds to no change', () => {
+    // The bound it states is the largest change `formatFeature` still prints as nothing.
+    expect(formatFeature(0.49, 'deg')).toBe(formatFeature(0, 'deg'));
+    expect(formatFeature(0.51, 'deg')).not.toBe(formatFeature(0, 'deg'));
+    expect(formatFeature(0.0049, 'ratio')).toBe(formatFeature(0, 'ratio'));
+    expect(formatFeature(0.0051, 'ratio')).not.toBe(formatFeature(0, 'ratio'));
   });
 });

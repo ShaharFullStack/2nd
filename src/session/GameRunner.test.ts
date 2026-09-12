@@ -1000,10 +1000,43 @@ describe('the song ends with a payoff, not a cut', () => {
     expect(s.results.reps).toBe(2);
   });
 
-  /** Nothing can be judged once the chart has run out, so the receptors say so. */
-  it('tells the renderer it is no longer accepting input', async () => {
+  /**
+   * WHAT THE ENDING SAYS AND WHAT THE ENGINE DOES HAVE TO BE THE SAME THING.
+   *
+   * `inputSuspended` used to be set for the whole 6.6 s of the payoff, which blanked every receptor
+   * to a broken ring with pause bars — the board's way of saying "nothing you do registers until
+   * this is resumed". Meanwhile the ending counts: `onRep` records every rep, the hero figure on the
+   * card visibly ticks up as the patient keeps marching (the test above drives exactly that), and
+   * the report two seconds later keeps them. The song's pay-off was telling the patient nothing
+   * counted while it counted what they did.
+   *
+   * A pause is a state in which a movement is DISCARDED. The ending is not one, so it does not wear
+   * the pause's mark — and what has actually stopped (scoring: there are no notes left) is said in
+   * words on the card rather than implied by blanking the hardware.
+   */
+  it('keeps the receptors live through the ending, and states in words what has stopped', async () => {
     const h = await setup(notes, hitAll);
+    const specs: FinaleSpec[] = [];
+    const start = h.runner.highway.startFinale.bind(h.runner.highway);
+    h.runner.highway.startFinale = (spec: FinaleSpec) => { specs.push(spec); start(spec); };
+
     h.advance(4.2);
+    expect(h.runner.getPhase()).toBe('finale');
+    for (const l of LANES) expect(h.runner.highway.receptorLookOf(l.index)?.suspended, `lane ${l.index}`).toBe(false);
+
+    // ...and the card carries the statement, so the agreement is not left to the hardware alone.
+    expect(specs.length).toBeGreaterThan(0);
+    expect(specs[0].heroNote ?? '').toMatch(/still counting/i);
+    expect(specs[0].heroNote ?? '').toMatch(/no notes left/i);
+    expect(specs[0].hint).toMatch(/movements still count/i);
+  });
+
+  /** A therapist pause is still a state in which nothing registers, and still says so. */
+  it('still blanks the receptors while the session is paused', async () => {
+    const h = await setup(notes, hitAll);
+    h.advance(0.5);
+    h.runner.pause();
+    h.runner.step();
     for (const l of LANES) expect(h.runner.highway.receptorLookOf(l.index)?.suspended, `lane ${l.index}`).toBe(true);
   });
 });

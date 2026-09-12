@@ -26,10 +26,18 @@ runs a bot, `?demo=highway` mounts the renderer on its own.
 
 1. **Mode** — legs or hands. One per session, never both.
 2. **Prescription** — the therapist picks 2–4 movements (with side), a difficulty, and a song.
-3. **Camera check** — live preview with landmark overlay, frame rate, mirror toggle.
+3. **Camera check** — live preview with landmark overlay, frame rate, mirror toggle, and a
+   statement of **what this device will and will not support**, made before the patient is in
+   the chair: the timing resolution this frame rate gives, which of the prescribed hit windows
+   are reachable at it, and how much of the check the landmarks were usable for. Two findings
+   gate the way forward rather than letting an appointment be spent discovering them — nothing
+   tracked at all, and frames further apart than the widest hit window the prescription grants.
+   Both clear by themselves, and both offer the keyboard session (which measures no range of
+   motion, and says so) as the way on.
 4. **Range-of-motion calibration** — per lane: rest for two seconds, then three comfortable
    reps. The hit threshold is a fraction of *that patient's* range, and the fraction is the
-   difficulty knob (easy 0.5, medium 0.65, hard 0.8).
+   difficulty knob (easy 0.5, medium 0.65, hard 0.8). The range carries **how well it was
+   measured** — see "How well was it measured?" below.
 5. **Latency calibration** — a metronome, eight beats, move on each click. Camera pipelines
    run 80–200 ms behind reality; this measures it rather than guessing.
 6. **Play.**
@@ -143,6 +151,23 @@ prints this table (timings vary by a couple of tenths between runs).
 one figure here the harness cannot reproduce on demand — rebuild the 44.1 kHz stems with
 `npm run gen-demo-stems -- --rate 44100` to see it again.)
 
+**The first run on a device pays for the tracker before any of this.** The table above is the
+autoplay path, which needs no camera. A camera session additionally transfers the MediaPipe wasm
+runtime and one model, once per device, and they are then cached for a year (`vercel.json`). What
+is actually transferred, measured on the real camera path in headless Chromium with a fake webcam
+(Home → patient → mode → Start, counting every `/wasm/` and `/models/` response body):
+
+| mode | `/wasm/` runtime | model | first run, total |
+| --- | --- | --- | --- |
+| leg (Pose) | 12.08 MB (11.52 MiB) | `pose_landmarker_lite.task` 5.78 MB (5.51 MiB) | **17.86 MB (17.03 MiB)** |
+| hand (Hands) | 12.08 MB (11.52 MiB) | `hand_landmarker.task` 7.82 MB (7.46 MiB) | **19.90 MB (18.98 MiB)** |
+
+Uncompressed, as this app's own static hosting serves them; a server with gzip or brotli on
+`.wasm` transfers less. The runtime is `vision_wasm_internal.wasm` (11.76 MB) plus its 0.32 MB
+JS glue — a browser without SIMD loads the 10.96 MB `nosimd` build instead. The camera check says
+this figure while it waits, because "about 8 MB" was the model alone and understated the wait by
+roughly two times.
+
 **4.0 s is the floor, and it is not loading.** It is the game's own lead-in: a 3 s count-in, two
 beats of musical lead before the first note, and that note's travel down the highway. Nothing that
 follows can go below it.
@@ -251,3 +276,35 @@ gates every number this app derives from two sessions:
 `npm run critic:uneven` drives all of that in the real app at 1024x768, 1280x800 and 1920x1080
 against a seeded shared tablet whose latest session was tracked at 11.8 fps with the limb usable
 for 62 % of the session, and fails if any qualified chip is green or anything clips.
+
+A trend card holds **two** sets of sessions — the ones it plots, and the two ends each change
+badge is taken across — and they are not the same set. The card used to print a warning counted
+over the first set directly above a green chip computed over the second, in the same words, with
+nothing to say they were about different things. The header badge now says which it is: it wears
+the delta chips' own phrase (*measured unevenly*) only when a delta chip really is wearing it,
+and otherwise reads *uneven between the ends* and names the two dates the change figures span.
+
+**And the denominator itself is measured.** Every ROM figure this app prints, exports and trends
+is a percentage of the range set at calibration — and that range was measured on the same webcam,
+on the same machine, under conditions that were nowhere in the record. `RomCalibration.measurement`
+(`CalibrationMeasurement`, built by `RomCalibrator` from the frames it was actually fed) now
+carries them:
+
+* every frame offered to the calibrator, **including the ones with no usable landmarks**, and the
+  share that were usable — a hold that was only visible for half its frames is a zero taken from
+  half a window, not a clean one;
+* the median and 10th-percentile **frame rate** those frames arrived at. `max` is the 90th
+  percentile of detected peaks and a peak between two frames is never seen, so a low frame rate
+  biases the top of the range *downward* — and every later rep then reads as a larger percentage
+  of it than it was. That direction is stated, because it decides whether to re-run;
+* the **number of reps** and how far apart they were, in feature units and as a fraction of the
+  range. Three reps agreeing to within 8 % of the range is a measurement; three spanning half of
+  it is an estimate of where the top is.
+
+`calibrationGrade` (in `src/session/tracking.ts`, beside `trackingGrade`, on the same thresholds,
+so "good" means one thing about a camera measurement anywhere in this app) grades it good / fair /
+poor. It is shown **while the range is being built** (when the chair and the light can still be
+moved), on the range **as it is accepted**, on every lane in the list, and on last session's range
+**before it is reused** — reusing a range is adopting its measurement as today's denominator.
+A range with no block reads as *quality not recorded*, never as good: it was typed in by hand, or
+captured before this device recorded one.

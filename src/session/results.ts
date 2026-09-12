@@ -14,11 +14,11 @@ import type { SongManifest } from '../audio/manifest.ts';
 import { attributionText } from '../audio/manifest.ts';
 import type { Fingertip, Mode, Movement, Side } from '../engine/types.ts';
 import { compensationKind, FINGERTIP_NAME, MOVEMENT_INFO } from '../vision/features.ts';
-import { formatFeature } from '../vision/calibration.ts';
+import { FEATURE_UNIT_SHORT, formatFeature } from '../vision/calibration.ts';
 import type { RomCalibration } from '../vision/calibration.ts';
 import type { LaneRepStats, RunSummary } from './GameRunner.ts';
 import type { InputMode, LaneResultSummary, Patient, SessionConfig, SessionEndReason, SessionResult, TrackingQuality } from './types.ts';
-import { TRACKING_NOT_RECORDED, trackingSentence } from './tracking.ts';
+import { TRACKING_NOT_RECORDED, calibrationConditions, calibrationGrade, trackingSentence } from './tracking.ts';
 
 /**
  * The FULL clinical name of a lane: side, the movement's real name, and the prescribed digit.
@@ -126,6 +126,8 @@ export function buildSessionResult(opts: BuildResultOptions): SessionResult {
       calibratedMin: cal ? cal.min : null,
       calibratedMax: cal ? cal.max : null,
       calibrationManual: cal?.manual === true,
+      // The uncertainty on the DENOMINATOR travels with the percentages taken against it.
+      calibrationMeasurement: cal?.measurement ?? null,
       // The movement decides WHETHER a compensation is monitored; the run decides whether it was
       // actually measured. Reading the kind off the observed events would report "n/a" for a lane
       // that monitors heel lift but produced no rep data, which reads as "nothing to check".
@@ -336,6 +338,49 @@ export function rangeChange(s: Pick<LaneRangeSummary, 'gain' | 'gainPct' | 'unit
 }
 
 /**
+ * THE STEP `formatFeature` PRINTS IN, and the bound a change too small for it actually satisfies.
+ *
+ * `formatFeature` rounds a joint angle to whole degrees (`Math.round`) and a body-scaled ratio to two
+ * places (`toFixed`), so the finest step it can show is 1° / 0.01 — and a change that prints as no
+ * change at all is strictly under HALF of that.
+ *
+ * BOTH NUMBERS HAVE TO EXIST, because the caption that states them used to state neither: it printed
+ * `formatFeature(1, unit)`, which is "1°" (twice the true bound) for degrees and "1.00" for a
+ * ratio — a hundred times the step, and a whole unit of a quantity whose entire calibrated range is
+ * routinely less than 1.0. A therapist reading "the change is under 1.00" on a seated march was being
+ * told the measurement was useless when it was resolved to 0.005.
+ */
+export const FEATURE_STEP: Readonly<Record<'deg' | 'ratio', number>> = Object.freeze({ deg: 1, ratio: 0.01 });
+
+/** The finest difference this app prints in that unit, as it is written ("1°", "0.01"). */
+export function featureStepLabel(unit: 'deg' | 'ratio'): string {
+  return unit === 'deg' ? '1°' : '0.01';
+}
+
+/**
+ * The true bound on a change that `formatFeature` rounds away to nothing, as it is written
+ * ("0.5°", "0.005"). This is what `belowResolution` on the Results screen actually tests.
+ */
+export function subResolutionBound(unit: 'deg' | 'ratio'): string {
+  return unit === 'deg' ? '0.5°' : '0.005';
+}
+
+/**
+ * The whole sentence the Results tile prints under a change it had to state in points of range.
+ *
+ * One place, because the number in it is a property of `formatFeature` and nothing else, and because
+ * the screen that shows it must not be able to invent a different bound from the one the formatter
+ * really applies.
+ */
+export function subResolutionNote(unit: 'deg' | 'ratio'): string {
+  return (
+    `in points of this movement’s own calibrated range: the change is under ${subResolutionBound(unit)}, ` +
+    `finer than the ${featureStepLabel(unit)} this screen prints ` +
+    `${unit === 'deg' ? 'degrees' : 'a body-scaled ratio'} to`
+  );
+}
+
+/**
  * The movement that gained the most against its own previous session, or null when nothing gained.
  *
  * THE ONLY SINGLING-OUT THIS SCREEN DOES. It ranks a patient against themselves per limb, so it can
@@ -433,6 +478,102 @@ export function pacingSentence(laneRestSec: number, lanes: readonly { side: Side
   );
 }
 
+/** Clock time alone ("14:02") — a visit happens inside one day, so the date is stated once. */
+export function formatTime(ts: number): string {
+  try {
+    return new Date(ts).toLocaleTimeString(undefined, { timeStyle: 'short' });
+  } catch {
+    return new Date(ts).toISOString().slice(11, 16);
+  }
+}
+
+// ------------------------------------------------------------------ several songs, or several visits
+
+/**
+ * THE LONGEST QUIET STRETCH THAT IS STILL ONE APPOINTMENT.
+ *
+ * A song is 97 seconds and the Results screen ends with a "Play again" button, so a 40-minute
+ * physiotherapy slot produces three, five, eight rows in the history table — and read down that
+ * table they are indistinguishable from three, five, eight visits. "Eight sessions this fortnight"
+ * is then a claim about attendance that the record does not support.
+ *
+ * 45 minutes is chosen to swallow everything that really happens inside one appointment — camera
+ * setup, ROM calibration per lane, the latency check, a rest, a transfer back to the chair, a
+ * conversation — while staying under the gap between two slots on one therapist's list.
+ */
+export const VISIT_GAP_MS = 45 * 60 * 1000;
+
+/**
+ * SAID WHEREVER THE GROUPING IS SHOWN. This app is never told when an appointment was: it has
+ * timestamps, and the grouping is an inference from them. A visit header that did not say so would be
+ * presenting a clinical fact (attendance) that nothing in the record actually contains.
+ */
+export const VISIT_LEGEND =
+  'VISITS: runs recorded within 45 minutes of each other are grouped as one visit. This is inferred ' +
+  'from the clock — the app is never told when an appointment starts or ends — so a long break inside ' +
+  'one session will read as two visits, and two slots back to back may read as one.';
+
+/** One appointment's worth of runs, as `groupVisits` infers it. */
+export interface Visit {
+  /** Stable key: the id of the EARLIEST run in the visit. */
+  id: string;
+  /** When the first run of the visit started and the last one ended (epoch ms). */
+  startedAt: number;
+  endedAt: number;
+  /** The visit's runs, newest first — the order the history table lists them in. */
+  sessions: SessionResult[];
+  /** Movements performed across the whole visit, and the song time those runs covered. */
+  reps: number;
+  songSec: number;
+  /** How many of the runs were camera runs (the only ones that measure the patient). */
+  cameraSessions: number;
+}
+
+/** When a run finished, from the record — falling back to its own stated length. */
+function endOfSession(s: SessionResult): number {
+  if (Number.isFinite(s.endedAt) && s.endedAt > s.startedAt) return s.endedAt;
+  return s.startedAt + Math.max(0, Number.isFinite(s.durationSec) ? s.durationSec : 0) * 1000;
+}
+
+/**
+ * Group runs into visits. Order-independent in, NEWEST VISIT FIRST out, each visit's own runs newest
+ * first, so it drops straight into the history table without re-sorting anything.
+ */
+export function groupVisits(sessions: readonly SessionResult[], gapMs: number = VISIT_GAP_MS): Visit[] {
+  const asc = [...sessions].sort((a, b) => a.startedAt - b.startedAt);
+  const out: Visit[] = [];
+  let current: SessionResult[] = [];
+  let currentEnd = -Infinity;
+  const flush = (): void => {
+    if (current.length === 0) return;
+    const runs = [...current].reverse();
+    out.unshift({
+      id: current[0].id,
+      startedAt: current[0].startedAt,
+      endedAt: current.reduce((t, s) => Math.max(t, endOfSession(s)), current[0].startedAt),
+      sessions: runs,
+      reps: runs.reduce((n, s) => n + (Number.isFinite(s.reps) ? s.reps : 0), 0),
+      songSec: runs.reduce((n, s) => n + (Number.isFinite(s.durationSec) ? Math.max(0, s.durationSec) : 0), 0),
+      cameraSessions: runs.filter((s) => s.inputMode === 'camera').length,
+    });
+    current = [];
+  };
+  for (const s of asc) {
+    if (current.length > 0 && s.startedAt - currentEnd > gapMs) flush();
+    current.push(s);
+    currentEnd = Math.max(currentEnd, endOfSession(s));
+  }
+  flush();
+  return out;
+}
+
+/** "3 songs · 14:02–14:41 · 212 movements · 4:51 of song" — one visit in one line. */
+export function visitSummary(v: Visit): string {
+  const runs = `${v.sessions.length} song${v.sessions.length === 1 ? '' : 's'}`;
+  const span = v.endedAt > v.startedAt + 60_000 ? `${formatTime(v.startedAt)}–${formatTime(v.endedAt)}` : formatTime(v.startedAt);
+  return `${runs} · ${span} · ${v.reps} movement${v.reps === 1 ? '' : 's'} · ${formatDuration(v.songSec)} of song`;
+}
+
 export function formatDate(ts: number): string {
   try {
     return new Date(ts).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
@@ -492,12 +633,64 @@ function isoDay(ts: number): string {
   }
 }
 
+/**
+ * WHAT UNIT EVERY FIGURE BELOW IS IN, said once at the top of the file.
+ *
+ * The export is pasted into notes and read by people who have never opened this app. A bare
+ * "0.10–0.50" means nothing to them, and neither does "62 %" without the thing it is 62 % OF.
+ */
+const UNITS_LEGEND =
+  'UNITS: a range is given in the movement’s own units — degrees at the joint for a joint angle, or a ' +
+  'body-scaled ratio (the movement measured against this patient’s own torso or palm size, which is ' +
+  'what makes it comparable across sessions and cameras) for the rest. The percentage beside it is ' +
+  'that rep as a share of the range CALIBRATED FOR THAT MOVEMENT IN THAT SESSION, so percentages from ' +
+  'two different movements — or from two sessions calibrated apart — are not the same quantity. A rep ' +
+  'is one movement performed, times are minutes:seconds, and every millisecond figure is a timing offset.';
+
+/** `calibratedMin + fraction x span`, printed in the movement's own units. Null when unavailable. */
+function laneAbsolute(l: LaneResultSummary, unit: 'deg' | 'ratio', fraction: number | null): string | null {
+  if (fraction === null || l.calibratedMin === null || l.calibratedMax === null) return null;
+  const v = l.calibratedMin + fraction * (l.calibratedMax - l.calibratedMin);
+  return Number.isFinite(v) ? formatFeature(v, unit) : null;
+}
+
+/**
+ * ONE MOVEMENT'S LINE — AND EVERY NUMBER ON IT CARRIES WHAT IT IS MEASURED IN.
+ *
+ * This line used to read "ROM mean 62% / best 75% of the calibrated range · range calibrated
+ * 0.10–0.50". Two faults, both in the artefact that leaves the device: the range the patient actually
+ * WORKED was never stated in the movement's own units at all (only as a share of a calibration the
+ * reader cannot see), and the calibration bounds — the one place the units do appear — were printed
+ * to two decimal places with no unit whatsoever, so a knee extension read "90.00–140.00" and a seated
+ * march read "0.10–0.50" in the same column of the same file.
+ */
 function laneLine(l: LaneResultSummary): string {
-  const parts = [`${l.movementName}: ${l.reps} reps`, `${formatPercent(l.accuracy)} accuracy`];
+  const unit: 'deg' | 'ratio' = MOVEMENT_INFO[l.movement]?.unit ?? 'ratio';
+  const parts = [`${l.movementName}: ${l.reps} reps`, `${formatPercent(l.accuracy)} of its notes hit in time`];
   if (l.romSamples > 0) {
-    parts.push(`ROM mean ${formatPercent(l.romMean)} / best ${formatPercent(l.romBest)} of the calibrated range`);
+    const meanAbs = laneAbsolute(l, unit, l.romMean);
+    const bestAbs = laneAbsolute(l, unit, l.romBest);
+    parts.push(
+      meanAbs !== null && bestAbs !== null
+        ? `range worked: mean rep ${meanAbs}, best rep ${bestAbs} (${FEATURE_UNIT_SHORT[unit]}) = ` +
+            `${formatPercent(l.romMean)} and ${formatPercent(l.romBest)} of the range calibrated for this movement`
+        : `range worked: ${formatPercent(l.romMean)} mean / ${formatPercent(l.romBest)} of the range calibrated for ` +
+            `this movement (the calibrated bounds were not stored, so it cannot be given in ${FEATURE_UNIT_SHORT[unit]})`,
+    );
     if (l.calibratedMin !== null && l.calibratedMax !== null) {
-      parts.push(`range calibrated ${l.calibratedMin.toFixed(2)}–${l.calibratedMax.toFixed(2)}${l.calibrationManual ? ' (set by hand)' : ''}`);
+      parts.push(
+        `calibrated for this session: 0% = ${formatFeature(l.calibratedMin, unit)} at rest, ` +
+          `100% = ${formatFeature(l.calibratedMax, unit)} at comfortable maximum (${FEATURE_UNIT_SHORT[unit]})` +
+          `${l.calibrationManual ? ', set by hand rather than measured' : ''}`,
+      );
+      // AND HOW WELL THAT RANGE WAS MEASURED. Every percentage on this line is taken against it, so
+      // the file that is read with no app around it has to be able to say whether the denominator
+      // came off a clean stream and three agreeing reps or off a slow one and three that did not.
+      parts.push(
+        l.calibrationMeasurement
+          ? `that range was measured at ${calibrationConditions(l.calibrationMeasurement)} (${calibrationGrade(l.calibrationMeasurement)})`
+          : 'how well that range was measured was not recorded',
+      );
     }
   } else {
     parts.push('range not measured');
@@ -506,6 +699,41 @@ function laneLine(l: LaneResultSummary): string {
   else if (!l.compensationMonitored) parts.push(`${l.compensationKind.replace('_', ' ')} not measured`);
   else parts.push(`${l.compensationFlags} rep(s) flagged for ${l.compensationKind.replace('_', ' ')}`);
   return `    - ${parts.join(' · ')}`;
+}
+
+/** One run, exactly as it appears inside a visit. Shared by the patient export and the single-session one. */
+function sessionLines(s: SessionResult): string[] {
+  const lines: string[] = [];
+  lines.push(`  ${formatDate(s.startedAt)} — ${s.songTitle} · ${s.mode === 'leg' ? 'Leg' : 'Hand'} · ${s.difficulty}${s.completed ? '' : ` · ${endReasonLabel(s.endReason)}`}`);
+  if (s.inputMode !== 'camera') {
+    lines.push(`    NOT THE PATIENT'S PERFORMANCE — this run was driven by ${s.inputMode}.`);
+  }
+  // THE WORK FIRST, THE GRADE AFTER — the same ordering the Results screen was corrected to. This
+  // is the copy that goes into the notes and off the device, and it used to open every session
+  // line with "4,200 pts · 1 stars", i.e. a grade on an impairment in the durable artefact.
+  lines.push(
+    `    ${s.reps} movements performed · ${s.hits} of ${s.hits + s.misses} notes answered in time · ` +
+      `${formatDuration(s.durationSec)} of song` +
+      `${s.laneRestSec === undefined ? ' · pacing not recorded' : ` · pacing ${pacingSentence(s.laneRestSec, s.lanes, s.mode)}`}`,
+  );
+  if (typeof s.answerRate === 'number') {
+    lines.push(
+      `    Notes answered with a movement: ${formatPercent(s.answerRate)}` +
+        `${typeof s.surplusMovements === 'number' ? ` · ${s.surplusMovements} movement(s) answered no note` : ''}`,
+    );
+  }
+  lines.push(
+    `    Scoring (clinical): ${s.score.toLocaleString()} pts · ${s.stars} stars · ${formatPercent(s.accuracy)} accuracy · ` +
+      `timing ${formatMs(s.timingBiasMs)} · input latency ${s.latencyOffsetMs} ms`,
+  );
+  // WHAT THE CAMERA WAS DOING WHILE THOSE FIGURES WERE MEASURED — per session, because it differs
+  // per session, which is exactly why a trend built without it can be a trend in the equipment.
+  if (s.inputMode === 'camera') {
+    lines.push(`    Tracking: ${s.tracking ? trackingSentence(s.tracking) : TRACKING_NOT_RECORDED}`);
+  }
+  for (const l of s.lanes) lines.push(laneLine(l));
+  lines.push('');
+  return lines;
 }
 
 export function buildPatientExport(input: PatientExportInput): PatientExport {
@@ -541,38 +769,18 @@ export function buildPatientExport(input: PatientExportInput): PatientExport {
       'measured. A change between two sessions tracked differently — or between one that recorded ' +
       'tracking quality and one that did not — is partly the equipment, not the patient.',
   );
+  lines.push(UNITS_LEGEND);
+  // WHICH RUNS WERE ONE APPOINTMENT. The sessions below are listed newest first and several of them
+  // can be one visit; the grouping is inferred from the clock, so the file says so rather than
+  // implying the app was told when the appointments were.
+  lines.push(VISIT_LEGEND);
   lines.push('');
 
-  for (const s of sessions) {
-    lines.push(`${formatDate(s.startedAt)} — ${s.songTitle} · ${s.mode === 'leg' ? 'Leg' : 'Hand'} · ${s.difficulty}${s.completed ? '' : ` · ${endReasonLabel(s.endReason)}`}`);
-    if (s.inputMode !== 'camera') {
-      lines.push(`    NOT THE PATIENT'S PERFORMANCE — this run was driven by ${s.inputMode}.`);
-    }
-    // THE WORK FIRST, THE GRADE AFTER — the same ordering the Results screen was corrected to. This
-    // is the copy that goes into the notes and off the device, and it used to open every session
-    // line with "4,200 pts · 1 stars", i.e. a grade on an impairment in the durable artefact.
-    lines.push(
-      `    ${s.reps} movements performed · ${s.hits} of ${s.hits + s.misses} notes answered in time · ` +
-        `${formatDuration(s.durationSec)}` +
-        `${s.laneRestSec === undefined ? ' · pacing not recorded' : ` · pacing ${pacingSentence(s.laneRestSec, s.lanes, s.mode)}`}`,
-    );
-    if (typeof s.answerRate === 'number') {
-      lines.push(
-        `    Notes answered with a movement: ${formatPercent(s.answerRate)}` +
-          `${typeof s.surplusMovements === 'number' ? ` · ${s.surplusMovements} movement(s) answered no note` : ''}`,
-      );
-    }
-    lines.push(
-      `    Scoring (clinical): ${s.score.toLocaleString()} pts · ${s.stars} stars · ${formatPercent(s.accuracy)} accuracy · ` +
-        `timing ${formatMs(s.timingBiasMs)} · input latency ${s.latencyOffsetMs} ms`,
-    );
-    // WHAT THE CAMERA WAS DOING WHILE THOSE FIGURES WERE MEASURED — per session, because it differs
-    // per session, which is exactly why a trend built without it can be a trend in the equipment.
-    if (s.inputMode === 'camera') {
-      lines.push(`    Tracking: ${s.tracking ? trackingSentence(s.tracking) : TRACKING_NOT_RECORDED}`);
-    }
-    for (const l of s.lanes) lines.push(laneLine(l));
-    lines.push('');
+  for (const visit of groupVisits(sessions)) {
+    // THE APPOINTMENT, THEN THE RUNS INSIDE IT. Read as a flat list, five "Play again" runs from one
+    // 40-minute slot are five visits — a claim about attendance the record cannot support.
+    lines.push(`VISIT — ${formatDate(visit.startedAt)} · ${visitSummary(visit)}`);
+    for (const s of visit.sessions) for (const line of sessionLines(s)) lines.push(line);
   }
   if (sessions.length === 0) lines.push('No sessions recorded for this patient.');
 
@@ -607,6 +815,16 @@ export function buildPatientExport(input: PatientExportInput): PatientExport {
           'BETWEEN TWO SESSIONS IS ONLY LIKE-FOR-LIKE WHEN BOTH CARRY THIS BLOCK AND BOTH WERE ' +
           'TRACKED WELL (fpsMedian >= 24 and trackedFraction >= 0.95); otherwise part of the change ' +
           'is the camera.',
+        'lanes[].calibrationMeasurement':
+          'HOW WELL THE DENOMINATOR ITSELF WAS MEASURED — romMean and romBest are percentages OF the ' +
+          'calibrated range, so this is the uncertainty they inherit. frames (every frame offered to the ' +
+          'calibrator, including ones with no usable landmarks), tracked and trackedFraction; fpsMedian ' +
+          'and fpsLow (the rate those frames arrived at); durationSec; reps (the peaks the top of the ' +
+          'range was taken from) and repSpread / repSpreadFraction (how far apart they were, in feature ' +
+          'units and as a fraction of the range). The top of the range is the 90th percentile of the ' +
+          'peaks, so A LOW FRAME RATE BIASES IT DOWNWARD (a peak between two frames is never seen) and ' +
+          'every percentage against it then reads high. Null = not recorded: the range was set by hand, ' +
+          'or captured before this existed. It is NOT the same thing as a clean measurement.',
       },
       exportedAt: now,
       patient,
@@ -621,6 +839,64 @@ export function buildPatientExport(input: PatientExportInput): PatientExport {
 
   return {
     filename: `beat-rehab-${exportSlug(patient.name, patient.id)}-${isoDay(now)}.json`,
+    json,
+    text: lines.join('\n'),
+  };
+}
+
+
+/**
+ * ONE SESSION, ON ITS OWN, FOR THE MOMENT THE DEVICE REFUSED TO KEEP IT.
+ *
+ * `buildPatientExport` reads the stored history — which is exactly what does not exist when the
+ * write failed. A quota-full tablet (the per-patient cap is 100 sessions, and a clinic tablet is
+ * shared) leaves the only copy of a session on the Results screen, and the therapist has one thing
+ * they can do about it before they navigate away: take it off the device by hand. So the Results
+ * screen builds the file straight from the record in memory.
+ *
+ * Same two forms, same scope and unit legends, so a file rescued this way reads like any other.
+ */
+export interface SessionExportInput {
+  result: SessionResult;
+  /** Why this file was produced, when it was not a plain "export" (printed at the top). */
+  reason?: string;
+  now?: () => number;
+}
+
+export function buildSessionExport(input: SessionExportInput): PatientExport {
+  const now = (input.now ?? Date.now)();
+  const s = input.result;
+  const lines: string[] = [];
+  lines.push('Beat Rehab — one session');
+  lines.push(`Patient: ${s.patientName || 'not recorded'}`);
+  lines.push(`Local record id: ${s.patientId || 'none'} · session ${s.id}`);
+  lines.push(`Exported: ${formatDate(now)}`);
+  if (input.reason) lines.push(input.reason);
+  lines.push('');
+  lines.push(`SCOPE: ${SCOPE_STATEMENT}`);
+  lines.push(UNITS_LEGEND);
+  lines.push('');
+  lines.push(`VISIT — ${formatDate(s.startedAt)} · 1 song · ${formatTime(s.startedAt)} · ${s.reps} movement${s.reps === 1 ? '' : 's'} · ${formatDuration(s.durationSec)} of song`);
+  for (const line of sessionLines(s)) lines.push(line);
+
+  const json = JSON.stringify(
+    {
+      app: 'beat-rehab',
+      format: 'session-record',
+      scope: SCOPE_STATEMENT,
+      version: 3,
+      exportedAt: now,
+      ...(input.reason ? { reason: input.reason } : {}),
+      sessionCount: 1,
+      cameraSessionCount: s.inputMode === 'camera' ? 1 : 0,
+      sessions: [s],
+    },
+    null,
+    2,
+  );
+
+  return {
+    filename: `beat-rehab-session-${exportSlug(s.patientName, s.patientId || s.id)}-${isoDay(s.startedAt)}.json`,
     json,
     text: lines.join('\n'),
   };

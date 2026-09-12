@@ -5,6 +5,7 @@
  * months later, so nothing in this file may hold a class instance, a DOM node or an audio handle.
  */
 import type { DifficultyName, Fingertip, LaneSpec, Mode, Movement, Side } from '../engine/types.ts';
+import type { CalibrationMeasurement } from '../vision/calibration.ts';
 
 /** Which input drives the lanes. `camera` is the product; the other two are dev/critic affordances. */
 export type InputMode = 'camera' | 'keyboard' | 'autoplay';
@@ -157,6 +158,16 @@ export interface LaneResultSummary {
   calibratedMax: number | null;
   /** True when the therapist set or nudged that range by hand rather than measuring it. */
   calibrationManual: boolean;
+  /**
+   * HOW WELL THAT RANGE ITSELF WAS MEASURED — the frame rate, the landmark availability and the rep
+   * spread behind the denominator (`CalibrationMeasurement`, built by RomCalibrator).
+   *
+   * `romMean` and `romBest` are percentages OF this range, so the uncertainty on the range is
+   * inherited by every one of them, and by every trend line and export that reads them. Null means
+   * NOT RECORDED (a hand-set range, or one captured before this existed) and must never be rendered
+   * as a clean measurement. Plain JSON, like everything else here.
+   */
+  calibrationMeasurement?: CalibrationMeasurement | null;
   /** Compensation the movement monitors, or null when it monitors none. */
   compensationKind: 'heel_lift' | 'trunk_lean' | null;
   /** True when a rest baseline was actually in effect — otherwise `compensationFlags` means "not measured". */

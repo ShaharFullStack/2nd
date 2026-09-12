@@ -206,6 +206,38 @@ function qualifierOf(c: TrackingComparison | null): { tag: string; title?: strin
   return { tag: c.tag, title: c.note ?? undefined };
 }
 
+/**
+ * THE SESSIONS THE CARD'S CHANGE BADGES ARE ACTUALLY TAKEN ACROSS.
+ *
+ * Not the same set as the plotted sessions, and that is the point. The header badge used to be
+ * computed over EVERY plotted session while the delta four lines under it was computed over its own
+ * two ends, so a card could print "measured unevenly" above a plain green "▲ +12 pts" — two true
+ * statements about two different sets, wearing the same words, with nothing on screen to say they
+ * were about different things. A therapist with ninety seconds reads that as a contradiction and
+ * discounts whichever one is less convenient.
+ *
+ * So the endpoints are named here and the header is written about them: it says which sessions the
+ * change figures span, and whether the unevenness it is counting reaches them.
+ */
+function deltaEndpoints(
+  shown: readonly TrendPoint[],
+  ends: readonly { n: number; firstIndex: number; lastIndex: number }[],
+): TrendPoint[] {
+  const seen = new Set<string>();
+  const out: TrendPoint[] = [];
+  for (const e of ends) {
+    if (e.n < 2) continue;
+    for (const i of [e.firstIndex, e.lastIndex]) {
+      const p = shown[i];
+      if (!p || seen.has(p.sessionId)) continue;
+      seen.add(p.sessionId);
+      out.push(p);
+    }
+  }
+  // In plotted order, so "from → to" reads left to right the way the plots do.
+  return out.sort((a, b) => a.at - b.at);
+}
+
 function TrendCard({ trend }: { trend: MovementTrend }) {
   const { shown, excluded } = cardBasis(trend.points);
   const romValues = shown.map((p) => p.rom);
@@ -241,6 +273,21 @@ function TrendCard({ trend }: { trend: MovementTrend }) {
   const accuracyComparison = endsComparison(shown, accuracyEnds);
   /** The mix behind THIS card, counted over the sessions it draws — never the whole stored history. */
   const mix = trackingMixOfGrades(shown.map((p) => p.trackingGrade));
+  /**
+   * THE TWO SETS, NAMED, SO THE HEADER AND THE DELTAS CANNOT WEAR EACH OTHER'S WORDS.
+   *
+   * `mix` counts the PLOTTED sessions; every change badge on this card is taken across its own two
+   * ENDS. Those are different sets and both statements are true, so the header says which one it is
+   * counting and whether the unevenness it found reaches the sessions the change figures span. The
+   * phrase "measured unevenly" — the tag the delta chips themselves carry — is used at the top ONLY
+   * when at least one of those chips really is carrying it.
+   */
+  const endpoints = deltaEndpoints(shown, [romEnds, absEnds, accuracyEnds]);
+  const changeQualified = [romComparison, absComparison, accuracyComparison].some(
+    (c) => c !== null && c.kind !== 'like-for-like',
+  );
+  const firstEndpoint = endpoints[0] ?? null;
+  const lastEndpoint = endpoints.length > 1 ? endpoints[endpoints.length - 1] : null;
   /** Reps in the sessions this card's figures are about, and in the ones it set aside. */
   const shownReps = shown.reduce((n, p) => n + p.reps, 0);
   const excludedReps = excluded.reduce((n, p) => n + p.reps, 0);
@@ -285,7 +332,15 @@ function TrendCard({ trend }: { trend: MovementTrend }) {
       */}
       {(mix.degraded > 0 || mix.unrecorded > 0) && (
         <div className="dim" data-testid={`trend-tracking-${trend.key}`}>
-          <span className="badge badge-warn">measured unevenly</span>{' '}
+          {/* The tag the delta chips carry, at the top of the card, ONLY when a delta chip is really
+              carrying it. Otherwise the unevenness is real but sits between the ends, and the badge
+              says that instead of borrowing the chips' words. */}
+          <span
+            className={changeQualified ? 'badge badge-warn' : 'badge'}
+            data-testid={`trend-tracking-badge-${trend.key}`}
+          >
+            {changeQualified ? 'measured unevenly' : 'uneven between the ends'}
+          </span>{' '}
           {mix.degraded > 0 && (
             <>
               {mix.degraded} of these {mix.total} sessions {mix.degraded === 1 ? 'was' : 'were'} measured on a degraded
@@ -298,8 +353,14 @@ function TrendCard({ trend }: { trend: MovementTrend }) {
               {mix.unrecorded} of these {mix.total} {mix.unrecorded === 1 ? 'has' : 'have'} no tracking quality recorded
             </>
           )}
-          . Those sessions are ringed on the plots and listed session by session below; a change taken
-          across one of them is marked on its badge.
+          . Those sessions are ringed on the plots and listed session by session below.{' '}
+          <span data-testid={`trend-tracking-scope-${trend.key}`}>
+            {firstEndpoint === null || lastEndpoint === null
+              ? 'There is no change figure on this card for it to reach: a change needs two measured sessions.'
+              : changeQualified
+                ? `The change figures below are taken across ${shortDate(firstEndpoint.at)} → ${shortDate(lastEndpoint.at)}, and that pair is one of them — each change badge says so on itself.`
+                : `The change figures below are taken across ${shortDate(firstEndpoint.at)} → ${shortDate(lastEndpoint.at)}, and BOTH of those were tracked good — so the change badges are not qualified. It is the sessions between them that were not, which moves the shape of the line and not its ends.`}
+          </span>
         </div>
       )}
 

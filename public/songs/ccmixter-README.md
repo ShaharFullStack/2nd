@@ -5,14 +5,51 @@ CC0). For real music, ccMixter publishes thousands of Creative-Commons songs, an
 artists also upload the individual **stems** (drums, bass, vocals, …) that Beat Rehab needs
 for per-instrument ducking.
 
-Only use tracks whose licence permits your use. For a rehab product that may be used
-commercially, stick to the **free for commercial use** section (CC BY / CC BY-SA / CC0) —
-avoid CC BY-NC.
+## Licences: what each one actually costs you
+
+Only use tracks whose licence permits your use. "Free for commercial use" on ccMixter is a
+filter about MONEY; it is not a statement that the licences in it ask the same thing of you.
+Three of them are in that section and they carry three different obligations:
+
+| licence | what it asks | what it means for this app |
+| --- | --- | --- |
+| **CC0** | nothing | Public-domain dedication. Credit the artist anyway; it is decent, not required. |
+| **CC BY** | attribution | Name the creator, the title, the source and the licence, and say if you changed the work. `song.json`'s `attribution` is shown in song select and on the results screen, which is what discharges this. |
+| **CC BY-SA** | attribution **and ShareAlike** | **The obligation ShareAlike adds is copyleft, not credit.** If you produce *adapted material* you must release that adaptation under CC BY-SA 4.0 (or a compatible licence), and you may not add restrictions of your own — including technical measures that stop anyone extracting it. |
+
+**Why CC BY-SA is a decision and not a formality here.** Everything this pipeline does to a
+stem pack is adaptation: `fetch-stems` downloads the stems, `gen-demo-stems`-style re-rendering
+resamples and re-balances them, `StemMixer` plays them as one arrangement with per-lane ducking,
+and the chart generator builds a part for the patient to play on top. Ship a BY-SA song and the
+audio you ship is adapted material — so that audio has to go out under CC BY-SA 4.0, with the
+licence named and linked wherever the song is credited, and nobody downstream may be stopped
+from taking it back out.
+
+What ShareAlike does **not** do: it is not a software copyleft. It binds the adapted MUSIC, not
+this repository's TypeScript, which is not an adaptation of anything in the song. But it does
+bind every build artefact that contains the adapted audio, and a clinic deployment is a
+distribution.
+
+So: **CC0 and CC BY cost you an attribution string. CC BY-SA costs you a licence on your own
+mix.** If you do not want that obligation, filter to CC BY and CC0 and leave BY-SA alone —
+this is a choice to make deliberately, before the stems are in the repo, not after.
+
+Avoid entirely:
+
+* **CC BY-NC** (and any NC variant) — not usable in a product that may be used commercially,
+  and a clinic licence is commercial use.
+* **CC BY-ND / CC BY-NC-ND** — NoDerivatives forbids sharing adapted material, and remixing
+  stems into a game arrangement is exactly that. ccMixter rarely lists ND, but check.
+
+And check the licence of the SOURCES, not only of the track: a ccMixter remix names the
+"pulls" it was built from, those can carry their own terms, and a BY-SA pull makes the remix
+BY-SA whatever its own page says. If the two disagree, believe the more restrictive one.
 
 ## 1. Find a stem pack
 
-* https://dig.ccmixter.org/ → "Free for commercial use" (filter: *CC BY* / *CC0*),
-  or https://stems.ccmixter.org/ (a cappella + stems / "sample packs").
+* https://dig.ccmixter.org/ → "Free for commercial use". That section holds CC BY, CC BY-SA
+  and CC0; narrow it to **CC BY / CC0** unless you have decided to take on ShareAlike (see
+  the table above). Or https://stems.ccmixter.org/ (a cappella + stems / "sample packs").
 * On the song page look for a *Stems* / *Multitrack* / *Sample pack* download (zip or
   individual files). You need at least 2 stems; the "player stem" is the one the patient
   drives (drums or another rhythmically obvious part works best).
@@ -34,8 +71,8 @@ Edit `song.json`:
 | `id` | must equal the folder name |
 | `title`, `artist`, `artistUrl` | as shown on ccMixter |
 | `sourceUrl` | the ccMixter song page (`https://ccmixter.org/files/<artist>/<id>`) |
-| `license`, `licenseUrl` | copy **exactly** from the song page, e.g. `CC BY 4.0` + `https://creativecommons.org/licenses/by/4.0/` |
-| `attribution` | `"Title" by Artist (ccmixter.org) is licensed under CC BY 4.0` — this string is shown in song select and on the results screen, which is what CC BY requires |
+| `license`, `licenseUrl` | copy **exactly** from the song page, e.g. `CC BY 4.0` + `https://creativecommons.org/licenses/by/4.0/`. For a ShareAlike track this is `CC BY-SA 4.0` + `https://creativecommons.org/licenses/by-sa/4.0/`, and it must also be the licence you publish YOUR mix of it under |
+| `attribution` | `"Title" by Artist (ccmixter.org) is licensed under CC BY 4.0` — shown in song select and on the results screen, which is what discharges the attribution. Name the licence you found, not a shorter one: `CC BY-SA 4.0` is not `CC BY 4.0`, and dropping the `-SA` in this string is how an obligation goes unrecorded. Say if you changed the work ("re-rendered at 16 kHz", "stems re-balanced"), which both BY and BY-SA require |
 | `bpm`, `offset` | tempo, and the time (seconds) of the first downbeat in the stems |
 | `swing` | rhythmic feel: the fraction of a 16th by which the **odd** 16ths are played late. `0` (or absent) for a straight track; `0.333` for a triplet shuffle (long:short = 2:1); measure it if the drummer swings, otherwise every off-16th note in the chart lands `swing × 15/bpm` seconds off the audio. `stepTimeSec()` in `src/audio/manifest.ts` applies it. |
 | `durationSec`, `previewStart` | length of the stems; where the preview snippet starts |
