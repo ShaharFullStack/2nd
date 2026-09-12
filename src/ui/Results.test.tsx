@@ -798,3 +798,41 @@ describe('a change too small for the movement’s own units states the true boun
     expect(tile.textContent).not.toContain('under 1°');
   });
 });
+
+describe('the last screen of the session does not promise a door it cannot open', () => {
+  /** The camera session a patient drove from the chair: the state that puts targets on this screen. */
+  function handsFreeResults(): void {
+    useStore.setState({ lastResult: result(), history: [result()], handsFree: true });
+    render(<ResultsScreen />);
+  }
+
+  it('keeps "New session" on the therapist\u2019s button, where it is true', () => {
+    handsFreeResults();
+    // The rings themselves are only drawn over live camera frames, which a test environment has
+    // none of — what they are labelled is asserted in the running app
+    // (critic/handsfree-dead-ends.mjs reads the caption off `results-dwell-new`).
+    expect(screen.getByRole('button', { name: 'New session' })).toBeTruthy();
+    expect(screen.getByTestId('results-handsfree')).toBeTruthy();
+  });
+
+  it('says what holding it does — the camera goes off and the tablet goes back', () => {
+    handsFreeResults();
+    const note = screen.getByTestId('results-handback-note').textContent ?? '';
+    expect(note).toMatch(/ends the patient.s own part of the visit/i);
+    expect(note).toMatch(/camera is turned off/i);
+    expect(note).toMatch(/does not start one/i);
+  });
+
+  it('the screen it hands to says the hands-free flow stops there', async () => {
+    // The other half of the same promise: `goto('mode')` lands on a screen with no camera and no
+    // targets, which is a dead end only while it does not admit to being one.
+    const { default: ModeSelect } = await import('./ModeSelect.tsx');
+    useStore.setState({ screen: 'mode' });
+    cleanup();
+    render(<ModeSelect />);
+    const note = screen.getByTestId('mode-handsfree-note').textContent ?? '';
+    expect(note).toMatch(/This step needs a hand/i);
+    expect(note).toMatch(/camera is off/i);
+    expect(note).toMatch(/takes over again at the camera check/i);
+  });
+});

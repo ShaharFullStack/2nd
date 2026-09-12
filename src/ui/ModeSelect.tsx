@@ -35,6 +35,19 @@ export default function ModeSelect() {
     <Screen>
       <TopBar eyebrow="Step 1 of 3" title="Which limb is this session for?" onBack={() => goto('home')} />
       <p className="muted">One mode per session — pose and hand tracking cannot run on the same frames without halving the frame rate.</p>
+      {/* THE SCREEN WHERE THE HANDS-FREE FLOW STOPS, saying so.
+          Every screen from the camera check onwards can be confirmed by holding a limb over a circle
+          on the camera preview. This one cannot, and neither can the prescription behind it: there is
+          no camera running here (arriving here releases it — `screenNeedsCamera`), and choosing two
+          movements, a difficulty, a song and a pace is not a choice a knee held in a circle can make.
+          A patient who reaches this screen from the results screen's "Hand back" circle has finished
+          their own part of the visit, and is owed a screen that admits it rather than one that simply
+          offers nothing. */}
+      <p className="muted" data-testid="mode-handsfree-note" style={{ maxWidth: 720 }}>
+        <b>This step needs a hand.</b> The camera is off, so nothing on this screen can be confirmed by holding a limb
+        over a circle — this screen and the prescription after it are set up by whoever is in the room. The patient takes
+        over again at the camera check, and from there to the end of the session every step can be confirmed hands-free.
+      </p>
 
       <div className="card-grid">
         {CARDS.map((c) => {

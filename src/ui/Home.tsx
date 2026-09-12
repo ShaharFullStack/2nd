@@ -110,7 +110,11 @@ export default function Home() {
             and the song is done by hand, before anyone gets into position — and one of those presses has to be a real
             one, because the browser will not start the sound without it and the song clock is that sound. From the
             camera check onwards the patient confirms every step themselves, by holding a hand or a knee inside a circle
-            on the camera preview until the ring fills. The buttons all keep working for whoever is in the room.
+            on the camera preview until the ring fills — with two exceptions, each of which the screen it
+            happens on names in those words. If the browser stops the sound mid-song, only a touch can start it again,
+            and no movement in front of the camera can; and if the camera itself will not start, there is no picture to
+            draw a circle on, so that step needs a hand or somebody to help. The buttons all keep working for whoever is
+            in the room.
           </p>
         )}
       </div>

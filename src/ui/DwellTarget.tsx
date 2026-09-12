@@ -1,10 +1,15 @@
 /**
  * THE HANDS-FREE CONFIRM, on screen.
  *
- * A target is drawn over the camera preview; the patient parks a hand (hand mode) or a hand or a knee
- * (leg mode) inside it; a ring fills while they hold; it confirms when the ring is full. The maths is
- * in `src/vision/dwell.ts` and is decided frame by frame in a test — this file places the targets,
- * renders them, and wires them to the vision module.
+ * A target is drawn over the camera preview; the patient parks a HAND inside it; a ring fills while
+ * they hold; it confirms when the ring is full. The maths is in `src/vision/dwell.ts` and is decided
+ * frame by frame in a test — this file places the targets, renders them, and wires them to the vision
+ * module.
+ *
+ * A hand in both modes, and in leg mode that is a change: the knees used to count and they cannot, for
+ * the reason set out at the top of `dwell.ts` — a seated patient only puts a knee anywhere by doing a
+ * prescribed leg movement, so a circle a knee can hold is a circle the exercise fills. It did, three
+ * times, in the running app.
  *
  * WHAT THE DRAWING HAS TO SURVIVE
  * -------------------------------
@@ -14,15 +19,18 @@
  *    (`paint-order`), which is the only thing that keeps white type legible over a live video of an
  *    unknown room.
  *  - LOW VISION, AND COLOUR VISION THAT IS NOT THE DESIGNER'S. No state is signalled by hue alone.
- *    Each one has its own GLYPH (✕ nothing tracked, ◎ come in, ↻ move out and back, a COUNTDOWN while
- *    holding, ✓ confirmed) and its own ring pattern (dashed when nothing is tracked, solid when the
- *    limb is there, a filling arc while holding). The colours are the fourth cue, not the first.
+ *    Each one has its own GLYPH (✕ nothing tracked, ◎ come in, ↻ move out and back, ⊘ a limb lives
+ *    here, a COUNTDOWN while holding, ✓ confirmed) and its own ring pattern (dashed when nothing is
+ *    tracked, solid when the limb is there, a filling arc while holding). Colour is the fourth cue.
  *  - TWO TARGETS THAT MEAN OPPOSITE THINGS, at 1/5 scale. "Next movement" and "Do it again" — or
  *    "Play again" and "New session" — used to render identically: same size, same white ring, same
  *    glyph, same caption size, distinguishable only by reading two words from two metres. The
  *    secondary action is now SMALLER (a smaller `radius`, which is a smaller circle to hold as well as
  *    a smaller ring to look at) and has a different SILHOUETTE (a square backing plate and a doubled
- *    ring, against the primary's disc and single ring). Shape and size first, words fourth.
+ *    ring, against the primary's disc and single ring), AND a tone mark inside the ring — a double
+ *    chevron onward, a back-pointing chevron with a tail — because size tells the two apart without
+ *    saying which is which, and at a fifth of the size the caption is not readable at all. Shape and
+ *    size first, words fourth.
  *  - `reducedMotion`. The idle breathing of the ring is the only animation, and that setting removes
  *    it. The arc still fills — that is not decoration, it is the measurement.
  *
@@ -42,7 +50,19 @@ import { useEffect, useRef, useState } from 'react';
 import type { Mode } from '../engine/types.ts';
 import { runtime } from '../session/runtime.ts';
 import { useStore } from '../state/store.ts';
-import { DWELL_AUTHORED_ASPECT, DwellTracker, dwellLimbs, pickDwellLimb, retargetForAspect } from '../vision/dwell.ts';
+import {
+  DWELL_AUTHORED_ASPECT,
+  DWELL_CLEAR_EXTRA,
+  DWELL_DEFAULTS,
+  DwellHabitat,
+  DwellLayout,
+  DwellTracker,
+  dwellAxisFor,
+  dwellEngaged,
+  dwellLimbs,
+  pickDwellLimb,
+  retargetForAspect,
+} from '../vision/dwell.ts';
 import type { DwellCircle, DwellLimb, DwellPoint, DwellState } from '../vision/dwell.ts';
 import type { VisionInput } from '../input/VisionInput.ts';
 
@@ -55,26 +75,39 @@ export const PREVIEW_ASPECT = DWELL_AUTHORED_ASPECT;
 /* ---------------- where the targets go ---------------- */
 
 /**
- * WHERE A TARGET IS PLACED IS A CLINICAL CHOICE, not a layout one — and the two halves of that choice
- * pull against each other:
+ * WHERE A TARGET STARTS. It is a clinical choice, not a layout one — and since the critic's report it
+ * is only ever a STARTING POINT: `useDwellTargets` measures where this patient's limbs actually live
+ * (`DwellHabitat`) and moves the circle off them when these numbers turn out to be wrong for the body
+ * in front of the camera. What is below is the position the app opens at, chosen so that it is right
+ * for most framings and so that a patient finds the same circle in the same place from screen to
+ * screen; what makes it SAFE is the measurement, not the number.
  *
- *  1. NOWHERE A LIMB ALREADY IS. Not just the centre of the circle: the whole activation region, the
- *     hysteresis band included. The first version of this file failed exactly there — the ROM pair sat
- *     0.1804 frame-heights from a resting knee with an exit radius of 0.2175, so a patient who entered
- *     the target and then RELAXED THE KNEE BACK TO REST kept filling the ring and the session advanced
- *     itself. `DwellTarget.test.tsx` now measures every placement against the resting position of
- *     every limb `dwellLimbs` can return, in both modes, entry radius and exit band, at 1:1, 4:3 and
- *     16:9 — and the margins are asserted, not eyeballed.
+ * That distinction is the whole lesson of the last two rounds of review. The numbers here used to be
+ * defended by a sweep over this repo's synthetic rigs, and a critic who rebuilt the envelope with
+ * different framing assumptions walked straight through it: a leg-mode hand resting at (0.70, 0.45)
+ * sits 0.1327 from the primary centre against an exit radius of 0.1438, and a hand-mode palm at 1.6×
+ * scale framed a tenth of a frame high sits 0.0967 from it — inside the drawn circle. `handPose` puts
+ * a resting palm at y 0.63 BY CONSTRUCTION, and nothing in the app enforces, measures or mentions
+ * that. The sweep in `DwellTarget.test.tsx` is now wide enough to contain both of those escapes, and
+ * where the OPENING position does not clear a body, the test asserts that the gate stands the ring
+ * down and the placement moves it — rather than asserting the escape away.
+ *
+ * The two things the opening position still has to get right:
+ *
+ *  1. SOMEWHERE A LIMB USUALLY IS NOT. Not just the centre of the circle: the whole activation region,
+ *     the hysteresis band included.
  *  2. SOMEWHERE THE PATIENT CAN ACTUALLY HOLD FOR 1.8 s. The app prescribes the posture itself
  *     (features.ts, POSTURE_INFO): in HAND mode "rest your forearm on the table with your palm facing
- *     the camera", which puts the palm centre low and central — the previous target at y 0.3, x 0.5
+ *     the camera", which puts the palm centre low and central — the original target at y 0.3, x 0.5
  *     was 0.45 frame-heights away and straight up, i.e. an unsupported arm held in the upper third of
  *     the frame for nearly two seconds, at the camera check AND the latency check, by an affected limb
- *     late in a fatigued session. That is a therapy exercise, not a click. The targets are now OUT TO
- *     THE SIDE and only modestly up: a slide along the table with the elbow still on it.
+ *     late in a fatigued session. That is a therapy exercise, not a click. The targets are OUT TO THE
+ *     SIDE and only modestly up: a slide along the table with the elbow still on it. Hand mode moves
+ *     the circle SIDEWAYS when it has to move it, for the same reason — the table carries the arm, and
+ *     sideways is the one direction the prescription never takes the palm.
  *     In LEG mode the patient is seated and their HANDS ARE FREE (they are exercising their legs), so
- *     the targets sit up and out where a raised hand reaches easily — `dwellLimbs` follows either a
- *     hand or a knee in leg mode, whichever is nearest — and well clear of both resting knees.
+ *     the targets sit up and out where a raised hand reaches easily, and leg mode moves the circle UP
+ *     when a hand lives too close to it.
  */
 const TARGET_Y: Readonly<Record<Mode, number>> = Object.freeze({ hand: 0.37, leg: 0.32 });
 /**
@@ -160,6 +193,16 @@ const IDLE: DwellSession = Object.freeze({ states: {}, limb: null, live: false, 
  * camera that has genuinely stopped is still called stopped within about a second.
  */
 const MIN_STALE_SEC = 0.2;
+/**
+ * How long a target must have been sitting on a limb before the layout is moved off it.
+ *
+ * Nothing is at risk while it waits — a target that does not clear the patient accumulates nothing
+ * from the moment it is measured (`DwellTracker.setOccupied`) — so this is purely about not shuffling
+ * the rings around the preview because a hand passed underneath one on its way somewhere else.
+ */
+const CROWDED_GRACE_SEC = 0.5;
+/** And once moved, it stays put for at least this long: a circle that jitters cannot be aimed at. */
+const MOVE_INTERVAL_SEC = 1.5;
 const MAX_STALE_SEC = 1.2;
 /** Gaps are counted over this many frames, and the 80th percentile of them is "the frame interval". */
 const CADENCE_WINDOW = 12;
@@ -208,19 +251,30 @@ function clamp(v: number, lo: number, hi: number): number {
 }
 
 /**
- * The frame aspect the camera is really delivering.
+ * The frame aspect the camera is really delivering — or the authored 4:3 while it has not said.
  *
- * `VisionInput.getXScale()` is the value the movement features are already corrected by — the one the
- * camera session measured from `videoWidth/videoHeight` — so reading it here is what makes "the circle
- * tested is the circle drawn" true on a sensor that is not 4:3. When there is no camera (or it has not
- * reported a size yet) the authored 4:3 is used, which is also what the layout falls back to.
+ * `VisionInput.getXScale()` is the value the movement features are already corrected by, so reading it
+ * here is what makes "the circle tested is the circle drawn" true on a sensor that is not 4:3.
+ *
+ * IT HAS A "NOT YET" VALUE AND IT LOOKS EXACTLY LIKE A SQUARE SENSOR. `getXScale()` answers 1 until the
+ * <video> element reports a size (VisionInput.ts: `this.lanes[0]?.pipeline.getXScale() ?? 1`, and
+ * `syncCameraAspect` cannot act until `videoWidth` is non-zero), and 1 is finite and positive, so the
+ * old test here accepted it: the first frames were re-aspected as if for a square sensor — detector x
+ * 0.72 became 0.793, a quarter of a radius out — and then jumped when the real aspect arrived, taking
+ * any hold in progress with them. That source cannot be changed from here, so the ambiguity is resolved
+ * on this side: the camera is not believed about its shape until it has actually delivered a frame,
+ * and until then the authored 4:3 (which is also the shape of the preview box) stands.
  */
 function liveXScale(): number {
   const vision = runtime.peekVision();
-  // Defensively: a replay or a stubbed input source need not implement it, and a target that cannot
-  // find out what shape the frames are falls back to the frame it was authored in rather than failing.
-  const s = typeof vision?.getXScale === 'function' ? vision.getXScale() : undefined;
-  return typeof s === 'number' && Number.isFinite(s) && s > 0 ? s : PREVIEW_ASPECT;
+  // Defensively: a replay or a stubbed input source need not implement either method, and a target
+  // that cannot find out what shape the frames are falls back to the frame it was authored in.
+  if (!vision) return PREVIEW_ASPECT;
+  const frames = typeof vision.getStats === 'function' ? vision.getStats().frames : undefined;
+  if (frames !== undefined && !(frames > 0)) return PREVIEW_ASPECT;
+  const s = typeof vision.getXScale === 'function' ? vision.getXScale() : undefined;
+  // A sensor outside this band is a number nobody should be re-aspecting a circle by.
+  return typeof s === 'number' && Number.isFinite(s) && s >= 0.5 && s <= 4 ? s : PREVIEW_ASPECT;
 }
 
 function sameState(a: DwellState | undefined, b: DwellState): boolean {
@@ -266,14 +320,42 @@ export function useDwellTargets(choices: readonly DwellChoice[]): DwellSession {
       return;
     }
     let xScale = liveXScale();
+    /**
+     * WHERE THE PATIENT'S LIMBS ACTUALLY LIVE, and what that is allowed to change.
+     *
+     * `DwellHabitat` (vision/dwell.ts) records every limb's position for twenty seconds and reports
+     * robust statistics about it. Two things are driven from it, every watchdog tick:
+     *   - THE GATE. A tracker whose circle does not clear every limb's habitat is told so
+     *     (`setOccupied`) and accumulates nothing. This is the guarantee, and it holds whatever the
+     *     framing, the patient's size or the sensor: nothing is assumed about where a limb rests.
+     *   - THE REMEDY. A circle that does not clear is MOVED — along the axis the confirm gesture is
+     *     made in for this mode — to the nearest place that does. A stood-down ring is safe and
+     *     useless; this is what keeps the hands-free path usable for the patient it lands on.
+     * Placement only ever moves off a limb, never back for cosmetic reasons: a circle that has been
+     * moved stays where the patient learned it for as long as this screen offers it.
+     */
+    const habitat = new DwellHabitat();
+    const layout = new DwellLayout(
+      offered.map((c) => ({ id: c.id, authored: c.target, enabled: c.enabled !== false })),
+      {
+        xScale,
+        axis: dwellAxisFor(mode),
+        exitRatio: DWELL_DEFAULTS.exitRatio,
+        extra: DWELL_CLEAR_EXTRA,
+        crowdedGraceSec: CROWDED_GRACE_SEC,
+        moveIntervalSec: MOVE_INTERVAL_SEC,
+        // The layout re-expresses its circles in the delivered frame; `xScale` here follows it.
+        fits: (circle: DwellCircle) => dwellCircleFits(circle, xScale),
+      },
+    );
     // Trackers only for what may actually be confirmed — but the camera is watched whenever a target
     // is DRAWN, enabled or not. Otherwise a screen whose gate has not opened yet would report "no
     // frames are arriving" over a preview that is plainly working, which is the opposite of honest.
     const trackers = new Map<string, DwellTracker>();
     for (const c of offered) {
-      if (c.enabled !== false) trackers.set(c.id, new DwellTracker(retargetForAspect(c.target, xScale), { xScale }));
+      if (c.enabled !== false) trackers.set(c.id, new DwellTracker(layout.circleFor(c.id) as DwellCircle, { xScale }));
     }
-    let circles = offered.map((c) => retargetForAspect(c.target, xScale));
+    let circles = layout.circles();
 
     let attached: VisionInput | null = null;
     let off: (() => void) | null = null;
@@ -322,16 +404,51 @@ export function useDwellTargets(choices: readonly DwellChoice[]): DwellSession {
       }
     };
 
+    /**
+     * THE DELIBERATE HOLD IS NOT EVIDENCE ABOUT WHERE THE LIMB LIVES.
+     *
+     * The exercise is, a tremor is, a hand that genuinely sits where a circle was drawn is. But the
+     * hold the patient is making right now, and the moment after it while the limb is still on the
+     * answered target, would teach the record that the limb LIVES on the target — and the requirement
+     * would then grow by exactly the reach the gesture consists of, until no ring could ever be
+     * filled. Order statistics absorb one such excursion; a ROM screen where the patient confirms four
+     * lanes in twenty seconds is another matter, so the gesture itself is excluded outright.
+     *
+     * In leg mode the exclusion goes one step further — see `dwellEngaged`: a HAND inside one of these
+     * circles is a hand the patient raised, because nothing in a leg prescription puts one there. Left
+     * counted, a patient who confirmed and then simply left their hand where it was would find the
+     * next screen's ring moving out from under them. (Hand mode counts those frames, because there the
+     * palm is anchored on the table by the prescription and being inside a circle says nothing at all
+     * about intent — which is the critic's second escape, a resting palm INSIDE the drawn circle.)
+     */
+    const busy = () => {
+      for (const tracker of trackers.values()) {
+        const s = tracker.state;
+        if (s.progress > 0 || s.blocked === 'refractory') return true;
+      }
+      return false;
+    };
+
+    /** Re-measure the layout against where the limbs live, and act on the verdict. */
+    const survey = (t: number) => {
+      const { occupied, moved } = layout.survey(habitat.all(t, xScale), t, busy());
+      if (moved) {
+        circles = layout.circles();
+        for (const [id, tracker] of trackers) tracker.setTarget(layout.circleFor(id) as DwellCircle, xScale);
+      }
+      for (const [id, tracker] of trackers) tracker.setOccupied(occupied.get(id) === true);
+    };
+
     /** The camera finally said what shape its frames are (or changed it mid-stream). */
     const syncAspect = () => {
       const next = liveXScale();
       if (next === xScale) return;
       xScale = next;
-      circles = offered.map((c) => retargetForAspect(c.target, xScale));
-      for (const [id, tracker] of trackers) {
-        const c = offered.find((o) => o.id === id);
-        if (c) tracker.setTarget(retargetForAspect(c.target, xScale), xScale);
-      }
+      layout.setXScale(next);
+      circles = layout.circles();
+      for (const [id, tracker] of trackers) tracker.setTarget(layout.circleFor(id) as DwellCircle, xScale);
+      // The record was taken in the old frame; the statistics it holds are in the old units.
+      habitat.clear();
     };
 
     const attach = () => {
@@ -339,13 +456,24 @@ export function useDwellTargets(choices: readonly DwellChoice[]): DwellSession {
       if (vision === attached) return;
       off?.();
       off = null;
+      // A different camera is a different framing: nothing the old one taught about where this
+      // patient's limbs live is evidence about the new one.
+      if (attached) habitat.clear();
       attached = vision;
       if (!vision) return;
       off = vision.onFrame((_samples, _ctxTime, result) => {
         if (cancelled) return;
         const t = nowSec();
         noteFrame(t);
-        limb = pickDwellLimb(dwellLimbs(result, mode, mirrored), circles, {
+        const limbs = dwellLimbs(result, mode, mirrored, xScale);
+        if (!busy()) {
+          const engagedCounts = dwellAxisFor(mode) === 'radial';
+          for (const l of limbs) {
+            if (engagedCounts && dwellEngaged(l.point, circles, xScale, DWELL_DEFAULTS.exitRatio)) continue;
+            habitat.noteOne(l.key, l.point, t, l.scale ?? null);
+          }
+        }
+        limb = pickDwellLimb(limbs, circles, {
           xScale,
           previous,
           previousKey,
@@ -361,6 +489,7 @@ export function useDwellTargets(choices: readonly DwellChoice[]): DwellSession {
       attach();
       syncAspect();
       const t = nowSec();
+      survey(t);
       if (t - lastFrame > staleSec) {
         limb = null;
         previous = null;
@@ -443,7 +572,27 @@ const CY = 52;
 const R = 46;
 const CIRC = 2 * Math.PI * R;
 
-type Phase = 'lost' | 'enter' | 'reenter' | 'holding' | 'done' | 'off';
+/**
+ * CAN THIS CIRCLE BE DRAWN WHOLE, ring and caption, inside the preview?
+ *
+ * The placement solver has to ask, because a target moved off a patient's limbs is no use where the
+ * ring or its two lines of type fall off the edge of the frame (seen in the running app at 1024x768
+ * before the caption learned to flip above a low ring). This is the SAME arithmetic the component
+ * below lays the target out with — box fractions, the caption's side chosen by `place.y <= 0.5` — so
+ * the answer is about the target that will actually be drawn rather than about an idealised disc.
+ */
+export function dwellCircleFits(circle: DwellCircle, xScale: number, boxAspect = PREVIEW_ASPECT): boolean {
+  const place = previewPlacement(circle, xScale, boxAspect);
+  if (!Number.isFinite(place.x) || !Number.isFinite(place.y)) return false;
+  const h = 2 * circle.radius * place.heightScale * (VB_H / (2 * R));
+  const cy = place.y <= 0.5 ? CY : VB_H - CY;
+  const top = place.y - (cy / VB_H) * h;
+  const w = (h * (VB_W / VB_H)) / boxAspect;
+  const left = place.x - w / 2;
+  return top > 0 && top + h < 1 && left > 0 && left + w < 1;
+}
+
+type Phase = 'lost' | 'enter' | 'reenter' | 'holding' | 'done' | 'off' | 'occupied';
 
 function phaseOf(state: DwellState | undefined, enabled: boolean): Phase {
   if (!enabled) return 'off';
@@ -453,6 +602,11 @@ function phaseOf(state: DwellState | undefined, enabled: boolean): Phase {
   if (!state) return 'lost';
   if (state.blocked === 'refractory') return 'done';
   if (!state.tracked) return 'lost';
+  // A ring standing on top of a limb that lives there. It is ahead of the hold states deliberately:
+  // this ring is not filling and will not fill, and a patient holding harder is the one thing that
+  // cannot help. It is behind "not seeing you" just as deliberately — a target cannot be said to be
+  // sitting on a limb the camera is not currently reporting.
+  if (state.blocked === 'occupied') return 'occupied';
   if (state.holding || state.progress > 0) return 'holding';
   if (state.blocked === 'entry') return 'reenter';
   return 'enter';
@@ -466,6 +620,7 @@ const PHASE_STYLE: Readonly<Record<Phase, { glyph: string; colour: string; dash:
   holding: { glyph: '', colour: '#35d6ff', dash: undefined },
   done: { glyph: '✓', colour: '#57e08a', dash: undefined },
   off: { glyph: '–', colour: '#9fabc7', dash: '4 10' },
+  occupied: { glyph: '⊘', colour: '#ffb020', dash: '3 7' },
 });
 
 /** The sentence in the middle of the ring — a countdown while holding, a glyph otherwise. */
@@ -615,6 +770,37 @@ export function DwellTarget({ choice, state, mirrored = true, reducedMotion = fa
             data-testid={testId ? `${testId}-arc` : undefined}
           />
         )}
+        {/* WHICH OF THE TWO THIS IS, at a fifth of the size.
+            Size and silhouette already say the two rings are different things; at 1/5 scale — the size
+            a reviewer sees them in a screenshot, and a patient sees them from across a room — nothing
+            said WHICH. A chevron pair for the action that carries on and a back-pointing chevron for
+            the one that goes back is the player-transport convention, it is a SHAPE rather than a hue
+            or a word, and it is drawn well inside the ring so nothing implies a target bigger than the
+            one being tested. It stays in every phase: it is what the ring IS, not what it is doing. */}
+        <g
+          className="dwell-mark"
+          data-testid={testId ? `${testId}-mark` : undefined}
+          data-mark={tone}
+          transform={`translate(${CX} ${cy + 27})`}
+          fill="none"
+          stroke="#ffffff"
+          strokeOpacity={0.92}
+          strokeWidth={4}
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        >
+          {tone === 'go' ? (
+            <>
+              <path d="M -11 -7 L -3 0 L -11 7" />
+              <path d="M 1 -7 L 9 0 L 1 7" />
+            </>
+          ) : (
+            <>
+              <path d="M 4 -7 L -4 0 L 4 7" />
+              <path d="M -4 0 L 11 0" />
+            </>
+          )}
+        </g>
         <text
           className="dwell-glyph"
           x={CX}
@@ -675,6 +861,10 @@ function describe(phase: Phase, state: DwellState | undefined): string {
       return state && state.holding ? 'keep holding' : 'hold here';
     case 'done':
       return 'got it';
+    case 'occupied':
+      // Not "hold harder" and not "the camera is broken": the circle is where a limb already lives, so
+      // holding there would be indistinguishable from sitting still. It moves itself off in a moment.
+      return 'a limb rests here';
     default:
       return 'not available yet';
   }
@@ -730,12 +920,26 @@ export function DwellLegend({
   const limb = session.limb;
   // Anything that can be held is waiting for the limb to leave the ring first — say what the rings say.
   const mustLeave = states.every((s) => s.blocked === 'entry' && s.tracked);
-  const anything = mode === 'leg' ? 'a hand or a knee' : 'a hand';
+  // …or every ring is standing on a limb that lives there, which is a different sentence again: the
+  // patient cannot fix it by holding, and telling them to hold would be telling them to do a thing
+  // that cannot work. The rings move themselves off; this says so rather than leaving a dead circle.
+  const crowded = states.length > 0 && states.every((s) => s.blocked === 'occupied');
+  const anything = 'a hand';
   const fps = session.frameIntervalSec > 0 ? 1 / session.frameIntervalSec : 0;
   return (
-    <div className="dwell-legend" data-testid={testId} data-state={mustLeave ? 'reenter' : limb ? 'tracking' : 'searching'}>
+    <div
+      className="dwell-legend"
+      data-testid={testId}
+      data-state={crowded ? 'occupied' : mustLeave ? 'reenter' : limb ? 'tracking' : 'searching'}
+    >
       <strong>
-        {mustLeave ? (
+        {crowded ? (
+          <>
+            Hold {what} — no need to touch the screen. The circle is on top of{' '}
+            {limb ? 'the limb below' : 'a limb that is already there'}, so holding it would mean nothing: it is moving
+            itself somewhere clear. If it cannot find room, the buttons still work.
+          </>
+        ) : mustLeave ? (
           <>
             Hold {what} — no need to touch the screen. {limb ? 'The limb below is' : `${anything[0].toUpperCase()}${anything.slice(1)} is`}{' '}
             already inside the circle: move it out, then back in, and keep it there while the ring fills.
@@ -748,7 +952,7 @@ export function DwellLegend({
         )}
       </strong>
       <span className={limb ? 'badge badge-ok' : 'badge badge-warn'} data-testid={`${testId}-limb`}>
-        {limb ? `Following ${limb.label}` : mode === 'leg' ? 'No hand or knee in view' : 'No hand in view'}
+        {limb ? `Following ${limb.label}` : 'No hand in view'}
       </span>
       {limb && limb.side === null && (
         <span className="dim" data-testid={`${testId}-unidentified`}>
@@ -767,9 +971,11 @@ export function DwellLegend({
             : ' which is slower than the ring can count: it fills as the frames arrive, so the hold takes longer than the countdown inside it says.'}
         </span>
       )}
-      <span className="dim">
-        Either side may do this, including the unaffected one
-        {mode === 'leg' ? ', and a hand counts as well as a knee' : ''}. The buttons still work too.
+      <span className="dim" data-testid={`${testId}-limbs`}>
+        Either side may do this, including the unaffected one.{' '}
+        {mode === 'leg'
+          ? 'It has to be a hand: your knees are doing the exercise, and a knee held in the circle cannot be told apart from a repetition, so the circles do not follow them. If your hands are out of the picture, use the buttons.'
+          : 'The buttons still work too.'}
       </span>
     </div>
   );

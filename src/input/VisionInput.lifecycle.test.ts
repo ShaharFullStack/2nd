@@ -364,6 +364,38 @@ describe('VisionInput takes the frame aspect from the live camera', () => {
     classic.stop();
   });
 
+  /**
+   * WHAT THE MODULE SAYS BEFORE THE CAMERA HAS SAID ANYTHING, which used to be `?? 1`.
+   *
+   * 1 is not "unknown": it is "square sensor", it is finite and positive so every caller takes it as a
+   * measurement, and no camera in a clinic is square. The cost landed on the hands-free targets, which
+   * are placed from this number — the first frames were laid out for a square frame and the circles
+   * then JUMPED when the real 16:9 arrived, moving out from under a limb that was already holding one
+   * and throwing the hold away. The documented fallback is the frame the app ASKS for (4:3, the shape
+   * of the preview box and of the authored targets), and that is what it now reports.
+   */
+  it('reports the aspect it asked for — not a square sensor — until the camera says otherwise', async () => {
+    const input = makeInput({ detector: () => Promise.resolve(makeDetector()), driveLoop: false });
+    expect(input.getXScale()).toBeCloseTo(4 / 3, 10);
+    await input.start();
+    expect(input.getXScale()).toBeCloseTo(4 / 3, 10);
+    input.stop();
+  });
+
+  it('a camera that reports 0x0 has not reported a size — it does not make the frame square', async () => {
+    const camera = makeCamera();
+    camera.width = 0;
+    camera.height = 0;
+    const input = makeInput({ detector: () => Promise.resolve(makeDetector()), camera: () => Promise.resolve(camera) });
+    await input.start();
+    expect(input.getXScale()).toBeCloseTo(4 / 3, 10);
+    // ...and the moment it does report one, that is what is reported, mid-stream and all.
+    Object.assign(camera.video, { videoWidth: 1280, videoHeight: 720 });
+    input.processDetection({ tMs: 0, pose: seatedPose({ kneeLift: 0 }), hands: [] }, 0);
+    expect(input.getXScale()).toBeCloseTo(16 / 9, 10);
+    input.stop();
+  });
+
   it('an explicit config xScale wins over the camera (fixtures / pre-normalized streams)', async () => {
     const camera = makeCamera();
     const input = makeInput({ detector: () => Promise.resolve(makeDetector()), camera: () => Promise.resolve(camera), xScale: 1 });

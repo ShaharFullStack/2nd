@@ -21,7 +21,7 @@ import { runtime } from '../session/runtime.ts';
 import { DEFAULT_LATENCY_SEC, laneFingertip, useStore } from '../state/store.ts';
 import { movementInstructions } from '../vision/features.ts';
 import { CameraPreview } from './CameraPreview.tsx';
-import { DwellLegend, DwellTarget, singleDwellTarget, useDwellTargets } from './DwellTarget.tsx';
+import { DwellLegend, DwellTarget, pairedDwellTargets, useDwellTargets } from './DwellTarget.tsx';
 import type { DwellChoice } from './DwellTarget.tsx';
 import { Screen, Toast, TopBar, laneName } from './common.tsx';
 
@@ -143,25 +143,39 @@ export default function LatencyCalibrationScreen() {
         .join(' ');
 
   /**
-   * THE HANDS-FREE PATH THROUGH THE LATENCY CHECK.
+   * THE HANDS-FREE PATH THROUGH THE LATENCY CHECK — AND BACK OUT OF IT.
    *
-   * Both blocking presses on this screen are acknowledgements, and each gets the same target in turn:
-   * before the probe it starts the metronome, after an acceptable probe it stores the number the
-   * button names. The two GENUINE choices stay on their buttons — "measure again" and "discard the
-   * offset in force and use the generic default" are therapist decisions about what this session is
-   * judged at, and a discard in particular must never be reachable by a limb resting in the wrong
-   * place. What the patient alone gets instead, when the probe produced nothing usable, is a target
-   * that goes FORWARD on the offset already in force, naming it. Nobody is stranded, and nothing is
-   * overwritten by a hold.
+   * Both blocking presses on this screen are acknowledgements, and each gets the forward target in
+   * turn: before the probe it starts the metronome, after an acceptable probe it stores the number
+   * the target names. The two GENUINE choices stay on their buttons — "measure again" and "discard
+   * the offset in force and use the generic default" are therapist decisions about what this session
+   * is judged at, and a discard in particular must never be reachable by a limb resting in the wrong
+   * place. What the patient alone gets instead, when the probe produced nothing usable, is a forward
+   * target on the offset already in force, naming it. Nothing is overwritten by a hold.
+   *
+   * AND THERE IS A SECOND CIRCLE IN EVERY STATE, which there was not. A patient alone arrives here by
+   * a hold on the ROM screen — including by an accidental one, which is the case this exists for —
+   * and every state of this screen offered exactly ONE, forward-only target. The screen before it
+   * promises that no state is more than two holds from the one before; that promise cannot end at the
+   * screen it hands off to. The back circle is the same action as the Back arrow in the top bar (the
+   * range check), it is the smaller, square-backed secondary silhouette, and it writes nothing: the
+   * offset in force when this screen opened is the offset still in force after it.
    *
    * No target is drawn while the metronome is running: the patient is doing a rep on every click, and
    * a target live during those eight seconds is exactly the accidental confirm this design refuses.
    */
   const dwellChoices: DwellChoice[] = useMemo(() => {
     if (running) return [];
-    const target = singleDwellTarget(mode);
+    const [target, backTarget] = pairedDwellTargets(mode);
+    const back: DwellChoice = {
+      id: 'back',
+      target: backTarget,
+      label: 'Range check',
+      onConfirm: () => goto('rom'),
+      tone: 'back',
+    };
     if (!result) {
-      return [{ id: 'start', target, label: 'Start', onConfirm: () => void startProbe() }];
+      return [{ id: 'start', target, label: 'Start', onConfirm: () => void startProbe(), tone: 'go' }, back];
     }
     if (result.accepted) {
       return [
@@ -170,7 +184,9 @@ export default function LatencyCalibrationScreen() {
           target,
           label: `Use ${Math.round(result.offsetSec * 1000)} ms`,
           onConfirm: () => accept(result.offsetSec, true, result.warning ? result.message : ''),
+          tone: 'go',
         },
+        back,
       ];
     }
     return [
@@ -179,19 +195,21 @@ export default function LatencyCalibrationScreen() {
         target,
         label: inForce ? `Go on at ${currentMs} ms` : `Go on at ${DEFAULT_MS} ms`,
         onConfirm: skip,
+        tone: 'go',
       },
+      back,
     ];
     // Same rule as the other screens: the hook keeps the live list and calls the current callback, so
     // rebuilding the trackers whenever a closure changes identity would discard a hold in progress.
   }, [running, result, mode, inForce, currentMs]);
   const dwell = useDwellTargets(dwellChoices);
 
-  /** What the hold does right now, for the sentence beside the preview. */
+  /** What the hold does right now, for the sentence beside the preview. Both circles, both named. */
   const dwellWhat = !result
-    ? 'the circle to start the metronome'
+    ? 'the left circle to start the metronome, the right one to go back to the range check'
     : result.accepted
-      ? `the circle to use ${Math.round(result.offsetSec * 1000)} ms and start the song`
-      : `the circle to go on at ${inForce ? currentMs : DEFAULT_MS} ms`;
+      ? `the left circle to use ${Math.round(result.offsetSec * 1000)} ms and start the song, the right one to go back to the range check`
+      : `the left circle to go on at ${inForce ? currentMs : DEFAULT_MS} ms, the right one to go back to the range check`;
 
   return (
     <Screen>

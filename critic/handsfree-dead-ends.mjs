@@ -20,6 +20,9 @@
  *      (where there is nothing measured and the forward circle is correctly dead), that it says
  *      "Camera check" on the first lane and "Back a movement" on a later one, and that an advance
  *      made hands-free can be UNDONE hands-free.
+ *   3a. STOPPING THE SONG MID-PLAY WITH NOTHING BUT A LIMB. The patient stops moving; the rest offer
+ *      appears in the panel the renderer reserves beside the board; holding its circle pauses the song
+ *      (never ends it), and a second hold carries on. Asserts the offer and its ring are on screen.
  *   3. THE SONG STOPPING ITSELF. Hides the page (the lifecycle event, not an input), asserts the run
  *      pauses itself and that the dialog carries a live pair of targets on screen, then RESUMES the
  *      song by holding a limb and ENDS the session by holding a limb.
@@ -246,9 +249,27 @@ async function main() {
     const back = await box(page, 'camera-dwell-restart');
     const note = await box(page, 'camera-blocked-note');
     const legend = await box(page, 'camera-dwell-legend');
+    const limb = await box(page, 'camera-dwell-legend-limb');
     log('go', JSON.stringify(go), 'back', JSON.stringify(back));
-    log('note', JSON.stringify(note), 'legend', JSON.stringify(legend));
-    for (const [n, b] of [['forward target', go], ['back target', back], ['what it costs', note]]) {
+    log('note', JSON.stringify(note), 'legend', JSON.stringify(legend), 'limb', JSON.stringify(limb));
+    /**
+     * THE LIMB BADGE IS ASSERTED LIKE ANYTHING ELSE, which is the fix for this harness itself.
+     *
+     * It used to PRINT the legend's box and assert nothing about it, and at 1280x800 it explicitly
+     * excluded the legend from the visibility check (`t.i !== 'camera-dwell-legend'`) — so it printed
+     * `visible: false` for the sentence naming the limb and passed. Measured while it was passing:
+     * the camera check's legend ran 667–963 on a 768 px screen with the badge at 842–875, i.e. off
+     * the bottom, and a patient who cannot touch the tablet cannot scroll to it. What is lost there
+     * is the difference between "hold it there longer" and "it is watching the other leg", so it is
+     * exactly as load-bearing as the rings, and it is now checked as such on every screen and size.
+     */
+    for (const [n, b] of [
+      ['forward target', go],
+      ['back target', back],
+      ['what it costs', note],
+      ['the legend (what the circles do)', legend],
+      ['the limb badge (WHICH limb the app is following)', limb],
+    ]) {
       if (!b) failures.push(`${n} is not on the blocked camera check at all`);
       else if (!b.visible) failures.push(`${n} is NOT above the fold at 1024x768 (top ${b.top}, bottom ${b.bottom}, viewport ${b.vh})`);
     }
@@ -301,6 +322,10 @@ async function main() {
     }
     const romBackBox = await box(page, 'rom-dwell-redo');
     if (romBackBox && !romBackBox.visible) failures.push(`ROM back target is below the fold (top ${romBackBox.top}/${romBackBox.vh})`);
+    // Same rule on the range screen, where the badge measured 988 on a 768 px screen.
+    const romLimb = await box(page, 'rom-dwell-legend-limb');
+    if (!romLimb) failures.push('the ROM legend does not say which limb is being followed at all');
+    else if (!romLimb.visible) failures.push(`the ROM limb badge is off screen at 1024x768 (top ${romLimb.top}, bottom ${romLimb.bottom}, viewport ${romLimb.vh})`);
 
     // Measure lane 1 for real, then hold forward to lane 2, then hold BACK to lane 1.
     const still = () => page.evaluate(() => { window.__hfBody.dx = 0; window.__hfBody.dy = 0; window.__hfBody.side = 'left'; window.__hfBody.lift = 0; });
@@ -376,6 +401,67 @@ async function main() {
       await shoot(page, '07-play-stuck');
     } else {
       await shoot(page, '07-playing');
+
+      // ---- 3a. STOPPING MID-SONG, HANDS-FREE ---------------------------------------------------
+      // The patient is in pain / in spasm / frightened, alone, with the song still running. There is
+      // no target on the highway (a live one there is pressed by the exercise itself — see the note
+      // beside REST_OFFER_STILL_SEC in Play.tsx); the offer appears only after a stretch in which the
+      // prescribed movement demonstrably did not happen. So: stop moving the synthetic body — which
+      // is what it is already doing — wait for a note to be judged, and assert the offer arrives.
+      await page.waitForFunction(() => {
+        const h = window.__beatRehab.getScore?.();
+        return !!h && (h.hits + h.misses) > 0;
+      }, null, { timeout: 60000 }).catch(() => failures.push('no note was ever judged during play'));
+      const offered = await page
+        .waitForFunction(() => !!document.querySelector('[data-testid="rest-offer"]'), null, { timeout: 40000 })
+        .then(() => true)
+        .catch(() => false);
+      if (!offered) failures.push('a patient alone who stops moving mid-song is offered no hands-free way to stop');
+      else {
+        const offer = await box(page, 'rest-offer');
+        const ring = await box(page, 'rest-dwell-stop');
+        log('rest offer', JSON.stringify(offer), 'ring', JSON.stringify(ring));
+        for (const [n, b] of [['the rest offer', offer], ['its circle', ring]]) {
+          if (!b) failures.push(`${n} is not on the play screen`);
+          else if (!b.visible) failures.push(`${n} is off screen at 1024x768 (top ${b.top}, bottom ${b.bottom}, viewport ${b.vh})`);
+        }
+        await shoot(page, '07b-rest-offer');
+
+        // THE HANDS-FREE "NO": one repetition of the prescribed movement takes the offer away. This is
+        // what makes the offer refusable without touching anything — and it is the same test that
+        // keeps the circle off the screen while the patient is working.
+        for (const l of [0.25, 0.5, 0.75, 1, 0.75, 0.5, 0.25, 0]) {
+          await page.evaluate((v) => { window.__hfBody.lift = v; }, l);
+          await wait(70);
+        }
+        const gone = await page
+          .waitForFunction(() => !document.querySelector('[data-testid="rest-offer"]'), null, { timeout: 8000 })
+          .then(() => true)
+          .catch(() => false);
+        if (!gone) failures.push('a repetition did not take the rest offer off the screen — it cannot be refused by carrying on');
+        else log('one repetition put the offer away, as the offer says it will');
+        // ...and it comes back when the patient stops again.
+        const again = await page
+          .waitForFunction(() => !!document.querySelector('[data-testid="rest-offer"]'), null, { timeout: 40000 })
+          .then(() => true)
+          .catch(() => false);
+        if (!again) failures.push('the rest offer never came back after the patient stopped again');
+
+        try {
+          await hold(page, 'rest-dwell-stop', async () =>
+            (await page.evaluate(() => window.__beatRehab.getScore?.()?.phase === 'paused')) === true, 45000);
+          log('STOPPED the song hands-free, mid-song, with nothing but a limb');
+        } catch (e) { failures.push(`hands-free STOP during play: ${e.message}`); }
+        await shoot(page, '07c-stopped-by-hold');
+        // ...and what it stopped into is the reversible one: the pause dialog, not the end of the
+        // session. Carry on again so the rest of this harness runs from a playing song.
+        try {
+          await hold(page, 'pause-dwell-resume', async () =>
+            (await page.evaluate(() => window.__beatRehab.getScore?.()?.phase === 'playing')) === true, 45000);
+          log('carried on again hands-free — a stop by hold costs a pause, never the session');
+        } catch (e) { failures.push(`carrying on after a hands-free stop: ${e.message}`); }
+      }
+
       await page.evaluate(() => {
         Object.defineProperty(document, 'visibilityState', { value: 'hidden', configurable: true });
         document.dispatchEvent(new Event('visibilitychange'));
@@ -456,6 +542,8 @@ async function main() {
       cameraBadge: document.querySelector('[data-testid="results-camera-on"]')?.textContent,
       again: document.querySelector('[data-testid="results-dwell-again"]')?.getAttribute('data-phase'),
       newOne: document.querySelector('[data-testid="results-dwell-new"]')?.getAttribute('data-phase'),
+      newLabel: document.querySelector('[data-testid="results-dwell-new"]')?.textContent,
+      handBack: document.querySelector('[data-testid="results-handback-note"]')?.textContent,
       off: !!document.querySelector('[data-testid="results-camera-off"]'),
     }));
     log('results:', JSON.stringify(res));
@@ -464,6 +552,17 @@ async function main() {
     if (res.again === 'off' || res.again === undefined) failures.push('results "play again" target is missing or dead');
     if (res.newOne === 'off' || res.newOne === undefined) failures.push('results "new session" target is missing or dead');
     if (!res.off) failures.push('the results screen does not offer to turn the camera off');
+    // WHAT THE SECOND CIRCLE CLAIMS. It goes to the mode screen, which has no camera and no targets,
+    // so "New session" was a hold that promised the patient something only a therapist can do.
+    if (!/Hand back/.test(res.newLabel ?? '')) failures.push(`the results back circle still reads "${res.newLabel}" — it hands the tablet back, it does not start a session`);
+    if (!/camera is turned off/.test(res.handBack ?? '')) failures.push('the results screen does not say what holding that circle actually does');
+    for (const [n, b] of [
+      ['the results legend', await box(page, 'results-dwell-legend')],
+      ['the results limb badge', await box(page, 'results-dwell-legend-limb')],
+    ]) {
+      if (!b) failures.push(`${n} is missing`);
+      else if (!b.visible) failures.push(`${n} is off screen at 1024x768 (top ${b.top}, bottom ${b.bottom}, viewport ${b.vh})`);
+    }
     await shoot(page, '09-results-handsfree');
 
     // ---- 5. the other clinic-tablet size --------------------------------------------------------
@@ -472,16 +571,20 @@ async function main() {
     await shoot(page, '10-results-1280');
     await page.evaluate(() => window.__beatRehab.gotoScreen('camera'));
     await wait(5000);
-    const wide = await page.evaluate(() => ['camera-dwell-continue', 'camera-dwell-restart', 'camera-dwell-legend'].map((i) => {
-      const el = document.querySelector(`[data-testid="${i}"]`);
-      if (!el) return { i, missing: true };
-      const r = el.getBoundingClientRect();
-      return { i, top: Math.round(r.top), bottom: Math.round(r.bottom), visible: r.top >= 0 && r.bottom <= window.innerHeight };
-    }));
+    const wide = await page.evaluate(() =>
+      ['camera-dwell-continue', 'camera-dwell-restart', 'camera-dwell-legend', 'camera-dwell-legend-limb'].map((i) => {
+        const el = document.querySelector(`[data-testid="${i}"]`);
+        if (!el) return { i, missing: true };
+        const r = el.getBoundingClientRect();
+        return { i, top: Math.round(r.top), bottom: Math.round(r.bottom), visible: r.top >= 0 && r.bottom <= window.innerHeight };
+      }),
+    );
     log('1280x800 camera check:', JSON.stringify(wide));
+    // NOTHING IS EXEMPT HERE ANY MORE. The exemption was `t.i !== 'camera-dwell-legend'`, and it was
+    // the reason this harness printed `visible: false` for the legend and passed anyway.
     for (const t of wide) {
       if (t.missing) failures.push(`${t.i} missing at 1280x800`);
-      else if (!t.visible && t.i !== 'camera-dwell-legend') failures.push(`${t.i} below the fold at 1280x800 (top ${t.top}, bottom ${t.bottom})`);
+      else if (!t.visible) failures.push(`${t.i} below the fold at 1280x800 (top ${t.top}, bottom ${t.bottom})`);
     }
     await shoot(page, '11-camera-1280');
 

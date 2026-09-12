@@ -13,6 +13,18 @@
  *  3. The keyboard escape hatch was presented as the fix. It is not: this is a camera-controlled
  *     rehab game, and a keyboard session measures no range of motion and records no reps the patient
  *     performed. It is offered here as a labelled, deliberate choice with its cost spelled out.
+ *
+ * AND A FOURTH THING, WHICH IS WHAT THIS SCREEN IS FOR A PATIENT SITTING ALONE.
+ * Every hands-free step in this app is a limb held over a circle drawn on the camera preview. This
+ * screen exists because there is no camera preview — so there is no circle, there is nothing to hold,
+ * and the four controls below are all for somebody with a hand on the tablet. The patient who was
+ * driving the session from the chair is, at this exact moment, stranded, and until now the screen
+ * simply did not mention it: four buttons, no sentence.
+ *
+ * It says so now, first, in the same voice as the stalled-audio-clock screen in Play.tsx — which is
+ * the other place in this app where the honest thing is to name a step that cannot be done by
+ * movement. Saying it plainly is not a fix for the camera; it is the difference between a patient
+ * holding a limb at a screen that will never respond and a patient who knows to call somebody.
  */
 import { useState } from 'react';
 import { classifyCameraError } from '../session/cameraError.ts';
@@ -74,6 +86,25 @@ export default function CameraFallback({
   return (
     <Screen testId="camera-fallback">
       <TopBar eyebrow="Camera check" title="The camera did not start" onBack={() => goto('setup')} />
+
+      {/* THE SENTENCE A PATIENT ALONE IS OWED, BEFORE ANY REMEDY ADDRESSED TO SOMEBODY ELSE.
+          First on the screen for the same reason the escape is first on the pause dialog: it is the
+          part addressed to the person who cannot scroll, and everything under it is written for
+          whoever is standing up. */}
+      <div className="card stack" data-testid="camera-fallback-handsfree" style={{ borderColor: 'var(--gold)' }}>
+        <h3 style={{ margin: 0 }}>This step cannot be done by moving — it needs a hand, or somebody to help</h3>
+        <p className="muted" style={{ margin: 0, fontSize: '1.1rem' }}>
+          Holding a hand or a knee inside a circle is how every other step of the session is confirmed, and that circle
+          is drawn on the camera picture. There is no camera picture here — that is what has gone wrong — so there is
+          nothing on this screen a movement can reach, however long it is held. {patientName ? `${patientName} cannot` : 'A patient sitting alone cannot'}{' '}
+          get past this one from the chair.
+        </p>
+        <p className="muted" style={{ margin: 0, fontSize: '1.1rem' }}>
+          <strong>Somebody needs to touch the tablet.</strong> The controls below are for them: what went wrong is named
+          at the top of this screen and the remedy is under it, and the camera can be asked for again as many times as it
+          takes. Nothing about the prescription has been lost while this screen is up.
+        </p>
+      </div>
 
       <div className="fallback-hero">
         <span className="glyph" aria-hidden="true">

@@ -10,7 +10,7 @@ import { POSTURE_INFO } from '../vision/features.ts';
 import type { VisionStatus } from '../input/types.ts';
 import type { InvalidCalibration } from '../input/VisionInput.ts';
 import type { DetectionResult } from '../vision/mediapipe.ts';
-import { drawDetection } from './overlay.ts';
+import { drawDetection, liveFrameAspect } from './overlay.ts';
 import CameraFallback from './CameraFallback.tsx';
 import { DwellLegend, DwellTarget, pairedDwellTargets, useDwellTargets } from './DwellTarget.tsx';
 import type { DwellChoice } from './DwellTarget.tsx';
@@ -34,6 +34,28 @@ export function reconcileDelegateHint(warning: string, delegate: 'GPU' | 'CPU' |
     /Lower the difficulty or use a machine with graphics acceleration\./,
     'This machine is already using the GPU, so graphics acceleration is not the remedy: lower the difficulty, close other tabs, or use a machine that can run this model faster.',
   );
+}
+
+/**
+ * THE FRAME RATE, PRINTED SO IT CANNOT CONTRADICT THE NUMBER BESIDE IT.
+ *
+ * This screen showed `fps.toFixed(0)`, and on the device this app is hardest on that printed
+ * "0 fps" next to "5244 ms/frame". Both were true — 0.19 rounds to 0 — and together they read as a
+ * contradiction on the one screen whose whole job is to state what this device can do: a therapist
+ * reads "0 fps" as "nothing is arriving" while the preview beside it is visibly, slowly moving, and
+ * the remedy for a stalled camera is not the remedy for a slow one.
+ *
+ * So the precision follows the magnitude, and a rate of zero says "no frames" rather than printing a
+ * number: zero is not a slow rate, it is the absence of one, and the two have different remedies.
+ * (It is deliberately not "no frames YET": the same reading appears when a camera that was working
+ * stops, and this badge cannot tell the two apart — the readiness card beside it can.)
+ */
+export function formatFps(fps: number | null | undefined): string {
+  if (fps === null || fps === undefined || !Number.isFinite(fps)) return '– fps';
+  if (fps <= 0) return 'no frames';
+  if (fps >= 10) return `${fps.toFixed(0)} fps`;
+  if (fps >= 1) return `${fps.toFixed(1)} fps`;
+  return `${fps.toFixed(2)} fps`;
 }
 
 export default function CameraCheck() {
@@ -96,7 +118,12 @@ export default function CameraCheck() {
           c.width = w;
           c.height = h;
         }
-        drawDetection(ctx, latest.current, c.width, c.height);
+        // THE SHAPE OF THE FRAMES THESE LANDMARKS CAME FROM, asked of the camera every frame (it can
+        // change mid-stream, and it is 0x0 until metadata lands). Without it the skeleton is painted
+        // as if the sensor were the 4:3 the app asked for, while the <video> under it is cropped to
+        // fill the box — so on a 16:9 webcam the dots sit ~0.6 of a dwell radius inboard of the limb
+        // they came from, and a patient aiming at the dot misses the circle the tracker tests.
+        drawDetection(ctx, latest.current, c.width, c.height, liveFrameAspect());
       }
       raf = requestAnimationFrame(paint);
     };
@@ -428,7 +455,7 @@ export default function CameraCheck() {
               </span>
             </div>
             <div className="row">
-              <span className="badge mono">{status ? `${status.fps.toFixed(0)} fps` : '– fps'}</span>
+              <span className="badge mono" data-testid="camera-fps">{status ? formatFps(status.fps) : '– fps'}</span>
               <span className="badge mono">{status ? `${status.inferenceMs.toFixed(0)} ms/frame` : '– ms'}</span>
               <span className="badge">{status?.delegate ?? 'starting'}</span>
             </div>

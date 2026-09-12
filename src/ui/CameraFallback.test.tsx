@@ -153,3 +153,44 @@ describe('CameraFallback', () => {
     expect(screen.queryByText(/Still no camera after/i)).toBeNull();
   });
 });
+
+describe('the screen admits that a patient alone is stranded on it', () => {
+  it('says, first, that this step cannot be done by moving', () => {
+    render(<CameraFallback error={domError('NotAllowedError', 'Permission denied')} onRetry={() => {}} />);
+    const block = screen.getByTestId('camera-fallback-handsfree');
+    expect(block.textContent).toMatch(/cannot be done by moving/i);
+    expect(block.textContent).toMatch(/needs a hand, or somebody to help/i);
+    // WHY it cannot, in the patient's own terms: the circle is drawn on a camera picture, and the
+    // camera picture is the thing that has failed.
+    expect(block.textContent).toMatch(/no camera picture/i);
+    expect(block.textContent).toMatch(/Somebody needs to touch the tablet/i);
+    // And it is the FIRST thing under the title, not a footnote below four buttons.
+    const screenEl = screen.getByTestId('camera-fallback');
+    const blocks = Array.from(screenEl.querySelectorAll('.card, .fallback-hero'));
+    expect(blocks[0]).toBe(block);
+  });
+
+  it('names the patient in the chair when there is one, and says "a patient" when there is not', () => {
+    render(<CameraFallback error={domError('NotFoundError', 'no device')} onRetry={() => {}} />);
+    expect(screen.getByTestId('camera-fallback-handsfree').textContent).toMatch(/A patient sitting alone cannot/);
+    cleanup();
+    useStore.setState({
+      patients: [{ id: 'p1', name: 'Maria', createdAt: 1, lastUsedAt: 1 }],
+      activePatientId: 'p1',
+    });
+    render(<CameraFallback error={domError('NotFoundError', 'no device')} onRetry={() => {}} />);
+    expect(screen.getByTestId('camera-fallback-handsfree').textContent).toMatch(/Maria cannot/);
+  });
+
+  it('is shown for every kind of camera failure — none of them can be held past', () => {
+    for (const err of [
+      domError('NotAllowedError', 'denied'),
+      domError('NotReadableError', 'busy'),
+      new Error('failed to load /models/pose_landmarker_lite.task'),
+    ]) {
+      cleanup();
+      render(<CameraFallback error={err} onRetry={() => {}} />);
+      expect(screen.getByTestId('camera-fallback-handsfree')).toBeTruthy();
+    }
+  });
+});

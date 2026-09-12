@@ -432,6 +432,43 @@ table.table tr:hover td { background: rgba(255, 255, 255, 0.03); }
 }
 .pip-alerts p:last-child { margin-bottom: 0; }
 
+/* THE REST OFFER (src/ui/Play.tsx): the patient's hands-free way to stop the song, which takes over
+   the reserved panel for as long as it is up.
+   It lives in the SAME box as the thumbnail and the meters, because that box is the one the renderer
+   guarantees is clear of the notes, the receptors and the lane labels (`Highway.overlayPanel`) — a
+   panel that covered a note would have the app hiding a movement it then records as unanswered. The
+   preview inside it is the full width of the panel (~280 px on a clinic tablet) rather than the
+   thumbnail's letterboxed strip: this one is not for judging framing, it is a target a patient has to
+   aim a limb at from two metres. It scrolls internally rather than growing, so it cannot escape the
+   box the renderer measured. */
+.rest-offer {
+  gap: 8px;
+  padding: 10px;
+  min-height: 0;
+  /* It scrolls inside its box rather than growing out of it — but the wording is short enough that
+     it does not have to, even in the 150 px gutter some boards leave (see Play.tsx). */
+  overflow-y: auto;
+  border-color: var(--gold);
+  background: rgba(14, 19, 33, 0.94);
+}
+.rest-offer-head {
+  margin: 0;
+  font-size: 1.02rem;
+  line-height: 1.15;
+}
+/* The preview is the target, so it never gives way: it is the panel's full width, and the ring on it
+   is a fraction of the FRAME, so the patient's limb goes to the same place whatever size it renders
+   at. The `.camera-frame` viewport cap that the setup screens use does not apply here — this box is
+   already as small as the board allows. */
+.rest-offer .camera-frame { flex: none; max-width: 100%; }
+.rest-offer .badge { align-self: flex-start; }
+.rest-offer-note {
+  margin: 0;
+  font-size: 0.82rem;
+  line-height: 1.3;
+}
+.rest-offer-note.dim { font-size: 0.78rem; }
+
 .lower-third {
   position: absolute;
   left: 0;
@@ -474,6 +511,22 @@ table.table tr:hover td { background: rgba(255, 255, 255, 0.03); }
 
 /* ---------- camera check / calibration ---------- */
 
+/*
+ * THE PREVIEW, AND THE SENTENCE THAT HAS TO FIT UNDER IT.
+ *
+ * The box is 4:3 and as wide as it is allowed to be, which on a clinic tablet turned out to be the
+ * whole budget: at 1024x768 the camera check's legend measured 667–963 and the ROM screen's 792–1035,
+ * i.e. WHOLLY off the bottom, with the "Following your left knee" badge inside it at 842–875. Two
+ * screens' worth of comments in this repo claim that capping the preview at 520 px fixed exactly
+ * that; it did not, because 520 px of width is 390 px of height and the legend needs ~200 px more
+ * than what was left. A legend below the fold is not a smaller problem than no legend: the patient
+ * who needs it is the one who cannot scroll to it, and what is in it is WHICH LIMB the app is
+ * following — the difference between "hold it there longer" and "it is watching the other leg".
+ *
+ * So the preview is capped by the VIEWPORT HEIGHT as well as by width. `max-width` (not max-height)
+ * is what does it, because the box keeps its aspect ratio from its width: a height cap on an element
+ * whose width is 100 % of its column would letterbox the patient instead of shrinking the box.
+ */
 .camera-frame {
   position: relative;
   border-radius: var(--radius);
@@ -482,6 +535,7 @@ table.table tr:hover td { background: rgba(255, 255, 255, 0.03); }
   background: #000;
   aspect-ratio: 4 / 3;
   width: 100%;
+  max-width: min(100%, calc(var(--preview-max-h, 100vh) * 4 / 3));
 }
 .camera-frame video, .camera-frame canvas { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
 .camera-frame video { background: #000; }
@@ -535,3 +589,68 @@ table.table tr:hover td { background: rgba(255, 255, 255, 0.03); }
 .toast-bad { border-left-color: var(--bad); background: rgba(255, 90, 90, 0.1); }
 
 .hidden { display: none !important; }
+
+
+/* =============================================================================================
+ * CLINIC TABLETS ARE 768 AND 800 PIXELS TALL, AND THE HANDS-FREE SCREENS HAVE TO FIT IN THAT.
+ * =============================================================================================
+ *
+ * Every screen that offers a hands-free confirm shows three things that only work together: the
+ * preview (so the patient can see themselves), the circle drawn on it (so they know where to put a
+ * limb) and the legend under it (which says what the hold does, WHICH LIMB is being followed, that
+ * either side may do it, and — on a slow camera — why the ring is filling in steps). Measured in the
+ * running app at 1024x768 before this block existed: the camera check's legend started 667 px down a
+ * 768 px screen and the ROM screen's started at 849, with the limb badge at 988. A patient who cannot
+ * touch the tablet cannot scroll it either, so those sentences were not merely awkward — they were
+ * not on the screen at all, on the two screens the feature is introduced on.
+ *
+ * The whole block is scoped to pages that actually carry a legend (`:has(.dwell-legend)`), so the
+ * therapist's own screens keep the roomier layout they were designed at. What it spends is padding,
+ * chrome and preview size — never a sentence.
+ */
+@media (max-height: 880px) {
+  /* The preview is the biggest single block, and it is the one that can afford to give. A 33vh cap
+     is 253 px at 768 (337 px wide) and 264 px at 800 — still several times the size of the PIP
+     thumbnail, and the targets are a fraction of the FRAME, so they shrink with it and stay where
+     the patient's limb has to go. */
+  .screen-inner:has(.dwell-legend) { --preview-max-h: 33vh; }
+  .screen-inner:has(.dwell-legend) { padding: 16px 18px; gap: 14px; }
+  .screen-inner:has(.dwell-legend) .card { padding: 14px; }
+  .screen-inner:has(.dwell-legend) .stack { gap: 10px; }
+  /* Touch targets stay well over the 56 px floor this file opens with; what goes is the extra. */
+  .screen-inner:has(.dwell-legend) .btn-lg { min-height: 60px; font-size: 1.1rem; padding: 0 26px; }
+  .screen-inner:has(.dwell-legend) h2 { font-size: 1.35rem; }
+  .screen-inner:has(.dwell-legend) [data-testid="patient-banner"] { padding: 10px 14px; }
+  .screen-inner:has(.dwell-legend) [data-testid="patient-banner"] .eyebrow { font-size: 0.66rem; }
+  /* The legend itself: tighter, never shorter. Every sentence in it survives — see DwellLegend. */
+  .screen-inner:has(.dwell-legend) .dwell-legend { padding: 10px 12px; gap: 6px; }
+  .screen-inner:has(.dwell-legend) .dwell-legend strong { font-size: 1.02rem; line-height: 1.32; }
+  .screen-inner:has(.dwell-legend) .dwell-legend .dim { font-size: 0.86rem; }
+}
+
+/*
+ * THE RANGE SCREEN PUTS THE LEGEND BESIDE THE PREVIEW INSTEAD OF UNDER IT.
+ *
+ * It carries more above the preview than any other screen — the top bar, the patient banner that says
+ * whose record this range is about to become the denominator of, and the ring-and-instruction row
+ * that IS the task — and with the preview merely capped, the limb badge still measured 794–827 on a
+ * 768 px screen. The alternative to this rule was a preview shrunk to 200 px, which buys the sentence
+ * by taking away the thing the sentence is about: the circle the patient has to aim a limb at.
+ *
+ * So on a short, WIDE viewport (a clinic tablet in landscape, which is how this app is used) the pair
+ * becomes two columns: the preview on the left at the size it was, the legend beside it, and the
+ * therapist's note about what the back circle does across the bottom. Nothing is hidden, nothing is
+ * shortened, and the whole legend — badge included — is on the screen. Narrow viewports keep the
+ * stacked layout, where two columns would be worse than a scroll.
+ */
+@media (max-height: 880px) and (min-width: 900px) {
+  [data-testid="rom-handsfree"] {
+    display: grid;
+    grid-template-columns: minmax(220px, 360px) minmax(240px, 1fr);
+    column-gap: 14px;
+    align-items: start;
+  }
+  [data-testid="rom-handsfree"] > :first-child { grid-column: 1; grid-row: 1; }
+  [data-testid="rom-handsfree"] > .dwell-legend { grid-column: 2; grid-row: 1; }
+  [data-testid="rom-handsfree"] > .dim { grid-column: 1 / -1; grid-row: 2; }
+}

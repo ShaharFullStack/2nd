@@ -69,6 +69,7 @@ import { DEFAULT_MIN_INTERVAL_SEC, LaneTrigger } from '../vision/trigger.ts';
 import { DetectLoop, MIN_USABLE_DETECT_FPS, createDetector, openCamera, pickHandResult } from '../vision/mediapipe.ts';
 import type { CameraOptions, CameraSession, DetectLoopOptions, DetectorOptions, DetectionResult, LandmarkDetector, LoopStats } from '../vision/mediapipe.ts';
 import { POSE, allVisible, aspectScale, distance2d, midpoint } from '../vision/landmarks.ts';
+import { DWELL_AUTHORED_ASPECT } from '../vision/dwell.ts';
 import type { Landmark } from '../vision/landmarks.ts';
 
 /**
@@ -467,6 +468,11 @@ export class VisionInput implements InputSource {
   private laneStatesDead = false;
   /** Lanes whose landmarks came from a hand nobody could identify this frame (see pickHandResult). */
   private unlabelledHand: number[] = [];
+  /**
+   * The frame aspect (width / height) the CAMERA has reported, or null while it has not reported one.
+   * Null is the honest state and is reported as the authored 4:3, never as 1 — see `getXScale`.
+   */
+  private cameraXScale: number | null = null;
   /** Last frame's tracked-body geometry, for the same-person guard. */
   private subjectSig: { cx: number; cy: number; torso: number } | null = null;
   /** ctxTime of the last tracked-body discontinuity (NaN: none seen). */
@@ -838,7 +844,9 @@ export class VisionInput implements InputSource {
           this.cameraEnded = true;
         };
         if (camera.ended) this.cameraEnded = true;
-        this.applyXScale(aspectScale(camera.width, camera.height));
+        // Only a REAL size counts: `aspectScale` returns 1 for a 0x0 / undefined frame, and storing
+        // that would be "the camera says it is square" rather than "the camera has not said yet".
+        if (camera.width > 0 && camera.height > 0) this.applyXScale(aspectScale(camera.width, camera.height));
       }
 
       const d = this.config.detector;
@@ -1306,14 +1314,43 @@ export class VisionInput implements InputSource {
     }));
   }
 
-  /** Frame aspect correction applied to the features (1 = square / unknown). */
+  /**
+   * THE FRAME ASPECT (width / height) THIS SESSION IS WORKING IN — measured where it can be, and
+   * otherwise the 4:3 the camera was ASKED for, which is never 1.
+   *
+   * This used to end `?? 1`, and 1 is a claim, not an absence: it says "square sensor", every caller
+   * accepts it because it is finite and > 0, and no camera in a clinic is square. The cost was paid
+   * by the hands-free targets, which are placed from this number: the first frames were laid out for
+   * a square frame and then JUMPED when `syncCameraAspect` reported the real 16:9, moving every
+   * circle under a limb that was already holding one and throwing the hold away. `DWELL_AUTHORED_ASPECT`
+   * is the frame the targets are authored in, the shape of the preview box, and the aspect
+   * `openCamera` requests — so when nothing has been measured yet it is the honest stand-in, and it is
+   * wrong by at most the difference between what was asked for and what arrived.
+   *
+   * Note what this does NOT do: it does not feed an unmeasured guess to the feature extractors. A
+   * movement measurement waits for the real frame (`applyXScale`), because a guessed aspect there
+   * would scale a range of motion.
+   */
   getXScale(): number {
+    if (this.config.xScale !== undefined) return this.config.xScale;
+    return this.cameraXScale ?? DWELL_AUTHORED_ASPECT;
+  }
+
+  /**
+   * The aspect the FEATURES are being corrected by right now — 1 (isotropic) until a camera has
+   * reported a size. Not the same question as `getXScale()`: anything comparing two measurements
+   * (the subject-continuity guard) has to use the scale those measurements were taken in, not the
+   * best available statement of the camera's shape.
+   */
+  private featureXScale(): number {
     return this.lanes[0]?.pipeline.getXScale() ?? 1;
   }
 
-  /** Push an aspect correction to every lane, unless the config pinned one explicitly. */
+  /** Push a MEASURED aspect correction to every lane, unless the config pinned one explicitly. */
   private applyXScale(xScale: number): void {
     if (this.config.xScale !== undefined) return;
+    if (!Number.isFinite(xScale) || xScale <= 0) return;
+    this.cameraXScale = xScale;
     for (const l of this.lanes) l.pipeline.setXScale(xScale);
   }
 
@@ -1569,7 +1606,7 @@ export class VisionInput implements InputSource {
       this.subjectSig = null;
       return;
     }
-    const xScale = this.getXScale();
+    const xScale = this.featureXScale();
     const hip = midpoint(pose[POSE.LEFT_HIP], pose[POSE.RIGHT_HIP]);
     const sho = midpoint(pose[POSE.LEFT_SHOULDER], pose[POSE.RIGHT_SHOULDER]);
     const torso = distance2d(hip, sho, xScale);

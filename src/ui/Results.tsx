@@ -481,7 +481,25 @@ export default function ResultsScreen() {
           goto('play');
         },
       },
-      { id: 'new', target: back, label: 'New session', onConfirm: () => goto('mode') },
+      /**
+       * THE ONE HOLD IN THE APP THAT ENDS THE HANDS-FREE PART OF THE VISIT, labelled as that rather
+       * than as "New session".
+       *
+       * It goes to the mode screen, and the mode screen — like the prescription screen behind it —
+       * has no targets and no camera: arriving there is not a camera screen, so the device is
+       * released on the way in (`screenNeedsCamera`). Calling it "New session" told the patient they
+       * were starting one, and what they were really doing was landing on a screen where nothing they
+       * can do reaches anything. Either that screen grows a hands-free way back, or the target stops
+       * claiming to be something it is not; a patient cannot pick two movements, a difficulty, a song
+       * and a pace by holding a knee in a circle, so the honest half is the label.
+       */
+      {
+        id: 'new',
+        target: back,
+        label: 'Hand back',
+        onConfirm: () => goto('mode'),
+        tone: 'back',
+      },
     ];
   }, [handsFree, mode, seed, setSeed, goto]);
   const dwell = useDwellTargets(dwellChoices);
@@ -721,7 +739,18 @@ export default function ResultsScreen() {
               </CameraPreview>
             </div>
           )}
-          <DwellLegend session={dwell} what="the left circle to play again, the right one to start a new session" testId="results-dwell-legend" />
+          <DwellLegend
+            session={dwell}
+            what="the left circle to play the same session again, the right one to finish and hand the tablet back"
+            testId="results-dwell-legend"
+          />
+          {/* WHAT THE SECOND CIRCLE REALLY DOES, because it is the end of the hands-free flow and
+              nothing past it can be reached from the chair. */}
+          <span className="dim" data-testid="results-handback-note">
+            Holding the right-hand circle ends the patient&rsquo;s own part of the visit: the camera is turned off and the
+            tablet goes back to the therapist, who sets up the next session — the limb, the movements, the song and the
+            pace — by hand. It does not start one.
+          </span>
           <div className="row">
             <button
               className="btn"

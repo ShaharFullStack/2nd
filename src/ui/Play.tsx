@@ -27,7 +27,7 @@ import type { LaneSpec } from '../engine/types.ts';
 import CameraFallback from './CameraFallback.tsx';
 import { reconcileDelegateHint } from './CameraCheck.tsx';
 import { CameraPreview } from './CameraPreview.tsx';
-import { DwellLegend, DwellTarget, pairedDwellTargets, useDwellTargets } from './DwellTarget.tsx';
+import { DwellLegend, DwellTarget, pairedDwellTargets, singleDwellTarget, useDwellTargets } from './DwellTarget.tsx';
 import type { DwellChoice } from './DwellTarget.tsx';
 import { Meter, Toast, laneName } from './common.tsx';
 
@@ -110,6 +110,94 @@ const PIP_REARM_LINE = PIP_LOCK_CAP;
 const PIP_LINE_CASING = '0 0 0 1px rgba(3, 6, 14, 0.88)';
 /** `.pip-meters` height in index.css — reserved out of the panel before the warning is capped. */
 const PIP_METERS_HEIGHT = 62;
+
+/* ------------------------------------------------------------------------------------------- *
+ * THE PATIENT'S OWN WAY TO STOP THE SONG — AND WHY IT IS NOT A CIRCLE ON THE HIGHWAY.
+ * ------------------------------------------------------------------------------------------- *
+ *
+ * THE HOLE. Mid-song, the only way to stop was the pause BUTTON. A patient alone, whose limb is the
+ * controller, in pain or in spasm or simply frightened, had a control they could not reach and a song
+ * that would run for another two minutes. The song ending by itself is not a safety case.
+ *
+ * WHY NOT SIMPLY DRAW A DWELL TARGET ON THE PREVIEW FOR THE WHOLE SONG. Because the prescribed
+ * exercise IS the movement that would confirm it. A seated march with hip drift lands a knee in a
+ * circle; three minutes of repetitions is three minutes of chances; and the thing at the other end of
+ * an accidental confirm is the end of a patient's session. A target that is live while the exercise is
+ * being performed is a target the exercise can press.
+ *
+ * WHAT IS OFFERED INSTEAD, AND WHY THE EXERCISE CANNOT PRESS IT.
+ *
+ *  1. THE OFFER ONLY EXISTS WHILE THE EXERCISE IS DEMONSTRABLY NOT HAPPENING. It appears after
+ *     `REST_OFFER_STILL_SEC` in which no lane fired a repetition and no lane's value moved by as much
+ *     as `REST_OFFER_BAND` of that patient's own calibrated range — measured from the same lane states
+ *     the meters are drawn from. A patient who is working never sees it. This is not a guess about
+ *     placement (which is the thing that goes wrong); it is a gate on the patient's own movement, and
+ *     it is the only condition under which the circle is drawn at all.
+ *  2. IT IS DISMISSED BY A REPETITION. One scored rep takes it off the screen, hold in progress and
+ *     all. So the way to refuse the offer is to carry on with the exercise, which is the one thing a
+ *     patient who does not want to stop is already doing — a hands-free "no" that needs no target.
+ *  3. WHAT IT CONFIRMS IS A PAUSE, NEVER AN END. The hold stops the song where it stands and raises
+ *     the pause dialog, which has its own pair of targets: carry on, or stop and see the results.
+ *     Ending the session still takes a second, separate, deliberate hold on a different circle. The
+ *     worst a false confirm can cost is a pause the patient can undo the same way they made it, with
+ *     nothing scored and nothing missed while it is up.
+ *  4. IT IS NOT ON THE HIGHWAY. It occupies the panel the renderer reserves beside the board
+ *     (`Highway.overlayPanel`) — the camera thumbnail's own box, which is guaranteed clear of the
+ *     notes, the receptors and the lane labels. It never covers a note the patient could still answer,
+ *     because a note hidden by a rest offer would be recorded as unanswered, and that would be this
+ *     app telling a lie about a limb.
+ */
+/** No repetition and no movement worth the name for this long, and the offer appears. */
+const REST_OFFER_STILL_SEC = 7;
+/**
+ * How far a lane's value may wander and still count as "not exercising", as a fraction of the
+ * patient's OWN calibrated range. Above a tremor, well below a repetition (the trigger fires at
+ * `thresholdFraction`, never less than a third of the range).
+ */
+const REST_OFFER_BAND = 0.12;
+/** How often the lane values are sampled for the test above. */
+const REST_OFFER_SAMPLE_MS = 150;
+
+/** One reading of every lane's normalized value, with the moment it was taken. */
+export interface LaneValueSample {
+  t: number;
+  values: readonly number[];
+}
+
+/**
+ * "THE PRESCRIBED EXERCISE IS NOT HAPPENING", decided from the numbers rather than from a feeling.
+ *
+ * True when the samples cover a whole `stillSec` window ending at `now` AND no lane's value moved by
+ * as much as `band` across it. Both halves matter: a window that is not covered (the song just
+ * started, the camera just came back, the patient just finished a rep) is not evidence of stillness,
+ * and it must never be read as some.
+ *
+ * `value` is a fraction of THIS patient's calibrated range, so `band` means the same amount of
+ * movement on a knee with twelve degrees as on one with ninety — and a repetition, which has to reach
+ * `thresholdFraction` of that range, cannot hide inside it.
+ */
+export function laneValuesQuiet(
+  samples: readonly LaneValueSample[],
+  now: number,
+  stillSec: number,
+  band: number,
+): boolean {
+  if (samples.length < 2) return false;
+  if (!(now - samples[0].t >= stillSec)) return false;
+  const lanes = Math.max(...samples.map((s) => s.values.length));
+  for (let i = 0; i < lanes; i++) {
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (const s of samples) {
+      const v = s.values[i];
+      if (typeof v !== 'number' || !Number.isFinite(v)) continue;
+      lo = Math.min(lo, v);
+      hi = Math.max(hi, v);
+    }
+    if (hi > lo && hi - lo >= band) return false;
+  }
+  return true;
+}
 /**
  * THE THUMBNAIL'S FLOOR, in pixels, reserved out of the panel beside the meters.
  *
@@ -498,6 +586,14 @@ export default function PlayScreen() {
   const trackingRef = useRef(new TrackingRecorder());
   /** The runner's phase, for the sampler: conditions are recorded WHILE THE SONG PLAYS, not before it. */
   const phaseRef = useRef<string>('idle');
+  /** The latest HUD, for the polls below — they must not re-subscribe five times a second. */
+  const hudRef = useRef<HudSnapshot | null>(null);
+  /**
+   * Whether the camera can see the patient at all right now (at least one prescribed lane has
+   * landmarks). The rest offer below is a statement about a limb that is NOT MOVING, and a limb that
+   * has left the frame is a different fact with a different remedy.
+   */
+  const trackedRef = useRef(false);
 
   const [hud, setHud] = useState<HudSnapshot | null>(null);
   const [phase, setPhase] = useState<'loading' | 'running' | 'error' | 'blocked' | 'camera'>('loading');
@@ -556,9 +652,20 @@ export default function PlayScreen() {
    * is what the patient sees.
    */
   const [pipBox, setPipBox] = useState<OverlayPanelBox | null>(null);
+  /**
+   * The rest offer's own box, asked for from the same placement rule with a wider ceiling.
+   *
+   * It sits where the thumbnail sits — the renderer's guarantee is what makes that box usable at all
+   * — but it is allowed to take the whole gutter when there is one, because this panel is READ by a
+   * patient two metres away deciding whether to stop, while the thumbnail it replaces is glanced at
+   * by a therapist standing over it. On a board that leaves no more than the 150 px minimum, the two
+   * are the same size and the offer's wording is written to fit that.
+   */
+  const [restBox, setRestBox] = useState<OverlayPanelBox | null>(null);
   const syncPipBox = useCallback(() => {
     const hw = runnerRef.current?.highway;
     setPipBox(hw ? hw.overlayPanel() : null);
+    setRestBox(hw ? hw.overlayPanel({ maxWidth: 420 }) : null);
   }, []);
 
   /**
@@ -606,6 +713,9 @@ export default function PlayScreen() {
   useEffect(() => {
     const src = selfReporting(input);
     if (!src) {
+      // A scripted source says nothing about the camera, so nothing here may claim the patient is in
+      // frame (the rest offer is camera-only anyway, and this keeps a stale `true` from surviving).
+      trackedRef.current = false;
       // A scripted source reports nothing about itself, so there is nothing to say and nothing to
       // fault. (`setLiveWarnings` is only called when the list actually changes — an unconditional
       // reset here would re-render every mount for a session that never had a warning.)
@@ -620,6 +730,11 @@ export default function PlayScreen() {
       // therapist is being shown. Only while the song is running: the seconds spent on the count-in
       // (or paused, with the patient resting) are not the session's tracking quality.
       if (phaseRef.current === 'playing') trackingRef.current.sample(status, lanes.length);
+      // "Is the patient in frame" for the rest offer — deliberately NOT `status.tracking`, which is
+      // every lane at once: on a bilateral prescription one knee drifting out would otherwise read as
+      // a patient who has left the room.
+      trackedRef.current =
+        status.tracking === true || (status.untrackedLanes?.length ?? lanes.length) < lanes.length;
       const faults = faultedLanes(status);
       runnerRef.current?.highway.setLaneFaults(faults);
       const words = status.warnings ?? [];
@@ -774,6 +889,7 @@ export default function PlayScreen() {
         hudIntervalMs: 200,
         onHud: (h) => {
           setHud(h);
+          hudRef.current = h;
           phaseRef.current = h.phase;
           setPaused(h.phase === 'paused');
         },
@@ -947,10 +1063,101 @@ export default function PlayScreen() {
   }, [inputMode, paused, mode]);
   const pauseDwell = useDwellTargets(pauseChoices);
 
+  /**
+   * THE REST OFFER (see the long note beside `REST_OFFER_STILL_SEC`): the patient's hands-free way to
+   * stop the song, drawn only in the stretches where the prescribed exercise is provably not being
+   * performed, and dismissed by a single repetition.
+   *
+   * The test is taken from the very lane states the meters are drawn from — `value` is already
+   * normalized to THIS patient's calibrated range, so "a movement worth the name" means the same
+   * thing on a knee with 12 degrees as on one with 90 — and from the input source's own repetition
+   * events. Everything it needs is polled; nothing here re-subscribes as the HUD ticks.
+   */
+  const [restOffer, setRestOffer] = useState(false);
+  const restOfferRef = useRef(false);
+  restOfferRef.current = restOffer;
+  useEffect(() => {
+    if (inputMode !== 'camera' || !input) {
+      setRestOffer(false);
+      return;
+    }
+    const now = () => performance.now() / 1000;
+    /** Lane values over the stillness window, oldest first. */
+    let samples: { t: number; values: number[] }[] = [];
+    let lastRepAt = now();
+    const clear = () => {
+      samples = [];
+      lastRepAt = now();
+    };
+    // A REPETITION IS THE PATIENT'S "NO". It takes the offer off the screen, hold in progress and all,
+    // and restarts the clock — so carrying on with the exercise is the hands-free way to refuse.
+    const off = input.onEvent(() => {
+      clear();
+      if (restOfferRef.current) setRestOffer(false);
+    });
+    const id = setInterval(() => {
+      const t = now();
+      const hud = hudRef.current;
+      const judged = (hud?.hits ?? 0) + (hud?.misses ?? 0);
+      // Only while the song is genuinely asking for movement: not during the count-in, not before the
+      // first note has been judged (the lead-in is not a patient who has stopped), not while paused —
+      // the pause dialog has its own targets — and not while the audio clock is stalled, where the
+      // only thing that helps is the touch that screen asks for.
+      const asking =
+        phaseRef.current === 'playing' && !paused && hud?.clockStalled !== true && judged > 0 && trackedRef.current;
+      if (!asking) {
+        clear();
+        if (restOfferRef.current) setRestOffer(false);
+        return;
+      }
+      samples.push({ t, values: input.getLaneStates().map((l) => l.value) });
+      // Keep one sample older than the window, so "the window is covered" can be asserted rather than
+      // assumed from a count of samples.
+      while (samples.length > 1 && t - samples[1].t >= REST_OFFER_STILL_SEC) samples.shift();
+      if (restOfferRef.current) return;
+      if (t - lastRepAt < REST_OFFER_STILL_SEC) return;
+      if (!laneValuesQuiet(samples, t, REST_OFFER_STILL_SEC, REST_OFFER_BAND)) return;
+      setRestOffer(true);
+    }, REST_OFFER_SAMPLE_MS);
+    return () => {
+      off();
+      clearInterval(id);
+    };
+  }, [input, inputMode, paused]);
+
+  /**
+   * One target, and it PAUSES. Ending the session is the pause dialog's separate, smaller, differently
+   * shaped circle — two deliberate holds, not one, between a resting limb and a session that stopped.
+   * It sits where every forward target in this app sits (the left of the mirrored preview), so it is
+   * the same circle, in the same place, that the patient has held on every screen on the way here.
+   */
+  const restChoices: DwellChoice[] = useMemo(() => {
+    if (!restOffer) return [];
+    return [
+      {
+        id: 'stop',
+        target: singleDwellTarget(mode),
+        label: 'Stop the song',
+        onConfirm: () => runnerRef.current?.pause(),
+        tone: 'go',
+      },
+    ];
+  }, [restOffer, mode]);
+  const restDwell = useDwellTargets(restChoices);
+
   if (phase === 'camera') return <CameraFallback error={cameraError} onRetry={retryCamera} retries={attempt} />;
 
   const countdown = hud?.countdown ?? 0;
   const { alertsMaxHeight, videoMinPx: pipVideoMin, noteMinPx: pipNoteMin } = pipPanelBudget(pipBox ? pipBox.maxHeight : null);
+  /** The rest offer's box — the same corner, allowed to be wider (see `restBox`). */
+  const restStyle = restBox
+    ? {
+        left: Math.round(restBox.left),
+        bottom: Math.round(restBox.bottom),
+        width: Math.round(restBox.width),
+        maxHeight: Math.round(restBox.maxHeight),
+      }
+    : {};
   const pipStyle = {
     ...(pipBox
       ? {
@@ -996,7 +1203,7 @@ export default function PlayScreen() {
           {paused ? '▶' : '❚❚'}
         </button>
 
-        {inputMode === 'camera' && input && (
+        {inputMode === 'camera' && input && !restOffer && (
           <div className="pip" ref={pipRef} style={pipStyle} data-testid="play-pip">
             {/* THE WORDS FOR WHAT THE RINGS CANNOT SAY. A faulted lane's receptor goes to "no
                 reading" with a "!" in it (see the status poll above); that is the honest thing to
@@ -1051,6 +1258,52 @@ export default function PlayScreen() {
               violet dashes = lower to here · dashed outline = no reading from this lane (out of frame,
               faulted, or the session is paused — nothing counts while it is)
             </div>
+          </div>
+        )}
+
+        {/* THE PATIENT'S WAY TO STOP, IN THE ONE BOX ON THIS SCREEN THAT IS GUARANTEED CLEAR OF THE
+            BOARD (see the note beside REST_OFFER_STILL_SEC). It takes the thumbnail's place rather
+            than sitting next to it: there is one <video> in the app, the thumbnail letterboxes it
+            (`object-fit: contain`, which is not the crop the targets are placed through) and the
+            panel's other tenants — the input warnings and the lane meters — are the therapist's
+            instruments. A single repetition puts all three back.
+            EVERY WORD HERE HAS TO FIT A 150 px GUTTER, which is what some boards leave: short lines,
+            no paragraph, and the two facts the rings cannot carry (what the hold does, and which limb
+            is being followed) in the fewest words that are still true. */}
+        {inputMode === 'camera' && input && restOffer && (
+          <div className="pip rest-offer" style={restStyle} data-testid="rest-offer">
+            <h3 className="rest-offer-head">Do you need to stop?</h3>
+            <CameraPreview overlay>
+              {restChoices.map((choice) => (
+                <DwellTarget
+                  key={choice.id}
+                  choice={choice}
+                  state={restDwell.states[choice.id]}
+                  reducedMotion={reducedMotion}
+                  xScale={restDwell.xScale}
+                  testId={`rest-dwell-${choice.id}`}
+                />
+              ))}
+            </CameraPreview>
+            {/* WHICH LIMB, or why there is nothing to hold — the same two states the legend beside
+                every other preview reports, in the words this panel has room for. */}
+            {!restDwell.live ? (
+              <span className="badge badge-bad" data-testid="rest-offer-limb">
+                No camera frames
+              </span>
+            ) : (
+              <span className={restDwell.limb ? 'badge badge-ok' : 'badge badge-warn'} data-testid="rest-offer-limb">
+                {restDwell.limb ? `Following your ${restDwell.limb.label.replace(/^your /, '')}` : 'No hand in view'}
+              </span>
+            )}
+            {/* SHORT ENOUGH TO BE READ WITHOUT SCROLLING in the narrowest box the board leaves —
+                measured at 1024x768, where the gutter is 151 px and the panel's own scroll is a
+                control this patient cannot work. */}
+            <p className="rest-offer-note" data-testid="rest-offer-note">
+              {restDwell.live
+                ? 'Hold the circle and the song stops where it is — nothing scored, nothing missed, and you can carry on from there. Only resting? Move again and this goes.'
+                : 'No frames are arriving, so the circle cannot be held. The pause button still works.'}
+            </p>
           </div>
         )}
 

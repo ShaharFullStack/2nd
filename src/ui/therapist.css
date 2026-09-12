@@ -319,6 +319,15 @@
    the same thing in the same breath — so it changes colour with them (the amber of the ↻ phase). */
 .dwell-legend[data-state='reenter'] { border-left-color: #ffb020; background: rgba(255, 176, 32, 0.07); }
 
+/* A ring standing on a limb that lives there: the amber of the ⊘ phase, in the sentence as well as on
+   the ring, because "hold it" and "this cannot be held" must never be on screen together. */
+.dwell-legend[data-state='occupied'] { border-left-color: #ffb020; background: rgba(255, 176, 32, 0.07); }
+
+/* The tone mark — the chevrons that say WHICH of the two rings this is at a fifth of the size. It is
+   not a state, so it never breathes and never animates: it is dimmed only when the ring is. */
+.dwell-target .dwell-mark { opacity: 0.92; }
+.dwell-target[data-phase='off'] .dwell-mark { opacity: 0.5; }
+
 /* The secondary target's inner ring breathes with the outer one, so the double ring reads as ONE
    object at 1/5 scale rather than two rings that disagree about the time. */
 .dwell-target .dwell-inner { transform-origin: center; animation: dwell-breathe 2.4s ease-in-out infinite; }
