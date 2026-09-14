@@ -62,8 +62,8 @@ function visible(l: Landmark | undefined): boolean {
  * points are enough to build the whole mapping once per frame.
  */
 function placer(w: number, h: number, xScale: number): (p: Landmark) => { x: number; y: number } {
-  const origin = previewPlacement({ x: 0, y: 0, radius: 0 }, xScale);
-  const unit = previewPlacement({ x: 1, y: 1, radius: 0 }, xScale);
+  const origin = previewPlacement({ x: 0, y: 0, radius: 0 }, xScale, w / h);
+  const unit = previewPlacement({ x: 1, y: 1, radius: 0 }, xScale, w / h);
   const sx = (unit.x - origin.x) * w;
   const sy = (unit.y - origin.y) * h;
   const x0 = origin.x * w;

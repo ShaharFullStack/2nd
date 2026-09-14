@@ -15,11 +15,13 @@ export function CameraPreview({
   overlay = false,
   className = 'camera-frame mirror',
   children,
+  onAspectRatioChange,
 }: {
   overlay?: boolean;
   className?: string;
   /** Drawn INSIDE the frame, over the video and the landmark overlay (the hands-free dwell targets). */
   children?: ReactNode;
+  onAspectRatioChange?: (aspect: number) => void;
 }) {
   const host = useRef<HTMLDivElement>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
@@ -33,6 +35,14 @@ export function CameraPreview({
     video.setAttribute('playsinline', '');
     video.muted = true;
     el.prepend(video);
+    const readAspect = () => {
+      if (video.videoWidth > 0 && video.videoHeight > 0) {
+        onAspectRatioChange?.(video.videoWidth / video.videoHeight);
+      }
+    };
+    readAspect();
+    video.addEventListener('loadedmetadata', readAspect);
+    video.addEventListener('resize', readAspect);
 
     let raf = 0;
     let off: (() => void) | null = null;
@@ -58,11 +68,13 @@ export function CameraPreview({
     }
 
     return () => {
+      video.removeEventListener('loadedmetadata', readAspect);
+      video.removeEventListener('resize', readAspect);
       off?.();
       if (raf) cancelAnimationFrame(raf);
       if (video.parentElement === el) el.removeChild(video);
     };
-  }, [overlay]);
+  }, [overlay, onAspectRatioChange]);
 
   return (
     <div className={className} ref={host}>

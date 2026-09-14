@@ -632,30 +632,3 @@ table.table tr:hover td { background: rgba(255, 255, 255, 0.03); }
   .screen-inner:has(.dwell-legend) .dwell-legend strong { font-size: 1.02rem; line-height: 1.3; }
   .screen-inner:has(.dwell-legend) .dwell-legend .dim { font-size: 0.82rem; line-height: 1.3; }
 }
-
-/*
- * THE RANGE SCREEN PUTS THE LEGEND BESIDE THE PREVIEW INSTEAD OF UNDER IT.
- *
- * It carries more above the preview than any other screen — the top bar, the patient banner that says
- * whose record this range is about to become the denominator of, and the ring-and-instruction row
- * that IS the task — and with the preview merely capped, the limb badge still measured 794–827 on a
- * 768 px screen. The alternative to this rule was a preview shrunk to 200 px, which buys the sentence
- * by taking away the thing the sentence is about: the circle the patient has to aim a limb at.
- *
- * So on a short, WIDE viewport (a clinic tablet in landscape, which is how this app is used) the pair
- * becomes two columns: the preview on the left at the size it was, the legend beside it, and the
- * therapist's note about what the back circle does across the bottom. Nothing is hidden, nothing is
- * shortened, and the whole legend — badge included — is on the screen. Narrow viewports keep the
- * stacked layout, where two columns would be worse than a scroll.
- */
-@media (max-height: 880px) and (min-width: 900px) {
-  [data-testid="rom-handsfree"] {
-    display: grid;
-    grid-template-columns: minmax(220px, 360px) minmax(240px, 1fr);
-    column-gap: 14px;
-    align-items: start;
-  }
-  [data-testid="rom-handsfree"] > :first-child { grid-column: 1; grid-row: 1; }
-  [data-testid="rom-handsfree"] > .dwell-legend { grid-column: 2; grid-row: 1; }
-  [data-testid="rom-handsfree"] > .dim { grid-column: 1 / -1; grid-row: 2; }
-}

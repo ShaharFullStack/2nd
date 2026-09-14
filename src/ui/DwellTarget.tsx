@@ -849,6 +849,10 @@ export interface DwellTargetProps {
    * the frames before the first). Tests pass it explicitly; screens do not have to.
    */
   xScale?: number;
+  /** Aspect of the displayed image box; full-screen calibration preserves the sensor aspect. */
+  boxAspect?: number;
+  /** Keep full-size hit areas with quieter labels on a full-screen camera. */
+  compact?: boolean;
   testId?: string;
 }
 
@@ -856,7 +860,7 @@ export interface DwellTargetProps {
  * The ring itself. Renders absolutely INSIDE a `.camera-frame`, on top of the video and the landmark
  * overlay.
  */
-export function DwellTarget({ choice, state, mirrored = true, reducedMotion = false, xScale, testId }: DwellTargetProps) {
+export function DwellTarget({ choice, state, mirrored = true, reducedMotion = false, xScale, boxAspect, compact = false, testId }: DwellTargetProps) {
   const enabled = choice.enabled !== false;
   const phase = phaseOf(state, enabled);
   const tone = toneOf(choice);
@@ -870,7 +874,7 @@ export function DwellTarget({ choice, state, mirrored = true, reducedMotion = fa
   const fallbackScale = xScale ?? liveXScale();
   const circle = state?.target ?? retargetForPreview(choice.target, fallbackScale);
   const frameScale = state?.xScale ?? fallbackScale;
-  const place = previewPlacement(circle, frameScale);
+  const place = previewPlacement(circle, frameScale, boxAspect);
   const { radius } = circle;
 
   // 2·R viewBox units must cover `2 · radius` of FRAME HEIGHT (as cropped into the box); the box is
@@ -895,7 +899,7 @@ export function DwellTarget({ choice, state, mirrored = true, reducedMotion = fa
 
   return (
     <div
-      className={`dwell-target${reducedMotion ? ' still' : ''}${enabled ? '' : ' off'}`}
+      className={`dwell-target${reducedMotion ? ' still' : ''}${enabled ? '' : ' off'}${compact ? ' dwell-compact' : ''}`}
       data-testid={testId}
       data-phase={phase}
       data-tone={tone}
@@ -921,6 +925,13 @@ export function DwellTarget({ choice, state, mirrored = true, reducedMotion = fa
         transform: `translate(-50%, -${(cy / VB_H) * 100}%)`,
       }}
     >
+      {compact && <>
+        <svg className="dwell-compact-ring" viewBox={`0 0 ${VB_W} ${VB_H}`} width="100%" height="100%" aria-hidden="true">
+          <circle cx={CX} cy={cy} r={R} fill="rgba(15, 28, 38, .12)" stroke="rgba(220, 238, 250, .65)" strokeWidth="1" strokeDasharray="3 4" />
+          {progress > 0 && <circle cx={CX} cy={cy} r={R} fill="none" stroke="#b8e9d5" strokeWidth="2" pathLength="100" strokeDasharray={`${progress * 100} 100`} transform={`rotate(-90 ${CX} ${cy})`} />}
+        </svg>
+        <span className="dwell-compact-label" style={{ top: `${(capY / VB_H) * 100}%` }}>{caption}<small>{describe(phase, state)}</small></span>
+      </>}
       {/* `overflow: visible` so a two-word caption is never TRIMMED to fit the ring's own box: seen in
           the running app as "ext moveme" under a 190 px target at 1024x768. The preview still clips at
           the frame edge, and the targets are placed far enough in that the spill has somewhere to go. */}

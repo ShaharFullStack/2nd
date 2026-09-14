@@ -225,7 +225,7 @@ describe('the screen that first puts a range into degrees says what kind of numb
 describe('the instruction names the prescribed digit', () => {
   it('reads out the little finger for a pinky lane, not "the fingertip"', async () => {
     render(<RomCalibrationScreen />);
-    const line = await screen.findByTestId('rom-instruction');
+    const line = await screen.findByTestId('rom-detailed-instruction');
     expect(line.textContent).toMatch(/little finger/i);
     expect(line.textContent).not.toMatch(/to the fingertip/i);
   });
@@ -233,13 +233,13 @@ describe('the instruction names the prescribed digit', () => {
   it('follows the therapist to another digit', async () => {
     useStore.setState({ lanes: [{ index: 0, movement: 'finger_opposition', side: 'right', fingertip: 'ring' }, LANES[1]] });
     render(<RomCalibrationScreen />);
-    expect((await screen.findByTestId('rom-instruction')).textContent).toMatch(/ring finger/i);
+    expect((await screen.findByTestId('rom-detailed-instruction')).textContent).toMatch(/ring finger/i);
   });
 
   it('leaves a movement with no fingertip dimension on its own wording', async () => {
     useStore.setState({ lanes: [LANES[1], LANES[0]] });
     render(<RomCalibrationScreen />);
-    expect((await screen.findByTestId('rom-instruction')).textContent).toMatch(/Open your hand as wide as is comfortable/i);
+    expect((await screen.findByTestId('rom-detailed-instruction')).textContent).toMatch(/Open your hand as wide as is comfortable/i);
   });
 });
 

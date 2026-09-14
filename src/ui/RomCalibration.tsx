@@ -28,6 +28,7 @@ import {
 import type { TrackingGrade } from '../session/tracking.ts';
 import { FINGERTIP_NAME, MOVEMENT_INFO, movementCalibrationInstruction } from '../vision/features.ts';
 import { CameraPreview } from './CameraPreview.tsx';
+import { CalibrationGuide } from './CalibrationGuide.tsx';
 import { DwellLegend, DwellTarget, pairedDwellTargets, useDwellTargets } from './DwellTarget.tsx';
 import type { DwellChoice } from './DwellTarget.tsx';
 import { Meter, ProgressRing, Screen, Toast, TopBar, laneName } from './common.tsx';
@@ -121,6 +122,7 @@ export default function RomCalibrationScreen() {
   const reducedMotion = useStore((s) => s.settings.reducedMotion);
 
   const [laneIndex, setLaneIndex] = useState(0);
+  const [cameraAspect, setCameraAspect] = useState(4 / 3);
   const [live, setLive] = useState<Live | null>(null);
   const [done, setDone] = useState<(RomCalibration | null)[]>(() => lanes.map(() => null));
   const calibrator = useRef<RomCalibrator | null>(null);
@@ -467,7 +469,15 @@ export default function RomCalibrationScreen() {
   }
 
   return (
-    <Screen>
+    <div className="rom-stage" data-testid="rom-stage">
+      <div className="rom-camera" data-testid="rom-handsfree" style={{ width: `min(100vw, ${cameraAspect * 100}dvh)`, height: `min(100dvh, ${100 / cameraAspect}vw)` }}>
+        <CameraPreview overlay className="rom-camera-frame mirror" onAspectRatioChange={setCameraAspect}>
+          {dwellChoices.map((choice) => <DwellTarget key={choice.id} choice={choice} state={dwell.states[choice.id]}
+            compact reducedMotion={reducedMotion} xScale={dwell.xScale} boxAspect={cameraAspect} testId={`rom-dwell-${choice.id}`} />)}
+        </CameraPreview>
+      </div>
+      <div className="rom-shade" />
+      <header className="rom-header">
       <TopBar
         eyebrow={`Range of motion — lane ${laneIndex + 1} of ${lanes.length}`}
         title={`${lane.side === 'left' ? 'Left' : 'Right'} ${info.label.toLowerCase()}${tipName(lane) ? ` \u2014 ${tipName(lane)}` : ''}`}
@@ -483,7 +493,20 @@ export default function RomCalibrationScreen() {
           </button>
         }
       />
-
+      <ol className="rom-steps" aria-label="Calibration steps">
+        {['Hold still', 'Move 3 times', 'Continue'].map((label, i) => <li key={label} aria-current={(laneDone ? i === 2 : restPhase || !status ? i === 0 : i === 1) ? 'step' : undefined}>
+          <span>{i + 1}</span>{label}</li>)}
+      </ol>
+      </header>
+      <CalibrationGuide lane={lane} status={status} tracking={live?.tracking ?? false} accepted={!!laneDone}
+        refused={laneRefused} reducedMotion={reducedMotion} retry={retry} />
+      <footer className="rom-footer">
+        <span className={live?.tracking ? 'rom-tracking is-visible' : 'rom-tracking'}>{live?.tracking ? '● Limb visible' : '○ Looking for your limb'}</span>
+        <button className="btn" onClick={retry}>Restart movement</button>
+      </footer>
+      <details className="rom-details">
+      <summary>Adjustments &amp; details</summary>
+      <div className="rom-details-content">
       <PatientBanner blocking />
 
       <div className="row" style={{ alignItems: 'stretch', gap: 24 }}>
@@ -495,12 +518,12 @@ export default function RomCalibrationScreen() {
           <div className="row" style={{ gap: 24 }}>
             <ProgressRing value={ringValue} label={ringLabel} />
             <div className="stack grow" style={{ gap: 10 }}>
-              <div className="eyebrow">{restPhase ? 'Hold still' : status?.phase === 'move' ? 'Now move' : status?.error || rejectedReason ? 'Try again' : 'Done'}</div>
+              <div className="eyebrow">{restPhase ? 'Hold still' : status?.phase === 'move' ? 'Now move' : status?.error || rejectedReason ? 'Range not ready' : 'Done'}</div>
               {/* THE SENTENCE THE PATIENT IS READ WHILE BEING MEASURED. It must name the digit that was
                   prescribed: `MOVEMENT_INFO.calibrationInstruction` says "touch your thumb to the
                   fingertip", which is wrong for three of the four tips a therapist can choose, and the
                   patient performing the rep is the one person who cannot see the heading above. */}
-              <p style={{ fontSize: '1.25rem' }} data-testid="rom-instruction">
+              <p style={{ fontSize: '1.25rem' }} data-testid="rom-detailed-instruction">
                 {restPhase ? info.restInstruction : moveInstruction}
               </p>
               {/* The calibrator's message repeats the instruction in the quiet phases — only show it
@@ -515,21 +538,7 @@ export default function RomCalibrationScreen() {
               so it and the instruction above it are both on the screen at 1024x768. The small sidebar
               preview is stood down: there is one <video> in the app, and the screen the patient has to
               read from a chair is not a 340 px thumbnail. */}
-          <div className="stack" style={{ gap: 12 }} data-testid="rom-handsfree">
-            <div style={{ width: 'min(440px, 100%)' }}>
-              <CameraPreview overlay>
-                {dwellChoices.map((choice) => (
-                  <DwellTarget
-                    key={choice.id}
-                    choice={choice}
-                    state={dwell.states[choice.id]}
-                    reducedMotion={reducedMotion}
-                    xScale={dwell.xScale}
-                    testId={`rom-dwell-${choice.id}`}
-                  />
-                ))}
-              </CameraPreview>
-            </div>
+          <div className="stack" style={{ gap: 12 }}>
             <DwellLegend
               session={dwell}
               what={
@@ -775,6 +784,8 @@ export default function RomCalibrationScreen() {
           </span>
         </div>
       </div>
-    </Screen>
+      </div>
+      </details>
+    </div>
   );
 }
