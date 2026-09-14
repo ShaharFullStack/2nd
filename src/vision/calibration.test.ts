@@ -27,6 +27,26 @@ describe('percentile / normalize', () => {
 });
 
 describe('RomCalibrator', () => {
+  it('keeps measuring after three small fluctuations and accepts subsequent usable movement', () => {
+    const cal = new RomCalibrator('seated_march');
+    // A still-enough rest window with measurable noise: the usable range must exceed 0.09.
+    for (let i = 0; i <= 60; i++) cal.push(i % 2 ? 0.515 : 0.485, i / 30);
+    expect(cal.getPhase()).toBe('move');
+    expect(cal.requiredRange()).toBeCloseTo(0.09);
+    let t = 2.1;
+    for (let rep = 0; rep < 3; rep++) {
+      for (const value of [0.5, 0.565, 0.5]) cal.push(value, t += 0.2);
+    }
+    expect(cal.getStatus().repsDetected).toBe(3);
+    expect(cal.getPhase()).toBe('move');
+    expect(cal.getResult()).toBeNull();
+    expect(cal.getStatus().message).toMatch(/Still measuring/);
+    for (const value of [0.5, 0.6, 0.7, 0.8, 0.7, 0.6, 0.5]) cal.push(value, t += 0.2);
+    expect(cal.getPhase()).toBe('done');
+    expect(cal.getError()).toBeNull();
+    expect(isCalibrationValid(cal.getResult()!, 'seated_march')).toBe(true);
+  });
+
   it('finds min (rest median) and max (90th pct of peaks) from a synthetic knee-lift sequence', () => {
     const cal = new RomCalibrator('seated_march');
     const seq = repSequence({ restSec: 2.5, reps: 3, repDurationSec: 1.5, amplitude: 0.8, noise: 0.03, seed: 7 });
@@ -72,11 +92,13 @@ describe('RomCalibrator', () => {
     for (const { t, amount } of repSequence({ reps: 3, amplitude: 0.05 })) {
       cal.push(extractFeature('knee_extension', seatedPose({ kneeExtension: amount }), 'left'), t);
     }
+    expect(cal.getPhase()).toBe('move');
+    cal.push(null, 40); // Small reps get the full movement window before rejection.
     expect(cal.getPhase()).toBe('done');
     expect(cal.getError()).toBe('insufficient_range');
     expect(cal.getResult()).toBeNull();
     const st = cal.getStatus();
-    expect(st.message).toMatch(/bigger movement|adjust/i);
+    expect(st.message).toMatch(/Redo this lane/i);
     expect(st.repsDetected).toBeGreaterThanOrEqual(1);
     // A clean, still rest window relaxes the absolute floor to half the nominal minRom - and no further.
     expect(cal.requiredRange()).toBeCloseTo(10, 6);
@@ -423,6 +445,8 @@ describe('the rest window is MEASURED, not assumed (the zero every value is norm
 
   it('rejects a range that cannot be told apart from its own noisy zero, and says why', () => {
     const cal = run({ jitter: (t) => 0.06 * Math.sin(t * 5), restSec: 11, peak: 0.25 });
+    expect(cal.getPhase()).toBe('move');
+    cal.push(null, 50);
     const spread = cal.getRestQuality()!.spread;
     // The range (0.25, twice the nominal minRom) is wide in absolute terms but under MIN_ROM_SNR x
     // the rest noise its own zero is buried in.

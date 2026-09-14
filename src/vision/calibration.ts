@@ -1052,7 +1052,13 @@ export class RomCalibrator {
       this.moveSamples++;
       if (feature > this.moveMax) this.moveMax = feature;
       this.detectPeak(feature);
-      if (this.peaks.length >= this.repsRequired) this.finish();
+      // Small fluctuations can satisfy the peak detector before they span a usable range.
+      // Keep collecting within the existing deadline instead of ending the attempt in failure
+      // before the patient has had a chance to complete their movement.
+      if (
+        this.peaks.length >= this.repsRequired &&
+        percentile(this.peaks, this.peakPercentile) - this.min! >= this.requiredRange()
+      ) this.finish();
       else if (tSec - this.moveStart > this.moveTimeoutSec) {
         if (this.peaks.length > 0) this.finish();
         else {
@@ -1531,14 +1537,18 @@ export class RomCalibrator {
     if (this.phase === 'rest') {
       const full = this.restProgress() >= 1;
       message = full && !this.restStill ? `${info.restInstruction} Hold still…` : info.restInstruction;
-    } else if (this.phase === 'move') message = `${info.calibrationInstruction} (${this.peaks.length}/${this.repsRequired})`;
+    } else if (this.phase === 'move') {
+      message = this.peaks.length >= this.repsRequired
+        ? 'Still measuring: the movements so far do not span a usable range. Return to the resting position, then repeat the movement as far as is comfortable.'
+        : `${info.calibrationInstruction} (${this.peaks.length}/${this.repsRequired})`;
+    }
     else if (this.error === 'insufficient_range') {
       // When the floor was RAISED by a noisy rest window, "do a bigger movement" is the wrong
       // instruction: the range is fine, it is the zero it is measured from that will not hold still.
       const noisyRest = this.restAtAdvance !== null && this.requiredRange() > this.minRom * 1.001;
       message = noisyRest
         ? `The movement could not be told apart from the resting position, which was itself moving by ${this.formatValue(this.restAtAdvance!.spread)} (${this.formatRom()}). Support the limb, hold still, and calibrate again.`
-        : `Not enough movement was detected (${this.formatRom()}). Try a bigger movement, move closer to the camera, or let the therapist adjust the range manually.`;
+        : `Not enough movement was detected (${this.formatRom()}). Select Redo this lane, start in the resting position shown, then repeat the named movement on the named side as far as is comfortable. Good visibility alone does not establish a movement range.`;
     } else if (this.error === 'no_reps') {
       message = this.noRepsMessage();
     } else if (this.error === 'not_tracked') {

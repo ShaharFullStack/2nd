@@ -454,9 +454,9 @@ export default function RomCalibrationScreen() {
   const ringLabel = useMemo(() => {
     if (!status) return '…';
     if (status.phase === 'rest') return `${Math.round(status.restProgress * 100)}%`;
-    if (status.phase === 'move') return `${status.repsDetected}/${status.repsRequired}`;
-    return '✓';
-  }, [status]);
+    if (status.phase === 'move') return status.repsDetected >= status.repsRequired ? '…' : `${status.repsDetected}/${status.repsRequired}`;
+    return status.error || rejectedReason ? '!' : '✓';
+  }, [status, rejectedReason]);
 
   if (!lane || !info) {
     return (
@@ -495,7 +495,7 @@ export default function RomCalibrationScreen() {
           <div className="row" style={{ gap: 24 }}>
             <ProgressRing value={ringValue} label={ringLabel} />
             <div className="stack grow" style={{ gap: 10 }}>
-              <div className="eyebrow">{restPhase ? 'Hold still' : status?.phase === 'move' ? 'Now move' : 'Done'}</div>
+              <div className="eyebrow">{restPhase ? 'Hold still' : status?.phase === 'move' ? 'Now move' : status?.error || rejectedReason ? 'Try again' : 'Done'}</div>
               {/* THE SENTENCE THE PATIENT IS READ WHILE BEING MEASURED. It must name the digit that was
                   prescribed: `MOVEMENT_INFO.calibrationInstruction` says "touch your thumb to the
                   fingertip", which is wrong for three of the four tips a therapist can choose, and the
@@ -505,7 +505,7 @@ export default function RomCalibrationScreen() {
               </p>
               {/* The calibrator's message repeats the instruction in the quiet phases — only show it
                   when it is actually saying something else (progress, a problem, a next step). */}
-              {status && status.message !== info.restInstruction && status.message !== info.calibrationInstruction && status.message !== moveInstruction && (
+              {status && status.error !== 'insufficient_range' && status.message !== info.restInstruction && status.message !== info.calibrationInstruction && status.message !== moveInstruction && (
                 <p className="muted">{status.message}</p>
               )}
             </div>
@@ -576,8 +576,9 @@ export default function RomCalibrationScreen() {
 
           {status?.error === 'insufficient_range' && (
             <Toast kind="bad">
-              The range measured is too small to tell movement from noise. Ask for a bigger, slower movement — or nudge the
-              top of the range down if this really is the patient's maximum.
+              {status.message}
+              <br />
+              Start position: {info.restInstruction}
             </Toast>
           )}
           {status?.error === 'no_reps' && (

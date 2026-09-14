@@ -98,6 +98,24 @@ describe('the range offered back from last session carries how it was measured',
 });
 
 describe('the range this screen accepts carries how it was measured', () => {
+  it('explains a failed range without offering a disabled adjustment or showing success', async () => {
+    const cal = new RomCalibrator('knee_extension');
+    cal.setManualRange(90, 92);
+    const create = vi.spyOn(vision, 'createCalibrator').mockReturnValue(cal);
+    try {
+      render(<RomCalibrationScreen />);
+      await screen.findByText('Try again');
+      expect(screen.getByText(/Good visibility alone/).textContent).toContain('Redo this lane');
+      expect(screen.getByText(/Start position:/).textContent).toContain('Sit upright');
+      expect(screen.queryByText(/nudge the top/)).toBeNull();
+      expect(screen.queryByText('✓')).toBeNull();
+      expect((screen.getByTestId('rom-next') as HTMLButtonElement).disabled).toBe(true);
+      expect((screen.getByTestId('rom-redo') as HTMLButtonElement).disabled).toBe(false);
+    } finally {
+      create.mockRestore();
+    }
+  });
+
   it('shows the grade on the accepted range and on the lane list', async () => {
     saveRange(range(measurement({ fpsMedian: 20, fpsLow: 18 })));
     render(<RomCalibrationScreen />);
