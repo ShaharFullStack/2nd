@@ -21,10 +21,10 @@ import { mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
+import { chromiumExecutable } from './browser-path.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, '..');
-const EXECUTABLE = '/opt/pw-browsers/chromium';
 
 const argv = process.argv.slice(2);
 const arg = (name, fallback) => (argv.includes(name) ? argv[argv.indexOf(name) + 1] : fallback);
@@ -113,7 +113,7 @@ async function main() {
   }
 
   const browser = await chromium.launch({
-    executablePath: EXECUTABLE,
+    executablePath: chromiumExecutable,
     headless: true,
     args: ['--no-sandbox', '--autoplay-policy=no-user-gesture-required', '--use-gl=swiftshader'],
   });

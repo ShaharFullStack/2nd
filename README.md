@@ -124,6 +124,10 @@ npm run critic:handsfree  # one tap on Home, then a body: camera check → calib
 
 Each of these starts and stops its own dev server. `critic:smoke` drives the whole flow and
 asserts the engine scored, the clock froze on pause, and the session was saved.
+The three browser checks in CI (`critic:smoke`, `critic:audio`, and `critic:frames`) use
+Playwright's installed Chromium (`npx playwright install chromium`). They also support
+`PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` for an explicit browser, and use
+`/opt/pw-browsers/chromium` when that optional preinstalled executable exists.
 `critic:audio` is the one that checks the game's central promise: it plays a session, stops
 feeding the engine, and reads the live Web Audio gains to confirm the missing lane's
 instrument dips in proportion, that no other lane's instrument moves with it, and that the

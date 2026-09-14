@@ -13,6 +13,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
+import { chromiumExecutable } from './browser-path.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, '..');
@@ -23,7 +24,6 @@ const RESULTS_SHOT = resolve(SHOT_DIR, 'results.png');
 const HOME_SHOT = resolve(SHOT_DIR, 'home.png');
 const SETUP_SHOT = resolve(SHOT_DIR, 'setup.png');
 const HISTORY_SHOT = resolve(SHOT_DIR, 'history.png');
-const EXECUTABLE = '/opt/pw-browsers/chromium';
 const PORT = Number(process.env.SMOKE_PORT ?? 5173);
 
 const args = process.argv.slice(2);
@@ -86,7 +86,7 @@ async function main() {
   }
 
   const browser = await chromium.launch({
-    executablePath: EXECUTABLE,
+    executablePath: chromiumExecutable,
     headless: !headed,
     args: ['--no-sandbox', '--autoplay-policy=no-user-gesture-required', '--use-gl=swiftshader'],
   });
