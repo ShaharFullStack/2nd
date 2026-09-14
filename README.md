@@ -1,6 +1,7 @@
 # Beat Rehab
 
-A rhythm game you play with your body, built for physiotherapy. The patient performs
+A rhythm game you play with your body, built for physiotherapy. 
+The patient performs
 therapist-prescribed exercises in time with real music; each exercise is a lane on a
 Guitar-Hero-style note highway, and a camera — not a controller — reads the movement.
 
