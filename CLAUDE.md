@@ -19,6 +19,12 @@ the fact. `README.md` explains what the game is.
   cover the claim. If you change something visual or behavioural, drive it and look at the
   screenshots.
 
+## Shipping
+
+`main` is the branch. Finished work goes there — commit and push to `main` when a piece is
+done, rather than leaving it on a side branch for someone to chase. "Done" means the gates
+below pass, not that the code was written.
+
 ## Commands
 
 ```bash
