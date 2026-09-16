@@ -1073,7 +1073,7 @@ export default function PlayScreen() {
       const faults = faultedLanes(status);
       runnerRef.current?.highway.setLaneFaults(faults);
       const words = status.warnings ?? [];
-      const key = `${faults.join(',')}${words.join(' ')}${status.delegate ?? ''}`;
+      const key = `${faults.join(',')}\u0001${words.join('\u0000')}\u0001${status.delegate ?? ''}`;
       if (key === lastKey) return;
       lastKey = key;
       setVisionDelegate(status.delegate ?? null);

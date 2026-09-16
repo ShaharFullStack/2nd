@@ -405,6 +405,8 @@ export class VisionInput implements InputSource {
   private repListeners = new Set<(e: LaneRepEvent) => void>();
   private compListeners = new Set<(e: CompensationEvent) => void>();
   private frameListeners = new Set<FrameCallback>();
+  /** Groups whose listeners have thrown this run, with the first message and a count. */
+  private listenerFaults = new Map<string, { message: string; count: number }>();
   private detector: LandmarkDetector | null = null;
   private camera: CameraSession | null = null;
   private loop: DetectLoop | null = null;
@@ -1028,6 +1030,45 @@ export class VisionInput implements InputSource {
     };
   }
 
+  /**
+   * Dispatch to one listener group, isolating each callback.
+   *
+   * A frame listener is APP CODE — the calibration screen's sampler, the in-song range learner, a
+   * harness probe — and it is not the camera. Before this, one throwing listener escaped
+   * processDetection into DetectLoop's catch, which reports through `onError`, which sets
+   * `reason = 'error'`. The patient was then told "Camera or detector error.", every other
+   * diagnostic was suppressed (buildStatus short-circuits on 'error'), and the actual fault — a bug
+   * in one of our own frame handlers — was named nowhere at all. A working camera must never be
+   * blamed for our bug, and no failure mode here is allowed to be silent.
+   */
+  private emit<A extends unknown[]>(where: string, cbs: Iterable<(...a: A) => void>, ...args: A): void {
+    for (const cb of cbs) {
+      try {
+        cb(...args);
+      } catch (err) {
+        this.noteListenerFault(where, err);
+      }
+    }
+  }
+
+  /**
+   * Record a listener fault and say so ONCE per group per run. These fire from the frame loop, so an
+   * unthrottled log is 30 lines a second and the first (the one with the useful stack) scrolls away.
+   */
+  private noteListenerFault(where: string, err: unknown): void {
+    const message = err instanceof Error ? err.message : String(err);
+    const prev = this.listenerFaults.get(where);
+    this.listenerFaults.set(where, { message, count: (prev?.count ?? 0) + 1 });
+    if (!prev) {
+      console.error(`[vision] a ${where} listener threw and was isolated; the camera is fine. ${message}`, err);
+    }
+  }
+
+  /** Listener faults seen this run, by group. Empty is the normal state. */
+  getListenerFaults(): { where: string; message: string; count: number }[] {
+    return [...this.listenerFaults].map(([where, f]) => ({ where, ...f }));
+  }
+
   isRunning(): boolean {
     return this.running;
   }
@@ -1155,6 +1196,14 @@ export class VisionInput implements InputSource {
     if (subjectChanged) {
       warnings.push(
         'The person being tracked changed position abruptly — the camera may have switched to a different person in the frame (this model follows only one body and cannot tell them apart). Check that only the patient is in view: everything measured while someone else is tracked belongs to them, not the patient.',
+      );
+    }
+    // A part of the app that consumes frames threw. It is not the camera and it is not the patient,
+    // and the screen may not stay quiet about it: whatever that listener does — sampling the range,
+    // learning it inside the song — has not been happening since.
+    for (const f of this.getListenerFaults()) {
+      warnings.push(
+        `A part of the app that reads the camera (the ${f.where} handler) has failed ${f.count} time${f.count === 1 ? '' : 's'} and was isolated so the camera keeps running: ${f.message}. The camera itself is fine, but whatever that part does has stopped — report this session.`,
       );
     }
     return Object.freeze({
@@ -1743,7 +1792,7 @@ export class VisionInput implements InputSource {
         if (ctxTime - l.compFlagLastEmit > 0.5) {
           l.compFlagLastEmit = ctxTime;
           const ev: CompensationEvent = { lane: l.spec.index, ctxTime, kind: c.kind, value: c.value };
-          for (const cb of this.compListeners) cb(ev);
+          this.emit('compensation', this.compListeners, ev);
         }
       }
 
@@ -1789,9 +1838,9 @@ export class VisionInput implements InputSource {
     else if (untracked.length > 0) this.reason = this.config.mode === 'leg' || lowVis ? 'low_visibility' : 'hand_missing';
     else this.reason = 'ok';
 
-    for (const cb of this.frameListeners) cb(samples, ctxTime, res);
-    for (const ev of events) for (const cb of this.listeners) cb(ev);
-    for (const rep of reps) for (const cb of this.repListeners) cb(rep);
+    this.emit('frame', this.frameListeners, samples, ctxTime, res);
+    for (const ev of events) this.emit('lane event', this.listeners, ev);
+    for (const rep of reps) this.emit('repetition', this.repListeners, rep);
     return events;
   }
 }
