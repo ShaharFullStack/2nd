@@ -792,10 +792,26 @@ async function main() {
       await glide(page, 'knee', 0.5, 0.5, 4);
       await setLimb(page, { side, lift: 0, dx: 0, dy: 0 });
       await handsDown(page);
-      // The screen's own eyebrow, which is what the patient is reading. (It is CSS-uppercased, so the
-      // match is case-insensitive.)
+      // THE SCREEN HAS MOVED PAST THE REST HOLD AND IS ASKING FOR REPETITIONS.
+      //
+      // This used to grep the visible text for "now move". That is the wrong thing to assert on: the
+      // calibration screen was redesigned, the eyebrow carrying that phrase moved into the collapsed
+      // "Adjustments & details" block (so `innerText` no longer sees it), and the patient-facing
+      // heading now reads "Move, then return" — and this check failed on a build whose calibration was
+      // working perfectly, which is a false alarm in the harness that is meant to catch real ones.
+      // So key off the step indicator's own state instead: `aria-current="step"` on step 2 is the
+      // screen saying which step it is on, in markup, and it does not change when the prose does.
       const asked = await page
-        .waitForFunction(() => /now move/i.test(document.body.innerText), null, { timeout: 25_000 })
+        .waitForFunction(
+          () => {
+            const steps = [...document.querySelectorAll('.rom-steps li')];
+            if (steps.length >= 2 && steps[1].getAttribute('aria-current') === 'step') return true;
+            // Fall back to either wording, so this still works against an older build.
+            return /now move|move, then return/i.test(document.body.innerText);
+          },
+          null,
+          { timeout: 25_000 },
+        )
         .then(() => true)
         .catch(() => false);
       if (!asked) failures.push(`lane ${i + 1}: the rest hold never completed, so the screen never asked for the reps`);
