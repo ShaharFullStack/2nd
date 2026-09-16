@@ -13,6 +13,7 @@
  */
 import type { Sfx } from '../audio/sfx.ts';
 import type { StemMixer } from '../audio/StemMixer.ts';
+import { scaleWindows } from '../engine/difficulty.ts';
 import { RhythmEngine } from '../engine/rhythm.ts';
 import { beatAt } from '../engine/scheduler.ts';
 import type { ClockSource } from '../engine/scheduler.ts';
@@ -142,6 +143,24 @@ export interface GameRunnerOptions {
    * scripted inputs, which emit every crossing and have no such window.
    */
   minIntervalSec?: number;
+  /**
+   * THE OPENING IN WHICH THE APP DOES NOT YET KNOW THE PATIENT'S RANGE (in-song calibration).
+   *
+   * `endsAt` is the song time the warm-up closes at. Until then:
+   *  - the judgment windows are the prescription's own, multiplied by `windowScale` (the same lever
+   *    the therapist's window scale pulls, so nothing new has to be understood to read it);
+   *  - a MISS DOES NOT DUCK THE PATIENT'S INSTRUMENT. Per-lane ducking is the reward the weak side
+   *    is earning with every rep (audio/ducking.ts); dipping it in a window where the app itself
+   *    cannot say what it was asking for would punish a patient for the app's own uncertainty.
+   *
+   * The windows narrow back exactly once, and only after the last note that could still be judged
+   * under the wide ones has been judged — a window that narrows under a pending note would turn a
+   * note the patient was inside into a miss (see Judge.setWindows).
+   *
+   * Omitted on the measured path and for the scripted inputs: there is nothing to be forgiving
+   * about once the ranges have been established.
+   */
+  warmup?: { endsAt: number; windowScale: number };
   countdownSec?: number;
   highwayOptions?: Partial<HighwayOptions>;
   songTitle?: string;
@@ -283,6 +302,11 @@ export function sessionAchievement(input: AchievementInput): { text: string; not
 }
 
 /** Seconds of judged notes kept in `recentHits` so the renderer can spawn their effects. */
+/** `scaleWindows` over either shape the runner accepts (one set for every lane, or one per lane). */
+function widenWindows(w: TimingWindows | TimingWindows[], k: number): TimingWindows | TimingWindows[] {
+  return Array.isArray(w) ? w.map((x) => scaleWindows(x, k)) : scaleWindows(w, k);
+}
+
 const RECENT_HIT_SEC = 1.2;
 /** Never play more than one miss cue in this window, however many notes expire at once. */
 const MISS_CUE_COOLDOWN_SEC = 0.15;
@@ -431,6 +455,15 @@ export class GameRunner {
    * pause is not mistaken for one a human asked for.
    */
   private pausedByPage = false;
+  /**
+   * The warm-up in force, or null. `narrowAt` is the song time the prescription's own windows are
+   * restored at: the warm-up's end PLUS the widest good window that was in force during it, so
+   * every note offered inside the warm-up has already been judged (or missed) under the wide
+   * windows before they are taken away. See `GameRunnerOptions.warmup`.
+   */
+  private readonly warmup: { endsAt: number; narrowAt: number } | null;
+  /** True once the prescription's own windows have been restored (at most once per run). */
+  private windowsNarrowed = false;
 
   constructor(options: GameRunnerOptions) {
     this.opts = options;
@@ -445,10 +478,19 @@ export class GameRunner {
     this.schedule = options.schedule ?? defaultSchedule;
     this.lifecycle = options.lifecycle === undefined ? browserLifecycle() : options.lifecycle;
     this.outroSec = outroSecFor(options.windows);
+    const warmupOpt = options.warmup;
+    if (warmupOpt && Number.isFinite(warmupOpt.endsAt) && warmupOpt.windowScale > 1) {
+      this.warmup = { endsAt: warmupOpt.endsAt, narrowAt: warmupOpt.endsAt + outroSecFor(widenWindows(options.windows, warmupOpt.windowScale)) };
+    } else {
+      this.warmup = null;
+      this.windowsNarrowed = true;
+    }
 
     this.engine = new RhythmEngine({
       chart: options.chart,
-      windows: options.windows,
+      // Wide for the opening when there is one; `step` restores the prescription's own windows once
+      // nothing offered under the wide ones can still be pending.
+      windows: this.warmup ? widenWindows(options.windows, warmupOpt!.windowScale) : options.windows,
       ctx: options.clock,
       inputLatencySec: options.inputLatencySec ?? 0,
       missGraceMs: options.missGraceMs,
@@ -664,12 +706,24 @@ export class GameRunner {
     this.lastCtxTime = ctxNow;
 
     const { songTime, misses } = this.engine.tick(ctxNow);
+    // THE PRESCRIPTION'S OWN WINDOWS COME BACK ONCE — and only once nothing offered under the wide
+    // ones can still be pending, so no note the patient was inside is turned into a miss by the
+    // change. After this the run is judged at exactly what the therapist prescribed.
+    if (!this.windowsNarrowed && this.warmup && songTime >= this.warmup.narrowAt) {
+      this.windowsNarrowed = true;
+      this.engine.setWindows(this.opts.windows);
+    }
+    const warmingUp = this.warmup !== null && songTime < this.warmup.endsAt;
     if (misses.length > 0) {
       for (const m of misses) {
         this.pushRecent(m);
         // Per lane, one step per miss: the weak side dims its own stem only, and only in proportion
         // to the run of misses. A single miss anywhere used to drop the player's instrument to 5 %.
-        this.mixer?.onLaneMiss(m.lane);
+        //
+        // EXCEPT WHILE THE APP IS STILL LEARNING THE RANGE. The lane's instrument is what the limb
+        // is earning; taking it away for missing a target the app cannot yet state is the app
+        // charging the patient for its own uncertainty. See `GameRunnerOptions.warmup`.
+        if (!warmingUp) this.mixer?.onLaneMiss(m.lane);
       }
       if (this.sfx && songTime - this.lastMissCueSongTime > MISS_CUE_COOLDOWN_SEC) {
         this.lastMissCueSongTime = songTime;

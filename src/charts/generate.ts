@@ -17,6 +17,22 @@ export interface GenerateOptions {
   accents?: boolean;
   /** Beats of silence before the first note (default 2). */
   leadInBeats?: number;
+  /**
+   * THE OPENING THE PATIENT IS NOT BEING MEASURED IN (song seconds from the audio start, default 0
+   * = no warm-up). Inside it the chart is thinned so that each LANE is asked for a repetition at
+   * most every `warmupLaneRestSec`.
+   *
+   * It exists for the in-song calibration path (session/inSongCalibration.ts): the song starts on a
+   * provisional range and the patient's real one is learned from the movements they make in this
+   * window, so a note missed here is a note missed while the app did not yet know what it was
+   * asking for. The answer is not to hide those notes — the patient has to be MOVING for anything
+   * to be learned — it is to ask for much less, much further apart, so the opening is reachable by
+   * somebody who has not found the movement yet. The dose figures on the setup screen are measured
+   * from the chart this produces, so the thinning is stated rather than discovered.
+   */
+  warmupSec?: number;
+  /** Least seconds between two notes of ONE LANE inside the warm-up (default: the lane spacing). */
+  warmupLaneRestSec?: number;
   /** Seconds at the end of the song kept free of notes (default 1). */
   tailSec?: number;
   /** Bars per repeating phrase; the last bar of each phrase is a seeded variation (default 4). */
@@ -732,9 +748,11 @@ export function generateChartDetailed(
   const slotSec = beatSec / SLOTS_PER_BEAT;
   const accents = opts.accents ?? true;
   const leadInBeats = Math.max(0, opts.leadInBeats ?? 2);
+  const warmupSec = Math.max(0, opts.warmupSec ?? 0);
   const tailSec = opts.tailSec ?? 1;
   const phraseBars = Math.max(1, Math.floor(opts.phraseBars ?? 4));
   const minSpacing = opts.minLaneSpacingSec ?? MIN_LANE_SPACING_SEC[diff.name] ?? 0.6;
+  const warmupLaneRest = Math.max(minSpacing, opts.warmupLaneRestSec ?? minSpacing);
   const crossGap = opts.minCrossLaneGapSec ?? defaultCrossLaneGapSec(diff.name, bpm);
   const density = Math.max(0, diff.noteDensity);
   const { budget, table } = computeBudget(bpm, laneCount, density, minSpacing, crossGap, beatsPerBar, accents);
@@ -852,10 +870,9 @@ export function generateChartDetailed(
    * no longer a single predictable cycle the patient memorises within a bar.
    */
   const finish = (slots: readonly number[]): GenerateResult => {
-    const notes: Note[] = [];
+    const assigned: { slot: number; lane: number }[] = [];
     const laneCounts = new Array<number>(laneCount).fill(0);
     const lastSlotForLane = new Array<number>(laneCount).fill(Number.NEGATIVE_INFINITY);
-    let offBeats = 0;
     for (let k = 0; k < slots.length; k++) {
       const slot = slots[k];
       let lane = -1;
@@ -880,13 +897,51 @@ export function generateChartDetailed(
       }
       laneCounts[lane]++;
       lastSlotForLane[lane] = slot;
+      assigned.push({ slot, lane });
+    }
+
+    /**
+     * THE WARM-UP THINNING, applied after the lanes are assigned because it is a per-LANE rule: what
+     * costs an impaired limb is being asked for the same movement again, not the board being busy.
+     * Everything below — the metrics, the warnings and the dose the setup screen prints — is
+     * computed from what SURVIVES this, so nothing downstream promises reps that were removed.
+     */
+    const kept: { slot: number; lane: number }[] = [];
+    let thinned = 0;
+    if (warmupSec > 0) {
+      const lastKept = new Array<number>(laneCount).fill(Number.NEGATIVE_INFINITY);
+      for (const a of assigned) {
+        const time = song.offset + a.slot * slotSec;
+        if (time < warmupSec && time - lastKept[a.lane] < warmupLaneRest - EPS) {
+          thinned++;
+          continue;
+        }
+        lastKept[a.lane] = time;
+        kept.push(a);
+      }
+      if (thinned > 0) {
+        warnings.push(
+          `warm-up: ${thinned} note(s) removed from the first ${warmupSec}s so each lane is asked for a repetition at most ` +
+            `every ${warmupLaneRest.toFixed(2)}s while the range of motion is still being learned`,
+        );
+      }
+    } else {
+      kept.push(...assigned);
+    }
+
+    const notes: Note[] = [];
+    laneCounts.fill(0);
+    let offBeats = 0;
+    for (let k = 0; k < kept.length; k++) {
+      const { slot, lane } = kept[k];
+      laneCounts[lane]++;
       if (slot % SLOTS_PER_BEAT !== 0) offBeats++;
       notes.push({ id: k, lane, time: round6(song.offset + slot * slotSec) });
     }
 
     let downbeatsTotal = 0;
     let downbeatsHit = 0;
-    const keptSet = new Set(slots);
+    const keptSet = new Set(kept.map((a) => a.slot));
     for (let b = firstBar; b <= lastBar; b++) {
       const d = b * S;
       if (d < firstSlot || d > lastSlot) continue;

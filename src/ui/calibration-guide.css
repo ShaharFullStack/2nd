@@ -159,3 +159,52 @@
   .rom-coach-demonstration > span { display: none; }
   .rom-footer .btn { display: none; }
 }
+
+/* ------------------------------------------------------------------------------------------------
+   THE TWO BEATS THAT ARE NOT A MEASUREMENT.
+
+   Both reuse the coach shell (and therefore its position between the header and the footer at every
+   viewport the layout critic drives); only the columns change. The posture beat needs a WIDE
+   illustration — two setups and the arrow between them — so its first column grows and the drawing
+   takes its height from its own aspect ratio rather than from a fixed box that would letterbox it.
+   ------------------------------------------------------------------------------------------------ */
+.rom-demo-posture { height: auto; }
+.rom-posture-from { opacity: .38; }
+.rom-coach .rom-posture-why { font-size: 13px; line-height: 1.45; color: #c2d4e2; margin-top: 8px; }
+.rom-coach .rom-reuse-facts { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 15px; margin-top: 8px; color: #eaf3fa; }
+.rom-coach .rom-reuse-facts .mono { font-weight: 700; }
+.rom-reuse-actions { flex-direction: column; }
+.rom-reuse-actions .btn { width: 100%; }
+.rom-coach.is-reuse .rom-coach-demonstration > span { font-size: 10px; }
+
+@media (max-width: 700px) and (orientation: portrait) {
+  .rom-coach.is-posture { grid-template-columns: 1fr; }
+  .rom-coach.is-posture .rom-coach-demonstration { grid-column: 1; }
+  .rom-coach.is-posture .rom-demo-posture { max-width: 250px; margin: 0 auto; }
+  .rom-reuse-actions { flex-direction: row; }
+  .rom-reuse-actions .btn { width: auto; }
+  .rom-coach .rom-reuse-quality { display: none; }
+}
+@media (min-width: 701px), (orientation: landscape) {
+  .rom-coach.is-posture { grid-template-columns: 300px minmax(0, 1fr) 200px; }
+}
+@media (min-width: 701px) and (max-width: 1200px), (orientation: landscape) and (max-width: 1200px) {
+  .rom-coach.is-posture { grid-template-columns: 240px minmax(0, 1fr) 160px; }
+}
+@media (orientation: landscape) and (max-height: 680px) {
+  .rom-coach.is-posture { grid-template-columns: 190px minmax(0, 1fr) 150px; }
+  .rom-coach .rom-posture-why { font-size: 12px; margin-top: 5px; }
+  .rom-coach .rom-reuse-facts { font-size: 13px; margin-top: 5px; }
+  .rom-reuse-actions .btn { min-height: 34px; font-size: 12px; padding: 0 10px; }
+  .rom-coach .rom-reuse-quality { display: none; }
+  .rom-coach.is-posture { padding: 10px 14px; }
+  .rom-coach.is-posture .rom-side { font-size: 10px; margin-bottom: 2px; }
+  .rom-coach.is-posture h1 { font-size: 18px; margin-bottom: 4px; }
+  .rom-coach.is-posture .rom-coach-heading p { font-size: 13px; line-height: 1.3; }
+  .rom-coach.is-posture .rom-posture-why { font-size: 11px; margin-top: 4px; }
+  .rom-coach.is-posture .rom-coach-progress > span { font-size: 10px; }
+}
+@media (orientation: landscape) and (max-width: 750px) {
+  .rom-coach.is-posture { grid-template-columns: 124px minmax(0, 1fr) 104px; gap: 10px; }
+  .rom-coach.is-posture .rom-coach-demonstration > span { display: none; }
+}

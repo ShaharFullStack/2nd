@@ -16,8 +16,9 @@ import type { Fingertip, Mode, Movement, Side } from '../engine/types.ts';
 import { compensationKind, FINGERTIP_NAME, MOVEMENT_INFO } from '../vision/features.ts';
 import { FEATURE_UNIT_SHORT, formatFeature } from '../vision/calibration.ts';
 import type { RomCalibration } from '../vision/calibration.ts';
+import { calibrationModeOf } from './inSongCalibration.ts';
 import type { LaneRepStats, RunSummary } from './GameRunner.ts';
-import type { InputMode, LaneResultSummary, Patient, SessionConfig, SessionEndReason, SessionResult, TrackingQuality } from './types.ts';
+import type { CalibrationMode, InputMode, LaneResultSummary, Patient, SessionConfig, SessionEndReason, SessionResult, TrackingQuality } from './types.ts';
 import { TRACKING_NOT_RECORDED, calibrationConditions, calibrationGrade, trackingSentence } from './tracking.ts';
 
 /**
@@ -166,6 +167,9 @@ export function buildSessionResult(opts: BuildResultOptions): SessionResult {
     mode: config.mode,
     difficulty: config.difficulty,
     windowScale: config.windowScale,
+    // HOW THE RANGES BEHIND EVERY PERCENTAGE BELOW WERE ARRIVED AT — a property of the visit, stored
+    // beside the per-lane measurement blocks so a list of sessions can say it without opening one.
+    calibrationMode: calibrationModeOf(config),
     inputMode: opts.inputMode,
     songId: config.songId,
     songTitle: manifest?.title ?? 'Silent session',
@@ -694,8 +698,8 @@ function laneLine(l: LaneResultSummary): string {
       // came off a clean stream and three agreeing reps or off a slow one and three that did not.
       parts.push(
         l.calibrationMeasurement
-          ? `that range was measured at ${calibrationConditions(l.calibrationMeasurement)} (${calibrationGrade(l.calibrationMeasurement)})`
-          : 'how well that range was measured was not recorded',
+          ? `that range was ${calibrationConditions(l.calibrationMeasurement)} (${calibrationGrade(l.calibrationMeasurement)})`
+          : 'how that range was measured was not recorded',
       );
     }
   } else {
@@ -708,6 +712,21 @@ function laneLine(l: LaneResultSummary): string {
 }
 
 /** One run, exactly as it appears inside a visit. Shared by the patient export and the single-session one. */
+/** How a session's calibration mode reads in a file with no app around it. Never guesses. */
+export function calibrationModeSentence(mode: CalibrationMode | undefined): string {
+  if (mode === 'in_song') {
+    return (
+      'learned inside the song — the session started on a provisional range and the real one was learned from the ' +
+      'patient\u2019s own first movements. A less controlled measurement than the calibration screen: the zero was not ' +
+      'held and the top is the effort the music drew out.'
+    );
+  }
+  if (mode === 'measured') {
+    return 'measured before the song on the range-of-motion screens (a rest hold and three maximum-effort repetitions per lane).';
+  }
+  return 'not recorded on this session (it predates the choice; every such session ran the range-of-motion screens).';
+}
+
 function sessionLines(s: SessionResult): string[] {
   const lines: string[] = [];
   lines.push(`  ${formatDate(s.startedAt)} — ${s.songTitle} · ${s.mode === 'leg' ? 'Leg' : 'Hand'} · ${s.difficulty}${s.completed ? '' : ` · ${endReasonLabel(s.endReason)}`}`);
@@ -736,6 +755,10 @@ function sessionLines(s: SessionResult): string[] {
   // per session, which is exactly why a trend built without it can be a trend in the equipment.
   if (s.inputMode === 'camera') {
     lines.push(`    Tracking: ${s.tracking ? trackingSentence(s.tracking) : TRACKING_NOT_RECORDED}`);
+    // AND WHERE THE RANGES THOSE PERCENTAGES ARE OF CAME FROM. Read with no app around it, a session
+    // whose ranges were learned mid-song is not the same document as one whose ranges were measured,
+    // and nothing else in this file says which it is.
+    lines.push(`    Range of motion: ${calibrationModeSentence(s.calibrationMode)}`);
   }
   for (const l of s.lanes) lines.push(laneLine(l));
   lines.push('');
@@ -831,6 +854,21 @@ export function buildPatientExport(input: PatientExportInput): PatientExport {
           'peaks, so A LOW FRAME RATE BIASES IT DOWNWARD (a peak between two frames is never seen) and ' +
           'every percentage against it then reads high. Null = not recorded: the range was set by hand, ' +
           'or captured before this existed. It is NOT the same thing as a clean measurement.',
+        'lanes[].calibrationMeasurement.method':
+          'HOW THE RANGE WAS ARRIVED AT, which is a different question from how well it was measured. ' +
+          '"rom_screen" = the deliberate path: a still rest hold for the zero, then three maximum-effort ' +
+          'repetitions with nothing else to attend to. "in_song" = learned from the movements the patient ' +
+          'made while the song was already playing (the zero is a low percentile of the frames that ' +
+          'arrived rather than a hold anybody asked for, and the top is the peaks of reps performed while ' +
+          'chasing notes, at whatever effort the music drew out). An "in_song" range is a real measurement ' +
+          'of a real movement and a LESS CONTROLLED one: it is never graded better than "fair", and A ' +
+          'DIFFERENCE BETWEEN TWO SESSIONS WHOSE RANGES WERE ARRIVED AT DIFFERENTLY IS NOT LIKE-FOR-LIKE. ' +
+          'Absent = not recorded, which is not the same as "rom_screen".',
+        calibrationMode:
+          'What the session was prescribed to do about its range of motion: "measured" = the ' +
+          'range-of-motion screens were run before the song; "in_song" = the song started immediately on a ' +
+          'provisional range and the real one was learned from the patient\u2019s first movements. Absent ' +
+          'on every session recorded before the choice existed, all of which ran the range-of-motion screens.',
       },
       exportedAt: now,
       patient,

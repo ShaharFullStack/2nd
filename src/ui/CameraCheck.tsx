@@ -61,6 +61,20 @@ export function formatFps(fps: number | null | undefined): string {
 
 export default function CameraCheck() {
   const goto = useStore((s) => s.goto);
+  const calibrationMode = useStore((s) => s.calibrationMode);
+  /**
+   * WHERE "CONTINUE" GOES, and it is not always the calibration screen any more.
+   *
+   * On the in-song path (the default — session/inSongCalibration.ts) the range of motion is learned
+   * from the patient's first movements while the song plays, so there is nothing between this screen
+   * and the music: the next thing after framing the patient IS the song. On the measured path the
+   * range-of-motion screens and the latency metronome are exactly what the therapist chose, and the
+   * flow is unchanged.
+   *
+   * "Re-calibrate this lane" is deliberately NOT this: it is a request for the calibration screen,
+   * whatever the session's mode, and it still goes there.
+   */
+  const forward = useCallback(() => goto(calibrationMode === 'in_song' ? 'play' : 'rom'), [goto, calibrationMode]);
   const mode = useStore((s) => s.mode);
   const lanes = useStore((s) => s.lanes);
   const calibrations = useStore((s) => s.calibrations);
@@ -343,7 +357,7 @@ export default function CameraCheck() {
         id: 'continue',
         target: go,
         label: readiness.gate ? 'Go on anyway' : 'Continue',
-        onConfirm: () => goto('rom'),
+        onConfirm: forward,
         tone: 'go',
       },
       {
@@ -354,7 +368,7 @@ export default function CameraCheck() {
         tone: 'back',
       },
     ];
-  }, [mode, readiness.gate, starting, goto, retry]);
+  }, [mode, readiness.gate, starting, forward, retry]);
   const dwell = useDwellTargets(dwellChoices);
   /**
    * The ring's own pointer, read every render and averaged on the poll below. `null` = the dwell
@@ -429,7 +443,7 @@ export default function CameraCheck() {
             {readiness.gate && readiness.kind === 'blocked' && (
               <button
                 className="btn btn-lg"
-                onClick={() => goto('rom')}
+                onClick={forward}
                 title={readiness.wont.join(' ')}
                 data-testid="camera-continue-anyway"
               >
@@ -438,12 +452,12 @@ export default function CameraCheck() {
             )}
             <button
               className="btn btn-primary btn-lg"
-              onClick={() => goto('rom')}
+              onClick={forward}
               disabled={readiness.gate}
               title={readiness.gate ? readiness.headline : undefined}
               data-testid="camera-continue"
             >
-              {readiness.gate && readiness.kind === 'measuring' ? 'Checking this device…' : 'Calibrate movement →'}
+              {readiness.gate && readiness.kind === 'measuring' ? 'Checking this device…' : calibrationMode === 'in_song' ? 'Start the song →' : 'Calibrate movement →'}
             </button>
           </>
         }
@@ -666,7 +680,7 @@ export default function CameraCheck() {
                     forward UNAWARE, not to make the decision for them. */}
                 <button
                   className="btn"
-                  onClick={() => goto('rom')}
+                  onClick={forward}
                   title={readiness.wont.join(' ')}
                   data-testid="camera-readiness-continue-anyway"
                 >
