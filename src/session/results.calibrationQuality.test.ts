@@ -38,8 +38,16 @@ function session(lanes: LaneResultSummary[]): SessionResult {
 }
 
 const RAGGED: CalibrationMeasurement = {
+  method: 'rom_screen',
   frames: 140, tracked: 87, trackedFraction: 0.62, fpsMedian: 11, fpsLow: 8,
   durationSec: 9, reps: 3, repSpread: 22, repSpreadFraction: 0.44,
+};
+
+/** The same range, learned while the patient was chasing notes on a perfectly healthy stream. */
+const IN_SONG: CalibrationMeasurement = {
+  method: 'in_song',
+  frames: 900, tracked: 890, trackedFraction: 0.989, fpsMedian: 30, fpsLow: 28,
+  durationSec: 30, reps: 5, repSpread: 3, repSpreadFraction: 0.06,
 };
 
 describe('the exported record states how the calibrated range was measured', () => {
@@ -49,7 +57,7 @@ describe('the exported record states how the calibrated range was measured', () 
       sessions: [session([lane({ calibrationMeasurement: RAGGED })])],
       now: () => 3_000_000,
     });
-    expect(out.text).toContain('that range was measured at 11 fps');
+    expect(out.text).toContain('that range was measured on the calibration screen, at 11 fps');
     expect(out.text).toContain('62 %');
     expect(out.text).toContain('3 reps within 44 % of the range');
     expect(out.text).toContain('(poor)');
@@ -62,7 +70,41 @@ describe('the exported record states how the calibrated range was measured', () 
       now: () => 3_000_000,
     });
     expect(out.text).toContain('how well that range was measured was not recorded');
-    expect(out.text).not.toMatch(/that range was measured at/);
+    expect(out.text).not.toMatch(/that range was measured on/);
+  });
+
+  /**
+   * A RANGE LEARNED INSIDE THE MUSIC MAY NOT READ LIKE ONE MEASURED ON THE CALIBRATION SCREEN.
+   *
+   * This is the failure the in-song path could most easily cause: a clean 30 fps stream and five
+   * agreeing reps would grade 'good' on every camera test there is, and the file would then present
+   * a range gathered while the patient was chasing notes as a deliberate measurement. The method is
+   * the thing that has to be in the file, and the grade has to be capped by it.
+   */
+  it('names an in-song range as one, and never grades it better than fair however clean the stream was', () => {
+    const out = buildPatientExport({
+      patient: PATIENT,
+      sessions: [session([lane({ calibrationMeasurement: IN_SONG })])],
+      now: () => 3_000_000,
+    });
+    expect(out.text).toContain('that range was learned during the song, at 30 fps');
+    expect(out.text).toContain('(fair)');
+    expect(out.text).not.toContain('(good)');
+    expect(out.text).not.toContain('measured on the calibration screen');
+  });
+
+  it('states on the session line where the whole visit got its ranges from', () => {
+    const inSong = { ...session([lane({ calibrationMeasurement: IN_SONG })]), calibrationMode: 'in_song' as const };
+    const measured = { ...session([lane({ calibrationMeasurement: RAGGED })]), id: 's2', calibrationMode: 'measured' as const };
+    const legacy = session([lane({ calibrationMeasurement: RAGGED })]);
+    const out = buildPatientExport({ patient: PATIENT, sessions: [inSong, measured, legacy], now: () => 3_000_000 });
+    expect(out.text).toContain('Range of motion: learned inside the song');
+    expect(out.text).toContain('Range of motion: measured before the song on the range-of-motion screens');
+    // A record written before the choice existed says so, rather than being given the new default.
+    expect(out.text).toContain('not recorded on this session');
+    const parsed = JSON.parse(out.json) as { fields: Record<string, string> };
+    expect(parsed.fields['lanes[].calibrationMeasurement.method']).toMatch(/NOT LIKE-FOR-LIKE/);
+    expect(parsed.fields.calibrationMode).toMatch(/learned from the patient/);
   });
 
   it('carries the block into the JSON archive, with a legend that explains which way it biases', () => {

@@ -616,7 +616,7 @@ export default function RomCalibrationScreen() {
           // says where it is in its own walk AND which prescribed lane that is, so the number on
           // screen is never a silent renumbering of a clinical decision.
           regrouped
-            ? `Range of motion — ${step + 1} of ${lanes.length}, grouped by set-up · prescribed lane ${laneIndex + 1}`
+            ? `Range of motion — ${step + 1} of ${lanes.length} · prescribed lane ${laneIndex + 1}`
             : `Range of motion — lane ${laneIndex + 1} of ${lanes.length}`
         }
         title={`${lane.side === 'left' ? 'Left' : 'Right'} ${info.label.toLowerCase()}${tipName(lane) ? ` \u2014 ${tipName(lane)}` : ''}`}
@@ -633,7 +633,11 @@ export default function RomCalibrationScreen() {
         }
       />
       <ol className="rom-steps" aria-label="Calibration steps">
-        {['Hold still', 'Move 3 times', 'Continue'].map((label, i) => <li key={label} aria-current={(laneDone ? i === 2 : restPhase || !status ? i === 0 : i === 1) ? 'step' : undefined}>
+        {/* These three are the steps of a MEASUREMENT. On the set-up change and on the reuse offer
+            nothing is being held and nothing is being counted, so none of them is marked current —
+            a lit "Hold still" over a screen that is not measuring is a claim about the patient. */}
+        {['Hold still', 'Move 3 times', 'Continue'].map((label, i) => <li key={label}
+          aria-current={measuring && (laneDone ? i === 2 : restPhase || !status ? i === 0 : i === 1) ? 'step' : undefined}>
           <span>{i + 1}</span>{label}</li>)}
       </ol>
       </header>
@@ -803,7 +807,8 @@ export default function RomCalibrationScreen() {
                     same breath as the grade, not left to be inferred from a green badge. */}
                 {reusedLanes[laneIndex] && (
                   <strong data-testid="rom-accepted-reused">
-                    Reused from a previous session ({whenMeasured(laneDone.capturedAt)}), not measured today.{' '}
+                    Reused from a previous session
+                    {laneDone.capturedAt ? ` (${whenMeasured(laneDone.capturedAt)})` : ''}, not measured today.{' '}
                   </strong>
                 )}
                 {laneDone.measurement ? calibrationSentence(laneDone.measurement) : CALIBRATION_NOT_RECORDED}

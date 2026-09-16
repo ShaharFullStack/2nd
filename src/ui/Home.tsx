@@ -239,6 +239,7 @@ export default function Home() {
               */}
               <MeasurementNote
                 tracking={last.tracking}
+                session={last}
                 inputMode={last.inputMode}
                 testId="home-measurement-note"
               />

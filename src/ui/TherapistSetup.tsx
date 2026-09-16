@@ -18,7 +18,9 @@ import type { DifficultyName, Fingertip, LaneSpec, Side } from '../engine/types.
 import { SILENT_GRID, songGridOf } from '../session/chart.ts';
 import { formatDuration, limbLabel } from '../session/results.ts';
 import { runtime } from '../session/runtime.ts';
-import { MAX_LANES, MIN_LANES, laneFingertip, movementsFor, useStore } from '../state/store.ts';
+import { MAX_LANES, MIN_LANES, calibrationKey, laneFingertip, movementsFor, useStore } from '../state/store.ts';
+import { calibrationContext, isCalibrationValid, withPatient } from '../vision/calibration.ts';
+import { WARMUP_SEC } from '../session/inSongCalibration.ts';
 import { MOVEMENT_INFO, laneConflicts, movementInstructions } from '../vision/features.ts';
 import { Screen, Toast, TopBar } from './common.tsx';
 import PatientBanner from './PatientBanner.tsx';
@@ -74,6 +76,11 @@ export default function TherapistSetup() {
   const inputMode = useStore((s) => s.inputMode);
   const seed = useStore((s) => s.seed);
   const laneRestSec = useStore((s) => s.laneRestSec);
+  const calibrationMode = useStore((s) => s.calibrationMode);
+  const setCalibrationMode = useStore((s) => s.setCalibrationMode);
+  const savedCalibrations = useStore((s) => s.savedCalibrations);
+  /** The mirror convention this session will play under — it selects WHICH LIMB a stored range is of. */
+  const mirrored = useStore((s) => s.settings.mirrored);
   const setLaneRestSec = useStore((s) => s.setLaneRestSec);
   /** Set when the patient in this tab's chair was not put there by this tab (see the banner below). */
   const activePatientNotice = useStore((s) => s.activePatientNotice);
@@ -306,6 +313,23 @@ export default function TherapistSetup() {
 
   /** The limb the pacing ceiling has to be quoted for: the one carrying the most lanes. */
   const mostLanesOnALimb = dose ? Math.max(1, ...dose.perLimb.map((l) => l.laneIndices.length)) : 1;
+  /**
+   * How many of this prescription's lanes would start on a range this patient has already produced,
+   * rather than on the movement's own floor.
+   *
+   * Counted with the same validity check the session itself applies (`isCalibrationValid` with the
+   * lane's own context), so the sentence under the choice cannot promise a range that the session
+   * will then refuse. It is the honest version of "we remember you": a range measured on another
+   * fingertip, the other limb or another patient does not count here, because it will not be used.
+   */
+  const startsOnSaved = useMemo(
+    () =>
+      lanes.filter((l) => {
+        const cal = savedCalibrations[calibrationKey(l)];
+        return !!cal && isCalibrationValid(cal, l.movement, withPatient(calibrationContext(l.movement, { fingertip: laneFingertip(l), mirrored }), activePatientId ?? undefined));
+      }).length,
+    [lanes, savedCalibrations, mirrored, activePatientId],
+  );
   const busiestLimb = dose?.perLimb[0] ?? null;
 
   /** Which stem each lane's misses dim (audio/ducking.ts) — the mix the patient will hear. */
@@ -524,6 +548,59 @@ export default function TherapistSetup() {
             );
           })}
         </div>
+      </div>
+
+      {/* WHERE THIS SESSION'S RANGE OF MOTION COMES FROM — stated here, with what each choice costs,
+          because it decides both how long the patient waits before the music and how defensible the
+          number in their record is. The default is the one that starts the song. */}
+      <div className="stack" data-testid="setup-calibration-mode">
+        <div className="row">
+          <h3>Range of motion</h3>
+          <span className="dim">Where this session's 0–100 % comes from.</span>
+        </div>
+        <div className="card-grid">
+          <button
+            className="card pick"
+            aria-pressed={calibrationMode === 'in_song'}
+            onClick={() => setCalibrationMode('in_song')}
+            data-testid="calmode-in_song"
+          >
+            <div className="pick-title">Learn it in the song</div>
+            <div className="pick-sub">
+              The song starts straight after the camera check. The first {WARMUP_SEC} seconds are
+              deliberately sparse and forgiving while the app learns this patient's range from the
+              movements they make, and the target is then fixed for the rest of the song.
+            </div>
+            <div className="row" style={{ gap: 8 }}>
+              <span className="badge badge-ok">No reps before the music</span>
+              <span className="badge badge-warn">Range graded no better than “fair”</span>
+            </div>
+          </button>
+          <button
+            className="card pick"
+            aria-pressed={calibrationMode === 'measured'}
+            onClick={() => setCalibrationMode('measured')}
+            data-testid="calmode-measured"
+          >
+            <div className="pick-title">Measure it first</div>
+            <div className="pick-sub">
+              The range-of-motion screens, then the latency metronome, then the song. A rest hold and
+              three maximum-effort repetitions per lane — {lanes.length * 3} repetitions and{' '}
+              {lanes.length} rest holds for this prescription — before a note of music.
+            </div>
+            <div className="row" style={{ gap: 8 }}>
+              <span className="badge badge-ok">A range you can defend</span>
+              <span className="badge badge-warn">Maximum effort before the song</span>
+            </div>
+          </button>
+        </div>
+        <span className="dim" data-testid="setup-calibration-cost">
+          {calibrationMode === 'in_song'
+            ? `This session will start the song on ${startsOnSaved > 0 ? `this patient's saved range where there is one (${startsOnSaved} of ${lanes.length} lane${lanes.length === 1 ? '' : 's'})` : 'a provisional range'} and learn the rest as they play. ` +
+              'The ranges it records are stamped as learned in the song: they are graded no better than "fair", and the trend will not subtract one from a range measured on the calibration screen as if the two were alike. ' +
+              'The latency step is folded in too — the run measures its own timing from every movement, which is more evidence than the eight-beat metronome, and the Results screen offers the number for next time.'
+            : 'This session will run the range-of-motion screens and the latency metronome before the song, exactly as before. The ranges it records are deliberate measurements.'}
+        </span>
       </div>
 
       <div className="card stack" data-testid="setup-dose">

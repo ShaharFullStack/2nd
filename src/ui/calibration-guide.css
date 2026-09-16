@@ -174,25 +174,32 @@
 .rom-coach .rom-reuse-facts { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 15px; margin-top: 8px; color: #eaf3fa; }
 .rom-coach .rom-reuse-facts .mono { font-weight: 700; }
 .rom-reuse-actions { flex-direction: column; }
-.rom-reuse-actions .btn { width: 100%; }
+.rom-reuse-actions .btn { width: 100%; white-space: nowrap; padding: 0 12px; }
 .rom-coach.is-reuse .rom-coach-demonstration > span { font-size: 10px; }
+/* Both confirms live in a narrow column, so they take its width instead of their text's. */
+.rom-coach.is-posture .rom-coach-progress .btn { width: 100%; padding: 0 10px; }
 
 @media (max-width: 700px) and (orientation: portrait) {
   .rom-coach.is-posture { grid-template-columns: 1fr; }
   .rom-coach.is-posture .rom-coach-demonstration { grid-column: 1; }
   .rom-coach.is-posture .rom-demo-posture { max-width: 250px; margin: 0 auto; }
+  .rom-coach.is-reuse .rom-coach-progress { flex-wrap: wrap; gap: 8px; }
   .rom-reuse-actions { flex-direction: row; }
-  .rom-reuse-actions .btn { width: auto; }
+  .rom-reuse-actions .btn { width: auto; flex: 1 1 auto; min-width: 0; white-space: normal; }
+  .rom-coach.is-reuse .rom-coach-progress > span { flex-basis: 100%; font-size: 11px; }
   .rom-coach .rom-reuse-quality { display: none; }
 }
 @media (min-width: 701px), (orientation: landscape) {
   .rom-coach.is-posture { grid-template-columns: 300px minmax(0, 1fr) 200px; }
+  .rom-coach.is-reuse { grid-template-columns: 120px minmax(0, 1fr) 230px; }
 }
 @media (min-width: 701px) and (max-width: 1200px), (orientation: landscape) and (max-width: 1200px) {
   .rom-coach.is-posture { grid-template-columns: 240px minmax(0, 1fr) 160px; }
+  .rom-coach.is-reuse { grid-template-columns: 95px minmax(0, 1fr) 200px; }
 }
 @media (orientation: landscape) and (max-height: 680px) {
   .rom-coach.is-posture { grid-template-columns: 190px minmax(0, 1fr) 150px; }
+  .rom-coach.is-reuse { grid-template-columns: 70px minmax(0, 1fr) 180px; }
   .rom-coach .rom-posture-why { font-size: 12px; margin-top: 5px; }
   .rom-coach .rom-reuse-facts { font-size: 13px; margin-top: 5px; }
   .rom-reuse-actions .btn { min-height: 34px; font-size: 12px; padding: 0 10px; }

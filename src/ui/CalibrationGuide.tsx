@@ -85,7 +85,10 @@ const POSTURE_FIGURE: Readonly<Record<MovementPosture, { transform?: string; bod
     ),
   },
   hand_over_edge: {
-    transform: 'translate(-18 -70) scale(1.15)',
+    // A hand over a table edge is a wide, flat drawing where a palm-to-camera hand is a tall one, so
+    // this one is scaled up and re-centred; without it the two figures in a change read as a big hand
+    // and a small smudge rather than as two setups of the same arm.
+    transform: 'translate(-24 -98) scale(1.3)',
     body: (
       <>
         <path className="rom-demo-support" d="M20 145H140V182" />
@@ -104,13 +107,13 @@ const POSTURE_FIGURE: Readonly<Record<MovementPosture, { transform?: string; bod
 export function PostureIllustration({ from, to }: { from: MovementPosture; to: MovementPosture }) {
   const arrow = useId().replace(/:/g, '');
   return (
-    <svg className="rom-demo rom-demo-posture" viewBox="0 0 530 200" role="img"
+    <svg className="rom-demo rom-demo-posture" viewBox="0 0 565 200" role="img"
       aria-label={`Move from ${POSTURE_INFO[from].label.toLowerCase()} to ${POSTURE_INFO[to].label.toLowerCase()}`}>
       <defs><marker id={arrow} viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M1 1 9 5 1 9" fill="none" stroke="currentColor" strokeWidth="2" /></marker></defs>
       <g fill="none" strokeLinecap="round" strokeLinejoin="round" strokeWidth="7">
-        <g className="rom-posture-from" transform={POSTURE_FIGURE[from].transform} data-posture={from}>{POSTURE_FIGURE[from].body}</g>
-        <path className="rom-demo-arrow" markerEnd={`url(#${arrow})`} transform="translate(250 0)" d="M8 100H62" />
-        <g className="rom-posture-to" transform={`translate(290 0) ${POSTURE_FIGURE[to].transform ?? ''}`} data-posture={to}>{POSTURE_FIGURE[to].body}</g>
+        <g className="rom-posture-from" transform={`translate(-35 0) ${POSTURE_FIGURE[from].transform ?? ''}`} data-posture={from}>{POSTURE_FIGURE[from].body}</g>
+        <path className="rom-demo-arrow" markerEnd={`url(#${arrow})`} d="M192 100H250" />
+        <g className="rom-posture-to" transform={`translate(300 0) ${POSTURE_FIGURE[to].transform ?? ''}`} data-posture={to}>{POSTURE_FIGURE[to].body}</g>
       </g>
     </svg>
   );
@@ -204,7 +207,7 @@ function ReuseBeat({ lane, offer, reducedMotion }: { lane: LaneSpec; offer: Reus
           This movement was already measured for this patient, so the three practice repetitions can be skipped.
         </p>
         <p className="rom-reuse-facts" data-testid="rom-reuse-facts">
-          <span className="mono">{offer.rangeText}</span> · {offer.when} {offer.quality}
+          <span className="mono">{offer.rangeText}</span> <span>{offer.when}</span> {offer.quality}
         </p>
         {/* How well it was measured, in words. The chip above carries the same verdict and its
             conditions, and the details panel repeats the sentence, so the tightest viewports drop
@@ -265,7 +268,11 @@ export function CalibrationGuide({
       <span>{accepted ? (reused ? 'Reused from last session' : 'Range saved') : 'Movement example · stay within your comfort'}</span>
     </div>
     <div className="rom-coach-progress">
-      {resting && !failed ? <><ProgressRing value={status?.restProgress ?? 0} label={tracking ? 'Hold' : '…'} size={72} /><span>{tracking ? 'Keep still while the ring fills' : 'Waiting for a clear view'}</span></>
+      {/* A REUSED RANGE HAS NO REPETITIONS TO SHOW. It never ran a calibrator, so the rest ring would
+          sit at zero ("keep still while the ring fills") and the rep dots would tick three reps that
+          nobody performed today — the same claim in two different graphics. It says so instead. */}
+      {accepted && reused ? <span data-testid="rom-reused-progress">No repetitions were measured today.</span>
+        : resting && !failed ? <><ProgressRing value={status?.restProgress ?? 0} label={tracking ? 'Hold' : '…'} size={72} /><span>{tracking ? 'Keep still while the ring fills' : 'Waiting for a clear view'}</span></>
         : failed ? <button className="btn btn-primary btn-lg" onClick={retry} data-testid="rom-guide-retry">Try again</button>
         : <><div className="rom-rep-dots" aria-label={`${status?.repsDetected ?? 0} of ${status?.repsRequired ?? 3} repetitions detected`}>
           {Array.from({ length: status?.repsRequired ?? 3 }, (_, i) => <span key={i} className={accepted || i < (status?.repsDetected ?? 0) ? 'is-complete' : ''}>{accepted || i < (status?.repsDetected ?? 0) ? '✓' : i + 1}</span>)}

@@ -1679,21 +1679,31 @@ export class RomCalibrator {
 export const IN_SONG_BASELINE_SAMPLES = 15;
 
 /**
- * The percentile of the observed feature taken as the zero.
+ * THE ZERO IS THE STILLEST MOMENT THIS PATIENT HAS HAD, and this is how long a moment that is.
  *
- * NOT the minimum. A single dropped-out or mis-tracked frame is the minimum of any real stream, and
- * a zero pinned to it drags every percentage in the session with it. The 10th percentile is the same
- * statistic the rest-window spread on the deliberate path is measured between, and it is robust to
- * exactly that.
+ * The deliberate path asks the patient to hold still for `restDurationSec` and takes the median of
+ * that window. Nobody asks here — but a patient waiting through the 3-2-1 count-in, and a patient
+ * between two reps, IS holding still, and a trailing window of the same length over the same signal
+ * measures exactly the same thing. So the learner keeps the QUIETEST such window it has seen (the
+ * one with the smallest 10th-to-90th spread), takes its median as the zero, and records that
+ * window's own `RestQuality` — spread, drift, duration, sample count, and whether it passed the
+ * app's OWN stillness test, which is the same test `RomCalibrator` applies and not a looser one.
+ *
+ * Nothing is claimed that was not observed: `still` is true only when the window really was still by
+ * that test, and a session in which the patient never settles produces `still: false` and gets no
+ * relaxation of the range floor (`requiredRom`) — which is one of the things the deliberate path is
+ * still for.
  */
-export const IN_SONG_REST_PERCENTILE = 0.1;
+export const IN_SONG_REST_WINDOW_SEC = 2;
 
-/** Feature samples kept for the rolling zero. At 30 fps, ~20 s — long enough to survive a long rep. */
-const IN_SONG_REST_WINDOW = 600;
+/** The 10th..90th band the rest spread is measured across — the same one the deliberate path uses. */
+export const IN_SONG_REST_PERCENTILE = 0.1;
 
 export interface InSongLearnerOptions {
   /** Samples needed before `provisional()` returns a range (default IN_SONG_BASELINE_SAMPLES). */
   baselineSamples?: number;
+  /** Length of the trailing window the zero is taken from (default IN_SONG_REST_WINDOW_SEC). */
+  restWindowSec?: number;
   /** Peak prominence in feature units (default 0.5 x the movement's minimum ROM), as on the ROM screen. */
   prominence?: number;
   /** Percentile (0..1) of the detected peaks used as the top (default 0.9), as on the ROM screen. */
@@ -1720,14 +1730,18 @@ export class InSongRangeLearner {
   readonly prominence: number;
   readonly peakPercentile: number;
   private readonly baselineSamples: number;
+  private readonly restWindowSec: number;
   private readonly fingertip: Fingertip | undefined;
   private readonly mirrored: boolean | undefined;
   private readonly patient: string | undefined;
   private readonly sessionId: string | undefined;
   private readonly nowMs: () => number;
 
-  /** Rolling window of smoothed features, for the zero. */
+  /** Trailing window of smoothed features and their times, for the zero. */
   private rest: number[] = [];
+  private restTimes: number[] = [];
+  /** The stillest trailing window seen so far: the zero, and the quality of the window it came from. */
+  private zero: { value: number; rest: RestQuality } | null = null;
   private frames = 0;
   private tracked = 0;
   private frameFirst = NaN;
@@ -1745,6 +1759,7 @@ export class InSongRangeLearner {
     this.prominence = opts.prominence ?? minRom * 0.5;
     this.peakPercentile = opts.peakPercentile ?? 0.9;
     this.baselineSamples = Math.max(2, Math.floor(opts.baselineSamples ?? IN_SONG_BASELINE_SAMPLES));
+    this.restWindowSec = opts.restWindowSec ?? IN_SONG_REST_WINDOW_SEC;
     this.fingertip = opts.fingertip;
     this.mirrored = opts.mirrored;
     this.patient = opts.patient;
@@ -1771,9 +1786,47 @@ export class InSongRangeLearner {
     if (v === null || !Number.isFinite(v)) return;
     this.tracked++;
     this.rest.push(v);
-    if (this.rest.length > IN_SONG_REST_WINDOW) this.rest.shift();
+    this.restTimes.push(sample.t);
+    // Trim to the trailing window BY TIME, not by sample count: a 4 fps stream and a 30 fps one must
+    // mean the same two seconds by "the rest window", or the spread guard means different things on
+    // different machines.
+    while (this.restTimes.length > 1 && Number.isFinite(sample.t) && sample.t - this.restTimes[0] > this.restWindowSec) {
+      this.rest.shift();
+      this.restTimes.shift();
+    }
+    this.considerZero();
     if (v > this.observedMax) this.observedMax = v;
     this.detectPeak(v);
+  }
+
+  /**
+   * Is the trailing window the stillest one yet? If so it becomes the zero.
+   *
+   * Only ever replaced by a QUIETER window, so the zero improves monotonically and cannot be dragged
+   * by the patient's own repetitions — which are, by construction, the least still thing in the
+   * stream.
+   */
+  private considerZero(): void {
+    if (this.rest.length < this.baselineSamples) return;
+    const spread = percentile(this.rest, 1 - IN_SONG_REST_PERCENTILE) - percentile(this.rest, IN_SONG_REST_PERCENTILE);
+    if (this.zero !== null && spread >= this.zero.rest.spread) return;
+    const half = this.rest.length >> 1;
+    const drift =
+      half >= 2 ? median(this.rest.slice(this.rest.length - half)) - median(this.rest.slice(0, half)) : 0;
+    const minRom = MOVEMENT_INFO[this.movement].minRom;
+    const t0 = this.restTimes[0];
+    const t1 = this.restTimes[this.restTimes.length - 1];
+    this.zero = {
+      value: median(this.rest),
+      rest: {
+        // THE APP'S OWN TEST, not a looser one invented for this path (RomCalibrator's defaults).
+        still: spread <= minRom * 0.35 && Math.abs(drift) <= minRom * 0.2,
+        spread,
+        drift,
+        durationSec: Number.isFinite(t1 - t0) ? t1 - t0 : 0,
+        samples: this.rest.length,
+      },
+    };
   }
 
   /** The same prominence rule the deliberate path uses — one detector, one definition of a rep. */
@@ -1812,8 +1865,12 @@ export class InSongRangeLearner {
 
   /** The zero as it currently stands, or null before `baselineSamples` usable frames have arrived. */
   restLevel(): number | null {
-    if (this.rest.length < this.baselineSamples) return null;
-    return percentile(this.rest, IN_SONG_REST_PERCENTILE);
+    return this.zero?.value ?? null;
+  }
+
+  /** The quality of the window the zero came from, or null before there is one. */
+  restQuality(): RestQuality | null {
+    return this.zero?.rest ?? null;
   }
 
   /**
@@ -1832,7 +1889,7 @@ export class InSongRangeLearner {
   provisional(): RomCalibration | null {
     const min = this.restLevel();
     if (min === null) return null;
-    return this.build(min, min + requiredRom(this.movement, null));
+    return this.build(min, min + requiredRom(this.movement, this.restQuality()));
   }
 
   /**
@@ -1848,7 +1905,7 @@ export class InSongRangeLearner {
     const min = this.restLevel();
     if (min === null || this.peaks.length === 0) return null;
     const max = percentile(this.peaks, this.peakPercentile);
-    if (!(max - min >= requiredRom(this.movement, null))) return null;
+    if (!(max - min >= requiredRom(this.movement, this.restQuality()))) return null;
     return this.build(min, max);
   }
 
@@ -1860,7 +1917,10 @@ export class InSongRangeLearner {
       peaks: this.peaks.slice(),
       movement: this.movement,
       manual: false,
-      rest: null,
+      // The window the zero really came from — including, honestly, whether it was still. Nobody was
+      // asked to hold, so this is an observation about what the patient happened to be doing, and
+      // `requiredRom` reads it exactly as it reads the deliberate path's.
+      rest: this.zero?.rest ?? null,
       measurement: this.measurement(min, max),
       capturedAt: this.nowMs(),
       posture: MOVEMENT_INFO[this.movement].posture,

@@ -19,7 +19,7 @@ import type { RomCalibration } from '../vision/calibration.ts';
 import { calibrationModeOf } from './inSongCalibration.ts';
 import type { LaneRepStats, RunSummary } from './GameRunner.ts';
 import type { CalibrationMode, InputMode, LaneResultSummary, Patient, SessionConfig, SessionEndReason, SessionResult, TrackingQuality } from './types.ts';
-import { TRACKING_NOT_RECORDED, calibrationConditions, calibrationGrade, trackingSentence } from './tracking.ts';
+import { TRACKING_NOT_RECORDED, calibrationGrade, calibrationProvenance, trackingSentence } from './tracking.ts';
 
 /**
  * The FULL clinical name of a lane: side, the movement's real name, and the prescribed digit.
@@ -698,8 +698,8 @@ function laneLine(l: LaneResultSummary): string {
       // came off a clean stream and three agreeing reps or off a slow one and three that did not.
       parts.push(
         l.calibrationMeasurement
-          ? `that range was ${calibrationConditions(l.calibrationMeasurement)} (${calibrationGrade(l.calibrationMeasurement)})`
-          : 'how that range was measured was not recorded',
+          ? `that range was ${calibrationProvenance(l.calibrationMeasurement)} (${calibrationGrade(l.calibrationMeasurement)})`
+          : 'how well that range was measured was not recorded',
       );
     }
   } else {

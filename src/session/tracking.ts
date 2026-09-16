@@ -410,13 +410,22 @@ export function compareTracking(
  *
  * `compareTracking` above stops two sessions being subtracted from each other when the CAMERA was
  * not the same on both. This stops it when the RANGE THE PERCENTAGES ARE OF was not arrived at the
- * same way on both — which is the identical failure one level down: a patient whose range was
- * measured on the calibration screen in March and learned inside the song in April has a percentage
- * in each month taken against a differently-made denominator, and a delta across them is partly the
- * method. Deliberately the SAME shape and the SAME vocabulary (`ComparabilityKind`, `tag`, `note`)
- * as the tracking gate, so a surface passes its two endpoints through both and prints whichever is
- * worse (`worstComparison`) — one qualifier, in one place, reading the way the therapist already
- * learnt to read it.
+ * same way on both — the identical failure one level down. A patient whose range was measured on the
+ * calibration screen in March and learned inside the song in April has a percentage in each month
+ * taken against a differently-made denominator, and a delta across them is partly the method.
+ * Deliberately the SAME shape and vocabulary (`ComparabilityKind`, `tag`, `note`) as the tracking
+ * gate, so a surface passes its two endpoints through both and prints whichever is worse
+ * (`worstComparison`) — one qualifier, in one place, read the way the therapist already learnt to
+ * read it.
+ *
+ * WHAT IT IS SILENT ABOUT, AND WHY THAT IS NOT A LOOPHOLE. A measurement block with no `method` was
+ * written before this field existed, and until it existed THIS APP HAD EXACTLY ONE WAY TO PRODUCE A
+ * RANGE: the calibration screen. So an absent method is not an unknown method, it is 'rom_screen' —
+ * the same reading `calibrationModeOf` gives an absent `SessionConfig.calibrationMode`, and for the
+ * same reason. Two such ends are therefore genuinely like-for-like AS FAR AS METHOD GOES, and this
+ * function says nothing about them; how WELL each was measured is the tracking gate's business and
+ * the range's own grade, not this one's. What it will never do is let an in-song range be subtracted
+ * from anything else without a word.
  *
  * `from`/`to` carry the CALIBRATION grades, not the tracking grades: a reader who clicks into the
  * qualifier is told how well each end's own range was measured, which is the thing being compared.
@@ -428,47 +437,13 @@ export function compareCalibration(
 ): TrackingComparison {
   const a = from ? calibrationGrade(from) : null;
   const b = to ? calibrationGrade(to) : null;
-  if (!from || !to) {
-    const which =
-      !from && !to
-        ? `Neither ${labels.from} nor ${labels.to} recorded how its range of motion was measured`
-        : !from
-          ? `${cap(labels.from)} has no record of how its range of motion was measured`
-          : `${cap(labels.to)} has no record of how its range of motion was measured`;
-    return {
-      kind: 'unrecorded',
-      from: a,
-      to: b,
-      tag: 'range unknown',
-      note: `${which}, so there is no evidence these two percentages are of comparable ranges. Read the change as a direction, not as a measured gain.`,
-    };
-  }
-  const ma = from.method ?? null;
-  const mb = to.method ?? null;
-  if (ma === null || mb === null) {
-    return {
-      kind: 'unrecorded',
-      from: a,
-      to: b,
-      tag: 'range unknown',
-      note:
-        `${cap(ma === null ? labels.from : labels.to)} does not record how its range was arrived at, so it cannot be told ` +
-        'apart from one learned during the song. Read the change as a direction, not as a measured gain.',
-    };
-  }
-  if (ma !== mb) {
-    return {
-      kind: 'uneven',
-      from: a,
-      to: b,
-      tag: 'ranges measured differently',
-      note:
-        `The range behind ${labels.from} was ${calibrationMethodLabel(ma)} and the range behind ${labels.to} was ` +
-        `${calibrationMethodLabel(mb)}. The two percentages are of denominators arrived at in different ways, so part of ` +
-        'this difference may be the method rather than the patient.',
-    };
-  }
-  if (ma === 'in_song') {
+  // null = the record carries no measurement block at all (a hand-set range, or one from before the
+  // block existed). It is not claimed to be either method.
+  const ma: CalibrationMethod | null = from ? (from.method ?? 'rom_screen') : null;
+  const mb: CalibrationMethod | null = to ? (to.method ?? 'rom_screen') : null;
+  const alike: TrackingComparison = { kind: 'like-for-like', from: a, to: b, tag: null, note: null };
+  if (ma !== 'in_song' && mb !== 'in_song') return alike;
+  if (ma === 'in_song' && mb === 'in_song') {
     return {
       kind: 'uneven',
       from: a,
@@ -480,15 +455,18 @@ export function compareCalibration(
         'this size as a direction.',
     };
   }
-  if (a === 'good' && b === 'good') return { kind: 'like-for-like', from: a, to: b, tag: null, note: null };
+  const inSongIsFrom = ma === 'in_song';
+  const other = inSongIsFrom ? mb : ma;
   return {
     kind: 'uneven',
     from: a,
     to: b,
-    tag: a === b ? `both ranges measured ${a}` : 'ranges measured unevenly',
+    tag: 'ranges measured differently',
     note:
-      `The range behind ${labels.from} was measured ${a} and the range behind ${labels.to} ${b}, so part of this ` +
-      'difference may be how well the two ranges themselves were measured.',
+      `The range behind ${inSongIsFrom ? labels.from : labels.to} was learned during the song, and the range behind ` +
+      `${inSongIsFrom ? labels.to : labels.from} was ${other === null ? 'arrived at in a way this record does not state' : calibrationMethodLabel(other)}. ` +
+      'The two percentages are of denominators arrived at in different ways, so part of this difference may be the method ' +
+      'rather than the patient.',
   };
 }
 
@@ -497,10 +475,10 @@ export function compareCalibration(
  *
  * A session has a range per lane, and the gate above takes one block per end. The rule here is the
  * conservative one, because a qualifier that can be dodged by picking the flattering lane is not a
- * qualifier: if ANY lane of the session does not record how its range was measured, the session as
- * a whole does not (null), and otherwise the WORST-graded lane stands for it. An in-song lane is
- * capped at 'fair' by `calibrationGrade`, so a session with one in-song lane can never present as a
- * fully deliberate measurement.
+ * qualifier: if ANY lane of the session records no range measurement at all, the session as a whole
+ * does not (null), and otherwise the WORST-graded lane stands for it. An in-song lane is capped at
+ * 'fair' by `calibrationGrade`, and a session with one in-song lane reports `method: 'in_song'`, so
+ * a mixed session can never present as a fully deliberate measurement.
  */
 export function sessionCalibrationMeasurement(
   s: Pick<SessionResult, 'lanes'>,
@@ -513,7 +491,9 @@ export function sessionCalibrationMeasurement(
     const m = lane.calibrationMeasurement;
     if (!m) return null;
     const r = rank[calibrationGrade(m)];
-    if (r < worstRank) {
+    // A tie goes to the in-song lane: the session as a whole then reports the less controlled method,
+    // which is the only reading that cannot understate what the ranges behind it are.
+    if (r < worstRank || (r === worstRank && m.method === 'in_song')) {
       worstRank = r;
       worst = m;
     }
@@ -666,8 +646,20 @@ export function calibrationConditions(m: CalibrationMeasurement): string {
       : m.reps === 1
         ? '1 repetition (no repeat to compare it with)'
         : `${m.reps} reps within ${Math.round(m.repSpreadFraction * 100)} % of the range`;
-  const how = m.method ? `${calibrationMethodLabel(m.method)}, ` : '';
-  return `${how}${fps}${low}, ${seen}, ${reps}`;
+  return `${fps}${low}, ${seen}, ${reps}`;
+}
+
+/**
+ * "measured on the calibration screen at 23 fps, …" — the conditions WITH the clause that says what
+ * the patient was being asked to do while they were measured.
+ *
+ * Separate from `calibrationConditions` because the two answer different questions and read in
+ * different places: a badge tooltip beside a live range has the method in its own chip already,
+ * while a line in an exported file, read with no app around it, has nothing else to say it.
+ */
+export function calibrationProvenance(m: CalibrationMeasurement): string {
+  const how = m.method ? calibrationMethodLabel(m.method) : 'measured by a method this record does not state';
+  return `${how}, at ${calibrationConditions(m)}`;
 }
 
 /**
