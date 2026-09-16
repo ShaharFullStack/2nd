@@ -68,6 +68,26 @@ export const UNASSIGNED_PATIENT_ID = 'unassigned';
 /** The record keyboard / autoplay runs are filed under — a device test, not a person. */
 export const DEVICE_TEST_PATIENT_ID = 'device-test';
 
+/**
+ * HOW THIS SESSION GETS ITS RANGE OF MOTION — the therapist's choice, made on the setup screen and
+ * stored with the prescription because it changes what every percentage in the record means.
+ *
+ *  - 'in_song'  — THE DEFAULT. The song starts immediately on a provisional range (this patient's
+ *                 own saved range for the lane, else the most forgiving range the movement allows,
+ *                 anchored on their observed rest), and the real range is learned from their first
+ *                 movements. Costs nothing before the music; the range is a less controlled
+ *                 measurement and is stamped as such everywhere it surfaces.
+ *  - 'measured' — the controlled path: the range-of-motion screens, a rest hold and three
+ *                 maximum-effort repetitions per lane, then the latency metronome. Minutes of
+ *                 maximum-effort work from an impaired limb before a note of music, in exchange for
+ *                 a range a therapist can defend.
+ *
+ * Optional because records and prescriptions written before the choice existed all came through the
+ * range-of-motion screens; absent therefore reads as 'measured' (see `calibrationModeOf`), which is
+ * what actually happened, rather than as the new default.
+ */
+export type CalibrationMode = 'in_song' | 'measured';
+
 /** The therapist's prescription for one session. */
 export interface SessionConfig {
   /**
@@ -92,6 +112,11 @@ export interface SessionConfig {
   songId: string;
   /** Chart generation seed — the same seed and song gives the same chart. */
   seed: number;
+  /**
+   * Where this session's range of motion comes from (see CalibrationMode). Absent = the old flow,
+   * i.e. 'measured'.
+   */
+  calibrationMode?: CalibrationMode;
 }
 
 /** Per-lane rehab metrics for the Results screen. */
@@ -275,6 +300,15 @@ export interface SessionResult {
   latencyOffsetMs: number;
   /** What the run itself suggests the latency should have been (ms), when it is confident. */
   suggestedLatencyMs: number | null;
+  /**
+   * HOW THE RANGES THIS SESSION'S PERCENTAGES ARE AGAINST WERE ARRIVED AT (see CalibrationMode).
+   *
+   * Stored on the session as well as per lane (`lanes[].calibrationMeasurement.method`) because it
+   * is a property of the VISIT — what the therapist chose to spend the appointment on — and because
+   * a screen listing sessions has to be able to say it without opening every lane. Absent on records
+   * written before the choice existed, which all came through the range-of-motion screens.
+   */
+  calibrationMode?: CalibrationMode;
   /** False when the therapist quit before the chart finished. */
   completed: boolean;
   /**

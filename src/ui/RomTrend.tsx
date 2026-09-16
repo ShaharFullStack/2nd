@@ -48,7 +48,7 @@ import { endReasonLabel, formatPercent } from '../session/results.ts';
 import { DEFAULT_TREND_WINDOW, movementTrends, trendCoverage } from '../session/trends.ts';
 import type { MovementTrend, TrendPoint } from '../session/trends.ts';
 import type { SessionResult } from '../session/types.ts';
-import { compareTracking, trackingConditions, trackingMixOfGrades, TRACKING_NOT_RECORDED } from '../session/tracking.ts';
+import { compareCalibration, compareTracking, trackingConditions, trackingMixOfGrades, worstComparison, TRACKING_NOT_RECORDED } from '../session/tracking.ts';
 import type { TrackingComparison, TrackingGrade } from '../session/tracking.ts';
 import { DeltaBadge, SessionBars, Sparkline, shortDate } from './common.tsx';
 import { ScopeNote } from './ScopeNote.tsx';
@@ -160,9 +160,20 @@ function spanChange(e: { first: number | null; last: number | null; n: number })
   return e.last - e.first;
 }
 
-/** A point that was measured on a degraded stream, or whose record never said. */
+/**
+ * A point that was not measured like the rest: a degraded stream, a record that never said, OR a
+ * range that was not arrived at the way a deliberate calibration is.
+ *
+ * BOTH HALVES, because both are reasons this dot is not comparable with its neighbours. The scale a
+ * percentage is OF is as much a part of how it was measured as the frame rate it was measured at,
+ * and an in-song range is capped at 'fair' precisely so that this test catches it.
+ */
 function pointFlagged(p: TrendPoint): boolean {
-  return p.trackingGrade === null || p.trackingGrade !== 'good';
+  // A calibration grade that is ABSENT is left alone here, exactly as `compareCalibration` leaves it
+  // alone: before the method was recorded this app had one way to produce a range, so "no block" is
+  // not evidence of a differently-made one. A grade that IS recorded and is not 'good' — which every
+  // in-song range is, by the cap in `calibrationGrade` — is.
+  return p.trackingGrade !== 'good' || (p.calibrationGrade !== null && p.calibrationGrade !== 'good');
 }
 
 /** "tracking poor" / "tracking not recorded", in the badge the rest of the app uses for it. */
@@ -194,10 +205,14 @@ function endsComparison(
   const from = shown[e.firstIndex];
   const to = shown[e.lastIndex];
   if (!from || !to) return null;
-  return compareTracking(from.tracking, to.tracking, {
-    from: `the ${shortDate(from.at)} session`,
-    to: `the ${shortDate(to.at)} one`,
-  });
+  const labels = { from: `the ${shortDate(from.at)} session`, to: `the ${shortDate(to.at)} one` };
+  // TWO GATES OVER THE SAME PAIR, AND THE WORSE ONE WINS. The camera, and the range the percentages
+  // are of. Showing the kinder of the two would be the screen choosing the flattering half of what
+  // it knows — see session/tracking.ts `worstComparison`.
+  return worstComparison(
+    compareTracking(from.tracking, to.tracking, labels),
+    compareCalibration(from.calibrationMeasurement, to.calibrationMeasurement, labels),
+  );
 }
 
 /** The chip qualifier for a comparison, or null when the two ends were measured alike. */

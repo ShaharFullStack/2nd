@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { DIFFICULTIES } from '../engine/difficulty.ts';
+import type { LaneSpec } from '../engine/types.ts';
 import type { InvalidCalibration } from '../input/VisionInput.ts';
 import { runtime } from '../session/runtime.ts';
 import { calibrationKey, laneFingertip, useStore } from '../state/store.ts';
@@ -26,9 +27,17 @@ import {
   calibrationSentence,
 } from '../session/tracking.ts';
 import type { TrackingGrade } from '../session/tracking.ts';
-import { FINGERTIP_NAME, MOVEMENT_INFO, movementCalibrationInstruction } from '../vision/features.ts';
+import {
+  FINGERTIP_NAME,
+  MOVEMENT_INFO,
+  POSTURE_INFO,
+  movementCalibrationInstruction,
+  requiredPostures,
+} from '../vision/features.ts';
+import type { MovementPosture } from '../vision/features.ts';
 import { CameraPreview } from './CameraPreview.tsx';
 import { CalibrationGuide } from './CalibrationGuide.tsx';
+import type { CalibrationBeat } from './CalibrationGuide.tsx';
 import { DwellLegend, DwellTarget, pairedDwellTargets, useDwellTargets } from './DwellTarget.tsx';
 import type { DwellChoice } from './DwellTarget.tsx';
 import { Meter, ProgressRing, Screen, Toast, TopBar, laneName } from './common.tsx';
@@ -39,6 +48,33 @@ import { ScopeNote } from './ScopeNote.tsx';
 function tipName(spec: Parameters<typeof laneFingertip>[0]): string {
   const tip = laneFingertip(spec);
   return tip ? FINGERTIP_NAME[tip] : '';
+}
+
+/**
+ * THE ORDER THE LANES ARE MEASURED IN: lanes that share a physical setup, together.
+ *
+ * The prescribed order is a clinical decision and it is not touched — it is what the lane list, the
+ * lane numbers and the session itself are in. This is only the order the SCREEN walks them in, and it
+ * exists because walking the prescription as written can ask a patient to rebuild the whole support
+ * under their arm two or three times (palm to the camera, hand over the table edge, palm to the
+ * camera again) for movements that could have been measured back to back. Postures keep their
+ * first-prescribed order, and so do the lanes inside each one, so a single-setup prescription — every
+ * leg session today — comes out exactly as prescribed.
+ */
+export function calibrationOrder(lanes: readonly LaneSpec[]): number[] {
+  const out: number[] = [];
+  for (const posture of requiredPostures(lanes)) {
+    lanes.forEach((l, i) => {
+      if (MOVEMENT_INFO[l.movement].posture === posture) out.push(i);
+    });
+  }
+  return out;
+}
+
+/** "3 September" — enough to tell last week's range from last spring's, in a sentence. */
+function whenMeasured(at: number | undefined): string {
+  if (!at) return 'measured in an earlier session';
+  return `measured ${new Date(at).toLocaleDateString(undefined, { day: 'numeric', month: 'long' })}`;
 }
 
 interface Live {
@@ -121,7 +157,12 @@ export default function RomCalibrationScreen() {
   const mode = useStore((s) => s.mode);
   const reducedMotion = useStore((s) => s.settings.reducedMotion);
 
-  const [laneIndex, setLaneIndex] = useState(0);
+  /** Where the screen is in ITS order (`order[step]` is the prescribed lane it is measuring). */
+  const [step, setStep] = useState(0);
+  const order = useMemo(() => calibrationOrder(lanes), [lanes]);
+  const laneIndex = order[step] ?? 0;
+  /** True when this prescription is measured in a different order from the one it is prescribed in. */
+  const regrouped = order.some((laneAt, i) => laneAt !== i);
   const [cameraAspect, setCameraAspect] = useState(4 / 3);
   const [live, setLive] = useState<Live | null>(null);
   const [done, setDone] = useState<(RomCalibration | null)[]>(() => lanes.map(() => null));
@@ -134,7 +175,23 @@ export default function RomCalibrationScreen() {
    * cascading render is needed to retire it.
    */
   const [rejected, setRejected] = useState<{ attempt: string; reason: string } | null>(null);
-  const [vetting, setVetting] = useState<Vetting>(NO_VETTING);
+  /**
+   * Null until the runtime has been asked once. It is NOT `NO_VETTING`, because "no problem found" and
+   * "not looked yet" are different answers and only the first of them may put the reuse offer on
+   * screen: a stored range whose mirror convention belongs to the other limb would otherwise be
+   * offered for the frame between mount and the first poll.
+   */
+  const [vetting, setVetting] = useState<Vetting | null>(null);
+  /**
+   * The setup the patient is actually in, as last confirmed on the posture beat. It starts as the one
+   * the first lane needs (the camera check asked for it and the rest instruction repeats it), so a
+   * prescription measured in a single setup never sees the beat at all.
+   */
+  const [heldPosture, setHeldPosture] = useState<MovementPosture | null>(null);
+  /** Lanes where "measure it again" was chosen over the stored range; keyed by PRESCRIBED lane index. */
+  const [declinedReuse, setDeclinedReuse] = useState<Record<number, boolean>>({});
+  /** Lanes whose accepted range came from a previous session rather than from reps measured just now. */
+  const [reusedLanes, setReusedLanes] = useState<Record<number, boolean>>({});
 
   /** Identifies one attempt at one lane: a Redo (generation++) or a lane change starts a new one. */
   const attemptKey = `${laneIndex}:${generation}`;
@@ -148,10 +205,57 @@ export default function RomCalibrationScreen() {
   const threshold = DIFFICULTIES[difficulty].thresholdFraction;
   const previous = lane ? savedCalibrations[calibrationKey(lane)] : undefined;
 
+  /** The verdicts in hand right now; `vetting === null` means they have not been asked for yet. */
+  const verdicts = vetting ?? NO_VETTING;
+  // "Done" means the RUNTIME holds a usable range for this lane, not that this screen measured one.
+  const laneRefused = verdicts.refusals.some((r) => r.lane === laneIndex) || rejectedReason !== null;
+  const laneDone = laneRefused ? null : (done[laneIndex] ?? null);
+  const status = live?.status ?? null;
+  const restPhase = status?.phase === 'rest';
+  /**
+   * THE ATTEMPT ENDED WITH NOTHING USABLE — the state a patient alone can most easily be trapped in.
+   *
+   * The calibrator can finish with 'insufficient_range', 'no_reps' or 'not_tracked', and the runtime
+   * can refuse the range it produced. In every one of those cases the lane has no range, the forward
+   * target is therefore (correctly) dead, and the calibrator will not measure again until somebody
+   * presses Redo. Without a hands-free Redo that is a dead end with no patient-reachable way out.
+   */
+  const romStuck = laneRefused || (status?.phase === 'done' && !!status.error);
+  const previousProblem = verdicts.previousProblem;
+
+  /**
+   * THE THREE BEATS OF A LANE, and why two of them are not the measurement.
+   *
+   *  - 'posture' — the setup this movement is measured in is NOT the one the patient is currently in.
+   *    Three hand movements are measured palm-to-camera and wrist_extension with the hand over the
+   *    table edge; those are ninety degrees apart about the wrist, which is the wrist_extension axis
+   *    itself, so the forearm and the support it rests on have to be rebuilt. That used to be carried
+   *    by one reworded sentence in the instruction line, which is how a patient ends up doing reps
+   *    against the wrong support. It is asked for ONCE, before any repetition, and nothing is measured
+   *    until it is confirmed.
+   *  - 'reuse'  — a stored range for THIS patient, limb, quantity and mirror convention applies here.
+   *    On a return visit that is the choice that removes the whole wall of repetitions, so it is put
+   *    in front of the patient rather than inside the "Adjustments & details" disclosure. It states
+   *    what it would adopt and how well it was measured, and BOTH answers are one hold away.
+   *  - 'measure' — the rest hold and the three reps, unchanged.
+   *
+   * Once a range is in force the lane is on 'measure' whatever it came from: that is the state that
+   * shows the accepted range, its quality and the way on.
+   */
+  const declined = !!declinedReuse[laneIndex];
+  const reuseReady = !!previous && vetting !== null && !previousProblem && !laneDone && !declined && !romStuck;
+  /** The setup the patient is in: the one they last confirmed, or the one the first lane assumes. */
+  const currentPosture = heldPosture ?? (lanes[order[0]] ? MOVEMENT_INFO[lanes[order[0]].movement].posture : null);
+  const needsPosture = !!info && currentPosture !== null && info.posture !== currentPosture;
+  const beat: CalibrationBeat = laneDone ? 'measure' : reuseReady ? 'reuse' : needsPosture ? 'posture' : 'measure';
+  const measuring = beat === 'measure';
+
   // One calibrator per lane per attempt; the vision pipeline it reads is the SAME object the game
   // will play with, so the calibration and the session see identical smoothing.
+  // It only exists on the 'measure' beat: a rest hold that starts while the patient is still moving
+  // the table, or while they are reading a choice, is a rest hold measured on the wrong thing.
   useEffect(() => {
-    if (!lane) return;
+    if (!lane || !measuring) return;
     const vision = runtime.peekVision();
     // The calibrator MUST be built from the lane's own context (which fingertip it opposes, which
     // mirror convention its frames are in) — that is what stamps the resulting range with what it
@@ -191,7 +295,7 @@ export default function RomCalibrationScreen() {
       // meter for the frames before its own first poll lands.
       setLive(null);
     };
-  }, [lane, laneIndex, generation, patientId]);
+  }, [lane, laneIndex, generation, patientId, measuring]);
 
   /**
    * Hand a measured range to the runtime and BELIEVE ITS ANSWER.
@@ -262,6 +366,7 @@ export default function RomCalibrationScreen() {
       const ctx = withPatient(vision?.getCalibrationContext(laneIndex), patientId);
       const previousProblem = lane && previous ? calibrationMismatch(previous, lane.movement, ctx) : null;
       setVetting((v) =>
+        v !== null &&
         v.previousProblem?.reason === previousProblem?.reason &&
         v.refusals.length === refusals.length &&
         v.refusals.every((r, i) => r.lane === refusals[i].lane && r.reason === refusals[i].reason)
@@ -274,18 +379,18 @@ export default function RomCalibrationScreen() {
     return () => clearInterval(poll);
   }, [lane, laneIndex, previous, generation, patientId]);
 
-  // "Done" means the RUNTIME holds a usable range for this lane, not that this screen measured one.
-  const laneRefused = vetting.refusals.some((r) => r.lane === laneIndex) || rejectedReason !== null;
-  const laneDone = laneRefused ? null : (done[laneIndex] ?? null);
-  const status = live?.status ?? null;
-  const restPhase = status?.phase === 'rest';
-
+  /**
+   * Measure this lane again from scratch. It is also the way OUT of a reused range: a range adopted
+   * from a previous session is refusable by exactly the gesture that redoes a measured one.
+   */
   const retry = () => {
     setDone((d) => {
       const next = d.slice();
       next[laneIndex] = null;
       return next;
     });
+    setReusedLanes((r) => (r[laneIndex] ? { ...r, [laneIndex]: false } : r));
+    setDeclinedReuse((d) => ({ ...d, [laneIndex]: true }));
     setGeneration((g) => g + 1);
   };
 
@@ -329,21 +434,27 @@ export default function RomCalibrationScreen() {
     [laneDone, lane],
   );
 
+  const hasNext = step + 1 < order.length;
   const next = () => {
-    if (laneIndex + 1 < lanes.length) {
-      setLaneIndex(laneIndex + 1);
+    if (hasNext) {
+      setStep(step + 1);
       setGeneration((g) => g + 1);
     } else {
       goto('latency');
     }
   };
 
+  /** The patient says the support has been rebuilt; only now does anything start measuring. */
+  const confirmPosture = useCallback(() => {
+    if (info) setHeldPosture(info.posture);
+    setGeneration((g) => g + 1);
+  }, [info]);
+
   /**
    * THE HANDS-FREE PAIR, AND WHY "REDO" IS ONE OF THEM.
    *
-   * Every other genuine CHOICE on this screen — easier, harder, reuse last session's range — is a
-   * therapist's decision about the denominator of the whole record, and none of them is put behind a
-   * dwell target. Redo is not in that class. It is the patient's own account of their own attempt: a
+   * Easier and harder are a therapist's decision about the denominator of the whole record, and
+   * neither is put behind a dwell target. Redo is not in that class. It is the patient's own account of their own attempt: a
    * patient working alone who coughed, whose spasticity took the third rep, or who simply moved
    * before the ring said to, has measured a range that is about to become the scale of every
    * percentage in their session, and the only other hands-free thing they can do is walk forward onto
@@ -354,23 +465,37 @@ export default function RomCalibrationScreen() {
    * Neither target exists while the range is being measured — `laneDone` is false for the whole rest
    * hold and all three reps — so nothing here can fire during the exercise itself.
    */
-  /**
-   * THE ATTEMPT ENDED WITH NOTHING USABLE — the state a patient alone can most easily be trapped in.
-   *
-   * The calibrator can finish with 'insufficient_range', 'no_reps' or 'not_tracked', and the runtime
-   * can refuse the range it produced. In every one of those cases the lane has no range, the forward
-   * target is therefore (correctly) dead, and the calibrator will not measure again until somebody
-   * presses Redo. Without a hands-free Redo that is a dead end with no patient-reachable way out.
-   */
-  const romStuck = laneRefused || (status?.phase === 'done' && !!status.error);
   /** True when there is a measured (or failed) attempt on this lane to do over. */
   const somethingToRedo = laneDone !== null || romStuck;
 
-  /** Go back one lane, re-arming its calibrator so the range there can be measured again. */
+  /** Go back one movement, re-arming its calibrator so the range there can be measured again. */
   const back = useCallback(() => {
-    setLaneIndex((i) => Math.max(0, i - 1));
+    setStep((i) => Math.max(0, i - 1));
     setGeneration((g) => g + 1);
   }, []);
+
+  /**
+   * Adopt last session's range — ONLY when it describes what this lane measures now.
+   *
+   * Every guard that stood behind the old disclosed button stands behind this one, because it IS the
+   * same call: the saved-calibration key is `movement:side[:fingertip]` and does not carry the mirror
+   * convention or the patient, so `calibrationMismatch` (against the lane's own derived context, plus
+   * the patient) refuses a range that belongs to another person, another digit, another movement or —
+   * after the mirror switch is flipped — the other limb, and `finishLane` still hands it to the
+   * runtime, which can refuse it again in the therapist's words. Adopting never advances the session:
+   * the lane then sits in its accepted state, with the range, the date and the quality chip, and one
+   * hold of the back circle measures it instead.
+   */
+  const usePrevious = () => {
+    if (!previous || previousProblem) return;
+    setReusedLanes((r) => ({ ...r, [laneIndex]: true }));
+    finishLane(previous);
+  };
+  /** "Measure it again" — the refusal of the offer, which is the ordinary rest-hold-and-three-reps. */
+  const declineReuse = () => {
+    setDeclinedReuse((d) => ({ ...d, [laneIndex]: true }));
+    setGeneration((g) => g + 1);
+  };
 
   /**
    * THE HANDS-FREE PAIR — AND WHY THERE IS NOW ONE IN EVERY STATE THIS SCREEN CAN BE IN.
@@ -396,55 +521,62 @@ export default function RomCalibrationScreen() {
    *    The three chain: on a lane with a range, one hold does it over and the next hold goes back a
    *    lane, so no state on this screen is more than two holds from the one before it.
    *
-   * Easier, harder and reusing last session's range stay on the buttons: those change the scale every
-   * later figure is a percentage of, and that is the therapist's call, not a thing to be held into.
+   * Easier and harder stay on the buttons: those change the scale every later figure is a percentage
+   * of, and that is the therapist's call, not a thing to be held into.
+   *
+   * THE TWO BEATS THAT ARE NOT A MEASUREMENT GET THE SAME PAIR, with their own ids so that a hold in
+   * flight can never be handed to an action the patient did not start:
+   *  - posture: forward is "I have moved" (it confirms the setup and measures nothing), back is still
+   *    the way back a movement.
+   *  - reuse: forward adopts last session's range, back measures it instead. Neither is destructive —
+   *    nothing has been measured on this lane yet — and adopting does NOT carry the session forward,
+   *    so going on is still a separate, deliberate hold, and the back circle then reads "Do it again".
    */
   const dwellChoices: DwellChoice[] = useMemo(() => {
     const [go, away] = pairedDwellTargets(mode);
+    const backChoice: DwellChoice = {
+      id: 'redo',
+      target: away,
+      label: somethingToRedo ? 'Do it again' : step > 0 ? 'Back a movement' : 'Camera check',
+      onConfirm: somethingToRedo ? retry : step > 0 ? back : () => goto('camera'),
+      tone: 'back',
+    };
+    if (beat === 'posture') {
+      return [
+        { id: 'posture-ready', target: go, label: 'I have moved', onConfirm: confirmPosture, tone: 'go' },
+        { ...backChoice, id: 'posture-back' },
+      ];
+    }
+    if (beat === 'reuse') {
+      return [
+        { id: 'reuse-use', target: go, label: 'Use last range', onConfirm: usePrevious, tone: 'go' },
+        { id: 'reuse-measure', target: away, label: 'Measure it now', onConfirm: declineReuse, tone: 'back' },
+      ];
+    }
     return [
       {
         id: 'next',
         target: go,
-        label: laneIndex + 1 < lanes.length ? 'Next movement' : 'Latency check',
+        label: hasNext ? 'Next movement' : 'Latency check',
         enabled: laneDone !== null,
         disabledNote: 'No range yet',
         onConfirm: next,
         tone: 'go',
       },
-      {
-        id: 'redo',
-        target: away,
-        label: somethingToRedo ? 'Do it again' : laneIndex > 0 ? 'Back a movement' : 'Camera check',
-        onConfirm: somethingToRedo ? retry : laneIndex > 0 ? back : () => goto('camera'),
-        tone: 'back',
-      },
+      backChoice,
     ];
-    // `next` and `retry` close over this render's lane state; the hook keeps the LIVE list and calls
-    // the current one, so they are deliberately not dependencies (including them would rebuild the
-    // trackers on every poll and throw away a hold in progress).
-  }, [mode, laneIndex, lanes.length, laneDone, somethingToRedo, back, goto]);
+    // `next`, `retry`, `usePrevious` and `declineReuse` close over this render's lane state; the hook
+    // keeps the LIVE list and calls the current one, so they are deliberately not dependencies
+    // (including them would rebuild the trackers on every poll and throw away a hold in progress).
+  }, [mode, beat, step, hasNext, laneDone, somethingToRedo, back, goto, confirmPosture]);
   const dwell = useDwellTargets(dwellChoices);
 
   /** What the back circle does right now, in the patient's words — for the legend and the caption. */
   const backNote = somethingToRedo
     ? 'the right circle to measure this movement again'
-    : laneIndex > 0
+    : step > 0
       ? 'the right circle to go back to the movement before this one'
       : 'the right circle to go back to the camera check';
-
-  /**
-   * Offer last session's range ONLY when it describes what this lane measures now.
-   *
-   * The saved-calibration key is `movement:side[:fingertip]` — it does not carry the mirror
-   * convention, and the convention selects WHICH LIMB every lane reads. So a range saved un-mirrored
-   * and reused after the mirror switch is flipped is a genuinely inapplicable range that the store
-   * will happily hand over: it has to be refused HERE, with the reason and the action, rather than
-   * pushed at a runtime that refuses it where no therapist is looking.
-   */
-  const previousProblem = vetting.previousProblem;
-  const usePrevious = () => {
-    if (previous && !previousProblem) finishLane(previous);
-  };
 
   const ringValue = useMemo(() => {
     if (!status) return 0;
@@ -479,7 +611,14 @@ export default function RomCalibrationScreen() {
       <div className="rom-shade" />
       <header className="rom-header">
       <TopBar
-        eyebrow={`Range of motion — lane ${laneIndex + 1} of ${lanes.length}`}
+        eyebrow={
+          // THE THERAPIST'S ORDER IS STILL THE ORDER. When the screen groups the lanes by setup it
+          // says where it is in its own walk AND which prescribed lane that is, so the number on
+          // screen is never a silent renumbering of a clinical decision.
+          regrouped
+            ? `Range of motion — ${step + 1} of ${lanes.length} · prescribed lane ${laneIndex + 1}`
+            : `Range of motion — lane ${laneIndex + 1} of ${lanes.length}`
+        }
         title={`${lane.side === 'left' ? 'Left' : 'Right'} ${info.label.toLowerCase()}${tipName(lane) ? ` \u2014 ${tipName(lane)}` : ''}`}
         onBack={() => goto('camera')}
         right={
@@ -489,17 +628,68 @@ export default function RomCalibrationScreen() {
             disabled={!laneDone}
             data-testid="rom-next"
           >
-            {laneIndex + 1 < lanes.length ? 'Next lane →' : 'Latency check →'}
+            {hasNext ? 'Next lane →' : 'Latency check →'}
           </button>
         }
       />
       <ol className="rom-steps" aria-label="Calibration steps">
-        {['Hold still', 'Move 3 times', 'Continue'].map((label, i) => <li key={label} aria-current={(laneDone ? i === 2 : restPhase || !status ? i === 0 : i === 1) ? 'step' : undefined}>
+        {/* These three are the steps of a MEASUREMENT. On the set-up change and on the reuse offer
+            nothing is being held and nothing is being counted, so none of them is marked current —
+            a lit "Hold still" over a screen that is not measuring is a claim about the patient. */}
+        {['Hold still', 'Move 3 times', 'Continue'].map((label, i) => <li key={label}
+          aria-current={measuring && (laneDone ? i === 2 : restPhase || !status ? i === 0 : i === 1) ? 'step' : undefined}>
           <span>{i + 1}</span>{label}</li>)}
       </ol>
       </header>
-      <CalibrationGuide lane={lane} status={status} tracking={live?.tracking ?? false} accepted={!!laneDone}
-        refused={laneRefused} reducedMotion={reducedMotion} retry={retry} />
+      <CalibrationGuide
+        lane={lane}
+        status={status}
+        tracking={live?.tracking ?? false}
+        accepted={!!laneDone}
+        refused={laneRefused}
+        reducedMotion={reducedMotion}
+        retry={retry}
+        beat={beat}
+        reused={!!reusedLanes[laneIndex]}
+        handsFree={
+          /* WHICH LIMB THE CIRCLES ARE FOLLOWING, WHERE THE PATIENT CAN READ IT. Inside the collapsed
+             "Adjustments & details" block this sat ~2000 px below the fold (measured, at 1024x768) and
+             a patient who cannot touch the glass cannot open a <details> to reach it — on the one
+             screen whose whole premise is that they do not have to. */
+          <DwellLegend
+            session={dwell}
+            what={
+              beat === 'posture'
+                ? 'the left circle once your arm and the table are set up the new way'
+                : beat === 'reuse'
+                  ? 'the left circle to use last session’s range, or the right circle to measure it now'
+                  : laneDone === null
+                    ? backNote
+                    : hasNext
+                      ? 'the left circle for the next movement'
+                      : 'the left circle to go on'
+            }
+            testId="rom-dwell-legend"
+          />
+        }
+        postureChange={
+          beat === 'posture' && currentPosture ? { from: currentPosture, to: info.posture, onReady: confirmPosture } : null
+        }
+        reuse={
+          beat === 'reuse' && previous
+            ? {
+                rangeText: `${formatFeature(previous.min, info.unit)} → ${formatFeature(previous.max, info.unit)}`,
+                when: whenMeasured(previous.capturedAt),
+                // The SAME chip that grades a range measured just now — reusing a range adopts its
+                // measurement, so it may never be presented more cleanly than it was recorded.
+                quality: <CalibrationQualityChip measurement={previous.measurement} testId="rom-reuse-offer-quality" />,
+                note: previous.measurement ? calibrationSentence(previous.measurement) : CALIBRATION_NOT_RECORDED,
+                onUse: usePrevious,
+                onMeasure: declineReuse,
+              }
+            : null
+        }
+      />
       <footer className="rom-footer">
         <span className={live?.tracking ? 'rom-tracking is-visible' : 'rom-tracking'}>{live?.tracking ? '● Limb visible' : '○ Looking for your limb'}</span>
         <button className="btn" onClick={retry}>Restart movement</button>
@@ -539,24 +729,17 @@ export default function RomCalibrationScreen() {
               preview is stood down: there is one <video> in the app, and the screen the patient has to
               read from a chair is not a 340 px thumbnail. */}
           <div className="stack" style={{ gap: 12 }}>
-            <DwellLegend
-              session={dwell}
-              what={
-                laneDone === null
-                  ? backNote
-                  : laneIndex + 1 < lanes.length
-                    ? 'the left circle for the next movement'
-                    : 'the left circle to go on'
-              }
-              testId="rom-dwell-legend"
-            />
+            {/* The LIVE legend is not here any more — it is in the coach panel, on the patient's side
+                of the screen (see `handsFree` on CalibrationGuide). What stays here is the therapist's
+                explanation of what the two circles are for. */}
             <span className="dim" data-testid="rom-handsfree-note">
               The right circle is the way BACK, and it is there in every state this screen can be in: it measures this
               movement again once there is something to re-do (including when nothing usable was measured at all), and
-              until then it goes back to {laneIndex > 0 ? 'the movement before this one' : 'the camera check'} — so a
-              confirm made by accident can always be undone without touching the screen. Easier, harder and reusing last
-              session&rsquo;s range stay on the buttons: those change the scale every later figure is a percentage of, and
-              that is the therapist&rsquo;s call.
+              until then it goes back to {step > 0 ? 'the movement before this one' : 'the camera check'} — so a
+              confirm made by accident can always be undone without touching the screen. Where last session&rsquo;s range
+              applies, the same pair offers it and refuses it, and taking it does not carry the session forward: going on
+              is still a separate hold. Easier and harder stay on the buttons: those change the scale every later figure
+              is a percentage of, and that is the therapist&rsquo;s call.
             </span>
           </div>
 
@@ -628,6 +811,15 @@ export default function RomCalibrationScreen() {
                 <CalibrationQualityChip measurement={laneDone.measurement} testId="rom-accepted-quality-chip" />
               </div>
               <span className="dim" data-testid="rom-accepted-quality-note">
+                {/* WHERE THE RANGE IN FORCE CAME FROM. A reused range was not measured today, and the
+                    chip beside it grades a stream this session never saw — that has to be said in the
+                    same breath as the grade, not left to be inferred from a green badge. */}
+                {reusedLanes[laneIndex] && (
+                  <strong data-testid="rom-accepted-reused">
+                    Reused from a previous session
+                    {laneDone.capturedAt ? ` (${whenMeasured(laneDone.capturedAt)})` : ''}, not measured today.{' '}
+                  </strong>
+                )}
                 {laneDone.measurement ? calibrationSentence(laneDone.measurement) : CALIBRATION_NOT_RECORDED}
               </span>
             </div>
@@ -636,7 +828,7 @@ export default function RomCalibrationScreen() {
           {/* Any OTHER lane the runtime is refusing — including one killed by a setting changed after
               it was calibrated (flip the mirror switch and every stored range belongs to the other
               limb). Without this the therapist would have to walk back through the lanes to find it. */}
-          {vetting.refusals
+          {verdicts.refusals
             .filter((r) => r.lane !== laneIndex || !rejectedReason)
             .map((r) => (
               <Toast kind="bad" key={r.lane}>
@@ -739,7 +931,7 @@ export default function RomCalibrationScreen() {
             {lanes.map((l, i) => {
               // A lane the runtime is refusing is NOT done, whatever this screen measured: the ✓ and the
               // min→max readout describe a range that will not score a single note.
-              const refused = vetting.refusals.some((r) => r.lane === i) || (i === laneIndex && rejectedReason !== null);
+              const refused = verdicts.refusals.some((r) => r.lane === i) || (i === laneIndex && rejectedReason !== null);
               const cal = refused ? null : done[i];
               return (
                 <li key={i} className="row">
@@ -754,6 +946,17 @@ export default function RomCalibrationScreen() {
                   <span className={i === laneIndex ? '' : 'muted'}>
                     {l.side === 'left' ? 'L' : 'R'} {MOVEMENT_INFO[l.movement].label}
                     {tipName(l) ? ` · ${tipName(l)}` : ''}
+                    {/* This list stays in the PRESCRIBED order — it is the therapist's — and says
+                        where each lane falls in the order the screen walks, plus the setup it is
+                        measured in, so the grouping is legible rather than a silent renumbering. */}
+                    {regrouped && (
+                      <span className="dim" data-testid={`rom-lane-order-${i}`}>
+                        {' '}
+                        · measured {order.indexOf(i) + 1}
+                        {order.indexOf(i) + 1 === 1 ? 'st' : order.indexOf(i) + 1 === 2 ? 'nd' : order.indexOf(i) + 1 === 3 ? 'rd' : 'th'} (
+                        {POSTURE_INFO[MOVEMENT_INFO[l.movement].posture].label.toLowerCase()})
+                      </span>
+                    )}
                   </span>
                   <div className="grow" />
                   {refused && <span className="dim">not calibrated</span>}
@@ -767,11 +970,23 @@ export default function RomCalibrationScreen() {
                   )}
                   {/* Every lane's denominator, graded, in the one list that shows them all: a session
                       whose four ranges were measured differently is not four comparable lanes. */}
+                  {cal && reusedLanes[i] && (
+                    <span className="badge badge-warn" data-testid={`rom-lane-reused-${i}`}>
+                      reused
+                    </span>
+                  )}
                   {cal && <CalibrationQualityChip measurement={cal.measurement} testId={`rom-lane-quality-${i}`} />}
                 </li>
               );
             })}
           </ul>
+          {regrouped && (
+            <span className="dim" data-testid="rom-order-note">
+              This list is the PRESCRIBED order and the session plays in it. The screen measures the lanes grouped by the
+              set-up each one needs — {order.map((i) => `lane ${i + 1}`).join(', ')} — so the patient rebuilds the support
+              under their arm once instead of alternating between two set-ups.
+            </span>
+          )}
           {/* WHERE THE RANGE IS FIRST PUT INTO DEGREES, the one line that says what kind of number it
               is. Every percentage on the results and trend screens is measured against the range set
               here, so this is the first place the scope has to be stated. */}

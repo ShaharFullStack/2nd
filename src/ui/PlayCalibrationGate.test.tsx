@@ -7,6 +7,12 @@
  * returns an input whose `getInvalidCalibrations()` is already populated — so Play stops there instead
  * of letting the patient work through three minutes of a dead lane and meet the verdict as a 0% row on
  * the results screen.
+ *
+ * THIS IS THE MEASURED PATH'S GATE. On the in-song path there is nothing to be blocked BY: a stored
+ * range that fails the same checks is never handed to VisionInput in the first place, the lane starts
+ * on a provisional range instead and the refusal is reported as a warning over a session that plays
+ * (see the last test in this file, and session/inSongCalibration.ts). So these cases prescribe
+ * `calibrationMode: 'measured'` deliberately — the block belongs to the flow that measured the range.
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, render, screen, waitFor } from '@testing-library/react';
@@ -22,6 +28,12 @@ const LANES: LaneSpec[] = [
 const refusals: InvalidCalibration[] = [];
 
 const vision = {
+  // The in-song calibration path (the default) drives these three: it asks each lane what it
+  // measures, watches the pipeline samples, and hands ranges back. A fake that lacks them is a fake
+  // of an older VisionInput, not a simpler one.
+  getCalibrationContext: () => ({ mirrored: false }),
+  onFrame: () => () => {},
+  setCalibration: () => true,
   getInvalidCalibrations: () => refusals,
   getLaneStates: () => LANES.map((l) => ({ lane: l.index, value: 0, armed: false })),
   getVideoElement: () => null,
@@ -60,6 +72,7 @@ beforeEach(() => {
     windowScale: 1,
     songId: 'demo-groove',
     inputMode: 'camera',
+    calibrationMode: 'measured',
     settings: { ...DEFAULT_SETTINGS },
   });
 });

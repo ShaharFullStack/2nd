@@ -14,7 +14,7 @@ import type { RomCalibration } from '../vision/calibration.ts';
 import { POSTURE_INFO } from '../vision/features.ts';
 import { LATENCY_MAX_MS, LATENCY_MIN_MS, clampLatencyMs } from '../session/latencyAdvice.ts';
 import { clinicalLaneName } from '../session/results.ts';
-import type { InputMode, Patient, SessionConfig, SessionResult } from '../session/types.ts';
+import type { CalibrationMode, InputMode, Patient, SessionConfig, SessionResult } from '../session/types.ts';
 import { DEVICE_TEST_PATIENT_ID, UNASSIGNED_PATIENT_ID } from '../session/types.ts';
 import type { CalibrationsByPatient } from './patients.ts';
 import { deviceTestPatient, makePatient, migrateToPatients, normalizePatientName, unassignedPatient, validatePatients } from './patients.ts';
@@ -69,6 +69,17 @@ export const DEFAULT_SETTINGS: Settings = {
 export const MIN_LANES = 2;
 export const MAX_LANES = 4;
 export const DEFAULT_SONG_ID = 'demo-groove';
+
+/**
+ * CALIBRATE INSIDE THE MUSIC, BY DEFAULT.
+ *
+ * The measured complaint this exists for: a four-lane hand prescription demanded twelve
+ * maximum-effort repetitions from an impaired hand, four rest holds, four dwell holds and an
+ * eight-beat metronome before a note of music, and patients quit in it. The controlled path is one
+ * press away on the setup screen and says there what it costs — it is not gone, it is no longer the
+ * toll every patient pays to hear the song.
+ */
+export const DEFAULT_CALIBRATION_MODE: CalibrationMode = 'in_song';
 
 const HISTORY_KEY = 'history';
 const SETTINGS_KEY = 'settings';
@@ -303,6 +314,9 @@ function validateConfig(raw: unknown): Partial<SessionConfig> | null {
     windowScale: Number.isFinite(r.windowScale) ? clampWindowScale(r.windowScale as number) : 1,
     laneRestSec: Number.isFinite(r.laneRestSec) ? clampLaneRestSec(r.laneRestSec as number) : DEFAULT_LANE_REST_SEC,
     songId: typeof r.songId === 'string' ? r.songId : DEFAULT_SONG_ID,
+    // A stored prescription from a build that had no choice is 'measured' — that IS what it ran.
+    // The new default applies to a device that has never stored one, not retroactively to one that has.
+    calibrationMode: r.calibrationMode === 'in_song' || r.calibrationMode === 'measured' ? r.calibrationMode : 'measured',
   };
 }
 
@@ -470,6 +484,13 @@ export interface AppState {
    * difficulty side effect — see charts/generate.ts `DEFAULT_LANE_REST_SEC`.
    */
   laneRestSec: number;
+  /**
+   * WHERE THIS SESSION'S RANGE OF MOTION COMES FROM (session/types.ts `CalibrationMode`), chosen on
+   * the setup screen. `in_song` is the default for a new device: the song starts immediately and the
+   * range is learned as the patient plays. `measured` keeps the range-of-motion screens and the
+   * latency metronome — the controlled path, which is still one press away.
+   */
+  calibrationMode: CalibrationMode;
   songId: string;
   seed: number;
 
@@ -558,6 +579,8 @@ export interface AppState {
   setWindowScale: (s: number) => void;
   /** Set the pacing floor (seconds of rest between reps in one lane); clamped to the safe range. */
   setLaneRestSec: (sec: number) => void;
+  /** Choose the controlled range-of-motion path, or calibrating inside the music (the default). */
+  setCalibrationMode: (mode: CalibrationMode) => void;
   setSong: (id: string) => void;
   setSeed: (seed: number) => void;
   setCalibration: (lane: number, cal: RomCalibration | null) => void;
@@ -811,7 +834,7 @@ export const useStore = create<AppState>((set, get) => {
   const persistDropped = (d: Record<string, number>): Record<string, number> => droppedSync.write(d).merged;
   const persistConfig = (): void => {
     const s = get();
-    writeJson(CONFIG_KEY, { mode: s.mode, lanes: s.lanes, difficulty: s.difficulty, windowScale: s.windowScale, laneRestSec: s.laneRestSec, songId: s.songId });
+    writeJson(CONFIG_KEY, { mode: s.mode, lanes: s.lanes, difficulty: s.difficulty, windowScale: s.windowScale, laneRestSec: s.laneRestSec, songId: s.songId, calibrationMode: s.calibrationMode });
   };
 
   return {
@@ -830,6 +853,8 @@ export const useStore = create<AppState>((set, get) => {
     difficulty: persistedConfig.difficulty ?? 'medium',
     windowScale: persistedConfig.windowScale ?? 1,
     laneRestSec: persistedConfig.laneRestSec ?? DEFAULT_LANE_REST_SEC,
+    // Nothing stored = a device that has never prescribed a session: it gets the new default.
+    calibrationMode: persistedConfig.calibrationMode ?? DEFAULT_CALIBRATION_MODE,
     songId: persistedConfig.songId ?? DEFAULT_SONG_ID,
     seed: 1,
 
@@ -1057,6 +1082,11 @@ export const useStore = create<AppState>((set, get) => {
       persistConfig();
     },
 
+    setCalibrationMode: (calibrationMode) => {
+      set({ calibrationMode: calibrationMode === 'measured' ? 'measured' : 'in_song' });
+      persistConfig();
+    },
+
     setSong: (songId) => {
       set({ songId });
       persistConfig();
@@ -1238,6 +1268,16 @@ export const useStore = create<AppState>((set, get) => {
         laneRestSec: s.laneRestSec,
         songId: s.songId,
         seed: s.seed,
+        /**
+         * ONLY A CAMERA SESSION HAS A RANGE OF MOTION TO GET FROM ANYWHERE.
+         *
+         * A keyboard or autoplay run measures no range at all, so it is never on the in-song path
+         * (it has nothing to learn from) and it did not run the range-of-motion screens either.
+         * Omitting the field is the only honest answer: the record then says "not recorded", the
+         * chart gets no in-song warm-up it has no reason for, and a device-test run cannot be filed
+         * as if a therapist had chosen a calibration path for it.
+         */
+        ...(s.inputMode === 'camera' ? { calibrationMode: s.calibrationMode } : {}),
       };
     },
   };

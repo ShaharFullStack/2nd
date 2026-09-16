@@ -289,6 +289,14 @@ async function main() {
       s.setLanes(lanes.map((l, i) => ({ index: i, movement: l.movement, side: l.side })));
       s.setDifficulty('hard');        // narrowest windows: the gate the critic reported
       s.setWindowScale(1);
+      /**
+       * THE CONTROLLED PATH, DELIBERATELY. In-song calibration is the default now
+       * (session/inSongCalibration.ts) and it goes camera -> play with no ROM or latency screen at
+       * all — which is a different, shorter claim. What this harness is about is that the THERAPIST'S
+       * measured path is still reachable by a patient who cannot touch the tablet, so it prescribes
+       * that path explicitly rather than inheriting whichever one happens to be the default.
+       */
+      s.setCalibrationMode('measured');
       s.updateSettings({ mirrored: false });
     }, LANES);
 
@@ -449,9 +457,35 @@ async function main() {
       } catch (e) { failures.push(`hands-free REDO of a stuck ROM lane: ${e.message}`); }
       await still();
     }
-    // Hold still until the screen asks for the repetitions, then do them.
-    const asked = await page.waitForFunction(() => /now move/i.test(document.body.innerText), null, { timeout: 40000 })
-      .then(() => true).catch(() => false);
+    /**
+     * Hold still until the screen asks for the repetitions, then do them.
+     *
+     * THIS READS THE SCREEN'S MARKUP, NOT ITS PROSE — the same correction critic/handsfree.mjs got in
+     * e2c1b7b, for the same reason and against the same screen. The phrase "Now move" is the eyebrow
+     * inside the collapsed "Adjustments & details" block, where `innerText` cannot see it; the
+     * patient-facing heading has read "Move, then return" since that redesign. Grepping for the old
+     * phrase therefore reported "the rest hold never completed" on a build whose rest hold had
+     * completed — and it cost this harness the whole lane, because the forty seconds it then spent
+     * waiting is longer than the calibrator's own thirty-second move timeout (`moveTimeoutSec`), so
+     * the attempt it was waiting for died before the first repetition was made. Driven against a clean
+     * worktree of main, that sequence ends in "Let's try again" and no range there too.
+     *
+     * `aria-current="step"` on step 2 is the screen saying which step it is on, in markup, and it does
+     * not move when the wording does. Either wording is still accepted, so this also runs against an
+     * older build.
+     */
+    const asked = await page
+      .waitForFunction(
+        () => {
+          const steps = [...document.querySelectorAll('.rom-steps li')];
+          if (steps.length >= 2 && steps[1].getAttribute('aria-current') === 'step') return true;
+          return /now move|move, then return/i.test(document.body.innerText);
+        },
+        null,
+        { timeout: 40000 },
+      )
+      .then(() => true)
+      .catch(() => false);
     if (!asked) failures.push('the rest hold never completed on lane 1');
     const dl = Date.now() + 90000;
     while (Date.now() < dl) {

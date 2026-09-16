@@ -37,9 +37,10 @@
  *    and a change of span is flagged (`recalibrated`) rather than silently averaged away.
  */
 import type { Fingertip, Movement, Side } from '../engine/types.ts';
+import type { CalibrationMeasurement, CalibrationMethod } from '../vision/calibration.ts';
 import { MOVEMENT_INFO } from '../vision/features.ts';
 import { clinicalLaneName } from './results.ts';
-import { sessionTrackingGrade } from './tracking.ts';
+import { calibrationGrade, sessionTrackingGrade } from './tracking.ts';
 import type { TrackingGrade } from './tracking.ts';
 import type { InputMode, LaneResultSummary, SessionEndReason, SessionResult, TrackingQuality } from './types.ts';
 
@@ -97,6 +98,21 @@ export interface TrendPoint {
    */
   tracking: TrackingQuality | null;
   trackingGrade: TrackingGrade | null;
+  /**
+   * HOW THE RANGE THIS POINT IS A PERCENTAGE OF WAS ARRIVED AT — on the point, for exactly the
+   * reason `tracking` is.
+   *
+   * `rom` is a fraction of a denominator, and a denominator learned inside the song is not the same
+   * measurement as one taken from a rest hold and three maximum-effort repetitions. A trend that
+   * plotted the two as the same kind of mark would show a change in METHOD as a change in the
+   * patient — the same failure the tracking qualifier exists to prevent, one level down. Null means
+   * NOT RECORDED (a hand-set range, or a record written before this existed) and must never render
+   * as a deliberate measurement.
+   */
+  calibrationMeasurement: CalibrationMeasurement | null;
+  calibrationMethod: CalibrationMethod | null;
+  /** The grade of that range's own measurement (session/tracking.ts `calibrationGrade`). */
+  calibrationGrade: TrackingGrade | null;
 }
 
 export interface MovementTrend {
@@ -314,6 +330,9 @@ export function movementTrends(
         endReason: session.endReason ?? null,
         tracking: session.tracking ?? null,
         trackingGrade: sessionTrackingGrade(session),
+        calibrationMeasurement: lane.calibrationMeasurement ?? null,
+        calibrationMethod: lane.calibrationMeasurement?.method ?? null,
+        calibrationGrade: lane.calibrationMeasurement ? calibrationGrade(lane.calibrationMeasurement) : null,
       });
       if (s !== null) previousSpan = s;
     }

@@ -34,12 +34,29 @@ runs a bot, `?demo=highway` mounts the renderer on its own.
    tracked at all, and frames further apart than the widest hit window the prescription grants.
    Both clear by themselves, and both offer the keyboard session (which measures no range of
    motion, and says so) as the way on.
-4. **Range-of-motion calibration** — per lane: rest for two seconds, then three comfortable
-   reps. The hit threshold is a fraction of *that patient's* range, and the fraction is the
-   difficulty knob (easy 0.5, medium 0.65, hard 0.8). The range carries **how well it was
-   measured** — see "How well was it measured?" below.
+4. **Where the range of motion comes from** — a choice on the setup screen, which says what each
+   one costs. The hit threshold is a fraction of *that patient's* range either way, and the
+   fraction is the difficulty knob (easy 0.5, medium 0.65, hard 0.8).
+   - **Learn it in the song (the default).** The song starts straight after the camera check. It
+     begins on the patient's own saved range for the lane where there is one, and otherwise on
+     the most forgiving range the movement allows, anchored on their observed resting position —
+     so the first notes are reachable rather than impossible. The real range is learned from the
+     movements they make in the opening seconds, adopted **once**, and then frozen for the rest of
+     the song: the target a patient is working against never rises under them. The opening is
+     deliberately sparse, its hit windows are wider, and a miss there does not dim the instrument
+     the limb is earning — the app does not charge the patient for its own uncertainty.
+   - **Measure it first.** The range-of-motion screens: per lane, rest for two seconds, then three
+     comfortable maximum reps, then the latency metronome. For a four-lane hand prescription that
+     is twelve maximum-effort repetitions and four rest holds from an impaired hand before a note
+     of music — which buys a range a therapist can defend, and is why the path is still here.
+
+   Either way the range carries **how it was arrived at and how well it was measured** — see "How
+   well was it measured?" below. A range learned in the song is never graded better than *fair*,
+   says so wherever it is shown, and is never silently subtracted from one that was measured.
 5. **Latency calibration** — a metronome, eight beats, move on each click. Camera pipelines
-   run 80–200 ms behind reality; this measures it rather than guessing.
+   run 80–200 ms behind reality. It is part of the "measure it first" path; on the default path it
+   is folded into the run, which measures the same bias from every crossing of a whole song
+   (hundreds of samples rather than eight) and offers it on the Results screen for next time.
 6. **Play.**
 7. **Results** — score and stars, but also reps performed, accuracy and timing bias per
    movement, range achieved against the calibrated range, and compensation flags.
@@ -120,6 +137,7 @@ npm run critic:uneven  # a seeded shared tablet whose latest session was tracked
                        # comparison across it may render as a plain gain, at 1024/1280/1920
 npm run critic:firstnote  # throttled 8 Mbit/s: bytes after Start and Start → first note
 npm run critic:handsfree  # one tap on Home, then a body: camera check → calibration → song
+npm run critic:firstscore # both calibration paths, timed from Start to the first scored note
 ```
 
 Each of these starts and stops its own dev server. `critic:smoke` drives the whole flow and
@@ -205,6 +223,31 @@ roughly two times.
 **4.0 s is the floor, and it is not loading.** It is the game's own lead-in: a 3 s count-in, two
 beats of musical lead before the first note, and that note's travel down the highway. Nothing that
 follows can go below it.
+
+### Time to the first note the PATIENT scores
+
+Loading was never the whole wait. Before in-song calibration, a four-lane hand prescription demanded
+**twelve maximum-effort repetitions from an impaired hand, four separate rest holds and an
+eight-beat metronome** before a single note of music — the therapy was fatiguing before the game
+started, and the most motivating thing in the product was on the far side of it.
+
+`npm run critic:firstscore` walks both calibration paths end to end in headless Chromium — the same
+app, the same store, the same screens — with a patient made of injected fixture landmarks moving at
+one fixed cadence, and times the therapist's press of Start to the patient's first **scored** note.
+
+| prescription | path | Start → first scored note | max-effort reps | rest holds | metronome beats |
+| --- | --- | --- | --- | --- | --- |
+| hand, 4 lanes | measure it first | 56.7 s | 12 | 4 | 8 |
+| hand, 4 lanes | **learn it in the song** | **10.9 s** | **0** | **0** | **0** |
+| leg, 2 lanes | measure it first | 43.0 s | 6 | 2 | 8 |
+| leg, 2 lanes | **learn it in the song** | **13.4 s** | **0** | **0** | **0** |
+
+The repetition and hold counts are exact and machine-independent — they are what the app demands of
+the patient. The seconds are real for the app and simulated for the patient: this container needs
+several seconds per MediaPipe inference, so the real detect loop is stopped after one measured frame
+(exactly as `critic:handsfree` does) and the injected body is the only frame source, on both paths
+alike. Read them as a comparison of the two paths at one movement cadence, not as a claim about any
+particular patient.
 
 Three changes, all measured the same way:
 

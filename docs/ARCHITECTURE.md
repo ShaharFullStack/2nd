@@ -132,7 +132,50 @@ result the way the README's table is measured: production build, `vite preview`,
 latency and the HTTP cache disabled, timed from the Start click to the bot answering note one.
 
 ## Session flow
-Home → Patient → Mode (leg/hand) → Therapist Setup (pick 2–4 movements+sides, difficulty, song, **pacing**) → Camera check → ROM calibration per lane → Latency calibration → Play → Results → persisted to localStorage (history, patient-scoped).
+Home → Patient → Mode (leg/hand) → Therapist Setup (pick 2–4 movements+sides, difficulty, song,
+**pacing**, **where the range of motion comes from**) → Camera check → **either** Play (the default)
+**or** ROM calibration per lane → Latency calibration → Play → Results → persisted to localStorage
+(history, patient-scoped).
+
+### Where the range of motion comes from (`SessionConfig.calibrationMode`)
+`in_song` is the default and `measured` is the controlled path; the choice is on the Setup screen,
+is stored with the prescription, and is recorded on the session (`SessionResult.calibrationMode`).
+Absent on any record written before the choice existed, which means `measured` — that is what those
+sessions ran. A keyboard / autoplay run carries no mode at all: it measures no range.
+
+**The in-song path** (`src/session/inSongCalibration.ts`, `InSongRangeLearner` in
+`src/vision/calibration.ts`) is bound by four rules, and they are safety properties:
+- **SEEDING, in order.** This patient's saved range for the lane — vetted with the SAME
+  `isCalibrationValid` / `calibrationMismatch` the rest of the app uses, so a range measured on
+  another patient, fingertip, limb or movement is still refused and is replaced rather than played;
+  else the most forgiving range the movement allows (`requiredRom`) anchored on the patient's own
+  observed resting position; else the first observed motion. A refused stored range never reaches
+  `VisionInput` at all, and the reason is shown.
+- **THE THRESHOLD MAY NEVER RISE MID-SONG.** What a patient feels is
+  `min + thresholdFraction × (max − min)` in feature units (`operativeThreshold`), which moves with
+  the RANGE. A lane's range is adopted **once**, at `WARMUP_SEC`, and is frozen from then on; a
+  range that came from a deliberate prior measurement is replaced only when doing so LOWERS the
+  threshold. The single exception is a lane that has no range at all, which may receive its first
+  one later — it had no threshold to raise.
+- **NEVER PAST THE PATIENT'S OWN RANGE.** The learned top is a percentile of the peaks this patient
+  produced, so it can never exceed a value they reached.
+- **THE OPENING IS FORGIVING.** Inside `WARMUP_SEC` the chart is thinned to one rep per lane per
+  `laneRestSec × WARMUP_LANE_REST_MULTIPLIER` (`GenerateOptions.warmupSec`, measured by `chartDose`
+  so the Setup screen's dose is the dose), the hit windows are `WARMUP_WINDOW_SCALE` wider (restored
+  once, only after the last note offered under them can no longer be pending), and a miss does NOT
+  duck the lane's stem — the app may not charge the patient for its own uncertainty.
+
+**And the record says which it was.** `CalibrationMeasurement.method` (`'rom_screen' | 'in_song'`,
+absent = not recorded) rides on every range into `SessionResult.lanes[].calibrationMeasurement`, the
+export and `TrendPoint`. `calibrationGrade` caps an in-song range at `fair` however clean the stream
+was — the cap is about what the patient was asked to do, not about the camera. `compareCalibration`
+is the gate, with the same shape and vocabulary as `compareTracking`, and every surface that spans
+two sessions passes its two endpoints through BOTH and prints the worse (`worstComparison`).
+
+**The latency step** is part of the `measured` path only (`foldsInLatencyStep`). On the in-song path
+the offset in force is used (the device default when nothing has ever been set, written with its
+provenance) and the run's own crossings measure the bias — hundreds of samples against the eight the
+metronome takes — which the Results screen already offers to apply for the next session.
 
 ### The prescription, and what is shown when
 - **Dose before Start.** Setup measures the chart it will actually play (`generateChartDetailed` with the prescribed seed and pacing) and states reps per lane, reps/min per limb and reps/min for the whole body (`chartDose`). Nothing on that screen may claim a dose it has not measured.

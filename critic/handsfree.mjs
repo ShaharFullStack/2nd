@@ -659,6 +659,14 @@ async function main() {
       // the windows is what a therapist does with a slow tablet, and it keeps the gate from standing in
       // for the gesture this harness is actually about.
       s.setWindowScale(4);
+      /**
+       * THE CONTROLLED PATH, DELIBERATELY. In-song calibration is the default now
+       * (session/inSongCalibration.ts) and it goes camera -> play with no ROM or latency screen at
+       * all — which is a different, shorter claim. What this harness is about is that the THERAPIST'S
+       * measured path is still reachable by a patient who cannot touch the tablet, so it prescribes
+       * that path explicitly rather than inheriting whichever one happens to be the default.
+       */
+      s.setCalibrationMode('measured');
       s.updateSettings({ mirrored: false });
     }, LANES);
 

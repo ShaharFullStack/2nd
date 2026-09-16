@@ -71,7 +71,28 @@ export interface RestQuality {
  * that grades a session's tracking grades this (`calibrationGrade` in session/tracking.ts), so one
  * rule decides what "good" means about a camera measurement anywhere in the app.
  */
+/**
+ * HOW A RANGE WAS ARRIVED AT — not how well it was measured (that is the rest of this block), but
+ * WHAT THE PATIENT WAS DOING while it was.
+ *
+ *  - 'rom_screen' — the deliberate measurement: a still rest hold for the zero, then three
+ *                   maximum-effort repetitions with nothing else to attend to. The controlled path.
+ *  - 'in_song'    — learned from the patient's own first movements while the song was already
+ *                   playing (session/inSongCalibration.ts). The zero is a percentile of the frames
+ *                   that arrived rather than a hold the patient was asked for, and the top is the
+ *                   peaks of reps performed while chasing notes, at whatever effort the music drew
+ *                   out. A real measurement of a real movement, and a LESS CONTROLLED one.
+ *
+ * Absent means NOT RECORDED (a hand-built range, or one captured before this existed) and must never
+ * read as 'rom_screen'. The grading, the sentence beside the range and the cross-session comparison
+ * gate all key off it (session/tracking.ts) — this field is the only place the distinction is
+ * stored, so every screen that shows a range reads it from here.
+ */
+export type CalibrationMethod = 'rom_screen' | 'in_song';
+
 export interface CalibrationMeasurement {
+  /** How the range was arrived at (see CalibrationMethod). Absent = not recorded. */
+  method?: CalibrationMethod;
   /** Frames offered to the calibrator, INCLUDING the ones whose landmarks were unusable. */
   frames: number;
   /** Frames whose feature was usable — the samples `min` and `max` were actually computed from. */
@@ -1149,6 +1170,9 @@ export class RomCalibrator {
     const span = lo !== null && lo !== undefined && hi !== null && hi !== undefined ? hi - lo : NaN;
     const spread = this.peaks.length >= 2 ? Math.max(...this.peaks) - Math.min(...this.peaks) : 0;
     return {
+      // The deliberate path, stamped at the source: a range that does not say how it was arrived at
+      // cannot be told from one learned mid-song, and the two are not the same measurement.
+      method: 'rom_screen',
       frames: this.frames,
       tracked: this.trackedFrames,
       trackedFraction: this.trackedFrames / this.frames,
@@ -1621,4 +1645,334 @@ export class RomCalibrator {
       ? `${rom.toFixed(0)}° of ${needed.toFixed(0)}° needed`
       : `${(rom * 100).toFixed(0)}% of ${(needed * 100).toFixed(0)}% needed`;
   }
+}
+
+/* ------------------------------------------------------------------------------------------------
+ * LEARNING THE RANGE INSIDE THE MUSIC.
+ *
+ * Everything above is the deliberate measurement: a still rest hold, then three maximum-effort
+ * repetitions with nothing else going on. For a four-lane hand prescription that is twelve
+ * maximum-effort reps and four rest holds from an impaired hand BEFORE a note of music, and the
+ * measured complaint is that patients quit in it. This class is the other path: the song starts on a
+ * provisional range and the real one is learned from the movements the patient makes while playing.
+ *
+ * IT IS A LESS CONTROLLED MEASUREMENT AND IT SAYS SO. The zero is a low percentile of the frames
+ * that arrived rather than a hold anybody asked for; the top is the peaks of reps performed while
+ * chasing notes, at whatever effort the music drew out, not at a therapist's "as far as is
+ * comfortable". Every range this produces carries `measurement.method = 'in_song'`, which is what
+ * the grading, the sentence beside the range and the cross-session comparison gate key off
+ * (session/tracking.ts). Nothing here is allowed to pass itself off as a calibration-screen range.
+ *
+ * WHAT IT WILL NOT DO. It never proposes a top above a peak the patient actually produced (the top
+ * is a percentile OF the observed peaks), and it never proposes a range narrower than the movement's
+ * own usable minimum — a narrower one is a hit generator, not a calibration, and `isCalibrationValid`
+ * refuses it anyway. WHEN a proposal is allowed to take effect, and in which direction, is not this
+ * class's business: it only measures. See session/inSongCalibration.ts, which owns the rule that the
+ * operative threshold may never rise once the opening window has closed.
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * Feature samples needed before a zero — and therefore a playable provisional range — may be
+ * published. At 30 fps this is half a second, which fits inside the 3-2-1 count-in with room to
+ * spare, so the first note of the song already has a range behind it.
+ */
+export const IN_SONG_BASELINE_SAMPLES = 15;
+
+/**
+ * THE ZERO IS THE STILLEST MOMENT THIS PATIENT HAS HAD, and this is how long a moment that is.
+ *
+ * The deliberate path asks the patient to hold still for `restDurationSec` and takes the median of
+ * that window. Nobody asks here — but a patient waiting through the 3-2-1 count-in, and a patient
+ * between two reps, IS holding still, and a trailing window of the same length over the same signal
+ * measures exactly the same thing. So the learner keeps the QUIETEST such window it has seen (the
+ * one with the smallest 10th-to-90th spread), takes its median as the zero, and records that
+ * window's own `RestQuality` — spread, drift, duration, sample count, and whether it passed the
+ * app's OWN stillness test, which is the same test `RomCalibrator` applies and not a looser one.
+ *
+ * Nothing is claimed that was not observed: `still` is true only when the window really was still by
+ * that test, and a session in which the patient never settles produces `still: false` and gets no
+ * relaxation of the range floor (`requiredRom`) — which is one of the things the deliberate path is
+ * still for.
+ */
+export const IN_SONG_REST_WINDOW_SEC = 2;
+
+/** The 10th..90th band the rest spread is measured across — the same one the deliberate path uses. */
+export const IN_SONG_REST_PERCENTILE = 0.1;
+
+export interface InSongLearnerOptions {
+  /** Samples needed before `provisional()` returns a range (default IN_SONG_BASELINE_SAMPLES). */
+  baselineSamples?: number;
+  /** Length of the trailing window the zero is taken from (default IN_SONG_REST_WINDOW_SEC). */
+  restWindowSec?: number;
+  /** Peak prominence in feature units (default 0.5 x the movement's minimum ROM), as on the ROM screen. */
+  prominence?: number;
+  /** Percentile (0..1) of the detected peaks used as the top (default 0.9), as on the ROM screen. */
+  peakPercentile?: number;
+  /** finger_opposition: the fingertip being opposed, stamped on every range produced. */
+  fingertip?: Fingertip;
+  /** The mirror convention the frames are in, stamped on every range produced (selects the LIMB). */
+  mirrored?: boolean;
+  /** The patient whose body this is (Patient.id), stamped on every range produced. */
+  patient?: string;
+  /** Session id stamped on the produced ranges (provenance). */
+  sessionId?: string;
+  /** Wall clock for `capturedAt` (default Date.now). Injectable for tests. */
+  now?: () => number;
+}
+
+/**
+ * One lane's in-song range learner. Fed the SAME smoothed feature the play pipeline uses (LaneSample
+ * .smoothed), exactly as `RomCalibrator.pushSample` is — a range measured on a different signal path
+ * is a range of a different quantity.
+ */
+export class InSongRangeLearner {
+  readonly movement: Movement;
+  readonly prominence: number;
+  readonly peakPercentile: number;
+  private readonly baselineSamples: number;
+  private readonly restWindowSec: number;
+  private readonly fingertip: Fingertip | undefined;
+  private readonly mirrored: boolean | undefined;
+  private readonly patient: string | undefined;
+  private readonly sessionId: string | undefined;
+  private readonly nowMs: () => number;
+
+  /** Trailing window of smoothed features and their times, for the zero. */
+  private rest: number[] = [];
+  private restTimes: number[] = [];
+  /** The stillest trailing window seen so far: the zero, and the quality of the window it came from. */
+  private zero: { value: number; rest: RestQuality } | null = null;
+  private frames = 0;
+  private tracked = 0;
+  private frameFirst = NaN;
+  private frameLast = NaN;
+  private gaps: number[] = [];
+  private peaks: number[] = [];
+  private observedMax = -Infinity;
+  private trough = Infinity;
+  private candidate = -Infinity;
+  private rising = false;
+
+  constructor(movement: Movement, opts: InSongLearnerOptions = {}) {
+    this.movement = movement;
+    const minRom = MOVEMENT_INFO[movement].minRom;
+    this.prominence = opts.prominence ?? minRom * 0.5;
+    this.peakPercentile = opts.peakPercentile ?? 0.9;
+    this.baselineSamples = Math.max(2, Math.floor(opts.baselineSamples ?? IN_SONG_BASELINE_SAMPLES));
+    this.restWindowSec = opts.restWindowSec ?? IN_SONG_REST_WINDOW_SEC;
+    this.fingertip = opts.fingertip;
+    this.mirrored = opts.mirrored;
+    this.patient = opts.patient;
+    this.sessionId = opts.sessionId;
+    this.nowMs = opts.now ?? Date.now;
+  }
+
+  /**
+   * One frame. `smoothed` null means the landmarks were unusable — counted (so the record can say
+   * what share of the window was measured at all) and otherwise ignored, exactly as the deliberate
+   * path ignores it.
+   */
+  push(sample: CalibrationSample): void {
+    this.frames++;
+    if (Number.isFinite(sample.t)) {
+      if (Number.isNaN(this.frameFirst)) this.frameFirst = sample.t;
+      else {
+        const gap = sample.t - this.frameLast;
+        if (gap > 0) this.gaps.push(gap);
+      }
+      this.frameLast = sample.t;
+    }
+    const v = sample.smoothed;
+    if (v === null || !Number.isFinite(v)) return;
+    this.tracked++;
+    this.rest.push(v);
+    this.restTimes.push(sample.t);
+    // Trim to the trailing window BY TIME, not by sample count: a 4 fps stream and a 30 fps one must
+    // mean the same two seconds by "the rest window", or the spread guard means different things on
+    // different machines.
+    while (this.restTimes.length > 1 && Number.isFinite(sample.t) && sample.t - this.restTimes[0] > this.restWindowSec) {
+      this.rest.shift();
+      this.restTimes.shift();
+    }
+    this.considerZero();
+    if (v > this.observedMax) this.observedMax = v;
+    this.detectPeak(v);
+  }
+
+  /**
+   * Is the trailing window the stillest one yet? If so it becomes the zero.
+   *
+   * Only ever replaced by a QUIETER window, so the zero improves monotonically and cannot be dragged
+   * by the patient's own repetitions — which are, by construction, the least still thing in the
+   * stream.
+   */
+  private considerZero(): void {
+    if (this.rest.length < this.baselineSamples) return;
+    const spread = percentile(this.rest, 1 - IN_SONG_REST_PERCENTILE) - percentile(this.rest, IN_SONG_REST_PERCENTILE);
+    if (this.zero !== null && spread >= this.zero.rest.spread) return;
+    const half = this.rest.length >> 1;
+    const drift =
+      half >= 2 ? median(this.rest.slice(this.rest.length - half)) - median(this.rest.slice(0, half)) : 0;
+    const minRom = MOVEMENT_INFO[this.movement].minRom;
+    const t0 = this.restTimes[0];
+    const t1 = this.restTimes[this.restTimes.length - 1];
+    this.zero = {
+      value: median(this.rest),
+      rest: {
+        // THE APP'S OWN TEST, not a looser one invented for this path (RomCalibrator's defaults).
+        still: spread <= minRom * 0.35 && Math.abs(drift) <= minRom * 0.2,
+        spread,
+        drift,
+        durationSec: Number.isFinite(t1 - t0) ? t1 - t0 : 0,
+        samples: this.rest.length,
+      },
+    };
+  }
+
+  /** The same prominence rule the deliberate path uses — one detector, one definition of a rep. */
+  private detectPeak(v: number): void {
+    if (!this.rising) {
+      if (v < this.trough) this.trough = v;
+      if (v - this.trough >= this.prominence) {
+        this.rising = true;
+        this.candidate = v;
+      }
+    } else {
+      if (v > this.candidate) this.candidate = v;
+      if (this.candidate - v >= this.prominence) {
+        this.peaks.push(this.candidate);
+        this.rising = false;
+        this.trough = v;
+        this.candidate = -Infinity;
+      }
+    }
+  }
+
+  /** Frames offered so far, and how many of them carried a usable feature. */
+  counts(): { frames: number; tracked: number } {
+    return { frames: this.frames, tracked: this.tracked };
+  }
+
+  /** Completed repetitions detected so far. */
+  repsDetected(): number {
+    return this.peaks.length;
+  }
+
+  /** The largest feature this patient has actually produced, or null when nothing was measured. */
+  patientBest(): number | null {
+    return Number.isFinite(this.observedMax) ? this.observedMax : null;
+  }
+
+  /** The zero as it currently stands, or null before `baselineSamples` usable frames have arrived. */
+  restLevel(): number | null {
+    return this.zero?.value ?? null;
+  }
+
+  /** The quality of the window the zero came from, or null before there is one. */
+  restQuality(): RestQuality | null {
+    return this.zero?.rest ?? null;
+  }
+
+  /**
+   * THE RANGE THE SONG CAN START ON, and the most forgiving one that is still a calibration.
+   *
+   * `min` is this patient's own observed rest; the span is the movement's own minimum usable ROM
+   * (`requiredRom`) and nothing more. That combination is deliberate and it is the whole point of
+   * seeding: the hit threshold is a fraction of the span, so the SMALLEST valid span is the LOWEST
+   * defensible target, i.e. the one a patient with a tiny range can still reach in the opening bars.
+   * Anything narrower is refused downstream as a hit generator (isCalibrationValid), so this is the
+   * floor, not a guess about how far this person can move.
+   *
+   * Null until the zero exists — there is nothing to anchor a span on, and inventing one would be a
+   * population figure standing in for a patient.
+   */
+  provisional(): RomCalibration | null {
+    const min = this.restLevel();
+    if (min === null) return null;
+    return this.build(min, min + requiredRom(this.movement, this.restQuality()));
+  }
+
+  /**
+   * THE RANGE THE PATIENT HAS DEMONSTRATED, or null when they have not demonstrated one yet.
+   *
+   * The top is the `peakPercentile` of the detected peaks — the same statistic the ROM screen takes,
+   * so the two paths mean the same thing by "the top of the range" — which by construction is never
+   * above a value this patient actually produced. Null when there are no peaks at all, or when the
+   * range they imply is narrower than the movement's usable minimum: in both cases there is no
+   * evidence to replace the provisional range with.
+   */
+  learned(): RomCalibration | null {
+    const min = this.restLevel();
+    if (min === null || this.peaks.length === 0) return null;
+    const max = percentile(this.peaks, this.peakPercentile);
+    if (!(max - min >= requiredRom(this.movement, this.restQuality()))) return null;
+    return this.build(min, max);
+  }
+
+  private build(min: number, max: number): RomCalibration {
+    const cal: RomCalibration = {
+      min,
+      max,
+      samples: this.tracked,
+      peaks: this.peaks.slice(),
+      movement: this.movement,
+      manual: false,
+      // The window the zero really came from — including, honestly, whether it was still. Nobody was
+      // asked to hold, so this is an observation about what the patient happened to be doing, and
+      // `requiredRom` reads it exactly as it reads the deliberate path's.
+      rest: this.zero?.rest ?? null,
+      measurement: this.measurement(min, max),
+      capturedAt: this.nowMs(),
+      posture: MOVEMENT_INFO[this.movement].posture,
+    };
+    if (this.sessionId !== undefined) cal.sessionId = this.sessionId;
+    if (this.fingertip !== undefined) cal.fingertip = this.fingertip;
+    if (this.mirrored !== undefined) cal.mirrored = this.mirrored;
+    if (this.patient !== undefined) cal.patient = this.patient;
+    return cal;
+  }
+
+  /**
+   * The same measurement block the deliberate path produces, from the same observations, stamped
+   * `in_song`. Built here rather than left absent because "not recorded" is a different claim from
+   * "recorded, and here are the conditions": a range learned at 4 fps off a limb that was visible for
+   * half the window has to be readable as exactly that.
+   */
+  private measurement(min: number, max: number): CalibrationMeasurement {
+    const medianGap = this.gaps.length > 0 ? median(this.gaps) : NaN;
+    const slowGap = this.gaps.length > 0 ? percentile(this.gaps, 0.9) : NaN;
+    const span = max - min;
+    const spread = this.peaks.length >= 2 ? Math.max(...this.peaks) - Math.min(...this.peaks) : 0;
+    return {
+      method: 'in_song',
+      frames: this.frames,
+      tracked: this.tracked,
+      trackedFraction: this.frames > 0 ? this.tracked / this.frames : 0,
+      fpsMedian: medianGap > 0 ? round1(1 / medianGap) : 0,
+      fpsLow: slowGap > 0 ? round1(1 / slowGap) : 0,
+      durationSec: Number.isFinite(this.frameLast - this.frameFirst) ? round1(this.frameLast - this.frameFirst) : 0,
+      reps: this.peaks.length,
+      repSpread: spread,
+      repSpreadFraction: span > 1e-9 ? spread / span : 0,
+    };
+  }
+}
+
+/** How a stored range was arrived at, or null when the record does not say. Never guesses. */
+export function calibrationMethodOf(cal: CalibrationRange | null | undefined): CalibrationMethod | null {
+  return cal?.measurement?.method ?? null;
+}
+
+/**
+ * The feature value a lane must reach to score, given a range and the difficulty's threshold
+ * fraction: `min + fraction x (max - min)`.
+ *
+ * THE ONE FUNCTION THE "IT MAY NEVER GET HARDER" RULE IS ARGUED IN. The threshold a patient feels is
+ * not `thresholdFraction` — that never moves — it is this value, in the movement's own units, and it
+ * moves whenever the RANGE moves. A wider range means a higher bar: learn a bigger range mid-song
+ * and the patient who was scoring starts missing, which is the opposite of rehab. Every place that
+ * decides whether a new range may take effect compares this quantity, not the ranges themselves.
+ */
+export function operativeThreshold(cal: Pick<RomCalibration, 'min' | 'max'>, thresholdFraction: number): number {
+  return cal.min + thresholdFraction * (cal.max - cal.min);
 }

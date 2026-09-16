@@ -6,6 +6,7 @@
  *   ?autoplay=1       alias of the above (docs/ARCHITECTURE.md)
  *   ?demo=highway     mounts the standalone renderer demo instead of the app
  *   ?song=<id> ?difficulty=easy|medium|hard ?mode=leg|hand ?seed=<n> ?scale=<n>
+ *   ?calibration=in_song|measured   which path this session takes to its range of motion
  *   ?lanes=seated_march:left,knee_extension:right
  *   ?lanes=finger_opposition:left:pinky   (third segment = fingertip, finger_opposition only)
  */
@@ -15,7 +16,7 @@ import { FINGERTIPS, HAND_MOVEMENTS, LEG_MOVEMENTS } from '../engine/types.ts';
 import { movementMode } from '../vision/features.ts';
 import { normalizeLanes, useStore } from '../state/store.ts';
 import type { Screen } from '../state/store.ts';
-import type { InputMode } from './types.ts';
+import type { CalibrationMode, InputMode } from './types.ts';
 import { runtime } from './runtime.ts';
 
 function parseLanes(value: string): LaneSpec[] {
@@ -72,6 +73,11 @@ export function applyUrlParams(search: string): InputMode {
   const scale = Number(params.get('scale'));
   if (Number.isFinite(scale) && scale > 0) store.setWindowScale(scale);
 
+  // Which path to the range of motion — 'in_song' (the default) or the controlled 'measured' one.
+  // A critic that wants the range-of-motion screens has to be able to ask for them by name.
+  const calibration = params.get('calibration');
+  if (calibration === 'in_song' || calibration === 'measured') store.setCalibrationMode(calibration);
+
   const screen = params.get('screen');
   if (screen) store.goto(screen as Screen);
 
@@ -86,6 +92,7 @@ export interface StartPlayOptions {
   seed?: number;
   windowScale?: number;
   inputMode?: InputMode;
+  calibrationMode?: CalibrationMode;
 }
 
 /** Jump straight into a session with the given prescription (critics / dev console). */
@@ -98,6 +105,7 @@ export function startPlayNow(opts: StartPlayOptions = {}): void {
   if (opts.songId) store.setSong(opts.songId);
   if (opts.seed !== undefined) store.setSeed(opts.seed);
   if (opts.windowScale !== undefined) store.setWindowScale(opts.windowScale);
+  if (opts.calibrationMode) store.setCalibrationMode(opts.calibrationMode);
   store.goto('play');
 }
 

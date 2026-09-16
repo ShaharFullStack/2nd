@@ -159,3 +159,100 @@
   .rom-coach-demonstration > span { display: none; }
   .rom-footer .btn { display: none; }
 }
+
+/* ------------------------------------------------------------------------------------------------
+   THE TWO BEATS THAT ARE NOT A MEASUREMENT.
+
+   Both reuse the coach shell (and therefore its position between the header and the footer at every
+   viewport the layout critic drives); only the columns change. The posture beat needs a WIDE
+   illustration — two setups and the arrow between them — so its first column grows and the drawing
+   takes its height from its own aspect ratio rather than from a fixed box that would letterbox it.
+   ------------------------------------------------------------------------------------------------ */
+.rom-demo-posture { height: auto; }
+.rom-posture-from { opacity: .38; }
+.rom-coach .rom-posture-why { font-size: 13px; line-height: 1.45; color: #c2d4e2; margin-top: 8px; }
+.rom-coach .rom-reuse-facts { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 15px; margin-top: 8px; color: #eaf3fa; }
+.rom-coach .rom-reuse-facts .mono { font-weight: 700; }
+.rom-reuse-actions { flex-direction: column; }
+.rom-reuse-actions .btn { width: 100%; white-space: nowrap; padding: 0 12px; }
+.rom-coach.is-reuse .rom-coach-demonstration > span { font-size: 10px; }
+/* Both confirms live in a narrow column, so they take its width instead of their text's. */
+.rom-coach.is-posture .rom-coach-progress .btn { width: 100%; padding: 0 10px; }
+
+@media (max-width: 700px) and (orientation: portrait) {
+  .rom-coach.is-posture { grid-template-columns: 1fr; }
+  .rom-coach.is-posture .rom-coach-demonstration { grid-column: 1; }
+  .rom-coach.is-posture .rom-demo-posture { max-width: 250px; margin: 0 auto; }
+  .rom-coach.is-reuse .rom-coach-progress { flex-wrap: wrap; gap: 8px; }
+  .rom-reuse-actions { flex-direction: row; }
+  .rom-reuse-actions .btn { width: auto; flex: 1 1 auto; min-width: 0; white-space: normal; }
+  .rom-coach.is-reuse .rom-coach-progress > span { flex-basis: 100%; font-size: 11px; }
+  .rom-coach .rom-reuse-quality { display: none; }
+}
+@media (min-width: 701px), (orientation: landscape) {
+  .rom-coach.is-posture { grid-template-columns: 300px minmax(0, 1fr) 200px; }
+  .rom-coach.is-reuse { grid-template-columns: 120px minmax(0, 1fr) 230px; }
+}
+@media (min-width: 701px) and (max-width: 1200px), (orientation: landscape) and (max-width: 1200px) {
+  .rom-coach.is-posture { grid-template-columns: 240px minmax(0, 1fr) 160px; }
+  .rom-coach.is-reuse { grid-template-columns: 95px minmax(0, 1fr) 200px; }
+}
+@media (orientation: landscape) and (max-height: 680px) {
+  .rom-coach.is-posture { grid-template-columns: 190px minmax(0, 1fr) 150px; }
+  .rom-coach.is-reuse { grid-template-columns: 70px minmax(0, 1fr) 180px; }
+  .rom-coach .rom-posture-why { font-size: 12px; margin-top: 5px; }
+  .rom-coach .rom-reuse-facts { font-size: 13px; margin-top: 5px; }
+  .rom-reuse-actions .btn { min-height: 34px; font-size: 12px; padding: 0 10px; }
+  .rom-coach .rom-reuse-quality { display: none; }
+  .rom-coach.is-posture { padding: 10px 14px; }
+  .rom-coach.is-posture .rom-side { font-size: 10px; margin-bottom: 2px; }
+  .rom-coach.is-posture h1 { font-size: 18px; margin-bottom: 4px; }
+  .rom-coach.is-posture .rom-coach-heading p { font-size: 13px; line-height: 1.3; }
+  /* 400 px of viewport height has to pay for the set-up drawing, the imperative, the confirm AND the
+     hands-free legend. The legend wins over the explanation: it is the one that says whether the
+     circles can be held at all. The imperative and the drawing both stay. */
+  .rom-coach.is-posture .rom-posture-why { display: none; }
+  .rom-coach.is-posture .rom-coach-progress > span { font-size: 10px; }
+}
+@media (orientation: landscape) and (max-width: 750px) {
+  .rom-coach.is-posture { grid-template-columns: 124px minmax(0, 1fr) 104px; gap: 10px; }
+  .rom-coach.is-posture .rom-coach-demonstration > span { display: none; }
+}
+
+/* ------------------------------------------------------------------------------------------------
+   THE HANDS-FREE LEGEND, IN THE PANEL THE PATIENT IS ALREADY READING.
+
+   It is the same component the camera check and the latency check carry, so it keeps its own voice
+   and its own states (offline / searching / occupied / coupled / tracking, each with its colour); what
+   changes here is only the scale, because this screen gives it a strip at the bottom of the coach
+   rather than a column of a page. Its badge used to be laid out ~2000 px below the fold inside the
+   collapsed disclosure — present in the markup, unreadable by anybody, and unopenable without a hand
+   on the glass.
+   ------------------------------------------------------------------------------------------------ */
+.rom-coach .dwell-legend {
+  grid-column: 1 / -1;
+  margin-top: 12px;
+  padding: 9px 12px;
+  gap: 6px;
+  border-radius: 12px;
+  font-size: 12px;
+}
+.rom-coach .dwell-legend strong { font-size: 13px; line-height: 1.35; font-weight: 650; }
+.rom-coach .dwell-legend .dim { font-size: 11px; line-height: 1.35; }
+.rom-coach .dwell-legend .badge { font-size: 11px; padding: 2px 8px; }
+
+@media (max-width: 700px) and (orientation: portrait) {
+  .rom-coach .dwell-legend { margin-top: 8px; padding: 7px 10px; gap: 4px; }
+  .rom-coach .dwell-legend strong { font-size: 12px; line-height: 1.3; }
+  /* Phone portrait keeps the state and the instruction, and gives up the secondary lines — the same
+     trade the short-landscape rule makes, for the same reason: nothing here may be scrolled to. */
+  .rom-coach .dwell-legend .dim { display: none; }
+}
+/* A short landscape viewport is the tightest the layout critic drives: the legend keeps its state —
+   which limb, and the sentence that says what to do about it — and gives up its secondary lines. */
+@media (orientation: landscape) and (max-height: 680px) {
+  .rom-coach .dwell-legend { margin-top: 7px; padding: 6px 9px; gap: 4px; }
+  .rom-coach .dwell-legend strong { font-size: 11px; line-height: 1.3; }
+  .rom-coach .dwell-legend .dim { display: none; }
+  .rom-coach .dwell-legend .badge { font-size: 10px; }
+}

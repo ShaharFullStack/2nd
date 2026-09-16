@@ -526,14 +526,38 @@ export const FINE_SMOOTHING: SmoothingSpec = Object.freeze({ kind: 'ema2', alpha
  */
 export type MovementPosture = 'seated_leg' | 'palm_to_camera' | 'hand_over_edge';
 
-export const POSTURE_INFO: Readonly<Record<MovementPosture, { label: string; setup: string }>> = Object.freeze({
+/**
+ * WHAT EACH SETUP IS, AND WHAT IT TAKES TO GET INTO IT.
+ *
+ * `setup` describes the posture to somebody who is not in one yet (the camera check states it before
+ * anything is measured). `change` is the other half, and it exists because a prescription can require
+ * TWO of these: three hand movements are measured palm-to-camera and wrist_extension is measured with
+ * the hand over the table edge, which is ninety degrees apart about the wrist — the wrist_extension
+ * axis itself. Walking from one lane to the next therefore asks the patient to physically rotate the
+ * forearm and move the support, and a changed sentence in a paragraph of instructions is not a way to
+ * say that. `change` is the imperative the ROM screen puts on its own beat — once, before any
+ * repetition is asked for against the new support (`CalibrationGuide`'s posture beat).
+ */
+export const POSTURE_INFO: Readonly<Record<MovementPosture, { label: string; setup: string; change: string }>> = Object.freeze({
   seated_leg: {
     label: 'Seated, facing the camera',
     setup:
       'Sit facing the camera so your hips, knees and feet are in view, and rest a hand where the camera can see it — on the arm of the chair, an armrest or a table, and NOT on your thigh. That hand is what holds the circles on screen, so you never have to touch the tablet: it has to be resting on something your leg does not move, because a hand carried by your thigh cannot be told apart from a repetition. Your knees cannot do it at all, for the same reason — they are doing the exercise.',
+    change:
+      'Sit back so you are facing the camera with your hips, knees and feet in view, and rest a hand on the arm of the chair or on a table — not on your thigh.',
   },
-  palm_to_camera: { label: 'Palm to the camera', setup: 'Rest your forearm on the table with your palm facing the camera.' },
-  hand_over_edge: { label: 'Hand over the table edge', setup: 'Rest your forearm on the table with your hand over the edge, fingers pointing at the camera.' },
+  palm_to_camera: {
+    label: 'Palm to the camera',
+    setup: 'Rest your forearm on the table with your palm facing the camera.',
+    change:
+      'Bring your forearm back onto the table and turn your hand so the palm faces the camera, fingers pointing up.',
+  },
+  hand_over_edge: {
+    label: 'Hand over the table edge',
+    setup: 'Rest your forearm on the table with your hand over the edge, fingers pointing at the camera.',
+    change:
+      'Slide your forearm forward until your hand is past the edge of the table, fingers pointing at the camera, and turn your palm down. Your forearm stays flat on the table.',
+  },
 });
 
 export interface MovementInfo {

@@ -6,9 +6,10 @@
  */
 import { findOffGridTimes } from '../audio/manifest.ts';
 import type { SongManifest } from '../audio/manifest.ts';
-import { clampLaneRestSec, generateChartDetailed } from '../charts/generate.ts';
+import { DEFAULT_LANE_REST_SEC, clampLaneRestSec, generateChartDetailed } from '../charts/generate.ts';
 import type { SongGrid } from '../charts/generate.ts';
 import type { Chart } from '../engine/types.ts';
+import { WARMUP_LANE_REST_MULTIPLIER, WARMUP_SEC, calibrationModeOf } from './inSongCalibration.ts';
 import type { SessionConfig } from './types.ts';
 
 export interface BuiltChart {
@@ -32,8 +33,24 @@ export function buildSessionChart(grid: SongGrid, config: SessionConfig, manifes
   // The therapist's pacing floor overrides the difficulty's own spacing: a difficulty is a statement
   // about timing windows and ROM threshold, not about how long an impaired limb needs to return to
   // rest (see charts/generate.ts DEFAULT_LANE_REST_SEC).
+  const laneRestSec = config.laneRestSec === undefined ? undefined : clampLaneRestSec(config.laneRestSec);
+  /**
+   * THE OPENING IS THINNED ONLY WHEN THE APP DOES NOT YET KNOW THE PATIENT'S RANGE.
+   *
+   * On the in-song path the first seconds of the song are where the range is learned, so the chart
+   * asks for far less there (charts/generate.ts `warmupSec`). On the measured path the ranges were
+   * established before a note was scheduled and there is nothing to be forgiving ABOUT — thinning
+   * that opening would just be reps the patient was prescribed and did not get.
+   */
+  const warmup = calibrationModeOf(config) === 'in_song';
   const result = generateChartDetailed(grid, config.lanes.length, config.difficulty, config.seed, {
-    minLaneSpacingSec: config.laneRestSec === undefined ? undefined : clampLaneRestSec(config.laneRestSec),
+    minLaneSpacingSec: laneRestSec,
+    ...(warmup
+      ? {
+          warmupSec: WARMUP_SEC,
+          warmupLaneRestSec: (laneRestSec ?? DEFAULT_LANE_REST_SEC) * WARMUP_LANE_REST_MULTIPLIER,
+        }
+      : {}),
   });
   const warnings = [...result.warnings];
   if (manifest && manifest.swing) {

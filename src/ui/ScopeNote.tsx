@@ -18,8 +18,17 @@
  *    with no tracking block says so rather than reading as a clean stream.
  */
 import { SCOPE_SHORT, SCOPE_STATEMENT } from '../session/results.ts';
-import { TRACKING_NOT_RECORDED, trackingGrade, trackingSentence } from '../session/tracking.ts';
-import type { TrackingQuality } from '../session/types.ts';
+import {
+  CALIBRATION_IN_SONG_NOTE,
+  CALIBRATION_NOT_RECORDED,
+  TRACKING_NOT_RECORDED,
+  calibrationGrade,
+  calibrationSentence,
+  sessionCalibrationMeasurement,
+  trackingGrade,
+  trackingSentence,
+} from '../session/tracking.ts';
+import type { SessionResult, TrackingQuality } from '../session/types.ts';
 
 /**
  * The scope line. `full` prints the whole statement (screens whose entire subject is measurement —
@@ -51,16 +60,30 @@ export function ScopeNote({
  */
 export function MeasurementNote({
   tracking,
+  session,
   inputMode = 'camera',
   full = false,
   testId = 'measurement-note',
 }: {
   tracking?: TrackingQuality | null;
+  /**
+   * The session whose RANGES these figures are percentages of, when the caller has it.
+   *
+   * The line beside `tracking` answers "how well was the camera working"; this one answers "how was
+   * the scale itself arrived at", which is the other half of the same caveat and the one the in-song
+   * path introduced. Optional because a caller may legitimately have only the tracking block (the
+   * trend's per-point chips carry their own), and an absent session prints nothing rather than
+   * guessing.
+   */
+  session?: Pick<SessionResult, 'lanes' | 'calibrationMode'> | null;
   inputMode?: 'camera' | 'keyboard' | 'autoplay';
   full?: boolean;
   testId?: string;
 }) {
   const grade = tracking ? trackingGrade(tracking) : null;
+  const calibration = session ? sessionCalibrationMeasurement(session) : null;
+  const calGrade = calibration ? calibrationGrade(calibration) : null;
+  const method = calibration?.method ?? null;
   return (
     <div className="stack scope-note" style={{ gap: 4 }} data-testid={testId}>
       <p className="dim" style={{ margin: 0 }}>
@@ -83,6 +106,24 @@ export function MeasurementNote({
           ) : (
             TRACKING_NOT_RECORDED
           )}
+        </p>
+      )}
+      {/* AND WHERE THE 0–100 % ITSELF CAME FROM. Every range figure above is a percentage OF a range,
+          and a range learned while the patient was chasing notes is not the same measurement as one
+          taken from a rest hold and three maximum-effort repetitions. Absent reads as absent. */}
+      {inputMode === 'camera' && session && (
+        <p className="dim" style={{ margin: 0 }} data-testid={`${testId}-calibration`}>
+          <span
+            className={calGrade === 'good' ? 'badge badge-ok' : calGrade === 'fair' ? 'badge badge-warn' : 'badge badge-bad'}
+            data-testid={`${testId}-calibration-grade`}
+          >
+            range {method === 'in_song' ? 'learned in song' : method === 'rom_screen' ? 'measured' : 'not recorded'}
+          </span>{' '}
+          {calibration
+            ? method === 'in_song'
+              ? CALIBRATION_IN_SONG_NOTE
+              : calibrationSentence(calibration)
+            : CALIBRATION_NOT_RECORDED}
         </p>
       )}
     </div>

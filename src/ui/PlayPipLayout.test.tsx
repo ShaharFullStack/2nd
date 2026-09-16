@@ -37,6 +37,12 @@ const WARNINGS = [
 ];
 
 const vision = {
+  // The in-song calibration path (the default) drives these three: it asks each lane what it
+  // measures, watches the pipeline samples, and hands ranges back. A fake that lacks them is a fake
+  // of an older VisionInput, not a simpler one.
+  getCalibrationContext: () => ({ mirrored: false }),
+  onFrame: () => () => {},
+  setCalibration: () => true,
   getInvalidCalibrations: () => [],
   getLaneStates: () => LANES.map((l) => ({ lane: l.index, value: 0.2, armed: true })),
   getVideoElement: () => null,

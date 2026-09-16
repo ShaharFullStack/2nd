@@ -9,10 +9,19 @@ import type { InvalidCalibration } from '../input/VisionInput.ts';
 import { GameRunner } from '../session/GameRunner.ts';
 import type { HudSnapshot } from '../session/GameRunner.ts';
 import { SILENT_GRID, buildSessionChart, songGridOf } from '../session/chart.ts';
-import { buildSessionResult } from '../session/results.ts';
+import {
+  InSongCalibration,
+  WARMUP_SEC,
+  WARMUP_WINDOW_SCALE,
+  calibrationModeOf,
+  foldsInLatencyStep,
+  seedCalibrations,
+} from '../session/inSongCalibration.ts';
+import { buildSessionResult, newSessionId } from '../session/results.ts';
 import { TRACKING_SAMPLE_MS, TrackingRecorder } from '../session/tracking.ts';
 import { runtime } from '../session/runtime.ts';
-import { useStore } from '../state/store.ts';
+import { DEFAULT_LATENCY_SEC, useStore } from '../state/store.ts';
+import { withPatient } from '../vision/calibration.ts';
 import {
   DEFAULT_REARM_FRACTION,
   ReceptorHistory,
@@ -1082,6 +1091,8 @@ export default function PlayScreen() {
     let alive = true;
     let ownedInput: InputSource | null = null;
 
+    let inSongCal: InSongCalibration | null = null;
+
     const boot = async () => {
       // A FRESH RECORD OF THE CONDITIONS FOR EVERY RUN — "Play again" on the same mounted screen must
       // not file the second song's figures under the first song's tracking.
@@ -1090,6 +1101,38 @@ export default function PlayScreen() {
       const st = useStore.getState();
       const config = st.config();
       const settings = st.settings;
+      /**
+       * CALIBRATING INSIDE THE MUSIC — the default path (session/inSongCalibration.ts).
+       *
+       * The song starts on a provisional range and the real one is learned from the patient's first
+       * movements. A keyboard / autoplay run has no camera and no range to learn, so it is never on
+       * this path whatever the prescription says.
+       */
+      const inSongMode = inputMode === 'camera' && calibrationModeOf(config) === 'in_song';
+      /**
+       * The id this run will be filed under, minted HERE rather than at the end, because the ranges
+       * learned during it are stamped with it (`RomCalibration.sessionId`) while it is still running.
+       * A range whose provenance points at a different session id than the record it is inside is a
+       * range nobody can trace.
+       */
+      const sessionId = newSessionId();
+
+      /**
+       * THE LATENCY METRONOME IS FOLDED IN ON THIS PATH, and the offset it would have written has to
+       * be written by somebody. The latency screen's own fast path is the rule: a value already in
+       * force is NEVER replaced (a therapist applied it on the Results screen for exactly this
+       * session), and the device default is reachable only from the state it is for — nothing has
+       * ever set a latency here. Written with its provenance, so every screen that prints the number
+       * prints where it came from. See `foldsInLatencyStep` for why the step goes.
+       */
+      if (inSongMode && foldsInLatencyStep(calibrationModeOf(config)) && st.latencySetAt === null) {
+        st.setLatency(
+          DEFAULT_LATENCY_SEC,
+          false,
+          `No latency has ever been measured on this device — the ${Math.round(DEFAULT_LATENCY_SEC * 1000)} ms default was used, ` +
+            "and this run's own crossings measure it for the next one",
+        );
+      }
 
       setLoadNote('Starting audio');
       const { ctx, mixer, sfx } = await runtime.ensureAudio();
@@ -1149,7 +1192,16 @@ export default function PlayScreen() {
           const attempting = runtime.ensureVision({
             mode: config.mode,
             lanes: config.lanes,
-            calibrations: st.calibrations,
+            /**
+             * ON THE IN-SONG PATH THE RANGES DO NOT COME THROUGH HERE.
+             *
+             * `seedCalibrations` vets every stored range with the very same checks VisionInput
+             * applies (`isCalibrationValid` / `calibrationMismatch`) and hands over only the ones
+             * that pass; a refused one is REPLACED by a provisional range rather than left to make
+             * the lane dead for the whole song, and the reason it was refused is reported. Handing
+             * the raw stored ranges in here would refuse them a second time and undo that.
+             */
+            calibrations: inSongMode ? config.lanes.map(() => null) : st.calibrations,
             difficulty: config.difficulty,
             mirrored: settings.mirrored,
           });
@@ -1162,6 +1214,41 @@ export default function PlayScreen() {
           return;
         }
         if (!alive) return;
+        if (inSongMode) {
+          /**
+           * The lane contexts are asked of the LANE (`getCalibrationContext`, derived from the very
+           * feature options its extractor runs with) and the patient is attached with `withPatient`,
+           * which is the one place a patient joins a CalibrationContext. Assembling a literal here
+           * is the drift calibration.ts exists to prevent.
+           */
+          const seeds = seedCalibrations(config.lanes, st.calibrations, (laneIndex) =>
+            withPatient(vision.getCalibrationContext(laneIndex), config.patientId),
+          );
+          inSongCal = new InSongCalibration({
+            vision,
+            lanes: config.lanes,
+            seeds,
+            thresholdFraction: DIFFICULTIES[config.difficulty].thresholdFraction,
+            // The runner does not exist yet: before it does, the song has not started and no warm-up
+            // can have closed, which is exactly what -Infinity means here.
+            songTime: () => runnerRef.current?.songTime() ?? Number.NEGATIVE_INFINITY,
+            warmupEndsAt: WARMUP_SEC,
+            patientId: config.patientId,
+            sessionId,
+          });
+          inSongCal.attach();
+          const refused = inSongCal.refusals();
+          if (refused.length > 0) {
+            setWarnings((w) => [
+              ...w,
+              ...refused.map(
+                (r) =>
+                  `Lane ${r.lane + 1} (${laneName(config.lanes[r.lane] ?? config.lanes[0])}): the stored range was not used because ${r.reason}. ` +
+                  'This lane starts on a provisional range and learns the real one from the first movements.',
+              ),
+            ]);
+          }
+        }
         // A LANE THAT PROVABLY CANNOT SCORE IS A HARD STOP, NOT A WARNING TO READ AFTERWARDS.
         // VisionInput refuses a range that measures a different quantity (another fingertip) or the
         // other limb (the other mirror convention), and a refused lane reads 0 and never triggers: the
@@ -1169,7 +1256,7 @@ export default function PlayScreen() {
         // the results screen. The app knows this BEFORE a note is scheduled, so it says so here — with
         // the reason and the way back to the screen that can fix it.
         const refused = vision.getInvalidCalibrations();
-        if (refused.length > 0) {
+        if (!inSongMode && refused.length > 0) {
           setBlocked(refused);
           setPhase('blocked');
           return;
@@ -1198,6 +1285,11 @@ export default function PlayScreen() {
         rearmFraction,
         maxGapSec,
         minIntervalSec,
+        // THE OPENING THE APP IS NOT MEASURING IN. Sparse notes come from the chart (chart.ts passes
+        // `warmupSec` to the generator); the wide windows and the suspended per-lane ducking come
+        // from here. Nothing on the measured path has a warm-up: the ranges were established before
+        // a note was scheduled, so there is nothing to be forgiving about.
+        warmup: inSongMode ? { endsAt: WARMUP_SEC, windowScale: WARMUP_WINDOW_SCALE } : undefined,
         songTitle: songManifest?.title,
         attribution: songManifest ? playCredit(songManifest) : undefined,
         highwayOptions: {
@@ -1230,8 +1322,19 @@ export default function PlayScreen() {
           // opening the screen and going back. Nothing was judged and no movement was made, so there
           // is nothing to file, and filing it would spend the patient's retention budget on it.
           if (summary.endReason === 'abandoned' && summary.results.judged === 0 && summary.results.reps === 0) return;
+          /**
+           * THE DENOMINATORS THE PATIENT ACTUALLY PLAYED AGAINST.
+           *
+           * On the in-song path the store's `calibrations` are whatever was there before the song —
+           * possibly nothing, possibly a range this run refused — while the ranges in force were
+           * built and installed during the run. The record's percentages are OF those, so those are
+           * what it is handed; anything else would file a session against a denominator it was not
+           * measured with.
+           */
+          const ranges = inSongCal ? inSongCal.ranges() : store.calibrations;
           const result = buildSessionResult({
             summary,
+            id: sessionId,
             config,
             manifest: songManifest,
             // The NAME as it is now, copied onto the record so an exported file is readable off the
@@ -1240,12 +1343,28 @@ export default function PlayScreen() {
             patientName: store.patients.find((p) => p.id === config.patientId)?.name ?? '',
             inputMode: store.inputMode,
             latencyOffsetSec: inputMode === 'camera' ? store.latencyOffsetSec : 0,
-            calibrations: store.calibrations,
+            calibrations: ranges,
             // THE CONDITIONS THE MEASUREMENT WAS TAKEN IN. Null for a keyboard or autoplay run (no
             // camera to describe, no samples taken), which the record stores as "not recorded".
             tracking: trackingRef.current.summary(),
           });
           store.addResult(result);
+          /**
+           * AND THE NEXT SESSION STARTS WHERE THIS ONE ENDED.
+           *
+           * The range in force is written back to the patient's stored ranges, so the same
+           * prescription tomorrow seeds from what this patient did today instead of from the
+           * movement's floor — which is what makes the opening bars of the SECOND session reachable
+           * without anybody measuring anything. It is stamped `in_song`, so nothing downstream can
+           * mistake it for a calibration-screen range: the grade is capped at fair, the sentence
+           * beside it says how it was arrived at, and a trend refuses to subtract it from a
+           * deliberately measured one like-for-like.
+           */
+          if (inSongCal) {
+            ranges.forEach((cal, i) => {
+              if (cal) store.setCalibration(i, cal);
+            });
+          }
           // NOT an unconditional `goto`. Only a run that ENDED WHILE THE SCREEN WAS ALIVE hands over
           // to the results: the chart finishing, or "End & see results". An abandoned run finishes
           // during teardown — the therapist has already pressed Back, or the page itself is going
@@ -1302,6 +1421,10 @@ export default function PlayScreen() {
       runnerRef.current?.dispose();
       runnerRef.current = null;
       runtime.runner = null;
+      // Stop consuming frames. Deliberately AFTER `dispose()`: disposing finishes an unfinished run,
+      // and `onEnd` reads the ranges this object is holding.
+      inSongCal?.detach();
+      inSongCal = null;
       ownedInput?.stop();
       // …and the camera goes unless the screen we have arrived at genuinely needs it within seconds
       // (a re-calibration). The store has already been navigated by the time a cleanup runs, so this

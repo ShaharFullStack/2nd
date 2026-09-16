@@ -29,7 +29,7 @@ import {
   subResolutionNote,
 } from '../session/results.ts';
 import type { LaneRangeSummary } from '../session/results.ts';
-import { compareTracking, timingResolutionMs } from '../session/tracking.ts';
+import { compareCalibration, compareTracking, sessionCalibrationMeasurement, timingResolutionMs, worstComparison } from '../session/tracking.ts';
 import type { TrackingComparison } from '../session/tracking.ts';
 import { isPatientDriven, patientSessions } from '../session/trends.ts';
 import type { LaneResultSummary, SessionResult } from '../session/types.ts';
@@ -580,10 +580,22 @@ export default function ResultsScreen() {
    * anywhere on the screen.
    */
   const comparison: TrackingComparison | null = previous
-    ? compareTracking(previous.tracking, result.tracking, {
-        from: `the session on ${shortDate(previous.startedAt)}`,
-        to: "today's session",
-      })
+    ? (() => {
+        const labels = { from: `the session on ${shortDate(previous.startedAt)}`, to: "today's session" };
+        /**
+         * TWO GATES, AND THE WORSE ONE RIDES ON EVERY CHIP.
+         *
+         * The camera was always here. The RANGE was not, and it is the same class of problem one
+         * level down: "+12 % of range" across a session whose range was measured on the calibration
+         * screen and one whose range was learned while the patient chased notes is partly a
+         * difference of method, not of patient. `worstComparison` is the one place that decides
+         * which of the two verdicts the screen prints.
+         */
+        return worstComparison(
+          compareTracking(previous.tracking, result.tracking, labels),
+          compareCalibration(sessionCalibrationMeasurement(previous), sessionCalibrationMeasurement(result), labels),
+        );
+      })()
     : null;
   const comparisonNote = comparison && comparison.kind !== 'like-for-like' ? comparison.note : null;
 
@@ -879,7 +891,7 @@ export default function ResultsScreen() {
           measured on a steady 30 fps stream and one measured on a 12 fps stream with the limb
           drifting out of frame, which the record could not previously tell apart at all.
         */}
-        <MeasurementNote tracking={result.tracking} inputMode={result.inputMode} full testId="results-measurement-note" />
+        <MeasurementNote tracking={result.tracking} session={result} inputMode={result.inputMode} full testId="results-measurement-note" />
       </div>
 
       <div className="card-grid" style={{ alignItems: 'stretch' }}>

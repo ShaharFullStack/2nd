@@ -25,7 +25,7 @@
  */
 import type { Mode } from '../engine/types.ts';
 import { MIN_USABLE_DETECT_FPS } from '../vision/mediapipe.ts';
-import type { CalibrationMeasurement } from '../vision/calibration.ts';
+import type { CalibrationMeasurement, CalibrationMethod } from '../vision/calibration.ts';
 import type { VisionStatus } from '../input/types.ts';
 import type { SessionResult, TrackingQuality } from './types.ts';
 
@@ -405,6 +405,133 @@ export function compareTracking(
   };
 }
 
+/**
+ * THE SAME GATE, FOR THE SCALE RATHER THAN THE STREAM.
+ *
+ * `compareTracking` above stops two sessions being subtracted from each other when the CAMERA was
+ * not the same on both. This stops it when the RANGE THE PERCENTAGES ARE OF was not arrived at the
+ * same way on both — the identical failure one level down. A patient whose range was measured on the
+ * calibration screen in March and learned inside the song in April has a percentage in each month
+ * taken against a differently-made denominator, and a delta across them is partly the method.
+ * Deliberately the SAME shape and vocabulary (`ComparabilityKind`, `tag`, `note`) as the tracking
+ * gate, so a surface passes its two endpoints through both and prints whichever is worse
+ * (`worstComparison`) — one qualifier, in one place, read the way the therapist already learnt to
+ * read it.
+ *
+ * WHAT IT IS SILENT ABOUT, AND WHY THAT IS NOT A LOOPHOLE. A measurement block with no `method` was
+ * written before this field existed, and until it existed THIS APP HAD EXACTLY ONE WAY TO PRODUCE A
+ * RANGE: the calibration screen. So an absent method is not an unknown method, it is 'rom_screen' —
+ * the same reading `calibrationModeOf` gives an absent `SessionConfig.calibrationMode`, and for the
+ * same reason. Two such ends are therefore genuinely like-for-like AS FAR AS METHOD GOES, and this
+ * function says nothing about them; how WELL each was measured is the tracking gate's business and
+ * the range's own grade, not this one's. What it will never do is let an in-song range be subtracted
+ * from anything else without a word.
+ *
+ * `from`/`to` carry the CALIBRATION grades, not the tracking grades: a reader who clicks into the
+ * qualifier is told how well each end's own range was measured, which is the thing being compared.
+ */
+export function compareCalibration(
+  from: CalibrationMeasurement | null | undefined,
+  to: CalibrationMeasurement | null | undefined,
+  labels: ComparisonLabels = DEFAULT_LABELS,
+): TrackingComparison {
+  const a = from ? calibrationGrade(from) : null;
+  const b = to ? calibrationGrade(to) : null;
+  // null = the record carries no measurement block at all (a hand-set range, or one from before the
+  // block existed). It is not claimed to be either method.
+  const ma: CalibrationMethod | null = from ? (from.method ?? 'rom_screen') : null;
+  const mb: CalibrationMethod | null = to ? (to.method ?? 'rom_screen') : null;
+  const alike: TrackingComparison = { kind: 'like-for-like', from: a, to: b, tag: null, note: null };
+  if (ma !== 'in_song' && mb !== 'in_song') return alike;
+  if (ma === 'in_song' && mb === 'in_song') {
+    return {
+      kind: 'uneven',
+      from: a,
+      to: b,
+      tag: 'ranges learned in song',
+      note:
+        'Both ranges were learned from the patient\u2019s movements while the song was playing rather than measured on the ' +
+        'calibration screen, so both denominators depend on the effort the music drew out that day. Read a difference of ' +
+        'this size as a direction.',
+    };
+  }
+  const inSongIsFrom = ma === 'in_song';
+  const other = inSongIsFrom ? mb : ma;
+  return {
+    kind: 'uneven',
+    from: a,
+    to: b,
+    tag: 'ranges measured differently',
+    note:
+      `The range behind ${inSongIsFrom ? labels.from : labels.to} was learned during the song, and the range behind ` +
+      `${inSongIsFrom ? labels.to : labels.from} was ${other === null ? 'arrived at in a way this record does not state' : calibrationMethodLabel(other)}. ` +
+      'The two percentages are of denominators arrived at in different ways, so part of this difference may be the method ' +
+      'rather than the patient.',
+  };
+}
+
+/**
+ * ONE SESSION'S RANGES, AS ONE MEASUREMENT BLOCK — for a comparison that spans whole sessions.
+ *
+ * A session has a range per lane, and the gate above takes one block per end. The rule here is the
+ * conservative one, because a qualifier that can be dodged by picking the flattering lane is not a
+ * qualifier: if ANY lane of the session records no range measurement at all, the session as a whole
+ * does not (null), and otherwise the WORST-graded lane stands for it. An in-song lane is capped at
+ * 'fair' by `calibrationGrade`, and a session with one in-song lane reports `method: 'in_song'`, so
+ * a mixed session can never present as a fully deliberate measurement.
+ */
+export function sessionCalibrationMeasurement(
+  s: Pick<SessionResult, 'lanes'>,
+): CalibrationMeasurement | null {
+  if (s.lanes.length === 0) return null;
+  const rank: Readonly<Record<TrackingGrade, number>> = { poor: 0, fair: 1, good: 2 };
+  let worst: CalibrationMeasurement | null = null;
+  let worstRank = Infinity;
+  for (const lane of s.lanes) {
+    const m = lane.calibrationMeasurement;
+    if (!m) return null;
+    const r = rank[calibrationGrade(m)];
+    // A tie goes to the in-song lane: the session as a whole then reports the less controlled method,
+    // which is the only reading that cannot understate what the ranges behind it are.
+    if (r < worstRank || (r === worstRank && m.method === 'in_song')) {
+      worstRank = r;
+      worst = m;
+    }
+  }
+  return worst;
+}
+
+/** Comparability ordered worst-first: an `unrecorded` end is the least defensible comparison. */
+const COMPARABILITY_RANK: Readonly<Record<ComparabilityKind, number>> = Object.freeze({
+  unrecorded: 0,
+  uneven: 1,
+  'like-for-like': 2,
+});
+
+/**
+ * The WORST of several verdicts about the same pair of sessions — the one a surface prints.
+ *
+ * A delta can be unqualified only when nothing disqualifies it. Two gates run over the same two
+ * endpoints (the camera, and the range the percentages are of) and a screen that showed the better
+ * of the two would be choosing the flattering half of what it knows. With no verdicts at all this
+ * returns `unrecorded`, because nothing was checked.
+ */
+export function worstComparison(...verdicts: readonly TrackingComparison[]): TrackingComparison {
+  let worst: TrackingComparison | null = null;
+  for (const v of verdicts) {
+    if (!worst || COMPARABILITY_RANK[v.kind] < COMPARABILITY_RANK[worst.kind]) worst = v;
+  }
+  return (
+    worst ?? {
+      kind: 'unrecorded',
+      from: null,
+      to: null,
+      tag: 'not checked',
+      note: 'Nothing about how these two sessions were measured was checked, so the change cannot be read as a measured gain.',
+    }
+  );
+}
+
 function cap(s: string): string {
   return s.length === 0 ? s : s[0].toUpperCase() + s.slice(1);
 }
@@ -447,6 +574,20 @@ export const EXPECTED_CALIBRATION_REPS = 3;
  *  - `good` — the range was measured under the conditions the figures downstream assume.
  */
 export function calibrationGrade(m: CalibrationMeasurement): TrackingGrade {
+  /**
+   * A RANGE LEARNED INSIDE THE MUSIC IS NEVER 'GOOD', HOWEVER CLEAN THE STREAM WAS.
+   *
+   * Every other test below is about the CAMERA. This one is about what the patient was doing: on the
+   * calibration screen they were asked for a still rest hold and three repetitions at their
+   * comfortable maximum, with nothing else to attend to. In the song the zero is a percentile of the
+   * frames that arrived rather than a hold anybody asked for, and the top is the peaks of reps
+   * performed while chasing notes — at whatever effort the music drew out, which is not the same
+   * instruction. That is a real measurement of a real movement and a materially less controlled one,
+   * and 30 clean frames per second cannot make it the other thing. So it is capped at 'fair', which
+   * is this file's own word for "usable but coarse: read the percentages it is the denominator of as
+   * approximate". It can still be 'poor' on its own merits.
+   */
+  const cap = m.method === 'in_song' ? 'fair' : 'good';
   if (
     m.fpsMedian < MIN_USABLE_DETECT_FPS ||
     m.trackedFraction < POOR_TRACKED_FRACTION ||
@@ -463,8 +604,26 @@ export function calibrationGrade(m: CalibrationMeasurement): TrackingGrade {
   ) {
     return 'fair';
   }
-  return 'good';
+  return cap;
 }
+
+/** How a range was arrived at, in the words the screens use. Never guesses at an absent method. */
+export function calibrationMethodLabel(method: CalibrationMethod | null | undefined): string {
+  if (method === 'in_song') return 'learned during the song';
+  if (method === 'rom_screen') return 'measured on the calibration screen';
+  return 'not recorded';
+}
+
+/**
+ * The sentence a screen prints beside an in-song range. Says what it IS, what it is not, and what
+ * to do about it — the same shape as `calibrationSentence`'s tail.
+ */
+export const CALIBRATION_IN_SONG_NOTE =
+  'This range was learned from the patient\u2019s own movements while the song was playing, not from a rest hold ' +
+  'and three maximum-effort repetitions on the calibration screen. It is a real measurement of a real movement ' +
+  'and a less controlled one: the zero is a percentile of the frames that arrived rather than a hold anybody ' +
+  'asked for, and the top is the effort the music drew out. Run the range-of-motion screens when a defensible ' +
+  'range is what the session is for.'
 
 /** The grade of a stored range, or null when it carries no measurement block — never "good". */
 export function calibrationMeasurementGrade(
@@ -491,6 +650,19 @@ export function calibrationConditions(m: CalibrationMeasurement): string {
 }
 
 /**
+ * "measured on the calibration screen at 23 fps, …" — the conditions WITH the clause that says what
+ * the patient was being asked to do while they were measured.
+ *
+ * Separate from `calibrationConditions` because the two answer different questions and read in
+ * different places: a badge tooltip beside a live range has the method in its own chip already,
+ * while a line in an exported file, read with no app around it, has nothing else to say it.
+ */
+export function calibrationProvenance(m: CalibrationMeasurement): string {
+  const how = m.method ? calibrationMethodLabel(m.method) : 'measured by a method this record does not state';
+  return `${how}, at ${calibrationConditions(m)}`;
+}
+
+/**
  * THE SENTENCE THAT GOES BESIDE THE RANGE — conditions first, then what they cost the reader.
  *
  * It says what follows from the sampling and nothing more. A low frame rate biases the top of a range
@@ -503,6 +675,13 @@ export function calibrationSentence(m: CalibrationMeasurement): string {
   const head = `This range was measured at ${calibrationConditions(m)}.`;
   if (grade === 'good') return head;
   const why: string[] = [];
+  // FIRST, because it is the largest caveat on the number and it is not about the camera at all.
+  if (m.method === 'in_song') {
+    why.push(
+      'it was learned from the movements the patient made while the song was playing rather than from a rest hold and three ' +
+        'maximum-effort repetitions, so the zero was not held and the top is the effort the music drew out',
+    );
+  }
   if (m.fpsMedian < GOOD_DETECT_FPS) {
     why.push(
       `at ${m.fpsMedian.toFixed(0)} fps a peak between two frames is never seen, so the top of the range is if anything too low — every later rep then reads as a larger percentage of it than it was`,

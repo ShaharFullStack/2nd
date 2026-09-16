@@ -17,6 +17,7 @@ critic/screenshots/*.png
 critic/screenshots/**/*.png
 critic/handsfree/
 critic/handsfree-thigh/
+critic/first-scored-note/
 critic/frames/
 critic/motion/
 critic/_tmp_*

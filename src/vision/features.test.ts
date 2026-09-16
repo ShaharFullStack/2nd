@@ -363,6 +363,29 @@ describe('MOVEMENT_INFO', () => {
     for (const p of ['palm_to_camera', 'hand_over_edge'] as const) expect(POSTURE_INFO[p].setup).toMatch(/hand|palm/);
   });
 
+  /**
+   * A PRESCRIPTION CAN NEED TWO SETUPS, so there has to be text for the MOVE between them.
+   *
+   * `setup` describes a posture to somebody not in one yet; it is not an instruction for changing out
+   * of another one, and the difference between the two hand setups is four words in the middle of a
+   * sentence. The ROM screen puts `change` on a beat of its own before any repetition is asked for.
+   */
+  it('every setup says how to get INTO it, not only what it is', () => {
+    for (const p of ['seated_leg', 'palm_to_camera', 'hand_over_edge'] as const) {
+      const { change, setup } = POSTURE_INFO[p];
+      expect(change.length, p).toBeGreaterThan(40);
+      expect(change, p).not.toBe(setup);
+      // An imperative about the body, not a description of a state.
+      expect(change, p).toMatch(/^(Sit|Bring|Slide|Turn|Move|Rest|Put)\b/);
+    }
+    // The two hand setups are 90 degrees apart about the wrist, so each move has to name the support
+    // AND where the hand ends up — that is exactly what a patient cannot infer from the other one.
+    expect(POSTURE_INFO.hand_over_edge.change).toMatch(/edge of the table/);
+    expect(POSTURE_INFO.hand_over_edge.change).toMatch(/fingers pointing at the camera/);
+    expect(POSTURE_INFO.palm_to_camera.change).toMatch(/onto the table/);
+    expect(POSTURE_INFO.palm_to_camera.change).toMatch(/palm faces the camera/);
+  });
+
   it('laneConflicts warns about physically coupled lanes on the same limb', () => {
     const lanes = (...specs: Array<[number, Movement, Side]>): LaneSpec[] => specs.map(([index, movement, side]) => ({ index, movement, side }));
     // Same limb, coupled movements: a knee lift almost always carries lateral drift.
