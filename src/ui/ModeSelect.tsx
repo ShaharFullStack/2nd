@@ -10,13 +10,13 @@ const CARDS: { mode: Mode; title: string; blurb: string; posture: string }[] = [
   {
     mode: 'leg',
     title: 'Leg mode',
-    blurb: 'Lift, extend and step into the rhythm.',
+    blurb: 'Lift, extend and flex in time with the music.',
     posture: 'Patient seated facing the camera, hips to feet in frame.',
   },
   {
     mode: 'hand',
     title: 'Hand mode',
-    blurb: 'Open, reach and play with your fingertips.',
+    blurb: 'Open, lift, pinch and spread in time with the music.',
     posture: 'Forearm on the table, hand toward the camera.',
   },
 ];
@@ -57,7 +57,7 @@ export default function ModeSelect() {
               <GameFrame />
               <div className="row">
                 <svg className="mode-emblem" viewBox="0 0 160 160" fill="none" stroke="currentColor" strokeWidth="5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                  {c.mode === 'leg' ? <path d="M60 20L51 62L89 93L74 131H108L119 118M51 62L32 104L45 133H65M68 25L93 62L126 64" /> : <path d="M48 132L29 94Q22 77 34 76L53 94L48 43Q48 29 59 32L70 76L70 23Q72 12 82 23L87 74L95 29Q100 19 107 31L104 83L118 52Q125 44 130 56L117 116L100 138Z" />}
+                  {c.mode === 'leg' ? <path d="M22 50C48 40 74 40 98 50L104 116L100 132H146L142 118H104M64 24Q92 8 120 24" /> : <path d="M48 132L29 94Q22 77 34 76L53 94L48 43Q48 29 59 32L70 76L70 23Q72 12 82 23L87 74L95 29Q100 19 107 31L104 83L118 52Q125 44 130 56L117 116L100 138Z" />}
                 </svg>
                 <div>
                   <div className="pick-title">{c.title}</div>

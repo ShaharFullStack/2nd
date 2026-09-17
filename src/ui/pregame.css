@@ -21,7 +21,7 @@
 .stage-actions .stage-start:hover { background: #c8b8ff; border-color: #eee8ff; }
 .play-symbol { width: 24px; height: 24px; margin-right: 6px; flex: none; }
 .stage-hint { color: #bcb6d1; font-size: .92rem; line-height: 1.5; }
-.stage-caption { position: absolute; right: 1%; bottom: 26px; color: #c4bbdc; font-size: .92rem; }
+.stage-caption { position: absolute; right: 1%; bottom: 26px; padding: 4px 10px; color: #c4bbdc; font-size: .92rem; background: #10101dcc; border-radius: 4px; }
 .stage-patient { border-top: 1px solid #ffffff22; border-bottom: 1px solid #ffffff22; }
 .stage-patient .card, .stage-patient .toast { border: 0; border-radius: 0; box-shadow: none; background: transparent; padding: 16px 0; }
 .stage-patient .eyebrow { text-transform: none; letter-spacing: 0; font-size: .9rem; }
