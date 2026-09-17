@@ -1,4 +1,6 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
+import { flushSync } from 'react-dom';
+import type { Screen } from './state/store.ts';
 import CameraCheck from './ui/CameraCheck.tsx';
 import ErrorBoundary from './ui/ErrorBoundary.tsx';
 import HistoryScreen from './ui/History.tsx';
@@ -31,9 +33,28 @@ export default function App() {
 }
 
 function Screens() {
-  const screen = useStore((s) => s.screen);
+  const [screen, setScreen] = useState(useStore.getState().screen);
   const inputMode = useStore((s) => s.inputMode);
   const goto = useStore((s) => s.goto);
+
+  useEffect(() => {
+    // Transition snapshots are visual only: camera/gameplay handoffs remain immediate.
+    const menus = new Set<Screen>(['home', 'patients', 'mode', 'setup', 'history']);
+    let transition: ViewTransition | undefined;
+    const unsubscribe = useStore.subscribe((next, previous) => {
+      if (next.screen === previous.screen) return;
+      transition?.skipTransition();
+      const reduced = next.settings.reducedMotion || window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      if (!document.startViewTransition || reduced || !menus.has(next.screen) || !menus.has(previous.screen)) {
+        setScreen(next.screen);
+        return;
+      }
+      transition = document.startViewTransition(() => {
+        flushSync(() => setScreen(useStore.getState().screen));
+      });
+    });
+    return () => { unsubscribe(); transition?.skipTransition(); };
+  }, []);
 
   // A dev input source has no camera, no ROM and no pipeline latency: those screens would hang.
   useEffect(() => {

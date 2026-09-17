@@ -3,20 +3,20 @@ import { MOVEMENT_INFO } from '../vision/features.ts';
 import { HAND_MOVEMENTS, LEG_MOVEMENTS } from '../engine/types.ts';
 import type { Mode } from '../engine/types.ts';
 import { Screen, TopBar } from './common.tsx';
+import './pregame.css';
+import GameFrame from './GameFrame.tsx';
 
-const CARDS: { mode: Mode; title: string; icon: string; blurb: string; posture: string }[] = [
+const CARDS: { mode: Mode; title: string; blurb: string; posture: string }[] = [
   {
     mode: 'leg',
     title: 'Leg mode',
-    icon: '🦵',
-    blurb: 'Seated lower-limb work tracked with full-body pose.',
+    blurb: 'Lift, extend and step into the rhythm.',
     posture: 'Patient seated facing the camera, hips to feet in frame.',
   },
   {
     mode: 'hand',
     title: 'Hand mode',
-    icon: '✋',
-    blurb: 'Fine and gross hand work tracked with hand landmarks.',
+    blurb: 'Open, reach and play with your fingertips.',
     posture: 'Forearm on the table, hand toward the camera.',
   },
 ];
@@ -32,9 +32,9 @@ export default function ModeSelect() {
   };
 
   return (
-    <Screen>
-      <TopBar eyebrow="Step 1 of 3" title="Which limb is this session for?" onBack={() => goto('home')} />
-      <p className="muted">One mode per session — pose and hand tracking cannot run on the same frames without halving the frame rate.</p>
+    <Screen testId="pregame-mode">
+      <TopBar eyebrow="Beat Rehab / Choose your mode" title="How will you play?" onBack={() => goto('home')} />
+      <p className="muted">Two ways to move with the music. Choose one for this session.</p>
       {/* THE SCREEN WHERE THE HANDS-FREE FLOW STOPS, saying so.
           Every screen from the camera check onwards can be confirmed by holding a limb over a circle
           on the camera preview. This one cannot, and neither can the prescription behind it: there is
@@ -43,27 +43,22 @@ export default function ModeSelect() {
           A patient who reaches this screen from the results screen's "Hand back" circle has finished
           their own part of the visit, and is owed a screen that admits it rather than one that simply
           offers nothing. */}
-      <p className="muted" data-testid="mode-handsfree-note" style={{ maxWidth: 720 }}>
-        <b>This step needs a hand.</b> The camera is off, so nothing on this screen can be confirmed by holding a limb
-        over a circle — this screen and the prescription after it are set up by whoever is in the room. The patient takes
-        over again at the camera check, and from there to the end of the session every step can be confirmed hands-free.
-      </p>
-
-      <div className="card-grid">
+      <div className="mode-roster">
         {CARDS.map((c) => {
           const movements = c.mode === 'leg' ? LEG_MOVEMENTS : HAND_MOVEMENTS;
           return (
             <button
               key={c.mode}
-              className="card pick"
+              className="card pick mode-pick"
               aria-pressed={mode === c.mode}
               onClick={() => choose(c.mode)}
               data-testid={`mode-${c.mode}`}
             >
+              <GameFrame />
               <div className="row">
-                <span className="art" aria-hidden="true">
-                  {c.icon}
-                </span>
+                <svg className="mode-emblem" viewBox="0 0 160 160" fill="none" stroke="currentColor" strokeWidth="5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                  {c.mode === 'leg' ? <path d="M60 20L51 62L89 93L74 131H108L119 118M51 62L32 104L45 133H65M68 25L93 62L126 64" /> : <path d="M48 132L29 94Q22 77 34 76L53 94L48 43Q48 29 59 32L70 76L70 23Q72 12 82 23L87 74L95 29Q100 19 107 31L104 83L118 52Q125 44 130 56L117 116L100 138Z" />}
+                </svg>
                 <div>
                   <div className="pick-title">{c.title}</div>
                   <div className="pick-sub">{c.blurb}</div>
@@ -81,6 +76,10 @@ export default function ModeSelect() {
           );
         })}
       </div>
+      <p className="mode-guidance" data-testid="mode-handsfree-note">
+        <b>This step needs a hand.</b> The camera is off. Tap to choose the mode, movements and song.
+        The patient takes over again at the camera check with hands-free controls.
+      </p>
     </Screen>
   );
 }

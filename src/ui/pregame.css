@@ -1,0 +1,89 @@
+/* Title-screen palette: ink #10101d, violet #b6a1ff, ice #8fe4e8,
+   amber #ffc77b, chalk #f4f1ff. The track is the single visual centerpiece. */
+[data-testid='pregame-home'], [data-testid='pregame-mode'] {
+  background: radial-gradient(ellipse at 78% 30%, #2e2453 0, transparent 55%), #10101d;
+  --muted: #bcb6d1;
+  --dim: #bcb6d1;
+  --accent: #b6a1ff;
+  --accent-2: #8fe4e8;
+}
+[data-testid='pregame-home'] .screen-inner { width: min(1500px, 100%); gap: 0; padding: 0 5vw 24px; }
+.title-stage { position: relative; isolation: isolate; min-height: min(730px, 77vh); padding: 34px 0 58px; display: flex; flex-direction: column; justify-content: center; }
+.stage-art { position: absolute; z-index: -1; right: -4vw; bottom: 0; width: 69%; height: 100%; opacity: .95; pointer-events: none; }
+.stage-wordmark { display: flex; gap: 14px; align-items: center; font-weight: 700; font-size: 1rem; margin-bottom: clamp(28px, 5vh, 64px); }
+.stage-wordmark span { color: #b6a1ff; letter-spacing: -5px; padding-right: 5px; transform: rotate(-12deg); }
+.stage-title { margin: 0 0 26px -7px; font-family: 'Arial Black', 'Segoe UI', sans-serif; font-size: clamp(5rem, 10.5vw, 9rem); line-height: .82; font-weight: 950; letter-spacing: -.075em; color: #f4f1ff; transform: skew(-7deg); transform-origin: left bottom; }
+.stage-title { width: fit-content; }
+.stage-period { color: #b6a1ff; }
+.stage-description { color: #ddd7ed; font-size: clamp(1.1rem, 1.7vw, 1.5rem); line-height: 1.45; }
+.stage-actions { margin-top: 30px; max-width: 650px; }
+.stage-actions .stage-start { background: #b6a1ff; color: #17122b; border: 1px solid #d1c4ff; border-radius: 5px; box-shadow: 0 5px 0 #68569a, 0 12px 32px #100b2440; min-height: 76px; font-size: 1.2rem; padding: 0 30px; }
+.stage-actions .stage-start:hover { background: #c8b8ff; border-color: #eee8ff; }
+.play-symbol { width: 24px; height: 24px; margin-right: 6px; flex: none; }
+.stage-hint { color: #bcb6d1; font-size: .92rem; line-height: 1.5; }
+.stage-caption { position: absolute; right: 1%; bottom: 26px; color: #c4bbdc; font-size: .92rem; }
+.stage-patient { border-top: 1px solid #ffffff22; border-bottom: 1px solid #ffffff22; }
+.stage-patient .card, .stage-patient .toast { border: 0; border-radius: 0; box-shadow: none; background: transparent; padding: 16px 0; }
+.stage-patient .eyebrow { text-transform: none; letter-spacing: 0; font-size: .9rem; }
+.stage-patient .btn { background: #ffffff08; border-color: #ffffff30; border-radius: 5px; color: #eee8ff; box-shadow: none; }
+.stage-menu { display: flex; align-items: flex-start; gap: 32px; flex-wrap: wrap; padding-top: 8px; }
+.stage-drawer { flex: 1 1 220px; min-width: 0; }
+.stage-drawer summary { min-height: 64px; padding: 20px 0; cursor: pointer; color: #ddd7ed; font-weight: 600; }
+.stage-drawer summary:hover { color: #fff; }
+.stage-drawer summary:focus-visible { outline: 3px solid #8fe4e8; outline-offset: 3px; }
+.stage-drawer .card { background: #191625; border-color: #3b334e; border-radius: 6px; box-shadow: none; }
+.stage-drawer .eyebrow { text-transform: none; letter-spacing: 0; }
+[data-testid='pregame-home'] > .screen-inner > .toast { margin-top: 12px; }
+[data-testid='pregame-mode'] .screen-inner { width: min(1320px, 100%); justify-content: center; gap: 28px; }
+[data-testid='pregame-mode'] .topbar h2 { font-size: clamp(2rem, 4vw, 3.2rem); letter-spacing: -.04em; }
+[data-testid='pregame-mode'] .eyebrow { text-transform: none; letter-spacing: 0; }
+.mode-roster { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+.mode-roster .mode-pick { position: relative; overflow: hidden; min-height: 345px; justify-content: flex-end; padding: 32px; border-radius: 6px; background: linear-gradient(155deg, #242139, #14121e); border: 1px solid #635679; box-shadow: none; gap: 16px; }
+.mode-roster .mode-pick[aria-pressed='true'] { border-color: #b6a1ff; box-shadow: inset 0 -4px #b6a1ff; }
+.mode-roster .mode-pick:hover { background: linear-gradient(155deg, #37304f, #1c182b); border-color: #d5c6ff; }
+.mode-roster .mode-pick:focus-visible { outline: 3px solid #8fe4e8; outline-offset: 4px; }
+.mode-pick .pick-title { font-size: 2.5rem; letter-spacing: -.04em; }
+.mode-pick .badge { border: 0; background: transparent; padding: 0; font-size: .9rem; color: #cbc3dd; font-weight: 400; }
+.mode-pick .badge + .badge::before { content: '/'; padding: 0 10px 0 4px; color: #8f82a6; }
+.mode-emblem { position: absolute; right: 18px; top: 14px; width: 150px; height: 150px; color: #b6a1ff; opacity: .65; transform: rotate(-12deg); }
+.mode-pick[data-testid='mode-hand'] .mode-emblem { color: #8fe4e8; }
+.game-frame { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: -1; overflow: visible; }
+.game-frame-body { fill: #211b32; stroke: #685a83; stroke-width: 1; transition: fill 160ms ease, stroke 160ms ease; }
+.game-frame-edge { fill: none; stroke: #b6a1ff; stroke-width: 3; }
+.stage-actions .stage-start { position: relative; isolation: isolate; background: transparent; border: 0; box-shadow: none; border-radius: 0; }
+.stage-actions .stage-start:hover { background: transparent; }
+.game-frame-button .game-frame-body { fill: #b6a1ff; stroke: #d1c4ff; }
+.game-frame-button .game-frame-edge { stroke: #e6dcff; }
+.stage-start:hover .game-frame-body { fill: #cabaff; }
+.mode-roster .mode-pick, .mode-roster .mode-pick:hover, .mode-roster .mode-pick[aria-pressed='true'] { isolation: isolate; background: transparent; border: 0; box-shadow: none; }
+.mode-pick:hover .game-frame-body { fill: #30263f; stroke: #cdb9ed; }
+.mode-pick[aria-pressed='true'] .game-frame-body { stroke: #b6a1ff; stroke-width: 2; }
+/* A short out/in dissolve only when navigation changes the menu screen. */
+::view-transition-old(root) { animation: menu-out 130ms ease-in both; }
+::view-transition-new(root) { animation: menu-in 180ms ease-out 100ms both; }
+@keyframes menu-out { to { opacity: 0; } }
+@keyframes menu-in { from { opacity: 0; } to { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) {
+  ::view-transition-old(root), ::view-transition-new(root) { animation: none; }
+  .game-frame-body { transition: none; }
+}
+.mode-guidance { max-width: 850px; color: #bcb6d1; }
+@media (max-width: 760px) {
+  .title-stage { min-height: 650px; padding-top: 26px; }
+  .stage-art { right: -5vw; width: 95%; opacity: .35; mask-image: linear-gradient(90deg, transparent, #000); }
+  .stage-caption { display: none; }
+  .stage-title { font-size: clamp(5rem, 16vw, 7rem); }
+  .stage-actions .row { gap: 12px !important; }
+  .stage-actions .stage-start { padding: 0 20px; font-size: 1.05rem; }
+  .stage-menu { gap: 0; flex-direction: column; }
+  .stage-drawer { flex: auto; width: 100%; border-bottom: 1px solid #ffffff18; }
+  .mode-roster { grid-template-columns: 1fr; }
+  .mode-roster .mode-pick { min-height: 360px; padding: 112px 24px 24px; justify-content: flex-start; }
+  .mode-emblem { width: 76px; height: 76px; top: 18px; right: 24px; }
+}
+@media (max-height: 800px) and (min-width: 761px) {
+  .title-stage { min-height: 565px; padding-top: 24px; padding-bottom: 32px; }
+  .stage-wordmark { margin-bottom: 28px; }
+  .stage-title { font-size: 6.4rem; }
+  .stage-actions { margin-top: 22px; }
+}

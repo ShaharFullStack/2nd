@@ -6,6 +6,9 @@ import PatientBanner from './PatientBanner.tsx';
 import { MeasurementNote } from './ScopeNote.tsx';
 import { formatDate, formatDuration, formatPercent, laneRangeSummaries } from '../session/results.ts';
 import { formatFeature } from '../vision/calibration.ts';
+import StageArtwork from './StageArtwork.tsx';
+import GameFrame from './GameFrame.tsx';
+import './pregame.css';
 
 const persistent = isPersistenceAvailable();
 
@@ -72,13 +75,14 @@ export default function Home() {
   };
 
   return (
-    <Screen>
-      <div className="stack" style={{ gap: 8, paddingTop: '4vh' }}>
-        <div className="eyebrow">Camera-controlled rhythm therapy</div>
-        <h1 className="title">Beat Rehab</h1>
-        <p className="muted" style={{ maxWidth: 620, fontSize: '1.1rem' }}>
-          A prescribed set of movements becomes the controller. The patient plays the song with their
-          own range of motion; you get reps, ROM, timing and compensation flags at the end.
+    <Screen testId="pregame-home">
+      <div className="title-stage">
+      <StageArtwork />
+      <div className="stage-heading">
+        <div className="stage-wordmark"><span aria-hidden="true">▰ ▰ ▰</span> Beat Rehab</div>
+        <h1 className="stage-title">Beat<br />Rehab<span className="stage-period">.</span></h1>
+        <p className="stage-description">
+          Find your rhythm.<br />Make every movement music.
         </p>
       </div>
 
@@ -95,31 +99,27 @@ export default function Home() {
         It is not hidden and it is not apologised for: it is the biggest thing on the screen, and the
         sentence under it says it is the last one.
       */}
-      <div className="row only-tap" style={{ gap: 18 }}>
+      <div className="row only-tap stage-actions">
         <div className="row" style={{ gap: 18 }}>
-          <button className="btn btn-primary btn-lg" onClick={start} data-testid="start-session">
+          <button className="btn btn-primary btn-lg stage-start" onClick={start} data-testid="start-session">
+            <GameFrame button />
+            <svg className="play-symbol" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3L21 12L6 21Z" fill="currentColor" /></svg>
             {activePatientId && !(inputMode === 'camera' && patient?.deviceTest) ? 'Start session' : 'Choose patient & start'}
           </button>
-          <button className="btn btn-lg" onClick={() => goto('history')} data-testid="open-history">
+          <button className="btn btn-ghost" onClick={() => goto('history')} data-testid="open-history">
             History {patientSessions > 0 && <span className="badge">{patientSessions}</span>}
           </button>
         </div>
         {inputMode === 'camera' && (
-          <p className="muted" style={{ margin: 0, maxWidth: 620, fontSize: '1.05rem' }} data-testid="only-tap-note">
-            <b>Setting up takes a few presses; the session itself takes none.</b> Choosing the patient, the movements
-            and the song is done by hand, before anyone gets into position — and one of those presses has to be a real
-            one, because the browser will not start the sound without it and the song clock is that sound. From the
-            camera check onwards the patient confirms every step themselves, by holding a hand or a knee inside a circle
-            on the camera preview until the ring fills — with two exceptions, each of which the screen it
-            happens on names in those words. If the browser stops the sound mid-song, only a touch can start it again,
-            and no movement in front of the camera can; and if the camera itself will not start, there is no picture to
-            draw a circle on, so that step needs a hand or somebody to help. The buttons all keep working for whoever is
-            in the room.
+          <p className="stage-hint" data-testid="only-tap-note">
+            Choose your movements and song, then play with the camera.<br />Setup needs a few taps. Play is hands-free.
           </p>
         )}
       </div>
+      <div className="stage-caption" aria-hidden="true">Your movement. Your tempo.</div>
+      </div>
 
-      <PatientBanner />
+      <div className="stage-patient"><PatientBanner /></div>
 
       {inputMode !== 'camera' && (
         <Toast>
@@ -130,7 +130,9 @@ export default function Home() {
 
       {!persistent && <Toast kind="bad">This browser is not storing data — session history will be lost when the tab closes.</Toast>}
 
-      <div className="card-grid">
+      <div className="stage-menu">
+        <details className="stage-drawer">
+        <summary>Display &amp; sound</summary>
         <div className="card stack">
           <h3>Display &amp; sound</h3>
           <label className="switch">
@@ -167,7 +169,10 @@ export default function Home() {
             <span className="dim">Slower scroll = more time to see the note coming.</span>
           </div>
         </div>
+        </details>
 
+        <details className="stage-drawer">
+        <summary>Session recap</summary>
         <div className="card stack">
           <h3>{patient ? `Last session — ${patient.name}` : 'Last session'}</h3>
           {!patient ? (
@@ -251,18 +256,22 @@ export default function Home() {
             <p className="muted">No sessions for {patient.name} yet. The first run takes about four minutes including calibration.</p>
           )}
         </div>
+        </details>
 
+        <details className="stage-drawer">
+        <summary>How to play</summary>
         <div className="card stack">
           <h3>How a session runs</h3>
           <ol className="muted" style={{ margin: 0, paddingLeft: '1.2em', lineHeight: 1.9 }}>
             <li>Pick leg or hand mode</li>
             <li>Prescribe 2–4 movements, difficulty and a song</li>
             <li>Frame the camera</li>
-            <li>Calibrate range of motion per movement</li>
-            <li>Measure camera latency</li>
+            <li>Warm up in the song, or measure your range and timing first</li>
             <li>Play — then review the results</li>
           </ol>
+          <p className="dim">From the camera check, hold a hand or knee in the preview circle to continue. Buttons stay available. If the sound stops or the camera cannot start, a tap or a helper is needed.</p>
         </div>
+        </details>
       </div>
     </Screen>
   );
